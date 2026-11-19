@@ -2059,6 +2059,7 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 	}
 	ns := icetable.Identifier{e.nsPrefix + "_" + database}
 	nsKey := catalogNamespaceKey(ns)
+	e.forgetExportLagNamespace(ns) // its tables' unpublished files will never be published (export_lag.go)
 
 	// This node's tables. A node that never exported the database has no
 	// namespace in its own catalog, but on a shared bucket another node's

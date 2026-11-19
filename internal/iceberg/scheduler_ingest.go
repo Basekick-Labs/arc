@@ -17,12 +17,16 @@ import (
 // rate (every few seconds per measurement, forever), which none of the
 // others do:
 //
-//   - Spaced per table by ingestInterval, counted from the last ATTEMPT an
-//     ingest request caused, whatever came of it. A table whose reconcile
-//     fails (a schema conflict, a storage outage) or is busy would otherwise
-//     be listed again at every flush. Spacing also bounds how fast a table
-//     publishes versions: readers resolve a published version and open it a
-//     moment later, and only retain_snapshots+1 are kept.
+//   - Spaced per table by ingestInterval, counted from the later of two
+//     moments: the last ATTEMPT an ingest request caused, whatever came of
+//     it, and the end of the last reconcile of any kind that changed the
+//     table. The first, because a table whose reconcile fails (a schema
+//     conflict, a storage outage) or is busy would otherwise be listed again
+//     at every flush. The second, because spacing is also what bounds how
+//     fast a table publishes versions: readers resolve a published version
+//     and open it a moment later, and only retain_snapshots+1 are kept, so
+//     an ingest request must not publish right behind a compaction's or a
+//     timed pass's version.
 //   - Served after every other kind. A compaction's request takes deleted
 //     inputs out of a table and must not queue behind a backlog of ingest
 //     ones; inside a timed pass only one ingest request is served between two
@@ -111,6 +115,14 @@ func (s *Scheduler) nextIngestDue() (time.Time, bool) {
 			earliest = r.due
 		}
 	}
+	// A spacing that has run out says nothing any more: forget it, so the
+	// map holds only the tables written to within the last interval.
+	now := time.Now()
+	for key, next := range s.ingestNext {
+		if !next.After(now) {
+			delete(s.ingestNext, key)
+		}
+	}
 	return earliest, !earliest.IsZero()
 }
 
@@ -156,8 +168,8 @@ func (s *Scheduler) takeDueIngest(now time.Time) (Measurement, string, bool) {
 	return pick.m, key, true
 }
 
-// requeueIngest asks again for a table whose ingest-served reconcile was busy
-// or left files behind, at its next allowed attempt.
+// requeueIngest asks again, at the table's next allowed attempt, for a table
+// whose ingest-served reconcile did not settle.
 func (s *Scheduler) requeueIngest(m Measurement, key string) {
 	s.reqMu.Lock()
 	if _, queued := s.ingestDue[key]; !queued {
@@ -186,25 +198,43 @@ func (s *Scheduler) otherRequestsQueued() bool {
 	return len(s.requested)+len(s.requestedPaths)+len(s.requestedHot)+len(s.drops) > 0
 }
 
-// noteIngestCovered records that a reconcile of key which started at
-// startedAt went through. A file reported before it started is in the table
-// now (or was already), so it no longer waits. One reported while it ran may
-// have missed the listing: it still waits, counted from the reconcile's
-// start (it was reported no earlier), and its request stays queued. Whatever
-// changed the table also starts the spacing for the next ingest request.
+// noteIngestCovered records what a reconcile of key which started at
+// startedAt means for the ingest files reported for it.
+//
+// A reconcile that changed the table restarts the spacing from its end, for
+// a request already queued as much as for the next one: it may have
+// published a version.
+//
+// A reconcile that SETTLED covers the files reported before it started: they
+// are in a published table version now (or already were), so they no longer
+// wait. settled is the loop's own notion: the measurement's state is cached
+// only when the listing was read, every file registered, and the discovery
+// files published. A reconcile that committed and could not publish, lost
+// the writer role, was busy, left files behind or failed covers nothing: the
+// files are not readable yet. A file reported while a settled reconcile ran
+// may have missed its listing: it still waits, counted from the reconcile's
+// start (it was reported no earlier), and its request stays queued.
+//
+// Loop goroutine only (it reads s.state).
 func (s *Scheduler) noteIngestCovered(key string, startedAt time.Time, outcome reconcileOutcome, err error) {
-	if s.ingestInterval <= 0 || err != nil {
+	if s.ingestInterval <= 0 {
 		return
 	}
-	if outcome != outcomeReconciled && outcome != outcomeUnchanged {
-		return // busy, or files left behind: the report still waits
-	}
+	_, settled := s.state[key]
 	s.reqMu.Lock()
 	defer s.reqMu.Unlock()
 	if outcome == outcomeReconciled {
-		if next := time.Now().Add(s.ingestInterval); next.After(s.ingestNext[key]) {
+		next := time.Now().Add(s.ingestInterval)
+		if next.After(s.ingestNext[key]) {
 			s.ingestNext[key] = next
 		}
+		if r, queued := s.ingestDue[key]; queued && r.due.Before(s.ingestNext[key]) {
+			r.due = s.ingestNext[key]
+			s.ingestDue[key] = r
+		}
+	}
+	if err != nil || !settled || (outcome != outcomeReconciled && outcome != outcomeUnchanged) {
+		return
 	}
 	reports, waiting := s.ingestPending[key]
 	if !waiting || !reports.first.Before(startedAt) {
@@ -256,7 +286,10 @@ func (s *Scheduler) serviceIngest(ctx context.Context, max int) {
 		}
 		event.Str("database", m.Database).Str("measurement", m.Measurement).Str("outcome", outcome.String()).
 			Msg("Iceberg reconcile on request (an ingest flush)")
-		if outcome == outcomeInProgress || outcome == outcomeBusy {
+		// Anything short of a settled reconcile comes back at the table's
+		// next allowed attempt, whether or not another flush asks: a failure,
+		// a busy table, files left behind, a publish that did not land.
+		if _, settled := s.state[key]; err != nil || !settled || outcome == outcomeInProgress || outcome == outcomeBusy {
 			s.requeueIngest(m, key)
 		}
 	}

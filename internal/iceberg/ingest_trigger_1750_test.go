@@ -191,6 +191,11 @@ func TestScheduler_IngestPendingTracksUncoveredReports(t *testing.T) {
 	if got := pending(); got != 0 {
 		t.Fatalf("pending = %v before any report", got)
 	}
+	// "Settled" is the loop's cached state for the measurement: these tables
+	// have it, as after a pass that listed, registered and published.
+	for _, k := range []string{key, "mydb\x00aaa", "mydb\x00bbb"} {
+		r.sched.state[k] = measurementState{}
+	}
 	r.sched.RequestIngestReconcile("mydb", "cpu")
 	time.Sleep(15 * time.Millisecond)
 	if got := pending(); got < 0.010 {
@@ -200,8 +205,14 @@ func TestScheduler_IngestPendingTracksUncoveredReports(t *testing.T) {
 	r.sched.noteIngestCovered(key, time.Now(), outcomeReconciled, errors.New("failed"))
 	r.sched.noteIngestCovered(key, time.Now(), outcomeBusy, nil)
 	r.sched.noteIngestCovered(key, time.Now(), outcomeInProgress, nil)
+	// One that committed and could not publish (or lost the writer role)
+	// returns "reconciled" too, and leaves no cached state: the file is not
+	// readable yet.
+	delete(r.sched.state, key)
+	r.sched.noteIngestCovered(key, time.Now(), outcomeReconciled, nil)
+	r.sched.state[key] = measurementState{}
 	if got := pending(); got == 0 {
-		t.Fatal("a reconcile that started before the report, failed, was busy or left files behind cleared the pending report")
+		t.Fatal("a reconcile that started before the report, failed, was busy, left files behind or did not publish cleared the pending report")
 	} else if got > 5 {
 		t.Fatalf("pending = %v s for a report made a moment ago: a reconcile that started before it moved its time back", got)
 	}
@@ -232,10 +243,13 @@ func TestScheduler_IngestPendingTracksUncoveredReports(t *testing.T) {
 
 	// The oldest of several tables is what is reported.
 	r.sched.RequestIngestReconcile("mydb", "aaa")
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 	r.sched.RequestIngestReconcile("mydb", "bbb")
+	if got := pending(); got < 0.3 {
+		t.Errorf("pending = %v s with a table waiting 300 ms, want the older table's wait", got)
+	}
 	r.sched.noteIngestCovered("mydb\x00aaa", time.Now(), outcomeReconciled, nil)
-	if got := pending(); got >= 0.020 {
+	if got := pending(); got == 0 || got >= 0.3 {
 		t.Errorf("pending = %v s after the older table was covered, want the newer table's wait", got)
 	}
 
@@ -330,5 +344,144 @@ func TestExportLagWaitsForAPublishThatLands(t *testing.T) {
 	r.sched.runPass(ctx)
 	if got := snapshotInt(t, "iceberg_export_lag_count") - count; got != 1 {
 		t.Errorf("%d lag observations after another pass, want still 1", got)
+	}
+}
+
+// A reconcile of any kind that changed the table restarts the spacing for a
+// request that is already queued: an ingest request must not publish a
+// version right behind a compaction's or a timed pass's.
+func TestScheduler_AnIngestRequestWaitsBehindAnotherReconcilesPublish(t *testing.T) {
+	const interval = time.Minute
+	const key = "mydb\x00cpu"
+	r, _ := newIngestRig(t, interval)
+	r.sched.state[key] = measurementState{}
+	started := time.Now()
+	time.Sleep(2 * time.Millisecond)
+	r.sched.RequestIngestReconcile("mydb", "cpu") // a flush, while another reconcile of the table runs
+	if due, ok := r.sched.nextIngestDue(); !ok || time.Until(due) > time.Second {
+		t.Fatalf("before the other reconcile ends the request is due in %v (queued=%v), want now", time.Until(due), ok)
+	}
+	r.sched.noteIngestCovered(key, started, outcomeReconciled, nil) // the other reconcile ends, having changed the table
+	due, ok := r.sched.nextIngestDue()
+	if !ok {
+		t.Fatal("the request was dropped: its file was reported after the reconcile started and may have missed it")
+	}
+	if wait := time.Until(due); wait < interval-5*time.Second || wait > interval {
+		t.Errorf("the request is due in %v, want a full interval after the reconcile that changed the table", wait)
+	}
+	// One that changed nothing publishes nothing: the request stays due.
+	r2, _ := newIngestRig(t, interval)
+	r2.sched.state[key] = measurementState{}
+	started = time.Now()
+	time.Sleep(2 * time.Millisecond)
+	r2.sched.RequestIngestReconcile("mydb", "cpu")
+	r2.sched.noteIngestCovered(key, started, outcomeUnchanged, nil)
+	if due, ok := r2.sched.nextIngestDue(); !ok || time.Until(due) > time.Second {
+		t.Errorf("after a reconcile that changed nothing the request is due in %v (queued=%v), want now", time.Until(due), ok)
+	}
+}
+
+// A file committed by a pass that could not publish is not exported yet: its
+// report keeps waiting, the request comes back on its own at the next
+// allowed attempt, and the lag is observed when a publish lands.
+func TestScheduler_IngestRequestSurvivesAPublishThatFails(t *testing.T) {
+	if os.Geteuid() == 0 || runtime.GOOS == "windows" {
+		t.Skip("needs a hint write that fails")
+	}
+	const interval = 200 * time.Millisecond
+	ctx := context.Background()
+	r, src := newIngestRig(t, interval)
+	first := ingestName("cpu", time.Now())
+	r.writeIn(t, "cpu", first)
+	r.sched.RequestIngestReconcile("mydb", "cpu")
+	r.sched.serviceIngest(ctx, ingestBatch)
+	if got := snapshotFloat(t, "iceberg_export_pending_seconds"); got != 0 {
+		t.Fatalf("pending = %v s after a settled export, want 0", got)
+	}
+	count := snapshotInt(t, "iceberg_export_lag_count")
+
+	hint := filepath.Join(r.root, "arc_mydb.db", "cpu", "metadata", "version-hint.text")
+	if err := os.Remove(hint); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(hint, 0o755); err != nil { // a directory where the hint goes: the write fails
+		t.Fatal(err)
+	}
+	time.Sleep(interval + 20*time.Millisecond)
+	r.writeIn(t, "cpu", ingestName("cpu", time.Now()))
+	r.sched.RequestIngestReconcile("mydb", "cpu")
+	r.sched.serviceIngest(ctx, ingestBatch)
+	if got := len(r.live(t)); got != 2 {
+		t.Fatalf("%d files committed, want 2", got)
+	}
+	if got := snapshotFloat(t, "iceberg_export_pending_seconds"); got == 0 {
+		t.Error("pending = 0 for a file whose table version was not published")
+	}
+	if due, ok := r.sched.nextIngestDue(); !ok || time.Until(due) > interval {
+		t.Fatalf("after a publish that failed the request is due in %v (queued=%v), want it queued for the next attempt with no further flush", time.Until(due), ok)
+	}
+	if got := snapshotInt(t, "iceberg_export_lag_count") - count; got != 0 {
+		t.Errorf("%d lag observations before the publish landed, want 0", got)
+	}
+
+	if err := os.Remove(hint); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(interval + 20*time.Millisecond)
+	listed := len(strings.Split(src.order(), ","))
+	r.sched.serviceIngest(ctx, ingestBatch) // no new flush: the requeued request alone
+	if got := len(strings.Split(src.order(), ",")); got != listed+1 {
+		t.Fatalf("the requeued request was not served (%d listings, then %d)", listed, got)
+	}
+	if got := snapshotFloat(t, "iceberg_export_pending_seconds"); got != 0 {
+		t.Errorf("pending = %v s once the publish landed, want 0", got)
+	}
+	if got := snapshotInt(t, "iceberg_export_lag_count") - count; got != 1 {
+		t.Errorf("%d lag observations once the publish landed, want 1", got)
+	}
+	if _, queued := r.sched.nextIngestDue(); queued {
+		t.Error("a request is still queued after the export settled")
+	}
+}
+
+// A failed reconcile comes back at the next allowed attempt with no further
+// flush, and a dropped database's unpublished files are not kept for a lag
+// that will never be observed.
+func TestScheduler_FailedIngestReconcileIsRequeued(t *testing.T) {
+	const interval = 200 * time.Millisecond
+	ctx := context.Background()
+	r, src := newIngestRig(t, interval)
+	src.fail["cpu"] = true
+	r.writeIn(t, "cpu", ingestName("cpu", time.Now()))
+	r.sched.RequestIngestReconcile("mydb", "cpu")
+	r.sched.serviceIngest(ctx, ingestBatch)
+	due, ok := r.sched.nextIngestDue()
+	if !ok || time.Until(due) <= 0 || time.Until(due) > interval {
+		t.Fatalf("after a failed reconcile the request is due in %v (queued=%v), want within the interval", time.Until(due), ok)
+	}
+	src.fail["cpu"] = false
+	time.Sleep(interval + 20*time.Millisecond)
+	r.sched.serviceIngest(ctx, ingestBatch)
+	if got := len(r.live(t)); got != 1 {
+		t.Errorf("%d files in the table after the retry, want 1", got)
+	}
+}
+
+func TestExportLagForgetsADroppedDatabase(t *testing.T) {
+	r := newExportRig(t, time.Hour)
+	mine, other := r.exp.tableIdent("mydb", "cpu"), r.exp.tableIdent("otherdb", "cpu")
+	r.exp.lag.pending = map[string][]time.Time{tableLagKey(mine): {time.Now()}, tableLagKey(other): {time.Now()}}
+	if err := r.exp.DropDatabase(context.Background(), "mydb"); err != nil {
+		t.Fatal(err)
+	}
+	if _, kept := r.exp.lag.pending[tableLagKey(mine)]; kept {
+		t.Error("the dropped database's unpublished files are still waiting for a lag observation")
+	}
+	if _, kept := r.exp.lag.pending[tableLagKey(other)]; !kept {
+		t.Error("another database's unpublished files were dropped")
+	}
+	r.exp.forgetExportLag(other)
+	if len(r.exp.lag.pending) != 0 {
+		t.Errorf("pending = %v after forgetting the last table", r.exp.lag.pending)
 	}
 }

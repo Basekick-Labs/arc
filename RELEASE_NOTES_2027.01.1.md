@@ -7,7 +7,8 @@
 A file written by ingest used to reach its Iceberg table only at the next timed export pass: up to `iceberg.reconcile_interval` (default 300 s) plus the pass. Compaction, DELETE, retention and tiering already asked for an export when they changed files; ingest did not. Now an ingest flush asks for its measurement's table too.
 
 - **New key `iceberg.ingest_export_interval`** (seconds, default `60`): the least time between two exports of one table that ingest causes. A flushed file is exported after at most this long, plus the export itself. `0` turns the trigger off and leaves the timed passes only.
-- **Bound:** `ingest_export_interval × (retain_snapshots + 1)` must be at least 120 s, or Arc refuses to start and says which values would do. Each export publishes a table version and only `retain_snapshots + 1` published versions are kept, while readers resolve a version and open it later (Snowflake about 80 s after a publish). With the default `retain_snapshots = 10` the shortest interval is 11 s.
+- **Bound:** `ingest_export_interval × retain_snapshots` must be at least 120 s. Each export publishes a table version, and a version a reader has resolved is deleted `retain_snapshots` publishes after the next one, while readers open it later (Snowflake about 80 s after a publish). With the default `retain_snapshots = 10` the shortest interval is 12 s. With Glue on, the bound is `iceberg.glue.sync_interval` + 60 s when that is larger, because a failed Glue update leaves Glue naming the older version until its retry.
+- **How the bound is applied:** a value you set that is too short is refused at startup, with the values that would do. The default is not refused: on a node whose `retain_snapshots` is below 2, the default 60 s is raised to meet the bound (120 s at `retain_snapshots = 1`) and a startup warning says so, so an upgrade does not stop a node.
 - **Standalone nodes only for now.** On a cluster node the trigger is not installed and the export runs on its timer as before: the node that flushes is usually not the node that exports. Tracked in [#1756](https://github.com/Basekick-Labs/arc/issues/1756).
 
 In a test on a standalone node with the timed pass set to an hour, writing one measurement for 150 s at the default settings: three exports, 58.6 s for the file that waited longest, 28.5 s on average.
@@ -15,7 +16,7 @@ In a test on a standalone node with the timed pass set to an hour, writing one m
 Three metrics, the first Iceberg ones:
 
 - `arc_iceberg_export_lag_seconds` (histogram): per ingest file published in a table, the time from the file being written to the table version that holds it being published (`version-hint.text` written). The Glue update follows about 2 s later and is not included.
-- `arc_iceberg_export_pending_seconds` (gauge): how long the oldest ingest file reported to the export has waited for an export that covers it; `0` when none waits. This is the one to alert on: it keeps growing when the export is stuck, which a histogram of finished exports cannot show.
+- `arc_iceberg_export_pending_seconds` (gauge): how long the oldest ingest file reported to the export has waited for an export that published it; `0` when none waits. This is the one to alert on: it keeps growing when the export is stuck or cannot publish, which a histogram of finished exports cannot show. It is fed by the ingest trigger, so it stays at 0 on a cluster node and with the trigger off.
 - `arc_iceberg_export_backlog_files_total` (counter): ingest files published that were written before the process started, such as existing data when the export is first enabled. Their age is not a lag of the running export, so they are kept out of the histogram.
 
 The `/metrics` JSON form carries `iceberg_export_lag_count`, `iceberg_export_lag_sum_seconds`, `iceberg_export_pending_seconds` and `iceberg_export_backlog_files`. The "Reconciled Iceberg table" log line gains `oldest_ingest_file_lag`.
@@ -23,8 +24,8 @@ The `/metrics` JSON form carries `iceberg_export_lag_count`, `iceberg_export_lag
 Notes:
 
 - **What an export costs is unchanged:** it still lists the measurement, reads the table's manifests and commits. The trigger only changes when it runs. With many measurements written at once the exports queue, one table at a time, and the real interval stretches; the pending gauge shows it. Requests from compaction, DELETE, retention and tiering are served first.
-- **Spacing counts from the attempt:** a table whose export fails is tried once per interval, not at every flush.
-- **More table versions:** a table written to continuously now gets a snapshot per interval instead of per timed pass. `retain_snapshots` still bounds what is kept.
+- **Spacing counts from the attempt:** a table whose export fails, or commits and cannot publish, is tried again once per interval, with or without further flushes. An export of any kind that changes a table also restarts the interval, so an ingest-triggered export does not publish right behind a compaction's.
+- **More table versions, and more log lines:** a table written to continuously now gets a snapshot per interval instead of per timed pass, and one "Reconciled Iceberg table" line at Info each time. `retain_snapshots` still bounds what is kept.
 - No labels: the metrics cover every table.
 
 ## Fix: a late or future-stamped row is read by queries as soon as its file is written ([#1757](https://github.com/Basekick-Labs/arc/issues/1757))

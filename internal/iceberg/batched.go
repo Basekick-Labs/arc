@@ -130,6 +130,16 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 	}
 	e.setPassGate(canCommit)
 	defer e.setPassGate(nil)
+	// A pass that ends fenced, or on a node that is no longer the writer,
+	// leaves its commits for another node to publish: their write times must
+	// not wait here for a publish this exporter will never make
+	// (export_lag.go). Deferred after the gate's reset is registered, so it
+	// runs first, while the gate still answers.
+	defer func() {
+		if e.fencedErr() != nil || !e.passMayCommit() {
+			e.forgetExportLag(e.tableIdent(database, measurement))
+		}
+	}()
 	// EnsureTable publishes the discovery files itself when it creates or evolves
 	// the table, so start from whether those writes succeeded. Otherwise a
 	// creation-time failure would be invisible here and the fingerprint would be

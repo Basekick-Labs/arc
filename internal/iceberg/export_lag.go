@@ -100,3 +100,32 @@ func (e *Exporter) drainExportLag(ident []string) time.Duration {
 	}
 	return oldest
 }
+
+// forgetExportLag drops the write times kept for a table whose committed
+// files this exporter will not publish: it lost the writer role or was
+// fenced during the pass (another node publishes from here), or the table
+// was dropped. Kept, they would be observed as an hours-long lag the next
+// time this node publishes a table of that name.
+func (e *Exporter) forgetExportLag(ident []string) {
+	if len(ident) == 0 {
+		return
+	}
+	e.lag.mu.Lock()
+	delete(e.lag.pending, tableLagKey(ident))
+	e.lag.mu.Unlock()
+}
+
+// forgetExportLagNamespace is forgetExportLag for every table of a namespace.
+func (e *Exporter) forgetExportLagNamespace(namespace []string) {
+	if len(namespace) == 0 {
+		return
+	}
+	prefix := tableLagKey(namespace) + "\x00"
+	e.lag.mu.Lock()
+	for key := range e.lag.pending {
+		if strings.HasPrefix(key, prefix) {
+			delete(e.lag.pending, key)
+		}
+	}
+	e.lag.mu.Unlock()
+}

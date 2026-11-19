@@ -209,11 +209,21 @@ type IngestConfig struct {
 	MaxBufferedBytesAuto bool
 }
 
-// icebergMinVersionSpanSeconds is the least time the published versions of
-// an Iceberg table must span when ingest triggers exports
-// (iceberg.ingest_export_interval x (iceberg.retain_snapshots+1)): longer
-// than the slowest reader takes between resolving a version and opening it.
-const icebergMinVersionSpanSeconds = 120
+// icebergMinVersionSpan is the least time, in seconds, that a published
+// version of an Iceberg table must stay on disk after the next one is
+// published, when ingest triggers exports: iceberg.ingest_export_interval x
+// iceberg.retain_snapshots must reach it. It has to outlast the slowest
+// reader between resolving a version and opening it. Snowflake was measured
+// refreshing about 80 s after a publish (120 leaves a margin). With Glue on,
+// a failed Glue update is retried after iceberg.glue.sync_interval, and until
+// then Glue names the older version: that interval plus a minute.
+func icebergMinVersionSpan(glueEnabled bool, glueSyncInterval int) int {
+	span := 120
+	if glueEnabled && glueSyncInterval+60 > span {
+		span = glueSyncInterval + 60
+	}
+	return span
+}
 
 // minMaxBufferedBytes is the smallest explicit ingest.max_buffered_bytes: a
 // limit below one ordinary request refuses every write once anything is
@@ -2073,17 +2083,33 @@ func Load() (*Config, error) {
 		}
 		// Each export publishes a table version, and only retain_snapshots+1
 		// published versions are kept. A reader resolves a version and opens
-		// it later (Snowflake about 80 s after a publish; a failed Glue update
-		// is retried after iceberg.glue.sync_interval), so the versions kept
-		// must span longer than that or the reader finds its version deleted.
-		// (retain_snapshots < 1 is refused by its own check below.)
-		if n := cfg.Iceberg.IngestExportInterval; n > 0 && cfg.Iceberg.RetainSnapshots >= 1 &&
-			n*(cfg.Iceberg.RetainSnapshots+1) < icebergMinVersionSpanSeconds {
-			return nil, fmt.Errorf("iceberg.ingest_export_interval (%d s) times iceberg.retain_snapshots+1 (%d) is %d s, under %d s: "+
-				"ingest would publish table versions faster than readers that resolved one can open it before it is deleted. "+
-				"Raise ingest_export_interval to at least %d, raise retain_snapshots, or set ingest_export_interval to 0",
-				n, cfg.Iceberg.RetainSnapshots+1, n*(cfg.Iceberg.RetainSnapshots+1), icebergMinVersionSpanSeconds,
-				(icebergMinVersionSpanSeconds+cfg.Iceberg.RetainSnapshots)/(cfg.Iceberg.RetainSnapshots+1))
+		// it later, and the version it resolved is deleted retain_snapshots
+		// publishes after the next one: the published versions must outlast
+		// the slowest reader (icebergMinVersionSpan). (retain_snapshots < 1
+		// is refused by its own check below.)
+		if n := cfg.Iceberg.IngestExportInterval; n > 0 && cfg.Iceberg.RetainSnapshots >= 1 {
+			span := icebergMinVersionSpan(cfg.Iceberg.Glue.Enabled, cfg.Iceberg.Glue.SyncInterval)
+			least := (span + cfg.Iceberg.RetainSnapshots - 1) / cfg.Iceberg.RetainSnapshots // rounded up
+			if n < least {
+				// An interval the operator wrote is refused. The default is
+				// raised instead, with a warning: an upgrade must not stop a
+				// node whose retain_snapshots was already low.
+				if v.InConfig("iceberg.ingest_export_interval") || os.Getenv("ARC_ICEBERG_INGEST_EXPORT_INTERVAL") != "" {
+					return nil, fmt.Errorf("iceberg.ingest_export_interval (%d s) times iceberg.retain_snapshots (%d) is %d s, under %d s: "+
+						"ingest would publish table versions faster than a reader that resolved one can open it before it is deleted. "+
+						"Raise ingest_export_interval to at least %d, raise retain_snapshots, or set ingest_export_interval to 0",
+						n, cfg.Iceberg.RetainSnapshots, n*cfg.Iceberg.RetainSnapshots, span, least)
+				}
+				cfg.Warnings = append(cfg.Warnings, LoadWarning{
+					Key:   "iceberg.ingest_export_interval",
+					Value: strconv.Itoa(n),
+					Message: fmt.Sprintf("iceberg.ingest_export_interval raised from its default %d s to %d s: with iceberg.retain_snapshots = %d, "+
+						"a shorter interval would delete a published table version before a reader that resolved it could open it "+
+						"(the versions kept must span %d s). Raise retain_snapshots to export sooner, or set ingest_export_interval to 0 "+
+						"to export on the timer only", n, least, cfg.Iceberg.RetainSnapshots, span),
+				})
+				cfg.Iceberg.IngestExportInterval = least
+			}
 		}
 		// Reject rather than silently treat as "keep every snapshot forever": an
 		// operator setting 0 almost certainly means "keep no history", and the

@@ -4752,8 +4752,9 @@ func main() {
 			Interval: time.Duration(cfg.Iceberg.ReconcileInterval) * time.Second,
 			Gate:     icebergGate,
 			Logger:   logger.Get("iceberg"),
-			// 0 leaves RequestIngestReconcile a no-op (#1750).
-			IngestInterval: time.Duration(cfg.Iceberg.IngestExportInterval) * time.Second,
+			// 0 leaves RequestIngestReconcile and its bookkeeping off (#1750),
+			// as on a cluster node, where nothing reports ingest files yet.
+			IngestInterval: icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil),
 		})
 		// #1731: with node-local warehouses (not icebergTopo.barrier, which is a shared bucket or
 		// shared_storage_mode), a database DELETE on the writer drops only the writer's tables.
@@ -4801,7 +4802,7 @@ func main() {
 			// file's registration lands costs a Raft barrier. The events that
 			// reach the exporting node (a file registered in a shared bucket,
 			// a pulled file landing) are #1756.
-			if clusterCoordinator == nil && cfg.Iceberg.IngestExportInterval > 0 {
+			if icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil) > 0 {
 				arrowBuffer.AddOnFilePublished(func(database, measurement string, _ time.Time) {
 					icebergScheduler.RequestIngestReconcile(database, measurement)
 				})
