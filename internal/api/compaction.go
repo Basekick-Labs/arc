@@ -284,8 +284,9 @@ func (h *CompactionHandler) getCandidates(c *fiber.Ctx) error {
 			"file_count":     cand.FileCount,
 			"tier":           cand.Tier,
 			"too_wide":       tooWide[cand.Tier+"/"+cand.PartitionPath],
-			// A settled sparse day (#1774): file_count is its hour-level
-			// files, and a cycle runs at most 500 of these per tier.
+			// A settled day (#1774, #1775): file_count is its hour-level
+			// files, never a daily file it already has, and a cycle runs at
+			// most 500 of these per tier.
 			"settled": cand.Settled,
 		}
 	}

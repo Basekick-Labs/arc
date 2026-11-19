@@ -89,9 +89,11 @@ type Candidate struct {
 }
 
 // maxSettledCandidatesPerCycle caps how many settled-day candidates (#1774)
-// one cycle starts a job for, per tier. They run after the tier's regular
-// candidates; the rest wait for the next cycle. The first cycle after an
-// upgrade can find one for every old day of every sparse measurement.
+// one cycle starts, per tier: days, not batches, since a day with many
+// stragglers next to its daily file (#1775) splits into several. They run
+// after the tier's regular candidates; the rest wait for the next cycle. The
+// first cycle after an upgrade can find one for every old day of every sparse
+// measurement.
 // maxSettledCandidatesCollected bounds how many a cycle holds while it
 // discovers, so candidates the filters defer do not use up the cap.
 const (
