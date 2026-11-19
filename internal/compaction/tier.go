@@ -89,9 +89,11 @@ type Candidate struct {
 }
 
 // maxSettledCandidatesPerCycle caps how many settled-day candidates (#1774)
-// one cycle starts a job for, per tier. They run after the tier's regular
-// candidates; the rest wait for the next cycle. The first cycle after an
-// upgrade can find one for every old day of every sparse measurement.
+// one cycle starts, per tier: days, not batches, since a day with many
+// stragglers next to its daily file (#1775) splits into several. They run
+// after the tier's regular candidates; the rest wait for the next cycle. The
+// first cycle after an upgrade can find one for every old day of every sparse
+// measurement.
 // maxSettledCandidatesCollected bounds how many a cycle holds while it
 // discovers, so candidates the filters defer do not use up the cap.
 const (
@@ -351,7 +353,11 @@ func (t *BaseTier) ShouldCompactByFileSuffix(
 		return true
 	}
 
-	// Case 2: Has compacted files, but many new uncompacted files accumulated
+	// Case 2: Has compacted files, but many new uncompacted files accumulated.
+	// The job rewrites the compacted files with the new ones. The daily tier
+	// keeps this only for days younger than daily_skip_file_age_check_days;
+	// an older day folds its stragglers into an additional daily file
+	// instead (DailyTier.foldsSeparately, #1775).
 	if len(compactedFiles) > 0 && len(uncompactedFiles) >= t.MinFiles {
 		t.Logger.Debug().
 			Int("compacted", len(compactedFiles)).

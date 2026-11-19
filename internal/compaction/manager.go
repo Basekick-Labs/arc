@@ -2359,7 +2359,7 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 			}(batches, candidate.PartitionPath, filteredCandidate.Files)
 			return nil
 		}
-		// Settled sparse days (#1774) run after every regular candidate of the
+		// Settled days (#1774, #1775) run after every regular candidate of the
 		// tier, and at most maxSettledCandidatesPerCycle of them, so a backlog
 		// of them cannot spend the cycle budget the regular days need.
 		var settled []Candidate
@@ -2452,7 +2452,7 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 				Str("tier", tierName).
 				Int("deferred", settledOverCap).
 				Int("limit", maxSettledCandidatesPerCycle).
-				Msg("More settled sparse days than one cycle takes; the rest compact in later cycles")
+				Msg("More settled days than one cycle takes; the rest compact in later cycles")
 		}
 
 		// Wait for all jobs in this tier to complete before moving to next tier

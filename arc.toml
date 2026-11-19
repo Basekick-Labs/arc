@@ -293,6 +293,9 @@ daily_min_files = 12
 # A day older than this many days whose newest file is older than
 # daily_min_age_hours is settled: it gets a daily file even with fewer than
 # daily_min_files hour-level files, so tiering can move it to cold (#1774).
+# Late files in a settled day that already has a daily file go into another
+# daily file instead of a rewrite of the existing one (#1775); a younger day
+# is rewritten, which also merges duplicate rows across the two.
 # 0 means the default, 7.
 # daily_skip_file_age_check_days = 7
 

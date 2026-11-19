@@ -1,8 +1,6 @@
 package compaction
 
 import (
-	"sort"
-	"strings"
 	"sync"
 	"time"
 )
@@ -19,43 +17,48 @@ const settledRetryAfter = 7 * 24 * time.Hour
 // selected every cycle, so without this it would fail, or be downloaded and
 // skipped, every cycle for good and take a slot of maxSettledCandidatesPerCycle.
 //
-// Keyed by tier and partition, by the exact file set: a file landing in or
-// leaving the day makes it a new attempt. In memory only, and retried after
-// settledRetryAfter, so a failure that was transient is not skipped for good.
+// Keyed by tier and partition, holding every file a job of the partition ran
+// over: a candidate split into batches records each batch it ran (#1775 made
+// settled candidates of any size). The day is skipped while every file it
+// holds is one a job already ran over; a new file landing in the day makes it
+// a new attempt. In memory only, and retried after settledRetryAfter, so a
+// failure that was transient is not skipped for good.
 type settledMemo struct {
 	mu      sync.Mutex
-	entries map[string]settledMemoEntry
+	entries map[string]*settledMemoEntry
 	now     func() time.Time
 }
 
 type settledMemoEntry struct {
-	files string
-	at    time.Time
+	files map[string]struct{}
+	at    time.Time // first record: the retry clock is not reset by later batches
 }
 
 func newSettledMemo() *settledMemo {
-	return &settledMemo{entries: map[string]settledMemoEntry{}, now: time.Now}
+	return &settledMemo{entries: map[string]*settledMemoEntry{}, now: time.Now}
 }
 
-func settledFileSet(files []string) string {
-	sorted := append([]string(nil), files...)
-	sort.Strings(sorted)
-	return strings.Join(sorted, "\n")
-}
-
-// record notes that a job ran over exactly these files of the partition.
-// A nil memo (a Manager not built by NewManager) records nothing.
+// record notes that a job ran over these files of the partition. A nil memo
+// (a Manager not built by NewManager) records nothing.
 func (s *settledMemo) record(tier, partition string, files []string) {
 	if s == nil {
 		return
 	}
+	key := tier + "|" + partition
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.entries[tier+"|"+partition] = settledMemoEntry{files: settledFileSet(files), at: s.now()}
+	e, ok := s.entries[key]
+	if !ok || s.now().Sub(e.at) >= settledRetryAfter {
+		e = &settledMemoEntry{files: map[string]struct{}{}, at: s.now()}
+		s.entries[key] = e
+	}
+	for _, f := range files {
+		e.files[f] = struct{}{}
+	}
 }
 
-// skip reports whether a settled candidate with these files was already run
-// within settledRetryAfter. A different file set drops the entry.
+// skip reports whether every file of a settled candidate was already run
+// over within settledRetryAfter. Any other candidate drops the entry.
 func (s *settledMemo) skip(tier, partition string, files []string) bool {
 	if s == nil {
 		return false
@@ -67,9 +70,15 @@ func (s *settledMemo) skip(tier, partition string, files []string) bool {
 	if !ok {
 		return false
 	}
-	if e.files != settledFileSet(files) || s.now().Sub(e.at) >= settledRetryAfter {
-		delete(s.entries, key)
-		return false
+	covered := len(files) > 0 && s.now().Sub(e.at) < settledRetryAfter
+	for _, f := range files {
+		if _, ran := e.files[f]; !ran {
+			covered = false
+			break
+		}
 	}
-	return true
+	if !covered {
+		delete(s.entries, key)
+	}
+	return covered
 }
