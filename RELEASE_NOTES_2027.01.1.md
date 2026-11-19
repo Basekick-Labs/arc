@@ -28,17 +28,17 @@ On the running binary, 200 measurements written for 4 minutes, standalone, local
 
 | `ingest_export_interval` | Append | Average export lag | Iceberg metadata written |
 |---|---|---|---|
-| 60 s (default) | on | 27.9 s | 26 MB |
-| 60 s | off | 27.0 s | 24 MB |
-| 15 s | on | 7.7 s | 94 MB |
-| 10 s | on | 5.4 s | 183 MB |
-| 5 s | on | 1.0 s | 210 MB |
-| 5 s | off | 0.8 s | 236 MB |
+| 60 s (default) | on | 27.5 s | 26 MB |
+| 15 s | on | 7.3 s | 113 MB |
+| 10 s | on | 4.7 s | 188 MB |
+| 5 s | on | 1.0 s | 223 MB |
+| 5 s | off | 1.0 s | 252 MB |
 
-- **The interval is what shortens the lag.** At 5 s a file is in its table about a second after it is written. At a given interval the append path does not change the lag.
+- **The interval is what shortens the lag.** At 5 s a file is in its table about a second after it is written with 200 tables being written at once (one goroutine serves them all, so they queue), and 54 ms after with 10. At a given interval the append path does not change the lag.
 - **The append path is what keeps an export cheap as a table grows** (the table above). In these runs the tables held about 48 files each and a full pass was already cheap, so on and off look the same. One pair of runs with ten tables that grew to about 1,300 files, and about 28 new files per export, averaged 57 ms per export as an append and 70 ms as a pass; it was a single run of each on a machine also serving the test's queries, so read it as "no worse", not as a measured gain.
 - **A short interval costs metadata.** Every export writes a new table version, about 40 KB of metadata in these runs: about eight times as much at 5 s as at 60 s. (In this load each table got a new file about every 9 s, so 5 s and 10 s made nearly the same number of exports and wrote nearly the same amount; they differ in lag.)
-- **What stays on disk is bounded.** In an 11-minute run (20 tables, 5 s interval, `min_version_age = 120`, a full pass every 30 s) the published versions levelled off at 21–25 per table and iceberg-go's own metadata files at 25 per table, both from the fourth minute on. Manifest files were still growing at the end, by about 16 per table per minute: the orphan sweep only removes them after an hour, which the run did not reach. Extrapolated, not measured: about 1,000 manifest files and 5 MB per table at that rate.
+- **What stays on disk is bounded.** In a 75-minute run (20 tables, 5 s interval, `min_version_age = 120`, a full pass every 30 s; 9,778 appends, none fell back) the published versions held at 18–23 per table and iceberg-go's own metadata files at 25 per table throughout. Manifest files grew by about 15 per table per minute for the first hour and then levelled off at about 920 per table, once the orphan sweep began removing the ones older than an hour. At the end the 20 tables held 125 MB of Iceberg metadata, about 6 MB each, and an export took the same time as at the start (35 ms on average).
+- **A table that stops receiving data** drops back to `retain_snapshots + 1` published versions within a few minutes, and its passes are skipped again.
 - In every run the Iceberg row counts matched storage on the tables checked, no file was in a table twice, and no append fell back to a full pass.
 
 New counters: `arc_iceberg_ingest_appends_total`, `arc_iceberg_ingest_append_files_total`, and `arc_iceberg_ingest_append_fallbacks_total` (exports that had files to add and ran a full pass instead; the log names the reason once per table). The `/metrics` JSON form carries `iceberg_ingest_appends`, `iceberg_ingest_append_files` and `iceberg_ingest_append_fallbacks`.
@@ -48,8 +48,8 @@ Notes:
 - **Snapshots are expired, versions pruned and orphans swept by the full pass**, which still runs every `iceberg.reconcile_interval`. Between two passes a table that is appended to carries the snapshots of those appends. A table also takes a full pass after 120 appends, so a long `reconcile_interval` does not let them pile up.
 - **Manifests:** each append adds one. Once there are four small ones the append merges them, up to about 4,000 files per manifest; a larger manifest is never rewritten by an append.
 - **A file ingest deletes after storing it** (the late-landed copy of a failed flush) now asks for an export of its table, so it leaves the table at once and not at the next timed pass.
-- **Also run:** `iceberg.warehouse` set to a subdirectory of the storage root (appends, row counts and published files as at the default), and age-based version pruning against an S3 API.
-- **Not run:** a cluster (the append path is off there), a warehouse outside the storage root, S3 over a real network, or a run long enough to reach the orphan sweep.
+- **Also run on the binary:** S3 as primary storage (SeaweedFS in a container: appends, row counts equal, an export about 49 ms as an append and 63 ms as a pass); `iceberg.warehouse` in a subdirectory of the storage root and outside it; a three-node cluster on shared storage, where the append path is off: the compactor exported on its timer, no node appended, and published versions held at 11 per table across a restart of all three nodes.
+- **Not run:** S3 over a wide-area network, or a cluster with node-local storage.
 
 ## Fix: a day with few files gets a daily file, so it can move to the cold tier ([#1774](https://github.com/Basekick-Labs/arc/issues/1774))
 
