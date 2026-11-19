@@ -198,6 +198,17 @@ func (s *Scheduler) dropIngest() {
 	s.reqMu.Unlock()
 }
 
+// forgetIngest drops what is kept for one table that will not be exported.
+func (s *Scheduler) forgetIngest(key string) {
+	s.reqMu.Lock()
+	delete(s.ingestDue, key)
+	if _, waiting := s.ingestPending[key]; waiting {
+		delete(s.ingestPending, key)
+		s.publishIngestPendingLocked()
+	}
+	s.reqMu.Unlock()
+}
+
 // otherRequestsQueued reports whether a request of another kind, or a
 // database drop, is waiting.
 func (s *Scheduler) otherRequestsQueued() bool {
@@ -283,6 +294,12 @@ func (s *Scheduler) serviceIngest(ctx context.Context, max int) {
 		}
 		if _, blocked := s.lastBlocked[key]; blocked {
 			continue // awaiting a namespace migration: the pass handles it
+		}
+		// The names come from the flush, not from the listing a pass
+		// filters: one a pass would never export is not exported here.
+		if x, ok := s.source.(interface{ Exportable(Measurement) bool }); ok && !x.Exportable(m) {
+			s.forgetIngest(key)
+			continue
 		}
 		mctx, cancel := context.WithTimeout(ctx, measurementTimeout)
 		outcome, err := s.reconcileOneRecovered(mctx, m, key)

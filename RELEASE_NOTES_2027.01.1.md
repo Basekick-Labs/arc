@@ -7,11 +7,19 @@
 A file written by ingest used to reach its Iceberg table only at the next timed export pass: up to `iceberg.reconcile_interval` (default 300 s) plus the pass. Compaction, DELETE, retention and tiering already asked for an export when they changed files; ingest did not. Now an ingest flush asks for its measurement's table too.
 
 - **New key `iceberg.ingest_export_interval`** (seconds, default `60`): the least time between two exports of one table that ingest causes. A flushed file is exported after at most this long, plus the export itself. `0` turns the trigger off and leaves the timed passes only.
-- **Bound:** `ingest_export_interval × retain_snapshots` must be at least 120 s. Each export publishes a table version, and a version a reader has resolved is deleted `retain_snapshots` publishes after the next one, while readers open it later (Snowflake about 80 s after a publish). With the default `retain_snapshots = 10` the shortest interval is 12 s. With Glue on, the bound is `iceberg.glue.sync_interval` + 60 s when that is larger, because a failed Glue update leaves Glue naming the older version until its retry.
+- **Bound:** `ingest_export_interval × retain_snapshots` must be at least 120 s. Each export publishes a table version, and a published version is deleted `retain_snapshots` publishes after the next one. A reader that resolved it, or a catalog that still names it, must not find it gone: a failed Glue update leaves Glue naming the older version until its retry (`iceberg.glue.sync_interval`, default 60 s), so with Glue on the bound is that interval + 60 s when it is larger. The 120 s is a margin, not a measured limit. With the default `retain_snapshots = 10` the shortest interval is 12 s.
 - **How the bound is applied:** a value you set that is too short is refused at startup, with the values that would do. The default is not refused: on a node whose `retain_snapshots` is below 2, the default 60 s is raised to meet the bound (120 s at `retain_snapshots = 1`) and a startup warning says so, so an upgrade does not stop a node.
-- **Standalone nodes only for now.** On a cluster node the trigger is not installed and the export runs on its timer as before: the node that flushes is usually not the node that exports. Tracked in [#1756](https://github.com/Basekick-Labs/arc/issues/1756).
+- **Standalone nodes only for now.** On a cluster node the trigger is not installed and the export runs on its timer as before: the node that flushes is usually not the node that exports. Tracked in [#1756](https://github.com/Basekick-Labs/arc/issues/1756). The lag histogram and the backlog counter are still filled there, by the timed passes; the pending gauge stays at 0. Not run on a cluster.
 
-In a test on a standalone node with the timed pass set to an hour, writing one measurement for 150 s at the default settings: three exports, 58.6 s for the file that waited longest, 28.5 s on average.
+Measured on a standalone node, local storage, default buffer age:
+
+| | Files exported | Within 60 s | Average lag | Table versions committed | Iceberg metadata on disk |
+|---|---|---|---|---|---|
+| One measurement, 130 s, timed pass at an hour | 24 of 26 | all 24 (longest 58.6 s) | 28.7 s | 3 | — |
+| 200 measurements for 4 min, trigger on, `reconcile_interval = 120` | 5,302 of 5,550 | 5,294 | 27.7 s | 1,015 | 24 MB, 4,836 files |
+| The same with the trigger off | 2,829 of 5,528 | 1,384 | 61.1 s | 200 | 7.4 MB, 1,645 files |
+
+In the 200-measurement runs the timed passes still completed, write round trips were 24 ms at p99 with the trigger on and 21 ms with it off, and query round trips 13 ms and 10 ms. The files not exported were still waiting for their table's next export when the run ended.
 
 Three metrics, the first Iceberg ones:
 
@@ -23,7 +31,7 @@ The `/metrics` JSON form carries `iceberg_export_lag_count`, `iceberg_export_lag
 
 Notes:
 
-- **What an export costs is unchanged:** it still lists the measurement, reads the table's manifests and commits. The trigger only changes when it runs. With many measurements written at once the exports queue, one table at a time, and the real interval stretches; the pending gauge shows it. Requests from compaction, DELETE, retention and tiering are served first.
+- **What an export costs is unchanged:** it still lists the measurement, reads the table's manifests and commits. The trigger only changes when it runs, which is more often: about five times the table versions and three times the metadata in the run above. With Glue on, each export is also one Glue update for its table. With more measurements than the exports can keep up with they queue, one table at a time, and the real interval stretches; the pending gauge shows it. Requests from compaction, DELETE, retention and tiering are served first.
 - **Spacing counts from the attempt:** a table whose export fails, or commits and cannot publish, is tried again once per interval, with or without further flushes. An export of any kind that changes a table also restarts the interval, so an ingest-triggered export does not publish right behind a compaction's.
 - **More table versions, and more log lines:** a table written to continuously now gets a snapshot per interval instead of per timed pass, and one "Reconciled Iceberg table" line at Info each time. `retain_snapshots` still bounds what is kept.
 - No labels: the metrics cover every table.

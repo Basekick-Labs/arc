@@ -135,11 +135,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 	// not wait here for a publish this exporter will never make
 	// (export_lag.go). Deferred after the gate's reset is registered, so it
 	// runs first, while the gate still answers.
-	defer func() {
-		if e.fencedErr() != nil || !e.passMayCommit() {
-			e.forgetExportLag(e.tableIdent(database, measurement))
-		}
-	}()
+	defer e.forgetExportLagIfNotPublisher(database, measurement)
 	// EnsureTable publishes the discovery files itself when it creates or evolves
 	// the table, so start from whether those writes succeeded. Otherwise a
 	// creation-time failure would be invisible here and the fingerprint would be

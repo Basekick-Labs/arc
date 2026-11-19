@@ -537,3 +537,56 @@ type busySource struct{ *StorageWalkSource }
 func (busySource) FilesAndLocal(context.Context, Measurement) ([]FileRef, []string, error) {
 	return nil, nil, errSourcesMoving
 }
+
+// A pass that ends on a node that is no longer the writer, or fenced, leaves
+// its commits for another node to publish: their write times are not kept.
+func TestExportLagForgottenWhenThisNodeWillNotPublish(t *testing.T) {
+	r := newExportRig(t, time.Hour)
+	ident := r.exp.tableIdent("mydb", "cpu")
+	seed := func() { r.exp.lag.pending = map[string][]time.Time{tableLagKey(ident): {time.Now()}} }
+	kept := func() bool { _, ok := r.exp.lag.pending[tableLagKey(ident)]; return ok }
+
+	seed()
+	r.exp.forgetExportLagIfNotPublisher("mydb", "cpu") // still the writer, not fenced
+	if !kept() {
+		t.Fatal("a pass that may still publish dropped its files' write times")
+	}
+	r.exp.setPassGate(func() bool { return false }) // the writer role moved
+	r.exp.forgetExportLagIfNotPublisher("mydb", "cpu")
+	r.exp.setPassGate(nil)
+	if kept() {
+		t.Error("write times kept on a node that is no longer the writer")
+	}
+	seed()
+	r.exp.hintFailMu.Lock()
+	r.exp.fenced = errFenced // another node published this version first
+	r.exp.hintFailMu.Unlock()
+	r.exp.forgetExportLagIfNotPublisher("mydb", "cpu")
+	if kept() {
+		t.Error("write times kept after the pass was fenced")
+	}
+}
+
+// A request names its measurement directly, so it is checked against what a
+// pass would list: Arc's reserved directories and the exporter's own
+// warehouse never get a table.
+func TestScheduler_IngestRequestForANameAPassSkipsIsDropped(t *testing.T) {
+	ctx := context.Background()
+	r, src := newIngestRig(t, time.Minute)
+	for _, db := range []string{"_schema", "_compaction_state", "arc_mydb.db"} {
+		r.sched.RequestIngestReconcile(db, "cpu")
+	}
+	r.sched.serviceIngest(ctx, ingestBatch)
+	if got := src.order(); got != "" {
+		t.Errorf("listed %q for names a pass never exports", got)
+	}
+	if _, queued := r.sched.nextIngestDue(); queued {
+		t.Error("a request for a name a pass never exports is still queued")
+	}
+	if got := snapshotFloat(t, "iceberg_export_pending_seconds"); got != 0 {
+		t.Errorf("pending = %v s for names that will never be exported, want 0", got)
+	}
+	if !r.src.Exportable(Measurement{Database: "mydb", Measurement: "cpu"}) || r.src.Exportable(Measurement{Database: "mydb"}) {
+		t.Error("Exportable: an ordinary measurement must pass, an empty name must not")
+	}
+}

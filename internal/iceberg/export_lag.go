@@ -115,6 +115,15 @@ func (e *Exporter) forgetExportLag(ident []string) {
 	e.lag.mu.Unlock()
 }
 
+// forgetExportLagIfNotPublisher is what a pass runs at its end: forget the
+// table's write times when this exporter was fenced during the pass or is no
+// longer the writer. Called while the pass's gate is still installed.
+func (e *Exporter) forgetExportLagIfNotPublisher(database, measurement string) {
+	if e.fencedErr() != nil || !e.passMayCommit() {
+		e.forgetExportLag(e.tableIdent(database, measurement))
+	}
+}
+
 // forgetExportLagNamespace is forgetExportLag for every table of a namespace.
 func (e *Exporter) forgetExportLagNamespace(namespace []string) {
 	if len(namespace) == 0 {

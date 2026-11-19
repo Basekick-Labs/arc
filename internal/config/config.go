@@ -212,11 +212,13 @@ type IngestConfig struct {
 // icebergMinVersionSpan is the least time, in seconds, that a published
 // version of an Iceberg table must stay on disk after the next one is
 // published, when ingest triggers exports: iceberg.ingest_export_interval x
-// iceberg.retain_snapshots must reach it. It has to outlast the slowest
-// reader between resolving a version and opening it. Snowflake was measured
-// refreshing about 80 s after a publish (120 leaves a margin). With Glue on,
-// a failed Glue update is retried after iceberg.glue.sync_interval, and until
-// then Glue names the older version: that interval plus a minute.
+// iceberg.retain_snapshots must reach it. It has to outlast whatever still
+// names the older version: a reader between resolving a version and opening
+// it, and Glue, which keeps naming the older one after a failed update until
+// its retry (iceberg.glue.sync_interval, default 60 s). So: that interval
+// plus a minute with Glue on, and never under 120 s. The 120 is a margin,
+// not a measured limit: no reader was observed opening a version that long
+// after resolving it.
 func icebergMinVersionSpan(glueEnabled bool, glueSyncInterval int) int {
 	span := 120
 	if glueEnabled && glueSyncInterval+60 > span {
