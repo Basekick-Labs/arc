@@ -84,9 +84,6 @@ Notes:
   An export on S3 is a few dozen requests made one after another, so it takes about half a second in the bucket's region and seconds from far away, and the tables queue behind each other. The interval you set is reached while `tables written at once × one export` fits in it: about ten tables at 5 s, and somewhere between 60 and 100 at the default 60 s, in the bucket's region. Past that the tables wait for each other and the interval no longer sets the lag. The timed pass before #1750 exported tables the same way, one after another; it was not measured on S3. With one new file the append took about 40% less than the pass in the bucket's region and about 20% less from far away (one run each); with many new files per export it reads each one in turn and cost the same as the pass. No 200-table run reached a steady state, so read their lag as "minutes", not as a figure. By these runs each further file in an export costs about 24 ms in the bucket's region (525 ms with one file, 954 ms with about 19), so a node exports at most about 40 files a second there, and the 200-table load (about 22 files a second) used about half of that: the estimate for its steady state is a cycle of about 3.5 minutes. Above about 40 files a second the queue would not be bounded. These are estimates from two runs, not measurements. Serving tables in parallel is [#1778](https://github.com/Basekick-Labs/arc/issues/1778).
 - In those S3 runs no append fell back, row counts matched storage and no file was in a table twice; on a table left quiet the published versions went from 26 to 11 within two minutes (the age rule reads S3's own timestamps).
 
-<<<<<<< HEAD
-||||||| parent of f9bd5e0c (feat(flight-sql): prepared statements without parameters, for JDBC and Tableau (#1645))
-=======
 ## New: Flight SQL prepared statements, so the JDBC driver and Tableau can run queries ([#1645](https://github.com/Basekick-Labs/arc/issues/1645))
 
 The Flight SQL listener now takes prepared statements without parameters. The Arrow Flight SQL JDBC driver, which Tableau, DBeaver and DataGrip use, prepares every query, even a plain `Statement.executeQuery`, so until now it could connect and browse tables but every query failed with `UNIMPLEMENTED`. With JDBC 19.0.0, `executeQuery` and `PreparedStatement` now return results. The ADBC drivers, which prepare before each execute when the server allows it, now take the prepared path too.
@@ -100,7 +97,8 @@ The Flight SQL listener now takes prepared statements without parameters. The Ar
 - **Documentation:** `docs/operations/flight-sql.md` has a prepared-statements section.
 
 No new configuration keys.
->>>>>>> f9bd5e0c (feat(flight-sql): prepared statements without parameters, for JDBC and Tableau (#1645))
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in [#1779](https://github.com/Basekick-Labs/arc/pull/1779).
 
 ## Fix: a day with few files gets a daily file, so it can move to the cold tier ([#1774](https://github.com/Basekick-Labs/arc/issues/1774))
 
