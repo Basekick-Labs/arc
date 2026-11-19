@@ -125,7 +125,7 @@ type Scheduler struct {
 	ingestInterval time.Duration
 	ingestDue      map[string]ingestRequest
 	ingestNext     map[string]time.Time
-	ingestPending  map[string]time.Time
+	ingestPending  map[string]ingestReports
 	// lastReconciled is when each measurement's table last changed, by a
 	// pass or a request. Loop goroutine only.
 	lastReconciled map[string]time.Time
@@ -252,7 +252,7 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		ingestInterval: cfg.IngestInterval,
 		ingestDue:      make(map[string]ingestRequest),
 		ingestNext:     make(map[string]time.Time),
-		ingestPending:  make(map[string]time.Time),
+		ingestPending:  make(map[string]ingestReports),
 		lastReconciled: make(map[string]time.Time),
 		drops:          make(map[string]struct{}),
 		dropRetry:      make(map[string]dropRetry),

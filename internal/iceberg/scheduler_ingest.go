@@ -30,10 +30,13 @@ import (
 //   - Timed by the loop's one timer (ingestDue holds when each is due), not by
 //     a timer per table.
 //
-// ingestPending is the other half: when a file was first reported for a
-// table that no reconcile has covered since. Its oldest entry is
+// ingestPending is the other half: for each table, when a file was first and
+// last reported that no reconcile has covered since. The oldest "first" is
 // arc_iceberg_export_pending_seconds, the number that keeps growing when the
-// export is stuck, which a histogram of completed exports cannot show.
+// export is stuck, which a histogram of completed exports cannot show. The
+// "last" is what tells a reconcile whether it covered everything: a file
+// reported after the reconcile started may have missed its listing, so its
+// request must survive that reconcile.
 
 // ingestBatch is how many due ingest requests the idle loop serves before it
 // looks at its timers again: with more tables than it can keep up with, the
@@ -44,6 +47,10 @@ type ingestRequest struct {
 	m   Measurement
 	due time.Time
 }
+
+// ingestReports is when files of a table were first and last reported since
+// the last reconcile that covered them all.
+type ingestReports struct{ first, last time.Time }
 
 // RequestIngestReconcile asks for one measurement's table to be reconciled
 // because an ingest flush has written a file of it. Safe from any goroutine,
@@ -57,8 +64,11 @@ func (s *Scheduler) RequestIngestReconcile(database, measurement string) {
 	key := database + "\x00" + measurement
 	now := time.Now()
 	s.reqMu.Lock()
-	if _, waiting := s.ingestPending[key]; !waiting {
-		s.ingestPending[key] = now
+	if reports, waiting := s.ingestPending[key]; waiting {
+		reports.last = now
+		s.ingestPending[key] = reports
+	} else {
+		s.ingestPending[key] = ingestReports{first: now, last: now}
 		s.publishIngestPendingLocked()
 	}
 	_, queued := s.ingestDue[key]
@@ -83,9 +93,9 @@ func (s *Scheduler) RequestIngestReconcile(database, measurement string) {
 // Caller holds reqMu.
 func (s *Scheduler) publishIngestPendingLocked() {
 	var oldest time.Time
-	for _, t := range s.ingestPending {
-		if oldest.IsZero() || t.Before(oldest) {
-			oldest = t
+	for _, r := range s.ingestPending {
+		if oldest.IsZero() || r.first.Before(oldest) {
+			oldest = r.first
 		}
 	}
 	metrics.Get().SetIcebergOldestPendingExport(oldest)
@@ -178,9 +188,10 @@ func (s *Scheduler) otherRequestsQueued() bool {
 
 // noteIngestCovered records that a reconcile of key which started at
 // startedAt went through. A file reported before it started is in the table
-// now (or was already), so it no longer waits; one reported while it ran may
-// have missed the listing and still does. Whatever changed the table also
-// starts the spacing for the next ingest request.
+// now (or was already), so it no longer waits. One reported while it ran may
+// have missed the listing: it still waits, counted from the reconcile's
+// start (it was reported no earlier), and its request stays queued. Whatever
+// changed the table also starts the spacing for the next ingest request.
 func (s *Scheduler) noteIngestCovered(key string, startedAt time.Time, outcome reconcileOutcome, err error) {
 	if s.ingestInterval <= 0 || err != nil {
 		return
@@ -195,12 +206,17 @@ func (s *Scheduler) noteIngestCovered(key string, startedAt time.Time, outcome r
 			s.ingestNext[key] = next
 		}
 	}
-	reported, waiting := s.ingestPending[key]
-	if !waiting || !reported.Before(startedAt) {
-		return
+	reports, waiting := s.ingestPending[key]
+	if !waiting || !reports.first.Before(startedAt) {
+		return // nothing waits, or everything waiting was reported after it started
 	}
-	delete(s.ingestPending, key)
-	delete(s.ingestDue, key) // nothing reported since: the request has been served
+	if reports.last.Before(startedAt) {
+		delete(s.ingestPending, key)
+		delete(s.ingestDue, key) // nothing reported since: the request has been served
+	} else {
+		reports.first = startedAt
+		s.ingestPending[key] = reports
+	}
 	s.publishIngestPendingLocked()
 }
 
