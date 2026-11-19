@@ -158,7 +158,7 @@ func (p *PartitionPruner) layoutIsStandard(ctx context.Context, basePath, databa
 	} else {
 		entries, err := os.ReadDir(filepath.Join(basePath, database, measurement))
 		if err != nil {
-			p.globCache.set(cacheKey, []string{"missing"})
+			p.globCache.setScoped(cacheKey, []string{"missing"}, scopeFrom(ctx))
 			return false
 		}
 		for _, e := range entries {
@@ -191,9 +191,9 @@ func (p *PartitionPruner) layoutIsStandard(ctx context.Context, basePath, databa
 		standard = true
 	}
 	if standard {
-		p.globCache.set(cacheKey, []string{"standard"})
+		p.globCache.setScoped(cacheKey, []string{"standard"}, scopeFrom(ctx))
 	} else {
-		p.globCache.set(cacheKey, []string{"other"})
+		p.globCache.setScoped(cacheKey, []string{"other"}, scopeFrom(ctx))
 	}
 	return standard
 }

@@ -26,6 +26,10 @@ type sqlTransformCacheEntry struct {
 	transformed string
 	metadata    []string
 	expiresAt   time.Time
+	// stale, when set, is asked on every read: true makes the entry a miss.
+	// It lets the owner tie an entry to state the key cannot name (which
+	// measurements the transform read is known only after it ran).
+	stale func() bool
 }
 
 // cacheShard is a single shard of the cache with its own lock
@@ -122,7 +126,7 @@ func (c *SQLTransformCache) GetWithMetadata(sql string) (string, []string, bool)
 		return "", nil, false
 	}
 
-	if time.Now().After(entry.expiresAt) {
+	if time.Now().After(entry.expiresAt) || (entry.stale != nil && entry.stale()) {
 		c.misses.Add(1)
 		return "", nil, false
 	}
@@ -139,6 +143,14 @@ func (c *SQLTransformCache) Set(sql, transformed string) {
 // SetWithMetadata stores transformed SQL with immutable metadata that remains
 // associated with the transform on cache hits.
 func (c *SQLTransformCache) SetWithMetadata(sql, transformed string, metadata []string) {
+	c.SetWithMetadataCheck(sql, transformed, metadata, nil)
+}
+
+// SetWithMetadataCheck is SetWithMetadata with a staleness check: stale is
+// called on every read of the entry, without the cache's lock held, and a
+// true answer makes the entry a miss. It must be cheap and safe to call from
+// any goroutine. nil means the entry only expires.
+func (c *SQLTransformCache) SetWithMetadataCheck(sql, transformed string, metadata []string, stale func() bool) {
 	shard := c.shardFor(sql)
 
 	shard.mu.Lock()
@@ -177,6 +189,7 @@ func (c *SQLTransformCache) SetWithMetadata(sql, transformed string, metadata []
 		transformed: transformed,
 		metadata:    append([]string(nil), metadata...),
 		expiresAt:   time.Now().Add(c.ttl),
+		stale:       stale,
 	}
 	shard.mu.Unlock()
 }

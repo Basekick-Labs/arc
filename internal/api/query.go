@@ -1758,6 +1758,15 @@ func (h *QueryHandler) SetFileTimePruning(enabled bool, margin time.Duration) {
 	h.pruner.SetFileTimePruning(enabled, margin)
 }
 
+// FilePublished tells the query caches that a file for the measurement, in
+// the hour partitionTime falls in, is now in storage: what they hold for that
+// measurement stops being used, unless the hour is the current one, whose
+// absence is never cached (pruning/publish.go, #1757). It is one atomic add:
+// safe to call from an ingest flush worker for every file it writes.
+func (h *QueryHandler) FilePublished(database, measurement string, partitionTime time.Time) {
+	h.pruner.FilePublished(database, measurement, partitionTime)
+}
+
 // InvalidateCaches clears all internal caches (partition pruner and SQL transform cache).
 // This should be called after compaction to prevent stale file references.
 func (h *QueryHandler) InvalidateCaches() {
@@ -3724,6 +3733,12 @@ func (h *QueryHandler) getTransformedSQLWithRefs(ctx context.Context, sql, heade
 		return transformed, true, refs, nil
 	}
 
+	// Read every measurement's publish generation before the transform lists
+	// anything: which measurements it reads is known only afterwards, and the
+	// cached SQL must go stale with a file published during the transform as
+	// well as after it (pruning/publish.go, #1757).
+	published := h.pruner.PublishSnapshot()
+
 	// Attach the volatility flag: file-level time pruning may embed an
 	// explicit live-hour file list into the transformed SQL, and caching
 	// that would hide every file flushed within the cache TTL.
@@ -3762,7 +3777,16 @@ func (h *QueryHandler) getTransformedSQLWithRefs(ctx context.Context, sql, heade
 	// cached: a raised query.max_sql_length would otherwise multiply its
 	// memory bound. Transforming is linear, so re-running it is cheap.
 	if !volatile.Volatile && len(sql) <= transformCacheMaxSQLLength && !storageFoldsNames(h.storage) {
-		h.queryCache.SetWithMetadata(cacheKey, transformed, encodeStoragePathReferences(refs))
+		// The entry is a miss once a file is published, outside the current
+		// hour, for any measurement the SQL reads: its path lists were made
+		// before that file existed.
+		stamps := make([]pruning.PublishStamp, len(refs))
+		for i, ref := range refs {
+			stamps[i] = published.Stamp(ref.Database, ref.Measurement)
+		}
+		pruner := h.pruner
+		h.queryCache.SetWithMetadataCheck(cacheKey, transformed, encodeStoragePathReferences(refs),
+			func() bool { return !pruner.StampsCurrent(stamps) })
 	}
 	return transformed, false, refs, nil
 }

@@ -221,7 +221,7 @@ func (p *PartitionPruner) remoteDirLister(basePath string) dirLister {
 			}
 			names = append(names, s)
 		}
-		p.globCache.set(cacheKey, names)
+		p.globCache.setScoped(cacheKey, names, scopeFrom(ctx))
 		return names, nil
 	}
 }
@@ -258,7 +258,7 @@ func (p *PartitionPruner) tierDirLister(backend storage.Backend, rootURL string,
 			}
 			names = append(names, s)
 		}
-		p.globCache.set(cacheKey, names)
+		p.globCache.setScoped(cacheKey, names, scopeFrom(ctx))
 		return names, nil
 	}
 }

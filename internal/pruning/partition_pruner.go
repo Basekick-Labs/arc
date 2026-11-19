@@ -22,6 +22,10 @@ type globCacheEntry struct {
 	matches   []string
 	expiresAt time.Time
 	setAt     time.Time
+	// scope is the measurement generation the listing was made under; an
+	// entry whose measurement has had a file published since is a miss
+	// (publish.go).
+	scope listScope
 }
 
 // globCache provides a TTL cache for filepath.Glob results
@@ -57,13 +61,13 @@ func (c *globCache) get(pattern string) ([]string, bool) {
 		return nil, false
 	}
 
-	if time.Now().After(entry.expiresAt) {
+	if time.Now().After(entry.expiresAt) || !entry.scope.current() {
 		c.misses.Add(1)
 		// Evict-on-read: remove the stale entry so it can't accumulate.
 		c.mu.Lock()
 		// Re-check under the write lock: another goroutine may have
 		// refreshed this key with a still-valid entry in the meantime.
-		if e, ok := c.entries[pattern]; ok && time.Now().After(e.expiresAt) {
+		if e, ok := c.entries[pattern]; ok && (time.Now().After(e.expiresAt) || !e.scope.current()) {
 			delete(c.entries, pattern)
 		}
 		c.mu.Unlock()
@@ -77,8 +81,16 @@ func (c *globCache) get(pattern string) ([]string, bool) {
 	return result, true
 }
 
-// set stores a glob result in the cache
+// set stores a result that belongs to no measurement's listing (the layout
+// verdict): it is never made stale by a published file.
 func (c *globCache) set(pattern string, matches []string) {
+	c.setScoped(pattern, matches, listScope{})
+}
+
+// setScoped stores a listing with the scope it was made under: the
+// measurement's generation as read BEFORE the listing (publish.go). Stored
+// even when the generation has already moved; such an entry is never read.
+func (c *globCache) setScoped(pattern string, matches []string, scope listScope) {
 	// Make a copy to prevent external mutation
 	cached := make([]string, len(matches))
 	copy(cached, matches)
@@ -100,6 +112,7 @@ func (c *globCache) set(pattern string, matches []string) {
 		matches:   cached,
 		expiresAt: now.Add(c.ttl),
 		setAt:     now,
+		scope:     scope,
 	}
 	c.mu.Unlock()
 }
@@ -114,7 +127,7 @@ func (c *globCache) getFresh(pattern string, maxAge time.Duration) ([]string, bo
 	c.mu.RLock()
 	entry, ok := c.entries[pattern]
 	c.mu.RUnlock()
-	if !ok || time.Now().After(entry.expiresAt) || time.Since(entry.setAt) > maxAge {
+	if !ok || time.Now().After(entry.expiresAt) || time.Since(entry.setAt) > maxAge || !entry.scope.current() {
 		c.misses.Add(1)
 		return nil, false
 	}
@@ -224,6 +237,9 @@ type partitionCacheEntry struct {
 	result    interface{} // string or []string
 	optimized bool
 	expiresAt time.Time
+	// scope is the measurement generation read before the paths were listed
+	// (publish.go); a file published since makes the entry a miss.
+	scope listScope
 }
 
 // partitionCache provides a TTL cache for OptimizeTablePath results
@@ -270,12 +286,12 @@ func (c *partitionCache) get(key string) (interface{}, bool, bool) {
 		return nil, false, false
 	}
 
-	if time.Now().After(entry.expiresAt) {
+	if time.Now().After(entry.expiresAt) || !entry.scope.current() {
 		c.misses.Add(1)
 		// Evict-on-read: remove the stale entry so it can't accumulate.
 		c.mu.Lock()
 		// Re-check under the write lock in case another goroutine refreshed it.
-		if e, ok := c.entries[key]; ok && time.Now().After(e.expiresAt) {
+		if e, ok := c.entries[key]; ok && (time.Now().After(e.expiresAt) || !e.scope.current()) {
 			delete(c.entries, key)
 		}
 		c.mu.Unlock()
@@ -286,8 +302,9 @@ func (c *partitionCache) get(key string) (interface{}, bool, bool) {
 	return entry.result, entry.optimized, true
 }
 
-// set stores a partition result in the cache
-func (c *partitionCache) set(key string, result interface{}, optimized bool) {
+// set stores a partition result in the cache, with the scope read before the
+// work that produced it (publish.go).
+func (c *partitionCache) set(key string, result interface{}, optimized bool, scope listScope) {
 	c.mu.Lock()
 	// Bound the cache: if inserting a new key would exceed maxEntries, drop
 	// expired entries first, and if still full, refuse the insert. Refreshing
@@ -303,6 +320,7 @@ func (c *partitionCache) set(key string, result interface{}, optimized bool) {
 		result:    result,
 		optimized: optimized,
 		expiresAt: time.Now().Add(c.ttl),
+		scope:     scope,
 	}
 	c.mu.Unlock()
 }
@@ -368,6 +386,11 @@ type PartitionPruner struct {
 	globCache      *globCache
 	partitionCache *partitionCache
 	storage        storage.Backend // Optional storage backend for object-store path validation
+
+	// published holds a generation per measurement (striped by hash), moved
+	// when a file is published outside the current hour; cached listings and
+	// pruned lists carry it and go stale with it (publish.go).
+	published [publishStripes]atomic.Uint64
 
 	// File-level time pruning (see file_time_pruning.go). nowFn is
 	// injectable for tests; production always uses time.Now.
@@ -669,6 +692,15 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 		return originalPath, false, false
 	}
 
+	// Read the measurement's generation before anything is listed or read
+	// from a cache: everything this call stores carries it, and a file
+	// published meanwhile makes all of it a miss (publish.go).
+	var scope listScope
+	if database, measurement, ok := splitStorageGlob(originalPath); ok {
+		scope = p.scopeFor(database, measurement)
+		ctx = withListScope(ctx, scope)
+	}
+
 	// The range is read once and keys the cache: a relative range's hours
 	// move with now() (CacheEpoch). Range, relative flag and hash depend on
 	// the SQL alone, so they come from the per-query memo: this runs once
@@ -691,7 +723,7 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 	if timeRange == nil {
 		p.logger.Debug().Msg("No time range found in query, skipping partition pruning")
 		// Cache negative result too
-		p.partitionCache.set(cacheKey, originalPath, false)
+		p.partitionCache.set(cacheKey, originalPath, false, scope)
 		return originalPath, false, false
 	}
 
@@ -701,7 +733,7 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 
 	if len(matches) < 4 {
 		p.logger.Debug().Str("path", originalPath).Msg("Path format not recognized")
-		p.partitionCache.set(cacheKey, originalPath, false)
+		p.partitionCache.set(cacheKey, originalPath, false, scope)
 		return originalPath, false, false
 	}
 
@@ -720,7 +752,7 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 
 	if len(partitionPaths) == 0 {
 		p.logger.Info().Msg("No partitions found, using fallback")
-		p.partitionCache.set(cacheKey, originalPath, false)
+		p.partitionCache.set(cacheKey, originalPath, false, scope)
 		return originalPath, false, false
 	}
 
@@ -738,7 +770,7 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 		switch {
 		case errors.Is(err, errTooManyBeyond):
 			p.logger.Info().Msg("Too many partitions past the assumed end; using the unpruned glob")
-			p.partitionCache.set(cacheKey, originalPath, false)
+			p.partitionCache.set(cacheKey, originalPath, false, scope)
 			return originalPath, false, false
 		case err != nil:
 			// The generated range alone, as before: a listing hiccup must
@@ -785,7 +817,7 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 		}
 		p.logger.Info().Msg("No data exists for time range, using fallback")
 		if !liveDropped {
-			p.partitionCache.set(cacheKey, originalPath, false)
+			p.partitionCache.set(cacheKey, originalPath, false, scope)
 		}
 		return originalPath, false, false
 	}
@@ -815,7 +847,7 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 	// the next query once older files fall out of the range. The per-query
 	// re-glob this costs is a few ms.
 	if !fileEligible && !liveDropped {
-		p.partitionCache.set(cacheKey, result, true)
+		p.partitionCache.set(cacheKey, result, true, scope)
 	}
 	return result, true, false
 }
@@ -885,19 +917,20 @@ func (p *PartitionPruner) filterExistingPathsOpts(ctx context.Context, paths []s
 	}
 
 	// Local path filtering using filepath.Glob
-	return p.filterExistingLocalPathsOpts(paths, maxAge)
+	return p.filterExistingLocalPathsOpts(ctx, paths, maxAge)
 }
 
 // filterExistingLocalPaths filters local paths using filepath.Glob
 func (p *PartitionPruner) filterExistingLocalPaths(paths []string) []string {
-	existing, _, _ := p.filterExistingLocalPathsOpts(paths, 0)
+	existing, _, _ := p.filterExistingLocalPathsOpts(context.Background(), paths, 0)
 	return existing
 }
 
-func (p *PartitionPruner) filterExistingLocalPathsOpts(paths []string, maxAge time.Duration) ([]string, bool, int) {
+func (p *PartitionPruner) filterExistingLocalPathsOpts(ctx context.Context, paths []string, maxAge time.Duration) ([]string, bool, int) {
 	existingPaths := []string{}
 	hits := 0
 	live := p.liveWindow()
+	scope := scopeFrom(ctx)
 
 	for _, pattern := range paths {
 		// Check cache first; a live partition's absence is never taken from
@@ -921,7 +954,7 @@ func (p *PartitionPruner) filterExistingLocalPathsOpts(paths []string, maxAge ti
 		// Cache the result (even empty results to avoid repeated globs,
 		// except a live partition's: it can appear at the next flush)
 		if len(matches) > 0 || !live.isLive(pattern) {
-			p.globCache.set(pattern, matches)
+			p.globCache.setScoped(pattern, matches, scope)
 		}
 
 		if len(matches) > 0 {
@@ -975,6 +1008,7 @@ func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, pat
 	pathToDir := make(map[string]string)
 	liveDirs := make(map[string]bool)
 	live := p.liveWindow()
+	scope := scopeFrom(ctx)
 
 	for _, path := range paths {
 		// Remove the glob suffix to get the directory
@@ -1072,7 +1106,7 @@ func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, pat
 		}
 
 		// Cache by parent directory
-		p.globCache.set(cacheKey, childNames)
+		p.globCache.setScoped(cacheKey, childNames, scope)
 		parentChildren[parentDir] = childSet
 		p.logger.Debug().Str("parent", parentDir).Int("children", len(childNames)).Msg("Cached parent listing")
 	}
@@ -1139,7 +1173,7 @@ func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, pat
 					}
 				}
 				// Cache the result
-				p.globCache.set(cacheKey, directFiles)
+				p.globCache.setScoped(cacheKey, directFiles, scope)
 				hasFiles = len(directFiles) > 0
 				p.logger.Debug().Str("prefix", prefix).Int("files", len(directFiles)).Msg("Cached day-level file check")
 			}

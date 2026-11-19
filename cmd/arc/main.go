@@ -4081,6 +4081,13 @@ func main() {
 	// Reads run on the server's query lifetime, which the HTTP drain cancels
 	// once its grace is over, so a long query cannot hold the shutdown (#1644).
 	queryHandler.SetLifetime(server.QueryLifetime())
+	// A file an ingest flush writes outside the current hour (late data, a
+	// future stamp) makes the query caches drop what they hold for its
+	// measurement; before, queries kept leaving that hour out until the
+	// cached lists expired (#1757). Set here, with flush workers already
+	// running: the setter is atomic, and a file flushed before this line has
+	// nothing cached to drop, the query routes not being registered yet.
+	arrowBuffer.SetOnFilePublished(queryHandler.FilePublished)
 	queryHandler.SetCancelOnClientDisconnect(cfg.Query.CancelOnClientDisconnect)
 	if authManager != nil && rbacManager != nil {
 		queryHandler.SetAuthAndRBAC(authManager, rbacManager)
