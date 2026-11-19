@@ -147,9 +147,11 @@ func (c *SQLTransformCache) SetWithMetadata(sql, transformed string, metadata []
 }
 
 // SetWithMetadataCheck is SetWithMetadata with a staleness check: stale is
-// called on every read of the entry, without the cache's lock held, and a
-// true answer makes the entry a miss. It must be cheap and safe to call from
-// any goroutine. nil means the entry only expires.
+// called on every read of the entry, and a true answer makes the entry a
+// miss. It is also called while the shard is locked, when a full shard looks
+// for entries to evict, so it must not call back into the cache; it must be
+// cheap and safe to call from any goroutine. nil means the entry only
+// expires.
 func (c *SQLTransformCache) SetWithMetadataCheck(sql, transformed string, metadata []string, stale func() bool) {
 	shard := c.shardFor(sql)
 
