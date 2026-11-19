@@ -117,7 +117,7 @@ func (t *DailyTier) FindCandidatesFromListing(database, measurement string, obje
 				Str("database", database).
 				Str("partition", settled.PartitionPath).
 				Int("file_count", settled.FileCount).
-				Msg("Found settled sparse day for daily compaction")
+				Msg("Found settled day for daily compaction")
 			continue
 		}
 		if t.foldsSeparately(partition) {

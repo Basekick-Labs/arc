@@ -188,3 +188,49 @@ func TestTooWideEntryWithDailyFileRetriesTheFold1775(t *testing.T) {
 		t.Fatal("a sibling daily output released the memo")
 	}
 }
+
+// A sibling batch that consumed the recorded daily file and wrote another
+// does not release the memo: the batch that failed is the same job.
+func TestTooWideSiblingConsumedOutputKeepsEntry1775(t *testing.T) {
+	daily := settledTier(12, 7, 24)
+	mem := &tooWideMemo{entries: map[string]*TooWideEntry{}, logger: zerolog.Nop()}
+	part := "db/cpu/2026/11/16"
+	d1 := part + "/cpu_20261117_020000_000000001_b1_daily.parquet"
+	d2 := part + "/cpu_20261119_020000_000000002_b1_daily.parquet"
+	s1 := part + "/03/cpu_20261117_030000_000000001.parquet"
+	mem.strike("daily", part, []string{d1, s1}, "memory_error", "s")
+	if !mem.skip(daily, part, []string{d2, s1}, "s") {
+		t.Fatal("a sibling's new daily output released the memo")
+	}
+
+	hourly := NewHourlyTier(&HourlyTierConfig{Enabled: true, Logger: zerolog.Nop()})
+	hp := "db/cpu/2026/11/16/03"
+	c1 := hp + "/cpu_20261117_030000_000000001_compacted.parquet"
+	c2 := hp + "/cpu_20261119_030000_000000002_compacted.parquet"
+	r := hp + "/cpu_20261117_031000_000000001.parquet"
+	mem.strike("hourly", hp, []string{c1, r}, "memory_error", "s")
+	if !mem.skip(hourly, hp, []string{c2, r}, "s") {
+		t.Fatal("hourly: a sibling's new compacted output released the memo")
+	}
+}
+
+// A settled fold split into batches: every batch that ran is remembered, so
+// the day is not run again while its files stay the ones that failed.
+func TestSettledMemoAcrossBatches1775(t *testing.T) {
+	s := newSettledMemo()
+	b1, b2 := []string{"a", "b"}, []string{"c", "d"}
+	s.record("daily", "p", b1)
+	s.record("daily", "p", b2)
+	if !s.skip("daily", "p", []string{"a", "b", "c", "d"}) {
+		t.Fatal("both batches failed: the day is run again")
+	}
+	if !s.skip("daily", "p", b2) {
+		t.Fatal("batch 1 compacted, batch 2 failed: the rest is run again")
+	}
+	if s.skip("daily", "p", []string{"c", "d", "e"}) {
+		t.Fatal("a new file did not make a new attempt")
+	}
+	if s.skip("daily", "p", b2) {
+		t.Fatal("the entry outlived the new attempt")
+	}
+}
