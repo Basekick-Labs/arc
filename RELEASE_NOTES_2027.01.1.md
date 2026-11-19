@@ -12,12 +12,15 @@ Since #1750 an ingest flush asks for an export of its table. Each of those expor
 - **New key `iceberg.ingest_append_enabled`** (default `true`). `false` makes every ingest-triggered export a full pass, as in #1750.
 - **Standalone nodes only**, like the trigger itself ([#1756](https://github.com/Basekick-Labs/arc/issues/1756)). Keeping versions by age applies on every node.
 
-What it costs to add one file to a table (the export alone, local disk):
+What one ingest export costs, as a full pass and as an append, through the scheduler on local disk (median of 7; `TestMeasure_AppendAgainstAPass`):
 
-| Files in the table | Full pass | Append |
-|---|---|---|
-| 1,000 | 47.6 ms | 21.6 ms |
-| 8,000 | 184.5 ms | 24.2 ms |
+| Files in the table | Full pass, 1 new file | Append, 1 new file | Full pass, 30 new files | Append, 30 new files |
+|---|---|---|---|---|
+| 1,000 | 43 ms | 30 ms | 43 ms | 34 ms |
+| 8,000 | 122 ms | 31 ms | 121 ms | 34 ms |
+| 20,000 | 251 ms | 28 ms | 266 ms | 34 ms |
+
+The full pass grows with the table; the append does not.
 
 On an S3 API (SeaweedFS on the same machine, so no network latency), a 400-file table: 35 ms as a pass, 10–17 ms as an append.
 
@@ -28,12 +31,14 @@ On the running binary, 200 measurements written for 4 minutes, standalone, local
 | 60 s (default) | on | 27.9 s | 26 MB |
 | 60 s | off | 27.0 s | 24 MB |
 | 15 s | on | 7.7 s | 94 MB |
+| 10 s | on | 5.4 s | 183 MB |
 | 5 s | on | 1.0 s | 210 MB |
 | 5 s | off | 0.8 s | 236 MB |
 
 - **The interval is what shortens the lag.** At 5 s a file is in its table about a second after it is written. At a given interval the append path does not change the lag.
-- **The append path is what keeps an export cheap as a table grows.** In these runs the tables held about 48 files each and a full pass was already cheap, so on and off look the same. With ten tables that grew to about 1,300 files, and about 28 new files per export, an export averaged 57 ms as an append and 70 ms as a pass.
-- **A short interval costs metadata.** Every export writes a new table version: about eight times as much at 5 s as at 60 s in the runs above. Old versions are removed by age and by the orphan sweep (after an hour), so what stays on disk is bounded, and larger the shorter the interval.
+- **The append path is what keeps an export cheap as a table grows** (the table above). In these runs the tables held about 48 files each and a full pass was already cheap, so on and off look the same. One pair of runs with ten tables that grew to about 1,300 files, and about 28 new files per export, averaged 57 ms per export as an append and 70 ms as a pass; it was a single run of each on a machine also serving the test's queries, so read it as "no worse", not as a measured gain.
+- **A short interval costs metadata.** Every export writes a new table version, about 40 KB of metadata in these runs: about eight times as much at 5 s as at 60 s. (In this load each table got a new file about every 9 s, so 5 s and 10 s made nearly the same number of exports and wrote nearly the same amount; they differ in lag.)
+- **What stays on disk is bounded.** In an 11-minute run (20 tables, 5 s interval, `min_version_age = 120`, a full pass every 30 s) the published versions levelled off at 21–25 per table and iceberg-go's own metadata files at 25 per table, both from the fourth minute on. Manifest files were still growing at the end, by about 16 per table per minute: the orphan sweep only removes them after an hour, which the run did not reach. Extrapolated, not measured: about 1,000 manifest files and 5 MB per table at that rate.
 - In every run the Iceberg row counts matched storage on the tables checked, no file was in a table twice, and no append fell back to a full pass.
 
 New counters: `arc_iceberg_ingest_appends_total`, `arc_iceberg_ingest_append_files_total`, and `arc_iceberg_ingest_append_fallbacks_total` (exports that had files to add and ran a full pass instead; the log names the reason once per table). The `/metrics` JSON form carries `iceberg_ingest_appends`, `iceberg_ingest_append_files` and `iceberg_ingest_append_fallbacks`.
@@ -43,7 +48,8 @@ Notes:
 - **Snapshots are expired, versions pruned and orphans swept by the full pass**, which still runs every `iceberg.reconcile_interval`. Between two passes a table that is appended to carries the snapshots of those appends. A table also takes a full pass after 120 appends, so a long `reconcile_interval` does not let them pile up.
 - **Manifests:** each append adds one. Once there are four small ones the append merges them, up to about 4,000 files per manifest; a larger manifest is never rewritten by an append.
 - **A file ingest deletes after storing it** (the late-landed copy of a failed flush) now asks for an export of its table, so it leaves the table at once and not at the next timed pass.
-- Not run: a cluster (the append path is off there), a warehouse outside the storage root, or S3 over a real network.
+- **Also run:** `iceberg.warehouse` set to a subdirectory of the storage root (appends, row counts and published files as at the default), and age-based version pruning against an S3 API.
+- **Not run:** a cluster (the append path is off there), a warehouse outside the storage root, S3 over a real network, or a run long enough to reach the orphan sweep.
 
 ## Fix: a day with few files gets a daily file, so it can move to the cold tier ([#1774](https://github.com/Basekick-Labs/arc/issues/1774))
 
