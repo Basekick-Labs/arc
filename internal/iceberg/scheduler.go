@@ -1039,6 +1039,9 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 			return outcomeReconciled, nil
 		}
 		s.state[key] = measurementState{fingerprint: fp}
+		if res.versionsHeld {
+			s.markAppended(key) // come back to prune them (see reconcileResult.versionsHeld)
+		}
 		return outcomeReconciled, nil
 	}
 	// Fingerprint the file set. Unchanged fingerprint + a cached schema => guaranteed no-op
@@ -1162,6 +1165,13 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 	// The table's schema, not a union of footers: every listed file is now in the table, so it
 	// covers all of them, and it is exactly what the next pass's EnsureTable compares against.
 	s.state[key] = measurementState{fingerprint: fp, schema: res.schema, schemaFiles: schemaSet}
+	if res.versionsHeld {
+		// Published versions are waiting out iceberg.min_version_age: the
+		// next pass runs whatever the listing is, and prunes the ones old
+		// enough by then. Without this a table that goes quiet would keep
+		// them, since an unchanged table's pass is skipped.
+		s.markAppended(key)
+	}
 	return outcomeReconciled, nil
 }
 

@@ -82,6 +82,12 @@ type reconcileResult struct {
 	// floor owed has landed and no heal commit failed (#1098). Only then may the scheduler cache
 	// the fingerprint.
 	settled bool
+	// versionsHeld: the pass's prune left published versions on disk only
+	// because the version after each was published too recently
+	// (iceberg.min_version_age). The scheduler runs the table's next pass
+	// whatever its listing, so they are pruned once old enough even if the
+	// table has gone quiet by then.
+	versionsHeld bool
 	// partial: new files remain unregistered because the pass ran out of time or lost the
 	// writer role. Not an error: what was committed stays, and the next pass continues.
 	partial bool
@@ -303,7 +309,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 		if err != nil {
 			return reconcileResult{}, err
 		}
-		return reconcileResult{settled: ok && hintOK && !e.healFailed(), schema: arcSchemaOf(tbl)}, nil
+		return reconcileResult{settled: ok && hintOK && !e.healFailed(), schema: arcSchemaOf(tbl), versionsHeld: e.versionsHeldByAge()}, nil
 	}
 
 	// Metadata-only: files are dropped and added as DataFiles. (Transaction.Delete is a
@@ -608,14 +614,15 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 			Msg("Iceberg: source files disappeared during this pass (a compaction, delete or retention is rewriting this measurement); what they touched is left for the next pass")
 	}
 	res := reconcileResult{
-		partial:     partial,
-		registered:  registered,
-		remaining:   remaining,
-		schema:      arcSchemaOf(tbl),
-		moved:       moved,
-		commits:     commits,
-		droppedCold: droppedCold,
-		writerLost:  writerGone && !partial && !moved,
+		partial:      partial,
+		registered:   registered,
+		remaining:    remaining,
+		schema:       arcSchemaOf(tbl),
+		moved:        moved,
+		commits:      commits,
+		droppedCold:  droppedCold,
+		writerLost:   writerGone && !partial && !moved,
+		versionsHeld: e.versionsHeldByAge(),
 	}
 	if loopErr != nil {
 		return res, loopErr

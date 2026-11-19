@@ -838,3 +838,66 @@ func TestAppend_APassThatCommitsNothingDoesNotDelayTheNextExport(t *testing.T) {
 		t.Errorf("after a pass that committed, the next ingest export is due in %v, want about %v", got, interval)
 	}
 }
+
+// A table that goes quiet still has its old published versions pruned: a
+// pass that leaves versions on disk only because of iceberg.min_version_age
+// makes the table's next pass run whatever its listing is. Without that an
+// unchanged table's pass is skipped, and the versions would stay for good.
+func TestAppend_AQuietTableStillHasItsOldVersionsPruned(t *testing.T) {
+	r := newAppendRig(t)
+	r.exp.retain = 1
+	r.exp.SetVersionRetention(time.Hour, 0)
+	r.settled()
+	for i := 0; i < 4; i++ {
+		r.report(r.newFile())
+		r.serve()
+	}
+	copies := func() int {
+		entries, err := os.ReadDir(filepath.Join(r.root, "arc_mydb.db", "cpu", "metadata"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), "v") && strings.HasSuffix(e.Name(), ".metadata.json") {
+				n++
+			}
+		}
+		return n
+	}
+	key := "mydb\x00cpu"
+	if _, err := r.pass(); err != nil { // the pass after the appends: everything is too young to prune
+		t.Fatal(err)
+	}
+	held := copies()
+	if held <= 2 {
+		t.Fatalf("%d copies inside the minimum age, want more than retain_snapshots+1 = 2 kept", held)
+	}
+	if st := r.sched.state[key]; st.fingerprint != appendedFingerprint {
+		t.Fatalf("fingerprint %q after a pass that left versions held by age: the next pass of an unchanged table would be skipped", st.fingerprint)
+	}
+	// Nothing changes in storage; the versions are old enough now.
+	r.exp.SetVersionRetention(time.Millisecond, 0)
+	time.Sleep(20 * time.Millisecond)
+	listed := r.listings()
+	if _, err := r.pass(); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.listings(); got != listed+1 {
+		t.Fatalf("the pass of the unchanged table was skipped (%d listings, then %d)", listed, got)
+	}
+	if got := copies(); got >= held || got > 3 {
+		t.Errorf("%d copies after the minimum age passed (was %d), want them pruned to about retain_snapshots+1", got, held)
+	}
+	// Nothing is held any more: the table's passes are skipped again.
+	if _, err := r.pass(); err != nil {
+		t.Fatal(err)
+	}
+	if st := r.sched.state[key]; st.fingerprint == appendedFingerprint {
+		t.Error("the table is still marked for a pass with nothing left to prune")
+	}
+	listed = r.listings()
+	if outcome, _ := r.pass(); outcome != outcomeUnchanged {
+		t.Errorf("a pass of the settled, unchanged table: outcome %v after %d listings, want unchanged", outcome, listed)
+	}
+}

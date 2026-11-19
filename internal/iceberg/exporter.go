@@ -142,6 +142,9 @@ type Exporter struct {
 	// passHints are the versions this pass wrote to version-hint.text (heals, evolutions, the
 	// end-of-pass publish). A reader may have resolved any of them, so none is pruned this pass.
 	passHints []int
+	// passVersionsHeld: this pass's prune kept a published version on disk only because of
+	// iceberg.min_version_age (versionsHeldByAge).
+	passVersionsHeld bool
 	// passGate, while a reconcile runs, is its canCommit: EnsureTable's heals check it before
 	// committing, so a node that lost the writer role mid-pass does not publish a heal (#1097).
 	// nil outside a reconcile (always allowed).
@@ -204,7 +207,16 @@ func (e *Exporter) resetHintFailure() {
 	e.passLoaded, e.passHint = -1, -1
 	e.passHintUnknown = false
 	e.passHints = e.passHints[:0]
+	e.passVersionsHeld = false
 	e.hintFailMu.Unlock()
+}
+
+// versionsHeldByAge reports that this pass's prune kept a published version
+// only because of iceberg.min_version_age (pruneOldVersionFilesFrom).
+func (e *Exporter) versionsHeldByAge() bool {
+	e.hintFailMu.Lock()
+	defer e.hintFailMu.Unlock()
+	return e.passVersionsHeld
 }
 
 // notePublishedHint records a version this pass wrote to version-hint.text.
@@ -1421,6 +1433,9 @@ func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.T
 			next := vs[keep+i-1] // the next version up that exists: vs is descending
 			at, ok := written[path.Base(next.key)]
 			if !ok || time.Since(at) < e.minVersionAge {
+				e.hintFailMu.Lock()
+				e.passVersionsHeld = true
+				e.hintFailMu.Unlock()
 				continue
 			}
 		}
