@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -77,4 +79,47 @@ func NameTime(now time.Time) time.Time {
 			return time.Unix(0, next).UTC()
 		}
 	}
+}
+
+// IngestFileTime extracts the flush timestamp from an ingest Parquet file
+// name: {measurement}_{YYYYMMDD}_{HHMMSS}_{nanos}.parquet, the time NameTime
+// returned just before the file was written. Parsing is deliberately strict
+// (exactly an 8-digit date and a 6-digit time that time.Parse accepts, an
+// all-digit last token, and a measurement token present) so no other name
+// shape (hourly and daily compacted outputs, hand-placed files) can parse to
+// a wrong time; anything else fails.
+//
+// A DELETE rewrite (<name>_rewrite_<unixnano>.parquet) parses to the time of
+// the file it rewrote, not of the rewrite: a caller that must tell them apart
+// compares StripRewriteSuffix(name) with name.
+func IngestFileTime(name string) (time.Time, bool) {
+	base := strings.TrimSuffix(filepath.Base(StripRewriteSuffix(name)), ".parquet")
+	toks := strings.Split(base, "_")
+	if len(toks) < 4 {
+		return time.Time{}, false
+	}
+	d, hms, nanos := toks[len(toks)-3], toks[len(toks)-2], toks[len(toks)-1]
+	if len(d) != 8 || len(hms) != 6 || !allDigits(d) || !allDigits(hms) || !allDigits(nanos) {
+		return time.Time{}, false
+	}
+	ts, err := time.Parse("20060102150405", d+hms)
+	if err != nil {
+		return time.Time{}, false
+	}
+	// The last token is the flush time's nanoseconds within its second
+	// (%09d). Without it a file flushed at hh:mm:ss.9 read as hh:mm:ss.0.
+	if len(nanos) == 9 {
+		n, _ := strconv.Atoi(nanos)
+		ts = ts.Add(time.Duration(n))
+	}
+	return ts, true
+}
+
+func allDigits(s string) bool {
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return len(s) > 0
 }

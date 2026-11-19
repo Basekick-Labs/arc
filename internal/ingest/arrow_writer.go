@@ -1313,7 +1313,7 @@ type ArrowBuffer struct {
 	deleteScope  deleteScopePtr
 	// onFilePublished is told about each file a flush stores (#1757,
 	// flush_split.go).
-	onFilePublished atomic.Pointer[FilePublishedFunc]
+	onFilePublished atomic.Pointer[[]FilePublishedFunc]
 
 	// ingestGate refuses live writes on a fenced node (#1207).
 	ingestGate atomic.Pointer[func() error]

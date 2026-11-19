@@ -164,3 +164,43 @@ func TestFilePublishedReportsEachStoredFile(t *testing.T) {
 		}
 	})
 }
+
+// Several receivers are each told about every file, in the order they were
+// added; Set replaces them all.
+func TestAddOnFilePublishedCallsEveryReceiverInOrder(t *testing.T) {
+	b, _, _ := newFilePublishedBuffer(t)
+	b.SetOnFilePublished(nil)
+	var mu sync.Mutex
+	var calls []string
+	note := func(name string) FilePublishedFunc {
+		return func(database, measurement string, _ time.Time) {
+			mu.Lock()
+			calls = append(calls, name+":"+database+"/"+measurement)
+			mu.Unlock()
+		}
+	}
+	b.AddOnFilePublished(note("first"))
+	b.AddOnFilePublished(nil) // ignored
+	b.AddOnFilePublished(note("second"))
+	writeAt(t, b, midHour(t).Add(-3*time.Hour))
+	if err := b.FlushAllAndWait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	got := append([]string(nil), calls...)
+	mu.Unlock()
+	if len(got) != 2 || got[0] != "first:db/cpu" || got[1] != "second:db/cpu" {
+		t.Fatalf("calls = %v, want first then second, once each", got)
+	}
+
+	b.SetOnFilePublished(note("only"))
+	writeAt(t, b, midHour(t).Add(-3*time.Hour))
+	if err := b.FlushAllAndWait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 3 || calls[2] != "only:db/cpu" {
+		t.Errorf("calls = %v, want Set to replace both receivers", calls)
+	}
+}

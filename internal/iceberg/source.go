@@ -185,6 +185,24 @@ func (s *StorageWalkSource) isWarehouseDir(name string) bool {
 	return s.layout.IsWarehouseRootDir(name)
 }
 
+// Exportable reports whether (database, measurement) is one Measurements
+// would yield: not the exporter's own warehouse directories, not Arc's
+// reserved state directories, not a nested warehouse. A request that names a
+// measurement directly (an ingest flush's) skips Measurements, so it asks
+// here: a database that happens to be named like one of those directories
+// must not get a table.
+func (s *StorageWalkSource) Exportable(m Measurement) bool {
+	db := strings.Trim(m.Database, "/")
+	name := strings.Trim(m.Measurement, "/")
+	if db == "" || name == "" {
+		return false
+	}
+	if s.isWarehouseDir(db) || db == compactionStateDir || storage.IsReservedRootDir(db) {
+		return false
+	}
+	return !s.layout.IsWarehouseMeasurement(db, name)
+}
+
 // dirLister is the subset of storage backends that can enumerate immediate subdirectories.
 type dirLister interface {
 	ListDirectories(ctx context.Context, prefix string) ([]string, error)

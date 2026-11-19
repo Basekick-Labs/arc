@@ -44,22 +44,47 @@ type claimedBatchPtr = atomic.Pointer[ClaimedBatchFunc]
 // does.
 type FilePublishedFunc func(database, measurement string, partitionTime time.Time)
 
-// SetOnFilePublished installs the function told about each file an ingest
-// flush stores (nil: none). The query layer uses it to stop serving path
-// lists cached before the file existed (#1757). It can be set while flushes
-// run.
+// SetOnFilePublished makes fn the only function told about each file an
+// ingest flush stores (nil: none), replacing any installed before. Tests use
+// it; cmd/arc installs each of its receivers with AddOnFilePublished.
 func (b *ArrowBuffer) SetOnFilePublished(fn FilePublishedFunc) {
 	if fn == nil {
 		b.onFilePublished.Store(nil)
 		return
 	}
-	b.onFilePublished.Store(&fn)
+	fns := []FilePublishedFunc{fn}
+	b.onFilePublished.Store(&fns)
 }
 
-// filePublished reports a stored file to the installed function, if any.
+// AddOnFilePublished adds fn to the functions told about each file an ingest
+// flush stores, after the ones already installed. The query layer uses it to
+// stop serving path lists cached before the file existed (#1757), and the
+// Iceberg export to export the file's measurement without waiting for its
+// timer (#1750). It can be called while flushes run.
+func (b *ArrowBuffer) AddOnFilePublished(fn FilePublishedFunc) {
+	if fn == nil {
+		return
+	}
+	for {
+		old := b.onFilePublished.Load()
+		var fns []FilePublishedFunc
+		if old != nil {
+			fns = append(fns, *old...)
+		}
+		fns = append(fns, fn)
+		if b.onFilePublished.CompareAndSwap(old, &fns) {
+			return
+		}
+	}
+}
+
+// filePublished reports a stored file to the installed functions, in the
+// order they were installed.
 func (b *ArrowBuffer) filePublished(database, measurement string, partitionTime time.Time) {
-	if fn := b.onFilePublished.Load(); fn != nil {
-		(*fn)(database, measurement, partitionTime)
+	if fns := b.onFilePublished.Load(); fns != nil {
+		for _, fn := range *fns {
+			fn(database, measurement, partitionTime)
+		}
 	}
 }
 

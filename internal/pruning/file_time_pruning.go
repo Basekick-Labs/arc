@@ -3,7 +3,6 @@ package pruning
 import (
 	"context"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -125,43 +124,11 @@ func (p *PartitionPruner) SetFileTimePruning(enabled bool, margin time.Duration)
 	}
 }
 
-func allDigits(s string) bool {
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return len(s) > 0
-}
-
-// parseFileTime extracts the flush timestamp from an ingest parquet filename:
-// {measurement}_{YYYYMMDD}_{HHMMSS}_{nanos}.parquet. Parsing is deliberately
-// strict — exactly 8-digit date and 6-digit time validated by time.Parse, all
-// -digit final token, and a measurement token present — so no other filename
-// shape (hourly/daily compacted outputs, hand-placed files) can mis-parse to
-// a wrong time; anything else fails and the caller keeps the file (fail open).
+// parseFileTime is storage.IngestFileTime: the flush timestamp in an ingest
+// Parquet file name, strict enough that no other name shape parses, so a file
+// it cannot read is kept (fail open).
 func parseFileTime(name string) (time.Time, bool) {
-	base := strings.TrimSuffix(filepath.Base(storage.StripRewriteSuffix(name)), ".parquet")
-	toks := strings.Split(base, "_")
-	if len(toks) < 4 {
-		return time.Time{}, false
-	}
-	d, hms, nanos := toks[len(toks)-3], toks[len(toks)-2], toks[len(toks)-1]
-	if len(d) != 8 || len(hms) != 6 || !allDigits(d) || !allDigits(hms) || !allDigits(nanos) {
-		return time.Time{}, false
-	}
-	ts, err := time.Parse("20060102150405", d+hms)
-	if err != nil {
-		return time.Time{}, false
-	}
-	// The last token is the flush time's nanoseconds within its second
-	// (generateStoragePath, %09d). Without it a file flushed at hh:mm:ss.9
-	// read as hh:mm:ss.0 and could be dropped for a start inside that second.
-	if len(nanos) == 9 {
-		n, _ := strconv.Atoi(nanos)
-		ts = ts.Add(time.Duration(n))
-	}
-	return ts, true
+	return storage.IngestFileTime(name)
 }
 
 // minFileTimeMargin is the smallest margin the pruner accepts.

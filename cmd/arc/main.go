@@ -4088,7 +4088,7 @@ func main() {
 	// running: the setter is atomic, and a file flushed before this line has
 	// nothing cached to drop, because the caches belong to the handler
 	// created just above.
-	arrowBuffer.SetOnFilePublished(queryHandler.FilePublished)
+	arrowBuffer.AddOnFilePublished(queryHandler.FilePublished)
 	queryHandler.SetCancelOnClientDisconnect(cfg.Query.CancelOnClientDisconnect)
 	if authManager != nil && rbacManager != nil {
 		queryHandler.SetAuthAndRBAC(authManager, rbacManager)
@@ -4752,6 +4752,9 @@ func main() {
 			Interval: time.Duration(cfg.Iceberg.ReconcileInterval) * time.Second,
 			Gate:     icebergGate,
 			Logger:   logger.Get("iceberg"),
+			// 0 leaves RequestIngestReconcile and its bookkeeping off (#1750),
+			// as on a cluster node, where nothing reports ingest files yet.
+			IngestInterval: icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil),
 		})
 		// #1731: with node-local warehouses (not icebergTopo.barrier, which is a shared bucket or
 		// shared_storage_mode), a database DELETE on the writer drops only the writer's tables.
@@ -4787,6 +4790,23 @@ func main() {
 		icebergStart = func() {
 			startScheduler()
 			icebergPathsChanged.Store(&requestPaths)
+			// An ingest flush asks for its measurement's table, so a new file
+			// is exported after at most iceberg.ingest_export_interval and not
+			// at the next timed pass (#1750). Installed when the export
+			// starts, like the path requests above: a scheduler that never
+			// starts would only collect them.
+			//
+			// Not on a cluster node yet. There the node that flushes is
+			// usually not the one that exports (its request would be dropped
+			// at the gate), and on the exporter a request served before the
+			// file's registration lands costs a Raft barrier. The events that
+			// reach the exporting node (a file registered in a shared bucket,
+			// a pulled file landing) are #1756.
+			if icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil) > 0 {
+				arrowBuffer.AddOnFilePublished(func(database, measurement string, _ time.Time) {
+					icebergScheduler.RequestIngestReconcile(database, measurement)
+				})
+			}
 			// In a cluster the writer's own requests are dropped here at the
 			// gate: the exporter node's coordinator tells it what its listing
 			// lost (local unlinks, shared-bucket manifest deletes by reason,

@@ -111,6 +111,12 @@ type Exporter struct {
 	// is single-writer and reconciles one measurement at a time, so a plain flag
 	// reset at the start of each call is sufficient; the mutex only guards
 	// against a future concurrent caller.
+	// lag holds the write times of ingest files committed and not yet
+	// published; passLag is the largest lag the current pass observed, for
+	// its log line (loop goroutine only). export_lag.go, #1750.
+	lag     exportLag
+	passLag time.Duration
+
 	hintFailMu  sync.Mutex
 	hintFailure bool
 	// fenced is set when a publish found another writer's v<N> (adopt.go); cleared with
@@ -316,6 +322,7 @@ func NewExporter(db *sql.DB, backend storage.Backend, warehouse, nsPrefix string
 		// warehouseRelKey call (the directories may not exist yet here).
 		nsPrefix: nsPrefix,
 		retain:   retain,
+		lag:      exportLag{started: time.Now()},
 		logger:   logger.With().Str("component", "iceberg-exporter").Logger(),
 		// Safe defaults for an Exporter used without ConfigureOrphanSweep (tests,
 		// future callers): the sweep is on, with the grace floor. Never leave the
@@ -1654,6 +1661,8 @@ func (e *Exporter) reachableManifestNames(ctx context.Context, tbl *icetable.Tab
 // Returns true when there was nothing to do (no backend) or everything was written.
 func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bool {
 	if e.backend == nil {
+		// No discovery files to write: the catalog commit is the publish.
+		e.drainExportLag(tbl.Identifier())
 		return true
 	}
 	metaLoc := tbl.MetadataLocation() // e.g. file:///…/metadata/00004-<uuid>.metadata.json
@@ -1673,6 +1682,8 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 		// so warn once per table rather than returning false and retrying a
 		// write that can never succeed.
 		e.warnHintUnaddressableOnce(metaLoc)
+		// Catalog readers are the only readers here, and they see the commit.
+		e.drainExportLag(tbl.Identifier())
 		return true
 	}
 	okAll := true
@@ -1719,6 +1730,10 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 		okAll = false
 	}
 	if okAll {
+		// The one place a table version becomes readable through the
+		// discovery files: observe the lag of every ingest file it holds
+		// that no earlier publish did (#1750).
+		e.drainExportLag(tbl.Identifier())
 		e.markPublished(tbl.Identifier(), metaLoc)
 		e.clearDropMarker(ctx, tbl.Identifier())
 		// Glue sync (#1690): report the publish. The callee must not block.
@@ -2044,6 +2059,7 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 	}
 	ns := icetable.Identifier{e.nsPrefix + "_" + database}
 	nsKey := catalogNamespaceKey(ns)
+	e.forgetExportLagNamespace(ns) // its tables' unpublished files will never be published (export_lag.go)
 
 	// This node's tables. A node that never exported the database has no
 	// namespace in its own catalog, but on a shared bucket another node's
