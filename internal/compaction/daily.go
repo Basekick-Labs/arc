@@ -111,6 +111,15 @@ func (t *DailyTier) FindCandidatesFromListing(database, measurement string, obje
 		Msg("Scanning for daily compaction candidates")
 
 	for _, partition := range t.groupDayPartitions(database, measurement, objects, cutoffTime) {
+		if settled, ok := t.settledCandidate(partition, cutoffTime); ok {
+			candidates = append(candidates, settled)
+			t.Logger.Debug().
+				Str("database", database).
+				Str("partition", settled.PartitionPath).
+				Int("file_count", settled.FileCount).
+				Msg("Found settled sparse day for daily compaction")
+			continue
+		}
 		if t.ShouldCompact(partition.Files, partition.PartitionTime) {
 			partition.Tier = t.GetTierName()
 			partition.FileCount = len(partition.Files)
@@ -145,7 +154,50 @@ func (t *DailyTier) ShouldCompact(files []string, partitionTime time.Time) bool 
 
 // IsCompactedFile checks if a file is a compacted daily file
 func (t *DailyTier) IsCompactedFile(filename string) bool {
-	return strings.HasSuffix(storage.StripRewriteSuffix(filename), "_daily.parquet")
+	return isDailyOutput(filename)
+}
+
+// settledCandidate returns the candidate for a settled day that ShouldCompact
+// leaves alone because it has fewer hour-level files than MinFiles (#1774).
+// Tiering moves only daily files to cold, so without this a sparse
+// measurement's days stay hot for good.
+//
+// A day is settled when it is older than SkipFileAgeCheckDays (the age past
+// which backfill is assumed complete) AND its newest file is older than the
+// cutoff, so a backfill still landing in an old day is not compacted into a
+// new small daily file every cycle. A day whose file times cannot be read is
+// not settled.
+//
+// The candidate holds only the hour-level files, never a daily file the day
+// already has: the output is one more daily file next to it, not a rewrite
+// of it (rewriting it is what made lowering daily_min_files cost hundreds of
+// GB on a store with many such days).
+func (t *DailyTier) settledCandidate(partition Candidate, cutoffTime time.Time) (Candidate, bool) {
+	if time.Since(partition.PartitionTime) <= time.Duration(t.SkipFileAgeCheckDays*24)*time.Hour {
+		return Candidate{}, false
+	}
+	var hourLevel []string
+	for _, f := range partition.Files {
+		if isHourLevelFile(storage.StripRewriteSuffix(f)) {
+			hourLevel = append(hourLevel, f)
+		}
+	}
+	// MinFiles or more is ShouldCompact's case, and keeps its behaviour,
+	// except a lone hour-level file under daily_min_files = 1: as a regular
+	// candidate it would be refused by the two-file floor (or, next to a
+	// daily file, rewrite it), so a settled day takes it here.
+	if len(hourLevel) == 0 || (len(hourLevel) >= t.MinFiles && len(hourLevel) >= MinFilesPerBatch) {
+		return Candidate{}, false
+	}
+	newest := extractNewestFileTime(partition.Files)
+	if newest.IsZero() || newest.After(cutoffTime) {
+		return Candidate{}, false
+	}
+	partition.Files = hourLevel
+	partition.FileCount = len(hourLevel)
+	partition.Tier = t.GetTierName()
+	partition.Settled = true
+	return partition, true
 }
 
 // GetStats returns tier statistics

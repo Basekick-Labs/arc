@@ -272,7 +272,10 @@ type Manager struct {
 	// one batch: a batch rescued by the adaptive splitter contributes several.
 	// tooWide remembers partitions too wide to compact in a job's memory
 	// (too_wide.go). Persisted under TempDirectory; per node.
-	tooWide    *tooWideMemo
+	tooWide *tooWideMemo
+	// settled remembers settled-day jobs that ran and left their files
+	// (#1774), so a day the job cannot compact is not run every cycle.
+	settled    *settledMemo
 	jobHistory []map[string]interface{}
 
 	// activeJobs counts attempts currently in flight -- incremented once
@@ -519,6 +522,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		logger:           logger,
 	}
 	m.tooWide = newTooWideMemo(cfg.TempDirectory, logger)
+	m.settled = newSettledMemo()
 	metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized(m.TooWideSettings())))
 
 	if len(excludeList) > 0 {
@@ -748,7 +752,7 @@ func (m *Manager) dropPending(objects []string) []string {
 // compacting them together would put the surviving rows in the output twice,
 // for good. They wait until the DELETE side removes the old copy. A staged
 // job compacts only files the cluster manifest lists, which never holds
-// both, so it is left alone. The tier's MinFiles is re-checked on the rest.
+// both, so it is left alone. minFilesFor is re-checked on the rest.
 func (m *Manager) filterRewriteLeftovers(candidate Candidate, tier Tier) (Candidate, bool) {
 	m.mu.Lock()
 	mode := m.stagedMode
@@ -775,7 +779,7 @@ func (m *Manager) filterRewriteLeftovers(candidate Candidate, tier Tier) (Candid
 		Str("tier", candidate.Tier).
 		Int("files", len(candidate.Files)-len(kept)).
 		Msg("Files a DELETE rewrote whose old copy is still in storage are not compacted until it is removed; queries read their rows twice meanwhile")
-	if len(kept) < tier.GetMinFiles() {
+	if len(kept) < minFilesFor(candidate, tier) {
 		return candidate, false
 	}
 	candidate.Files = kept
@@ -784,7 +788,7 @@ func (m *Manager) filterRewriteLeftovers(candidate Candidate, tier Tier) (Candid
 }
 
 // filterPending drops candidate files still pending cluster registration and
-// re-applies the tier's MinFiles to what remains (#1212). Compacting a pending
+// re-applies minFilesFor to what remains (#1212). Compacting a pending
 // file races its registration: the drain can register a source after
 // compaction dropped it from the manifest, leaving an entry for a file about
 // to be deleted.
@@ -825,7 +829,7 @@ func (m *Manager) filterPending(candidate Candidate, tier Tier) (Candidate, bool
 		Str("tier", candidate.Tier).
 		Int("pending", len(candidate.Files)-len(kept)).
 		Msg("Files pending cluster registration wait for the next compaction cycle")
-	if len(kept) < tier.GetMinFiles() {
+	if len(kept) < minFilesFor(candidate, tier) {
 		return candidate, false
 	}
 	candidate.Files = kept
@@ -834,8 +838,8 @@ func (m *Manager) filterPending(candidate Candidate, tier Tier) (Candidate, bool
 }
 
 // filterSyncEligibility drops candidate files the edge sync ledger has not
-// confirmed delivered, re-applying the TIER's MinFiles threshold to what
-// remains. Returns false when the partition should be deferred this cycle.
+// confirmed delivered, re-applying minFilesFor (the tier's MinFiles, or 1
+// for a settled day, #1774) to what remains. Returns false when the partition should be deferred this cycle.
 // A hook error defers the whole candidate: the fail-safe direction is to
 // compact nothing rather than risk consuming undelivered rows.
 func (m *Manager) filterSyncEligibility(ctx context.Context, candidate Candidate, tier Tier) (Candidate, bool) {
@@ -884,7 +888,7 @@ func (m *Manager) filterSyncEligibilityWithError(ctx context.Context, candidate 
 			Int("eligible", len(kept)).
 			Msg("Edge sync deferral: files await delivery before compaction")
 	}
-	if len(kept) < tier.GetMinFiles() {
+	if len(kept) < minFilesFor(candidate, tier) {
 		return candidate, false, nil
 	}
 	candidate.Files = kept
@@ -1314,7 +1318,8 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 	jobID = boundJobID(jobID)
 	var stagedInputs map[string]StagedInput
 	if staged, files, inputs := m.stagedCandidate(ctx, candidate); staged {
-		if len(files) < 2 {
+		// One file is enough only for a settled day's hour-level file (#1774).
+		if len(files) < MinFilesPerBatch && !singleFileJob(candidate, files) {
 			m.logger.Info().Str("partition", lockKey).Int("eligible", len(files)).
 				Msg("Too few files the cluster manifest lists unchanged; the partition waits for the next compaction cycle")
 			return nil
@@ -1367,6 +1372,15 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 	// manager stopping the whole process group) and reported a failure.
 	jobInterrupted := !jobSucceeded && ctx.Err() != nil
 	shouldInvalidateCache := jobSucceeded && result.FilesCompacted > 0
+	// A settled day's job that ran, whatever its outcome short of the cycle's
+	// own cancellation, is not run again while its files stay the same
+	// (#1774). Recorded here, where a job ran, not by the caller: a lock
+	// already held or a staged filter that left too few files returns nil
+	// without running one, and that day must be tried again next cycle. On
+	// success the files are gone, so the entry never matches again.
+	if candidate.Settled && !jobInterrupted {
+		m.settled.record(candidate.Tier, candidate.PartitionPath, candidate.Files)
+	}
 
 	// The job ran in the subprocess, whose metrics registry nothing scrapes:
 	// its outcome, and the storage I/O it did, are counted here (#1343).
@@ -1538,7 +1552,10 @@ func (m *Manager) compactFilesAdaptively(ctx context.Context, candidate Candidat
 	if depth > maxDepth {
 		return fmt.Errorf("compaction failed: exceeded max retry depth %d", maxDepth)
 	}
-	if len(files) < minBatchSize {
+	// A settled day's one hour-level file compacts alone (#1774); a split
+	// never yields one file (it needs 2*minBatchSize), so this is only ever
+	// the candidate as discovered and filtered.
+	if len(files) < minBatchSize && !singleFileJob(candidate, files) {
 		return fmt.Errorf("compaction failed: batch size %d below minimum %d", len(files), minBatchSize)
 	}
 
@@ -2139,6 +2156,215 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 		tierStartFailed := failed.Load()
 		tierStartInterrupted := interrupted.Load()
 
+		// processCandidate runs one discovered candidate through the filters
+		// and dispatches its batches. A non-nil error ends the cycle; the
+		// caller returns it as is (every such path has already waited for the
+		// running workers).
+		processCandidate := func(candidate Candidate) error {
+			if err := ctx.Err(); err != nil {
+				wg.Wait()
+				return err
+			}
+			tooWideSeen[tooWideKey(tierName, candidate.PartitionPath)] = true
+			// A slash-carrying database is by construction a
+			// pseudo-database from the namespace expander — received
+			// data the delivery gate must not defer (#619 F2).
+			if strings.ContainsRune(candidate.Database, '/') {
+				candidate.SyncExempt = true
+			}
+
+			// Filter out files that are tracked by manifests (pending compaction)
+			filteredCandidate, shouldProcess, manifestErr := m.filterCandidateFilesWithError(ctx, candidate)
+			if err := ctx.Err(); err != nil {
+				wg.Wait()
+				return err
+			}
+			if manifestErr != nil {
+				// The candidate stays excluded. Record genuine manifest
+				// failures without counting expired-context errors.
+				discoveryErrors.Add(1)
+			}
+			if !shouldProcess {
+				m.logger.Debug().
+					Str("partition", candidate.PartitionPath).
+					Msg("Skipping candidate: all files are tracked by manifests")
+				return nil
+			}
+
+			// A file a DELETE rewrote whose old copy is still in
+			// storage is not compacted: the output
+			// would hold its rows twice.
+			filteredCandidate, shouldProcess = m.filterRewriteLeftovers(filteredCandidate, tier)
+			if !shouldProcess {
+				return nil
+			}
+
+			// Files still pending cluster registration wait a cycle
+			// (#1212); minFilesFor is re-checked on the rest.
+			filteredCandidate, shouldProcess = m.filterPending(filteredCandidate, tier)
+			if !shouldProcess {
+				return nil
+			}
+
+			// Edge sync delivery gate (issue #610): drop files the
+			// sync ledger has not confirmed delivered and re-check
+			// minFilesFor on what remains. Deferring here is
+			// the design, not a failure — the partition compacts
+			// once its files have synced.
+			filteredCandidate, shouldProcess, eligibilityErr := m.filterSyncEligibilityWithError(ctx, filteredCandidate, tier)
+			if eligibilityErr != nil && ctx.Err() == nil {
+				discoveryErrors.Add(1)
+			}
+			if err := ctx.Err(); err != nil {
+				wg.Wait()
+				return err
+			}
+			if !shouldProcess {
+				return nil
+			}
+
+			// A partition that failed at the smallest batch is left
+			// alone while its files and the job sizing stay the same
+			// (too_wide.go): retrying downloads it and fails again.
+			if m.tooWide.skip(tier, filteredCandidate.PartitionPath, filteredCandidate.Files, tooWideSettings) {
+				progress.skippedTooWide.Add(1)
+				metrics.Get().IncCompactionPartitionsSkippedTooWide()
+				m.logger.Debug().
+					Str("partition", filteredCandidate.PartitionPath).
+					Str("tier", tierName).
+					Msg("Skipping candidate: remembered as too wide to compact")
+				return nil
+			}
+
+			// Split large candidates into batches to prevent DuckDB segfaults
+			// when processing too many files in a single read_parquet() call
+			batches := SplitCandidateIntoBatches(filteredCandidate, m.MaxFilesPerBatch)
+			if len(batches) > 1 {
+				m.logger.Info().
+					Str("partition", filteredCandidate.PartitionPath).
+					Int("total_files", len(filteredCandidate.Files)).
+					Int("batches", len(batches)).
+					Msg("Splitting large candidate into batches")
+			}
+
+			tierCandidateCount += len(batches)
+			discovered.Add(int64(len(batches)))
+
+			// Capacity acquisition must not outlive the cycle budget.
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				wg.Wait()
+				return ctx.Err()
+			}
+			// If both select arms were ready, cancellation still wins
+			// before a new worker can be launched.
+			if err := ctx.Err(); err != nil {
+				<-sem
+				wg.Wait()
+				return err
+			}
+			// The cluster-wide compaction pause (#1087): no new worker
+			// while a restore holds it. Checked here, with capacity in
+			// hand, because the pause lands while this waits behind a
+			// running batch. Workers already running finish their
+			// current batch (a subprocess is never killed for the
+			// pause: a kill between its two commit phases leaves the
+			// manifest and storage disagreeing), so the cycle waits for
+			// them and ends "paused"; the batch just discovered counts
+			// as unstarted. Sub-batch splitting inside
+			// compactFilesAdaptively does not see the gate: those are
+			// one job's inputs and splitting them is part of running it.
+			if m.Paused() {
+				<-sem
+				m.logger.Info().
+					Int64("cycle_id", cycleID).
+					Str("tier", tierName).
+					Str("partition", candidate.PartitionPath).
+					Msg("Compaction cycle stopping at a batch boundary: compaction is paused cluster-wide")
+				wg.Wait()
+				return ErrCompactionPaused
+			}
+			wg.Add(1)
+			active.Add(1)
+
+			// Run all batches for the same partition sequentially within a single goroutine.
+			// This prevents race conditions where batch N tries to compact files that were
+			// already deleted by batch N-1. Different partitions can still run in parallel.
+			go func(partitionBatches []Candidate, partition string, partitionFiles []string) {
+				defer wg.Done()
+				defer active.Done()
+				defer func() { <-sem }() // Release semaphore
+
+				// One strike per partition per cycle: its batches fail
+				// for the same reason, and a blip must not count twice.
+				// Cleared only when no batch struck: a batch that
+				// returned without compacting (the lock was busy, too
+				// few staged inputs) is no evidence it fits.
+				struck, compacted := false, false
+				defer func() {
+					if compacted && !struck {
+						m.tooWide.clear(tierName, partition)
+					}
+				}()
+				for _, batch := range partitionBatches {
+					if ctx.Err() != nil {
+						return
+					}
+					// Between two batches of one partition the pause
+					// (#1087) applies too; the remaining batches stay
+					// unstarted and the tier end turns this into
+					// ErrCompactionPaused.
+					if m.Paused() {
+						pausedSkipped.Store(true)
+						return
+					}
+					// Count a batch only when its execution actually starts.
+					started.Add(1)
+
+					var err error
+					if m.compactBatchForTest != nil {
+						err = m.compactBatchForTest(ctx, batch)
+					} else {
+						err = m.compactFilesAdaptively(ctx, batch, batch.Files, 0, "", cycleID)
+					}
+
+					if err != nil {
+						// Before the interrupted check: errSlowAttempt
+						// wraps the cycle's context error.
+						if !struck && tooWideReason(err) != "" {
+							struck = true
+							m.tooWideStrike(tierName, partition, partitionFiles, err)
+						}
+						if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+							interrupted.Add(1)
+							return
+						}
+						failed.Add(1)
+						progress.recordFailure(batch.PartitionPath)
+						m.logger.Error().Err(err).
+							Str("partition", batch.PartitionPath).
+							Str("tier", tierName).
+							Int("batch", batch.BatchNumber).
+							Int("total_batches", batch.TotalBatches).
+							Int64("cycle_id", cycleID).
+							Msg("Compaction failed")
+						// Continue after genuine failures, preserving existing
+						// per-partition batch behavior.
+					} else {
+						succeeded.Add(1)
+						compacted = true
+					}
+				}
+			}(batches, candidate.PartitionPath, filteredCandidate.Files)
+			return nil
+		}
+		// Settled sparse days (#1774) run after every regular candidate of the
+		// tier, and at most maxSettledCandidatesPerCycle of them, so a backlog
+		// of them cannot spend the cycle budget the regular days need.
+		var settled []Candidate
+		settledOverCap := 0
+
 		for _, database := range databases {
 			measurements := dbMeasurements[database]
 
@@ -2185,205 +2411,48 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 
 				// Process this measurement's candidates immediately
 				for _, candidate := range candidates {
-					if err := ctx.Err(); err != nil {
-						wg.Wait()
-						return err
-					}
-					tooWideSeen[tooWideKey(tierName, candidate.PartitionPath)] = true
-					// A slash-carrying database is by construction a
-					// pseudo-database from the namespace expander — received
-					// data the delivery gate must not defer (#619 F2).
-					if strings.ContainsRune(candidate.Database, '/') {
-						candidate.SyncExempt = true
-					}
-
-					// Filter out files that are tracked by manifests (pending compaction)
-					filteredCandidate, shouldProcess, manifestErr := m.filterCandidateFilesWithError(ctx, candidate)
-					if err := ctx.Err(); err != nil {
-						wg.Wait()
-						return err
-					}
-					if manifestErr != nil {
-						// The candidate stays excluded. Record genuine manifest
-						// failures without counting expired-context errors.
-						discoveryErrors.Add(1)
-					}
-					if !shouldProcess {
-						m.logger.Debug().
-							Str("partition", candidate.PartitionPath).
-							Msg("Skipping candidate: all files are tracked by manifests")
-						continue
-					}
-
-					// A file a DELETE rewrote whose old copy is still in
-					// storage is not compacted: the output
-					// would hold its rows twice.
-					filteredCandidate, shouldProcess = m.filterRewriteLeftovers(filteredCandidate, tier)
-					if !shouldProcess {
-						continue
-					}
-
-					// Files still pending cluster registration wait a cycle
-					// (#1212); the tier's MinFiles is re-checked on the rest.
-					filteredCandidate, shouldProcess = m.filterPending(filteredCandidate, tier)
-					if !shouldProcess {
-						continue
-					}
-
-					// Edge sync delivery gate (issue #610): drop files the
-					// sync ledger has not confirmed delivered and re-check
-					// the tier's MinFiles on what remains. Deferring here is
-					// the design, not a failure — the partition compacts
-					// once its files have synced.
-					filteredCandidate, shouldProcess, eligibilityErr := m.filterSyncEligibilityWithError(ctx, filteredCandidate, tier)
-					if eligibilityErr != nil && ctx.Err() == nil {
-						discoveryErrors.Add(1)
-					}
-					if err := ctx.Err(); err != nil {
-						wg.Wait()
-						return err
-					}
-					if !shouldProcess {
-						continue
-					}
-
-					// A partition that failed at the smallest batch is left
-					// alone while its files and the job sizing stay the same
-					// (too_wide.go): retrying downloads it and fails again.
-					if m.tooWide.skip(tier, filteredCandidate.PartitionPath, filteredCandidate.Files, tooWideSettings) {
-						progress.skippedTooWide.Add(1)
-						metrics.Get().IncCompactionPartitionsSkippedTooWide()
-						m.logger.Debug().
-							Str("partition", filteredCandidate.PartitionPath).
-							Str("tier", tierName).
-							Msg("Skipping candidate: remembered as too wide to compact")
-						continue
-					}
-
-					// Split large candidates into batches to prevent DuckDB segfaults
-					// when processing too many files in a single read_parquet() call
-					batches := SplitCandidateIntoBatches(filteredCandidate, m.MaxFilesPerBatch)
-					if len(batches) > 1 {
-						m.logger.Info().
-							Str("partition", filteredCandidate.PartitionPath).
-							Int("total_files", len(filteredCandidate.Files)).
-							Int("batches", len(batches)).
-							Msg("Splitting large candidate into batches")
-					}
-
-					tierCandidateCount += len(batches)
-					discovered.Add(int64(len(batches)))
-
-					// Capacity acquisition must not outlive the cycle budget.
-					select {
-					case sem <- struct{}{}:
-					case <-ctx.Done():
-						wg.Wait()
-						return ctx.Err()
-					}
-					// If both select arms were ready, cancellation still wins
-					// before a new worker can be launched.
-					if err := ctx.Err(); err != nil {
-						<-sem
-						wg.Wait()
-						return err
-					}
-					// The cluster-wide compaction pause (#1087): no new worker
-					// while a restore holds it. Checked here, with capacity in
-					// hand, because the pause lands while this waits behind a
-					// running batch. Workers already running finish their
-					// current batch (a subprocess is never killed for the
-					// pause: a kill between its two commit phases leaves the
-					// manifest and storage disagreeing), so the cycle waits for
-					// them and ends "paused"; the batch just discovered counts
-					// as unstarted. Sub-batch splitting inside
-					// compactFilesAdaptively does not see the gate: those are
-					// one job's inputs and splitting them is part of running it.
-					if m.Paused() {
-						<-sem
-						m.logger.Info().
-							Int64("cycle_id", cycleID).
-							Str("tier", tierName).
-							Str("partition", candidate.PartitionPath).
-							Msg("Compaction cycle stopping at a batch boundary: compaction is paused cluster-wide")
-						wg.Wait()
-						return ErrCompactionPaused
-					}
-					wg.Add(1)
-					active.Add(1)
-
-					// Run all batches for the same partition sequentially within a single goroutine.
-					// This prevents race conditions where batch N tries to compact files that were
-					// already deleted by batch N-1. Different partitions can still run in parallel.
-					go func(partitionBatches []Candidate, partition string, partitionFiles []string) {
-						defer wg.Done()
-						defer active.Done()
-						defer func() { <-sem }() // Release semaphore
-
-						// One strike per partition per cycle: its batches fail
-						// for the same reason, and a blip must not count twice.
-						// Cleared only when no batch struck: a batch that
-						// returned without compacting (the lock was busy, too
-						// few staged inputs) is no evidence it fits.
-						struck, compacted := false, false
-						defer func() {
-							if compacted && !struck {
-								m.tooWide.clear(tierName, partition)
-							}
-						}()
-						for _, batch := range partitionBatches {
-							if ctx.Err() != nil {
-								return
-							}
-							// Between two batches of one partition the pause
-							// (#1087) applies too; the remaining batches stay
-							// unstarted and the tier end turns this into
-							// ErrCompactionPaused.
-							if m.Paused() {
-								pausedSkipped.Store(true)
-								return
-							}
-							// Count a batch only when its execution actually starts.
-							started.Add(1)
-
-							var err error
-							if m.compactBatchForTest != nil {
-								err = m.compactBatchForTest(ctx, batch)
-							} else {
-								err = m.compactFilesAdaptively(ctx, batch, batch.Files, 0, "", cycleID)
-							}
-
-							if err != nil {
-								// Before the interrupted check: errSlowAttempt
-								// wraps the cycle's context error.
-								if !struck && tooWideReason(err) != "" {
-									struck = true
-									m.tooWideStrike(tierName, partition, partitionFiles, err)
-								}
-								if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
-									interrupted.Add(1)
-									return
-								}
-								failed.Add(1)
-								progress.recordFailure(batch.PartitionPath)
-								m.logger.Error().Err(err).
-									Str("partition", batch.PartitionPath).
-									Str("tier", tierName).
-									Int("batch", batch.BatchNumber).
-									Int("total_batches", batch.TotalBatches).
-									Int64("cycle_id", cycleID).
-									Msg("Compaction failed")
-								// Continue after genuine failures, preserving existing
-								// per-partition batch behavior.
-							} else {
-								succeeded.Add(1)
-								compacted = true
-							}
+					if candidate.Settled {
+						tooWideSeen[tooWideKey(tierName, candidate.PartitionPath)] = true
+						if m.settled.skip(candidate.Tier, candidate.PartitionPath, candidate.Files) {
+							continue
 						}
-					}(batches, candidate.PartitionPath, filteredCandidate.Files)
+						if len(settled) < maxSettledCandidatesCollected {
+							settled = append(settled, candidate)
+						} else {
+							settledOverCap++
+						}
+						continue
+					}
+					if err := processCandidate(candidate); err != nil {
+						return err
+					}
 				}
 				// candidates slice is now eligible for GC after this iteration
 			}
+		}
+		// Only candidates that start a job count toward the cap: one the
+		// filters defer, or the too-wide memo skips, does not use a slot.
+		dispatchedSettled := 0
+		for i, candidate := range settled {
+			if dispatchedSettled >= maxSettledCandidatesPerCycle {
+				settledOverCap += len(settled) - i
+				break
+			}
+			before := tierCandidateCount
+			if err := processCandidate(candidate); err != nil {
+				return err
+			}
+			if tierCandidateCount > before {
+				dispatchedSettled++
+			}
+		}
+		if settledOverCap > 0 {
+			m.logger.Info().
+				Int64("cycle_id", cycleID).
+				Str("tier", tierName).
+				Int("deferred", settledOverCap).
+				Int("limit", maxSettledCandidatesPerCycle).
+				Msg("More settled sparse days than one cycle takes; the rest compact in later cycles")
 		}
 
 		// Wait for all jobs in this tier to complete before moving to next tier

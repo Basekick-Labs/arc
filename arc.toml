@@ -290,6 +290,11 @@ daily_enabled = true
 daily_schedule = "0 3 * * *"
 daily_min_age_hours = 24
 daily_min_files = 12
+# A day older than this many days whose newest file is older than
+# daily_min_age_hours is settled: it gets a daily file even with fewer than
+# daily_min_files hour-level files, so tiering can move it to cold (#1774).
+# 0 means the default, 7.
+# daily_skip_file_age_check_days = 7
 
 # -----------------------------------------------------------------------------
 # Authentication
