@@ -5,12 +5,14 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/apache/iceberg-go"
+	"github.com/rs/zerolog"
 
 	"github.com/basekick-labs/arc/internal/metrics"
 )
@@ -553,5 +555,254 @@ func TestPreviousVersionsMaxCoversTheMinimumAge(t *testing.T) {
 		if got := e.previousVersionsMax(); got != c.want {
 			t.Errorf("retain %d, age %v, interval %v: %d, want %d", c.retain, c.age, c.interval, got, c.want)
 		}
+	}
+}
+
+// A file written longer ago than appendMaxFileAge is the pass's, not an
+// append's: recentAdds is only kept for so long, and past it nothing says
+// whether a pass already added the file.
+func TestAppend_AnOldFileTakesAPass(t *testing.T) {
+	r := newAppendRig(t)
+	first := r.settled()
+	r.sched.started = time.Now().Add(-2 * time.Hour)
+	old := ingestName("cpu", time.Now().Add(-appendMaxFileAge-time.Minute))
+	r.writeIn(t, "cpu", old)
+	r.report(old)
+	r.serve()
+	r.wantOnce(first, old)
+	if got := r.listings(); got != 2 {
+		t.Errorf("%d listings, want 2: a file written %v ago is not appended", got, appendMaxFileAge+time.Minute)
+	}
+}
+
+// An append that fails can still have committed (here: committed, and the
+// publish failed). The pass that follows may fail too, at its listing, which
+// keeps the cached listing. That cache must not match a later listing, or the
+// committed file, once deleted, would stay in the table for good.
+func TestAppend_AFailedAppendDoesNotLeaveTheOldFingerprint(t *testing.T) {
+	if os.Geteuid() == 0 || runtime.GOOS == "windows" {
+		t.Skip("needs a hint write that fails")
+	}
+	r := newAppendRig(t)
+	first := r.settled()
+	hint := filepath.Join(r.root, "arc_mydb.db", "cpu", "metadata", "version-hint.text")
+	if err := os.Remove(hint); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(hint, 0o755); err != nil { // a directory where the hint goes: the publish fails
+		t.Fatal(err)
+	}
+	r.src.mu.Lock()
+	r.src.fail["cpu"] = true // and the pass that follows fails at its listing
+	r.src.mu.Unlock()
+	a := r.newFile()
+	r.report(a)
+	r.serve()
+	if got := r.entries(); got[a] != 1 {
+		t.Fatalf("table %v: the append was meant to commit before its publish failed", got)
+	}
+	if st, ok := r.sched.state["mydb\x00cpu"]; ok && st.fingerprint != appendedFingerprint {
+		t.Fatalf("fingerprint %q kept after an append that committed and failed: a listing without the file would match it", st.fingerprint)
+	}
+	if r.sched.appendOK["mydb\x00cpu"] {
+		t.Error("the table still takes appends after one failed")
+	}
+	// The file leaves storage; with the listing working again, a pass takes
+	// it out of the table.
+	if err := os.Remove(hint); err != nil {
+		t.Fatal(err)
+	}
+	r.src.mu.Lock()
+	r.src.fail["cpu"] = false
+	r.src.mu.Unlock()
+	if err := os.Remove(filepath.Join(r.root, filepath.FromSlash(appendDir+a))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.pass(); err != nil {
+		t.Fatal(err)
+	}
+	r.wantOnce(first)
+}
+
+// More files reported than are remembered: the ones left out are known only
+// to a listing. A pass that started before they were reported did not list
+// them, so the table still takes a pass afterwards, not an append of the
+// files that were remembered.
+func TestAppend_AnOverflowAfterAPassStartedStillTakesAPass(t *testing.T) {
+	r := newAppendRig(t)
+	first := r.settled()
+	key := "mydb\x00cpu"
+	before := time.Now()
+	time.Sleep(2 * time.Millisecond)
+	a, b := r.newFile(), r.newFile()
+	r.report(a)
+	r.sched.reqMu.Lock()
+	p := r.sched.appendPending[key]
+	p.overflow, p.overflowAt = true, time.Now() // b was reported and not remembered
+	r.sched.appendPending[key] = p
+	r.sched.reqMu.Unlock()
+
+	r.sched.dropAppendPendingBefore(key, before) // a pass that started before both
+	r.sched.reqMu.Lock()
+	p = r.sched.appendPending[key]
+	r.sched.reqMu.Unlock()
+	if !p.overflow || len(p.files) != 1 {
+		t.Fatalf("after a pass that started before the reports: overflow %v, %d files; want the overflow and the file kept", p.overflow, len(p.files))
+	}
+	r.serve()
+	r.wantOnce(first, a, b)
+	if got := r.listings(); got != 2 {
+		t.Errorf("%d listings, want 2: only a pass finds the file that was not remembered", got)
+	}
+
+	// An overflow from before the pass started is covered by it.
+	r.sched.reqMu.Lock()
+	r.sched.appendPending[key] = pendingFiles{overflow: true, overflowAt: time.Now()}
+	r.sched.reqMu.Unlock()
+	time.Sleep(2 * time.Millisecond)
+	r.sched.dropAppendPendingBefore(key, time.Now())
+	r.sched.reqMu.Lock()
+	_, left := r.sched.appendPending[key]
+	r.sched.reqMu.Unlock()
+	if left {
+		t.Error("an overflow from before the pass is still remembered after it")
+	}
+}
+
+// Appends expire, prune and sweep nothing, so after appendMaxBetweenPasses of
+// them a table takes a pass, however far away the timed one is.
+func TestAppend_ATableTakesAPassAfterManyAppends(t *testing.T) {
+	r := newAppendRig(t)
+	first := r.settled()
+	a := r.newFile()
+	r.report(a)
+	r.serve()
+	if got := r.sched.appendsSince["mydb\x00cpu"]; got != 1 {
+		t.Fatalf("%d appends counted since the last pass, want 1", got)
+	}
+	r.sched.appendsSince["mydb\x00cpu"] = appendMaxBetweenPasses
+	b := r.newFile()
+	r.report(b)
+	r.serve()
+	r.wantOnce(first, a, b)
+	if got := r.listings(); got != 2 {
+		t.Errorf("%d listings, want 2: the table was due a pass", got)
+	}
+	if got := r.sched.appendsSince["mydb\x00cpu"]; got != 0 {
+		t.Errorf("%d appends counted after the pass, want 0", got)
+	}
+	c := r.newFile()
+	r.report(c)
+	r.serve()
+	if got := r.listings(); got != 2 {
+		t.Errorf("%d listings, want still 2: after the pass the table takes appends again", got)
+	}
+}
+
+// A measurement that is gone from the store is forgotten by the timed pass,
+// its append state included.
+func TestAppend_ATimedPassForgetsMeasurementsThatAreGone(t *testing.T) {
+	r := newAppendRig(t)
+	r.settled()
+	r.report(r.newFile())
+	r.serve()
+	if err := os.RemoveAll(filepath.Join(r.root, "mydb")); err != nil {
+		t.Fatal(err)
+	}
+	r.sched.runPass(context.Background())
+	key := "mydb\x00cpu"
+	if r.sched.appendOK[key] || len(r.sched.recentAdds[key]) != 0 || r.sched.appendsSince[key] != 0 {
+		t.Errorf("append state survives the measurement: ok %v, %d recent, %d appends", r.sched.appendOK[key], len(r.sched.recentAdds[key]), r.sched.appendsSince[key])
+	}
+}
+
+// A process that restarts finds the snapshots its appends left: the flag that
+// asks a pass to expire them is not kept across a restart, so a table's first
+// pass in a process expires, even when it commits nothing.
+func TestAppend_TheFirstPassOfAProcessExpiresWhatTheLastOneLeft(t *testing.T) {
+	r := newAppendRig(t)
+	r.exp.retain = 2
+	r.settled()
+	for i := 0; i < 4; i++ {
+		r.report(r.newFile())
+		r.serve()
+	}
+	// "Restart": the exporter forgets what it owes and which tables it saw,
+	// and the scheduler its cache.
+	r.exp.chunkMu.Lock()
+	r.exp.expireOwed, r.exp.expirySeen = nil, nil
+	r.exp.chunkMu.Unlock()
+	delete(r.sched.state, "mydb\x00cpu")
+	if _, err := r.pass(); err != nil {
+		t.Fatal(err)
+	}
+	tbl, err := r.exp.catalog.LoadTable(context.Background(), r.exp.tableIdent("mydb", "cpu"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(tbl.Metadata().Snapshots()); got != 2 {
+		t.Errorf("%d snapshots after the first pass of a new process, want retain_snapshots = 2", got)
+	}
+}
+
+// The permissions walk runs on every publish, and with ingest publishing
+// every few seconds the directory holds thousands of files: only entries it
+// has not tightened before are looked at. A new file is still tightened, and
+// a name that left the directory is looked at again if it comes back.
+func TestHardenLocalMetadataPerms_LooksAtEachEntryOnce(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits")
+	}
+	base := t.TempDir()
+	metaDir := filepath.Join(base, "wh", "arc_db.db", "cpu", "metadata")
+	if err := os.MkdirAll(metaDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name string) string {
+		p := filepath.Join(metaDir, name)
+		if err := os.WriteFile(p, []byte("m"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, 0o644); err != nil { // whatever the umask is
+			t.Fatal(err)
+		}
+		return p
+	}
+	perm := func(p string) os.FileMode {
+		info, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return info.Mode().Perm()
+	}
+	e := &Exporter{logger: zerolog.Nop(), warehouse: localFileURI(filepath.Join(base, "wh"))}
+	first := write("00001-a.metadata.json")
+	loc := "file://" + filepath.ToSlash(first)
+	e.hardenLocalMetadataPerms(loc)
+	if got := perm(first); got != 0o600 {
+		t.Fatalf("first file %v, want 0600", got)
+	}
+	// A file added later is tightened; the one already done is not looked at
+	// again (loosened here by hand to show it).
+	second := write("00002-b.metadata.json")
+	if err := os.Chmod(first, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.hardenLocalMetadataPerms(loc)
+	if got := perm(second); got != 0o600 {
+		t.Errorf("a file added after the first walk is %v, want 0600", got)
+	}
+	if got := perm(first); got != 0o644 {
+		t.Errorf("the file already tightened was looked at again (%v)", got)
+	}
+	// A name that left the directory and came back is a new file.
+	if err := os.Remove(second); err != nil {
+		t.Fatal(err)
+	}
+	e.hardenLocalMetadataPerms(loc)
+	write("00002-b.metadata.json")
+	e.hardenLocalMetadataPerms(loc)
+	if got := perm(second); got != 0o600 {
+		t.Errorf("a name that came back is %v, want 0600", got)
 	}
 }

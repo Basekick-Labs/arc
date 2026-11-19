@@ -23,10 +23,9 @@ import (
 //     table. The first, because a table whose reconcile fails (a schema
 //     conflict, a storage outage) or is busy would otherwise be listed again
 //     at every flush. The second, because spacing is also what bounds how
-//     fast a table publishes versions: readers resolve a published version
-//     and open it a moment later, and only retain_snapshots+1 are kept, so
-//     an ingest request must not publish right behind a compaction's or a
-//     timed pass's version.
+//     fast a table publishes versions, and each one is metadata kept on
+//     disk for iceberg.min_version_age (#1751): an ingest request does not
+//     publish right behind a compaction's or a timed pass's version.
 //   - Served after every other kind. A compaction's request takes deleted
 //     inputs out of a table and must not queue behind a backlog of ingest
 //     ones; inside a timed pass only one ingest request is served between two

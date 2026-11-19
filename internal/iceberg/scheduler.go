@@ -137,6 +137,8 @@ type Scheduler struct {
 	appendOK       map[string]bool
 	recentAdds     map[string]map[string]time.Time
 	appendFallback map[string]string
+	// appendsSince counts each table's appends since its last settled pass.
+	appendsSince map[string]int
 	// lastReconciled is when each measurement's table last changed, by a
 	// pass or a request. Loop goroutine only.
 	lastReconciled map[string]time.Time
@@ -274,6 +276,7 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		appendOK:       make(map[string]bool),
 		recentAdds:     make(map[string]map[string]time.Time),
 		appendFallback: make(map[string]string),
+		appendsSince:   make(map[string]int),
 		lastReconciled: make(map[string]time.Time),
 		drops:          make(map[string]struct{}),
 		dropRetry:      make(map[string]dropRetry),

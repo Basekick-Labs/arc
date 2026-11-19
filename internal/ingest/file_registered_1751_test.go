@@ -2,9 +2,12 @@ package ingest
 
 import (
 	"context"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/basekick-labs/arc/internal/wal"
 )
 
 // registeredRecorder notes what the file-registered hook was told.
@@ -126,4 +129,73 @@ func TestFileRegisteredWaitsForDeferredHourFilesToBeKept(t *testing.T) {
 			t.Errorf("%d reports for stored files the flush did not keep, want 0", rec.count())
 		}
 	})
+}
+
+// The late-landed copy of a failed flush is deleted once its rows are stored
+// again. A listing may have seen it meanwhile, so its measurement is reported
+// (the Iceberg export takes the file out of its table), and the failed write
+// itself was never reported as a stored file.
+func TestFileRemovedIsToldWhenTheLedgerDeletesALandedCopy(t *testing.T) {
+	f := newAmbiguousFixture(t)
+	var mu sync.Mutex
+	var removed []string
+	f.buffer.SetOnFileRemoved(func(database, measurement string) {
+		mu.Lock()
+		removed = append(removed, database+"/"+measurement)
+		mu.Unlock()
+	})
+	rec := &registeredRecorder{}
+	f.buffer.SetOnFileRegistered(rec.hook)
+	f.write(t, 50)
+	failed := f.failFlush(t)
+	if rec.count() != 0 {
+		t.Fatalf("%d files reported as stored for a flush whose write failed, want 0", rec.count())
+	}
+	f.storage.land(t)
+	f.replay(t)
+	if rec.count() != 1 || rec.paths[0] == failed {
+		t.Fatalf("stored files reported after the replay: %v, want the replayed file alone", rec.paths)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removal reported before anything was removed: %v", removed)
+	}
+	f.sweep(0)
+	database, measurement, _, ok := partitionOfPath(failed)
+	if !ok {
+		t.Fatalf("no partition in %q", failed)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(removed) != 1 || removed[0] != database+"/"+measurement {
+		t.Errorf("removals reported: %v, want one for %s/%s", removed, database, measurement)
+	}
+}
+
+// A file adopted from an interrupted flush is reported like one a flush
+// registered: it is stored and kept, and its registration may never have
+// happened. (The Iceberg export does not append such a file when it was
+// written before the process started; it takes a pass.)
+func TestFileRegisteredIsToldOfAnAdoptedFile(t *testing.T) {
+	f := newIntentFixture(t, false)
+	f.write(t, time.Now().UTC().Truncate(time.Hour).UnixMicro(), 10)
+	f.crash(t)
+	paths := parquetPaths(t, f.dataDir)
+	if len(paths) != 1 {
+		t.Fatalf("%d files after the crash, want 1", len(paths))
+	}
+	key := filepath.ToSlash(paths[0])
+	size, err := f.local.StatFile(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := newReplayTestBuffer(t, t.TempDir())
+	b.storage = f.local
+	rec := &registeredRecorder{}
+	b.SetOnFileRegistered(rec.hook)
+	if !b.AdoptFlushedFile(context.Background(), wal.FlushIntent{Path: key, Size: size, IDs: []string{"x"}}) {
+		t.Fatal("the file was not adopted")
+	}
+	if rec.count() != 1 || rec.paths[0] != key || rec.sizes[0] != size {
+		t.Errorf("reported %v %v, want %s with %d bytes", rec.paths, rec.sizes, key, size)
+	}
 }

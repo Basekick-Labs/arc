@@ -189,6 +189,8 @@ type Exporter struct {
 	// expireOwed: the tables appends have added snapshots to since a pass
 	// last expired any (batched.go expiryOwed); under chunkMu.
 	expireOwed map[string]bool
+	// expirySeen: the tables that have had a pass in this process.
+	expirySeen map[string]struct{}
 	chunkSize  map[string]int
 	floorDue   map[string]struct{}
 }
@@ -1307,7 +1309,8 @@ func (e *Exporter) expireSnapshots(ctx context.Context, tbl *icetable.Table, dat
 	return expired, true
 }
 
-// pruneOldVersionFiles keeps only the newest `retain` v<M>.metadata.json copies and deletes
+// pruneOldVersionFiles keeps the newest `retain`+1 v<M>.metadata.json copies, and any older
+// one whose successor was published less than iceberg.min_version_age ago (#1751), and deletes
 // the rest. iceberg-go prunes its own NNNNN-*.metadata.json (via delete-after-commit) but does
 // not know about the v<N> copies we write for directory-based readers, so we prune them here.
 // Scan-based (not arithmetic) so it's robust to non-contiguous version numbers — a reconcile
@@ -1391,11 +1394,12 @@ func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.T
 	// If a commit lands in that window, keeping exactly `retain` can delete the
 	// version the reader just resolved — sharpest at retain=1, where every
 	// commit would invalidate the immediately-preceding version. The extra file
-	// is a few KB. It holds the window open for as long as one reconcile of
-	// the table to the next: a reconcile interval between timed passes; when
-	// compactions ask for reconciles, at retain 1 or 2 at least
+	// is a few KB. By count alone it holds the window open for as long as one
+	// reconcile of the table to the next: a reconcile interval between timed
+	// passes; when compactions ask for reconciles, at retain 1 or 2 at least
 	// requestMinSpacing, and at larger retain the extra kept versions
-	// (requestSpacing, scheduler.go).
+	// (requestSpacing, scheduler.go). Ingest publishes far more often than
+	// that, so beyond the count a copy is also kept by age (below, #1751).
 	keep := e.retain + 1
 	if len(vs) <= keep {
 		return
@@ -1747,8 +1751,9 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 	// iceberg-go writes metadata files and directories at umask permissions
 	// (its LocalFS uses 0o777-masked creates), while every Arc-written file
 	// is 0600 (#639 item 7). Harden the freshly committed table's metadata
-	// tree after each commit; bounded by the retain cap and snapshot expiry,
-	// so this walk is O(retained versions), not O(history).
+	// tree after each commit. The directory holds what the version prune and
+	// the orphan sweep have not reclaimed yet; only entries not tightened
+	// before are looked at (hardenLocalMetadataPerms).
 	e.hardenLocalMetadataPerms(metaLoc)
 	version, dirKey, ok := e.parseVersionAndMetaDir(metaLoc)
 	if !ok {
@@ -1941,13 +1946,15 @@ func (e *Exporter) hardenLocalMetadataPerms(metaLoc string) {
 	// operator's deliberately restrictive mode (or a test's read-only
 	// directory) must stay restrictive; the target is iceberg-go's
 	// umask-wide 0644/0755 creates, not modes someone chose.
-	tighten := func(path string, info os.FileMode) {
+	tighten := func(path string, info os.FileMode) bool {
 		hardened := info &^ 0o077
 		if hardened != info {
 			if err := os.Chmod(path, hardened); err != nil {
 				e.logger.Debug().Err(err).Str("path", path).Msg("Could not harden metadata permissions")
+				return false
 			}
 		}
+		return true
 	}
 	// Only entries not seen before: this runs on every publish, the directory
 	// holds every metadata file the orphan sweep has not reclaimed yet
@@ -1964,9 +1971,7 @@ func (e *Exporter) hardenLocalMetadataPerms(metaLoc string) {
 		if _, done := seen[name]; done {
 			continue
 		}
-		if info, err := ent.Info(); err == nil {
-			tighten(filepath.Join(metaDir, name), info.Mode().Perm())
-		} else {
+		if info, err := ent.Info(); err != nil || !tighten(filepath.Join(metaDir, name), info.Mode().Perm()) {
 			delete(now, name) // not tightened: look again next time
 		}
 	}

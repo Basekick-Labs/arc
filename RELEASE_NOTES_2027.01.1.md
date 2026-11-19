@@ -40,7 +40,7 @@ New counters: `arc_iceberg_ingest_appends_total`, `arc_iceberg_ingest_append_fil
 
 Notes:
 
-- **Snapshots are expired, versions pruned and orphans swept by the full pass**, which still runs every `iceberg.reconcile_interval`. Between two passes a table that is appended to carries the snapshots of those appends.
+- **Snapshots are expired, versions pruned and orphans swept by the full pass**, which still runs every `iceberg.reconcile_interval`. Between two passes a table that is appended to carries the snapshots of those appends. A table also takes a full pass after 120 appends, so a long `reconcile_interval` does not let them pile up.
 - **Manifests:** each append adds one. Once there are four small ones the append merges them, up to about 4,000 files per manifest; a larger manifest is never rewritten by an append.
 - **A file ingest deletes after storing it** (the late-landed copy of a failed flush) now asks for an export of its table, so it leaves the table at once and not at the next timed pass.
 - Not run: a cluster (the append path is off there), a warehouse outside the storage root, or S3 over a real network.
@@ -96,7 +96,7 @@ Notes:
 
 - **What an export costs is unchanged:** it still lists the measurement, reads the table's manifests and commits. The trigger only changes when it runs, which is more often: about five times the table versions and three times the metadata in the run above. With Glue on, each export is also one Glue update for its table. With more measurements than the exports can keep up with they queue, one table at a time, and the real interval stretches; the pending gauge shows it. Requests from compaction, DELETE, retention and tiering are served first.
 - **Spacing counts from the attempt:** a table whose export fails, or commits and cannot publish, is tried again once per interval, with or without further flushes. An export of any kind that changes a table also restarts the interval, so an ingest-triggered export does not publish right behind a compaction's.
-- **More table versions, and more log lines:** a table written to continuously now gets a snapshot per interval instead of per timed pass, and one "Reconciled Iceberg table" line at Info each time. `retain_snapshots` still bounds what is kept.
+- **More table versions:** a table written to continuously now gets a snapshot per interval instead of per timed pass. With the append path of #1751 (above) most of those exports log at Debug; a full pass still logs one "Reconciled Iceberg table" line at Info. How long versions are kept is `retain_snapshots` and, since #1751, `iceberg.min_version_age`.
 - No labels: the metrics cover every table.
 
 ## Fix: a late or future-stamped row is read by queries as soon as its file is written ([#1757](https://github.com/Basekick-Labs/arc/issues/1757))

@@ -41,7 +41,8 @@ import (
 //     appendMaxFileAge ago, are appended; recentAdds keeps an entry for
 //     recentAddsKeep, three times as long. An older file is the pass's.
 //   - A pass drops the pending files reported before it started, whatever its
-//     outcome: it listed after they were stored.
+//     outcome: one that reached its listing listed after they were stored,
+//     and one that did not leaves the table taking no append.
 //
 // After an append the cached fingerprint no longer describes the table, so it
 // is replaced by one no listing produces: the next pass of the measurement
@@ -62,6 +63,12 @@ const (
 	// appendedFingerprint replaces a table's cached fingerprint after an
 	// append. fingerprint() returns a hex digest, so no listing equals it.
 	appendedFingerprint = "appended since the last pass"
+	// appendMaxBetweenPasses is the most appends a table takes before its
+	// ingest request runs a pass instead. Appends expire, prune and sweep
+	// nothing; the timed pass does, every iceberg.reconcile_interval, and
+	// this bounds what a table carries when that interval is long: its
+	// snapshots, published versions and manifests.
+	appendMaxBetweenPasses = 120
 )
 
 // pendingFile is one file an ingest flush reported and no export has covered.
@@ -75,6 +82,8 @@ type pendingFile struct {
 type pendingFiles struct {
 	files    []pendingFile
 	overflow bool
+	// overflowAt is when a file was last left out of files.
+	overflowAt time.Time
 }
 
 // RequestIngestAppend reports a file an ingest flush has stored and kept, and
@@ -95,7 +104,7 @@ func (s *Scheduler) RequestIngestAppend(database, measurement, storageKey string
 		key := database + "\x00" + measurement
 		p := s.appendPending[key]
 		if len(p.files) >= appendMaxPending {
-			p.overflow = true
+			p.overflow, p.overflowAt = true, now
 		} else {
 			p.files = append(p.files, pendingFile{key: storageKey, at: now})
 		}
@@ -137,13 +146,14 @@ func (s *Scheduler) dropAppendPendingBefore(key string, t time.Time) {
 			kept = append(kept, f)
 		}
 	}
-	if len(kept) == 0 {
-		// Nothing reported since it started. An overflow before it is covered
-		// too; one after it left files behind, which stay.
+	// A file left out of the list (overflow) after the pass started was not
+	// listed by it either: the overflow stands, and the table takes a pass.
+	p.files = kept
+	p.overflow = p.overflow && !p.overflowAt.Before(t)
+	if len(p.files) == 0 && !p.overflow {
 		delete(s.appendPending, key)
 		return
 	}
-	p.files, p.overflow = kept, false
 	s.appendPending[key] = p
 }
 
@@ -155,6 +165,7 @@ func (s *Scheduler) forgetAppend(key string) {
 	delete(s.appendOK, key)
 	delete(s.recentAdds, key)
 	delete(s.appendFallback, key)
+	delete(s.appendsSince, key)
 }
 
 // noteRecent records storage keys as in the table (or seen by a pass), and
@@ -213,6 +224,7 @@ func (s *Scheduler) notePassEnded(key string, startedAt time.Time, outcome recon
 	case outcome == outcomeReconciled:
 		s.appendOK[key] = true
 		delete(s.appendFallback, key)
+		delete(s.appendsSince, key)
 	}
 	// outcomeUnchanged with the state kept: the listing is the one of the
 	// last settled pass, so whatever appendOK says still holds.
@@ -260,7 +272,7 @@ func (s *Scheduler) exportIngest(ctx context.Context, m Measurement, key string)
 	// (notePassEnded), so every request is the pass.
 	resolver, canResolve := s.source.(appendResolver)
 	_, settled := s.state[key]
-	if !canResolve || !settled || !s.appendOK[key] {
+	if !canResolve || !settled || !s.appendOK[key] || s.appendsSince[key] >= appendMaxBetweenPasses {
 		// The pending files stay: the pass drops the ones it covers.
 		return s.reconcileOneRecovered(ctx, m, key)
 	}
@@ -288,8 +300,13 @@ func (s *Scheduler) exportIngest(ctx context.Context, m Measurement, key string)
 		}
 	}
 	// Not an append: the pass decides what the table holds. Until one
-	// settles, the table takes no append.
+	// settles, the table takes no append. And the cached listing may no
+	// longer be the table: an append that failed can still have committed (a
+	// publish that failed, a commit whose answer was lost). If the pass below
+	// then fails at its listing the cache is kept, and it must not match a
+	// later listing.
 	delete(s.appendOK, key)
+	s.markAppended(key)
 	metrics.Get().IncIcebergIngestAppendFallback()
 	if s.appendFallback[key] != reason {
 		// Once per reason per table: a table that keeps falling back would
@@ -299,6 +316,15 @@ func (s *Scheduler) exportIngest(ctx context.Context, m Measurement, key string)
 			Msg("Iceberg: ingest files not appended; running a reconcile pass of the measurement instead")
 	}
 	return s.reconcileOneRecovered(ctx, m, key)
+}
+
+// markAppended replaces the table's cached fingerprint with one no listing
+// produces, so its next pass runs whatever the listing is.
+func (s *Scheduler) markAppended(key string) {
+	if st, ok := s.state[key]; ok {
+		st.fingerprint = appendedFingerprint
+		s.state[key] = st
+	}
 }
 
 // appendResolver is the source's per-file resolution (StorageWalkSource.AppendRefs).
@@ -357,10 +383,8 @@ func (s *Scheduler) appendRecovered(ctx context.Context, resolver appendResolver
 	if len(res.added) > 0 {
 		// The cached listing no longer describes the table: make the next
 		// pass of the measurement run (see the file comment).
-		if st, ok := s.state[key]; ok {
-			st.fingerprint = appendedFingerprint
-			s.state[key] = st
-		}
+		s.markAppended(key)
+		s.appendsSince[key]++
 		metrics.Get().AddIcebergIngestAppend(len(res.added))
 	}
 	return len(res.added), ""

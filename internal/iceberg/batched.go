@@ -664,6 +664,7 @@ func (e *Exporter) finishPass(ctx context.Context, tbl *icetable.Table, tkey, da
 	// commit and does not prune or sweep: its view is stale, and the new writer's pass does those.
 	mayCommit := e.passMayCommit()
 	floor := e.floorOwed(tkey)
+	appended := e.expiryOwed(tkey) // read on every pass: it also notes the table's first one
 	expireOK := true
 	switch {
 	case !mayCommit:
@@ -671,10 +672,11 @@ func (e *Exporter) finishPass(ctx context.Context, tbl *icetable.Table, tkey, da
 	case floor:
 		tbl, expireOK = e.expireSnapshots(ctx, tbl, database, measurement, floorHistory)
 		e.setFloorOwed(tkey, !expireOK)
-	case commits > 0 || e.expiryOwed(tkey):
+	case commits > 0 || appended:
 		// Also on a pass that committed nothing, after appends (append.go):
 		// they add snapshots and expire none, and the pass that follows them
-		// finds every appended file in the table already.
+		// finds every appended file in the table already. And on a table's
+		// first pass in this process, for the appends of the last one.
 		tbl, expireOK = e.expireSnapshots(ctx, tbl, database, measurement, retainConfigured)
 		if expireOK {
 			e.setExpiryOwed(tkey, false)
@@ -998,13 +1000,22 @@ func (e *Exporter) setFloorOwed(tkey string, owed bool) {
 	}
 }
 
-// expiryOwed reports that appends have added snapshots to the table since a
-// pass last expired any (append.go). Per process, like floorOwed: after a
-// restart the table's first ingest export is a pass, which commits and so
-// expires.
+// expiryOwed reports that appends may have added snapshots to the table
+// since a pass last expired any (append.go): one did in this process, or this
+// is the table's first pass in this process and what the last process left is
+// not known. The flag is per process, like floorOwed; the first-pass rule is
+// what covers a restart, after which a table that goes quiet would otherwise
+// keep the snapshots of its appends until its next commit.
 func (e *Exporter) expiryOwed(tkey string) bool {
 	e.chunkMu.Lock()
 	defer e.chunkMu.Unlock()
+	if _, seen := e.expirySeen[tkey]; !seen {
+		if e.expirySeen == nil {
+			e.expirySeen = make(map[string]struct{})
+		}
+		e.expirySeen[tkey] = struct{}{}
+		return true
+	}
 	return e.expireOwed[tkey]
 }
 
