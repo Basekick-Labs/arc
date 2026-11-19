@@ -3,6 +3,8 @@ package compaction
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -283,5 +285,116 @@ func TestSettledCandidatesRunLastAndCapped1774(t *testing.T) {
 		if !c.Settled {
 			t.Fatalf("regular candidate ran after settled ones")
 		}
+	}
+}
+
+func TestSettledMemo1774(t *testing.T) {
+	s := newSettledMemo()
+	clock := time.Unix(1_800_000_000, 0)
+	s.now = func() time.Time { return clock }
+	s.record("daily", "db/cpu/2026/01/01", []string{"b", "a"})
+	if !s.skip("daily", "db/cpu/2026/01/01", []string{"a", "b"}) {
+		t.Fatal("same file set, any order: want skip")
+	}
+	if s.skip("hourly", "db/cpu/2026/01/01", []string{"a", "b"}) {
+		t.Fatal("other tier skipped")
+	}
+	clock = clock.Add(settledRetryAfter)
+	if s.skip("daily", "db/cpu/2026/01/01", []string{"a", "b"}) {
+		t.Fatal("skipped past settledRetryAfter")
+	}
+	s.record("daily", "db/cpu/2026/01/01", []string{"a"})
+	if s.skip("daily", "db/cpu/2026/01/01", []string{"a", "c"}) {
+		t.Fatal("a new file in the day: want a new attempt")
+	}
+	if s.skip("daily", "db/cpu/2026/01/01", []string{"a"}) {
+		t.Fatal("a different file set must drop the entry")
+	}
+	var nilMemo *settledMemo
+	nilMemo.record("daily", "p", []string{"a"})
+	if nilMemo.skip("daily", "p", []string{"a"}) {
+		t.Fatal("nil memo skipped")
+	}
+}
+
+// A settled day whose job ran and left its files is not run again next
+// cycle while they stay the same; new files make it a new attempt. A
+// compactPartition that returned without running a job records nothing.
+func TestSettledDayThatFailsIsNotRetriedEveryCycle1774(t *testing.T) {
+	m, b, cleanup := setupTestManager(t)
+	defer cleanup()
+	ctx := context.Background()
+	part := "db/cpu/2026/01/01"
+	c := candidateIssue915(part)
+	c.Settled, c.Files, c.FileCount = true, []string{part + "/03/corrupt.parquet"}, 1
+	if err := b.Write(ctx, c.Files[0], []byte("not parquet")); err != nil {
+		t.Fatal(err)
+	}
+	m.Tiers = []Tier{cycleTierIssue915{find: func(context.Context, string, string) ([]Candidate, error) {
+		return []Candidate{c}, nil
+	}}}
+	old := runJobInSubprocess
+	t.Cleanup(func() { runJobInSubprocess = old })
+	runs := 0
+	runJobInSubprocess = func(context.Context, *SubprocessJobConfig, zerolog.Logger) (*SubprocessJobResult, error) {
+		runs++
+		return &SubprocessJobResult{Success: false, Error: "no valid parquet files found"}, fmt.Errorf("no valid parquet files found")
+	}
+
+	// The partition lock is held elsewhere: no job runs, nothing is recorded.
+	lockKey := filepath.Join(c.Database, c.PartitionPath)
+	if !m.LockManager.AcquireLock(lockKey) {
+		t.Fatal("lock")
+	}
+	_, _ = m.RunCompactionCycleForMeasurement(ctx, "db", "cpu", []string{"hourly"})
+	m.LockManager.ReleaseLock(lockKey)
+	if runs != 0 || m.settled.skip(c.Tier, c.PartitionPath, c.Files) {
+		t.Fatalf("lock-busy return was recorded: runs %d", runs)
+	}
+
+	for i := 0; i < 3; i++ {
+		_, _ = m.RunCompactionCycleForMeasurement(ctx, "db", "cpu", []string{"hourly"})
+	}
+	if runs != 1 {
+		t.Fatalf("job ran %d times over 3 cycles, want 1", runs)
+	}
+	c.Files = append(c.Files, part+"/04/new.parquet")
+	_, _ = m.RunCompactionCycleForMeasurement(ctx, "db", "cpu", []string{"hourly"})
+	if runs != 2 {
+		t.Fatalf("a changed file set did not run: %d", runs)
+	}
+}
+
+// Settled candidates the filters defer do not use a slot of the cap.
+func TestSettledCapCountsStartedJobsOnly1774(t *testing.T) {
+	m, _, cleanup := setupTestManager(t)
+	defer cleanup()
+	m.MaxConcurrent = 1
+	const deferred = 50
+	var cands []Candidate
+	for i := 0; i < deferred+maxSettledCandidatesPerCycle+1; i++ {
+		c := candidateIssue915(fmt.Sprintf("db/cpu/2026/01/01/s%d", i))
+		c.Settled = true
+		c.Files = []string{fmt.Sprintf("db/cpu/2026/01/01/%d.parquet", i)}
+		if i < deferred {
+			c.Files[0] = fmt.Sprintf("db/cpu/2026/01/01/pending%d.parquet", i)
+		}
+		cands = append(cands, c)
+	}
+	m.SetPendingFilter(func(p string) bool { return strings.Contains(p, "/pending") })
+	m.Tiers = []Tier{cycleTierIssue915{find: func(context.Context, string, string) ([]Candidate, error) { return cands, nil }}}
+	var mu sync.Mutex
+	ran := 0
+	m.compactBatchForTest = func(context.Context, Candidate) error {
+		mu.Lock()
+		ran++
+		mu.Unlock()
+		return nil
+	}
+	if _, err := m.RunCompactionCycleForMeasurement(context.Background(), "db", "cpu", []string{"hourly"}); err != nil {
+		t.Fatal(err)
+	}
+	if ran != maxSettledCandidatesPerCycle {
+		t.Fatalf("ran %d, want %d: deferred candidates used slots", ran, maxSettledCandidatesPerCycle)
 	}
 }

@@ -272,7 +272,10 @@ type Manager struct {
 	// one batch: a batch rescued by the adaptive splitter contributes several.
 	// tooWide remembers partitions too wide to compact in a job's memory
 	// (too_wide.go). Persisted under TempDirectory; per node.
-	tooWide    *tooWideMemo
+	tooWide *tooWideMemo
+	// settled remembers settled-day jobs that ran and left their files
+	// (#1774), so a day the job cannot compact is not run every cycle.
+	settled    *settledMemo
 	jobHistory []map[string]interface{}
 
 	// activeJobs counts attempts currently in flight -- incremented once
@@ -519,6 +522,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		logger:           logger,
 	}
 	m.tooWide = newTooWideMemo(cfg.TempDirectory, logger)
+	m.settled = newSettledMemo()
 	metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized(m.TooWideSettings())))
 
 	if len(excludeList) > 0 {
@@ -1368,6 +1372,15 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 	// manager stopping the whole process group) and reported a failure.
 	jobInterrupted := !jobSucceeded && ctx.Err() != nil
 	shouldInvalidateCache := jobSucceeded && result.FilesCompacted > 0
+	// A settled day's job that ran, whatever its outcome short of the cycle's
+	// own cancellation, is not run again while its files stay the same
+	// (#1774). Recorded here, where a job ran, not by the caller: a lock
+	// already held or a staged filter that left too few files returns nil
+	// without running one, and that day must be tried again next cycle. On
+	// success the files are gone, so the entry never matches again.
+	if candidate.Settled && !jobInterrupted {
+		m.settled.record(candidate.Tier, candidate.PartitionPath, candidate.Files)
+	}
 
 	// The job ran in the subprocess, whose metrics registry nothing scrapes:
 	// its outcome, and the storage I/O it did, are counted here (#1343).
@@ -1541,7 +1554,7 @@ func (m *Manager) compactFilesAdaptively(ctx context.Context, candidate Candidat
 	}
 	// A settled day's one hour-level file compacts alone (#1774); a split
 	// never yields one file (it needs 2*minBatchSize), so this is only ever
-	// the candidate as discovered.
+	// the candidate as discovered and filtered.
 	if len(files) < minBatchSize && !singleFileJob(candidate, files) {
 		return fmt.Errorf("compaction failed: batch size %d below minimum %d", len(files), minBatchSize)
 	}
@@ -2195,7 +2208,7 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 
 			// Edge sync delivery gate (issue #610): drop files the
 			// sync ledger has not confirmed delivered and re-check
-			// the tier's MinFiles on what remains. Deferring here is
+			// minFilesFor on what remains. Deferring here is
 			// the design, not a failure — the partition compacts
 			// once its files have synced.
 			filteredCandidate, shouldProcess, eligibilityErr := m.filterSyncEligibilityWithError(ctx, filteredCandidate, tier)
@@ -2400,7 +2413,10 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 				for _, candidate := range candidates {
 					if candidate.Settled {
 						tooWideSeen[tooWideKey(tierName, candidate.PartitionPath)] = true
-						if len(settled) < maxSettledCandidatesPerCycle {
+						if m.settled.skip(candidate.Tier, candidate.PartitionPath, candidate.Files) {
+							continue
+						}
+						if len(settled) < maxSettledCandidatesCollected {
 							settled = append(settled, candidate)
 						} else {
 							settledOverCap++
@@ -2414,6 +2430,22 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 				// candidates slice is now eligible for GC after this iteration
 			}
 		}
+		// Only candidates that start a job count toward the cap: one the
+		// filters defer, or the too-wide memo skips, does not use a slot.
+		dispatchedSettled := 0
+		for i, candidate := range settled {
+			if dispatchedSettled >= maxSettledCandidatesPerCycle {
+				settledOverCap += len(settled) - i
+				break
+			}
+			before := tierCandidateCount
+			if err := processCandidate(candidate); err != nil {
+				return err
+			}
+			if tierCandidateCount > before {
+				dispatchedSettled++
+			}
+		}
 		if settledOverCap > 0 {
 			m.logger.Info().
 				Int64("cycle_id", cycleID).
@@ -2421,11 +2453,6 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 				Int("deferred", settledOverCap).
 				Int("limit", maxSettledCandidatesPerCycle).
 				Msg("More settled sparse days than one cycle takes; the rest compact in later cycles")
-		}
-		for _, candidate := range settled {
-			if err := processCandidate(candidate); err != nil {
-				return err
-			}
 		}
 
 		// Wait for all jobs in this tier to complete before moving to next tier

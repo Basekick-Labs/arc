@@ -2,6 +2,27 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: a day with few files gets a daily file, so it can move to the cold tier ([#1774](https://github.com/Basekick-Labs/arc/issues/1774))
+
+Daily compaction needed `compaction.daily_min_files` hour-level files in a day (default 12), and tiering moves only daily files to cold. A measurement that writes a few points a day ends up with one or two hour-level files per day, so those days never compacted and stayed on the hot tier for good. Lowering `daily_min_files` did not help: a day with a single file failed with `batch size 1 below minimum 2`, and a day that already had a daily file had it rewritten together with its stragglers.
+
+Daily compaction now takes a **settled** day with fewer than `daily_min_files` hour-level files:
+
+- **Settled** means the day is older than `compaction.daily_skip_file_age_check_days` (default 7) and its newest file was written more than `compaction.daily_min_age_hours` ago (default 24). The second condition holds back a backfill that is still writing into an old day, which would otherwise get a new small daily file every cycle.
+- Its hour-level files compact into **one more daily file**, even when there is only one. A daily file the day already has is left as it is, not rewritten. That includes a day whose daily file has already moved to cold: the new daily file follows it there.
+- These days run **after** the tier's other days, at most **500 jobs per cycle** per tier. A day the filters hold back (files pending registration, not yet delivered by edge sync, remembered as too wide) does not use one of the 500. The rest wait for the next cycle, and a log line says how many.
+- **A day whose job runs and leaves its files is not run again** while those files stay the same, for up to 7 days: for example a lone file the job cannot read, or files without a `time` column. Such files never made it into a daily file before either; now they are tried once a week instead of every cycle. A new file in the day makes it a new attempt. The memory is per node and starts empty after a restart.
+- `GET /api/v1/compaction/candidates` marks these days `"settled": true`; their `file_count` is the hour-level files only.
+
+What to expect:
+
+- **A one-time backlog on upgrade.** Every settled day with fewer than `daily_min_files` hour-level files compacts once, one job each. These are not necessarily small: a measurement written during business hours, or by a batch load, can have up to 11 full-size hourly files per day that were never compacted into a daily file. On a store with many such days the backlog takes several daily cycles, 500 jobs each; the regular days still run first.
+- **They reach cold after the later of** the database's hot age (`tiered_storage.default_hot_max_age_days` or its own policy) and `daily_skip_file_age_check_days`.
+- **To turn it off,** raise `daily_skip_file_age_check_days`: no day younger than that is settled. The only other effect is that days up to that age keep their file-age check, which is harmless. Setting it to `0` does not turn it off: `0` means the default, 7 days.
+- **If you lowered `daily_min_files` to work around this,** set it back to 12. Below 12, a day with a daily file and that many stragglers is still compacted the old way, rewriting its daily file.
+- **Duplicates are not merged across daily files.** Compaction removes duplicate rows only within one job, so a straggler that repeats a row of the day's existing daily file keeps it. Before this fix that row was never compacted at all.
+- **File names, not file times, say when a file was written.** Files that keep the name they had elsewhere (received from an edge-sync spoke, restored from a backup) can count as settled as soon as they land.
+
 ## New: ingested data reaches Iceberg tables within a minute, and the export's lag is measured ([#1750](https://github.com/Basekick-Labs/arc/issues/1750))
 
 A file written by ingest used to reach its Iceberg table only at the next timed export pass: up to `iceberg.reconcile_interval` (default 300 s) plus the pass. Compaction, DELETE, retention and tiering already asked for an export when they changed files; ingest did not. Now an ingest flush asks for its measurement's table too.
