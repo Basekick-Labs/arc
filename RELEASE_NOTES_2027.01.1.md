@@ -2,6 +2,26 @@
 
 > **Status:** Planned — January 2027 release.
 
+## New: a metric for how long ingested rows wait before their file is published, and a harness that measures freshness ([#1758](https://github.com/Basekick-Labs/arc/issues/1758))
+
+Arc had no number for how long a row waits between being written and being readable. `arc_buffer_oldest_unflushed_seconds` reports the age of what is still buffered, not how long flushed rows had waited.
+
+- `arc_ingest_publish_delay_seconds` (histogram): one observation for each Parquet file a successful ingest flush publishes. It is the time from the oldest row of the flushed buffer being buffered to the file being in the node's storage. No row of the file waited longer than that.
+- `arc_ingest_publish_delay_max_seconds` (gauge): the largest observation since the process started.
+- The `/metrics` JSON form carries `ingest_publish_delay_count`, `ingest_publish_delay_sum_seconds` and `ingest_publish_delay_max_seconds`.
+
+With `ingest.max_buffer_age_ms` at its default of 5000, expect observations of about 5 s for measurements written to slowly, and less for ones that reach `ingest.max_buffer_size` first. With many measurements it can be more: in one local run writing to 500 measurements, the mean was 5.5 s and the largest 9.6 s.
+
+Notes:
+
+- It measures publication on the node that flushed. It does not include the time for a query to pick the file up, or for another cluster node to receive it.
+- Rows written by imports, continuous queries and MQTT go through the same buffers and are counted.
+- After a failed flush, WAL replay refills the buffer and the wait starts again from the replay, so the time the failure cost is not in the histogram. Files a failed flush left in storage are not observed either. `arc_buffer_flush_failures_total` reports the failure.
+- A flush that splits into several files (rows in more than one hour) observes each file, all measured from the same buffer start. An hour file that waits for the rest of its flush is observed when the flush registers it, not when it is written.
+- No labels: the histogram covers every database and measurement.
+
+`scripts/freshness` is a harness for the reader's side of the same question. It writes marker rows, polls a query, and reports the time from the write's acknowledgement to the first query that returned the row, next to the server's histogram for the same period. A second mode writes one late or future-stamped row into an hour that a query has just found empty and times how long queries keep answering without it ([#1757](https://github.com/Basekick-Labs/arc/issues/1757)). See `scripts/freshness/README.md`. No product behaviour changes.
+
 ## Fix: on a node-local-storage cluster, deleting a database drops every node's Iceberg tables ([#1731](https://github.com/Basekick-Labs/arc/issues/1731))
 
 On a cluster whose nodes each keep their own disk, every node has its own Iceberg warehouse and catalog. A database `DELETE` runs on the primary writer and dropped only the writer's tables. Every other node that exported the database kept its tables: the node running the export, and any node that ran it before the compactor role moved. Those tables named deleted files. They stayed listed to directory readers, the REST catalog and Glue, and were never removed. In a 3-node test (writer, compactor, reader), the compactor kept 12 metadata files and its catalog row after the `DELETE`. Now it keeps none.
