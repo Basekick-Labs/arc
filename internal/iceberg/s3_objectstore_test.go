@@ -361,3 +361,101 @@ func TestS3ColdTier_LocalHotS3Cold(t *testing.T) {
 		t.Fatalf("read %d footers for the migration pass, want 1 (the cold-only file; the migrated one is cloned)", n)
 	}
 }
+
+// #1751 on a real S3 API: an ingest file reported to the scheduler is added
+// to the table without listing the measurement (the listing is counted), a
+// file reported again is not added twice, and the row count is the storage's.
+// It also logs what a pass and an append cost on a table of a few hundred
+// objects; the numbers are for the PR, not asserted.
+func TestS3Append_AddsTheReportedFileWithoutListing(t *testing.T) {
+	b, _ := s3Rig(t)
+	ctx := context.Background()
+	const seed = 400
+	base := int64(1_700_000_000_000_000)
+	local := filepath.Join(t.TempDir(), "f.parquet")
+	writeArcStyleParquet(t, local, base, 10)
+	data, err := os.ReadFile(local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := "mydb/cpu/2023/11/14/22/"
+	for i := 0; i < seed; i++ {
+		if err := b.Write(ctx, fmt.Sprintf("%sseed_%04d.parquet", dir, i), data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exp, _, _ := s3Exporter(t, b)
+	src := &recordingSource{StorageWalkSource: NewStorageWalkSource(b, "arc", zerolog.Nop()), fail: map[string]bool{}}
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: src, Interval: time.Hour, Logger: zerolog.Nop(),
+		IngestInterval: time.Millisecond, IngestAppend: true})
+	sched.started = time.Now().Add(-time.Second)
+	serve := func() time.Duration {
+		time.Sleep(5 * time.Millisecond)
+		start := time.Now()
+		sched.serviceIngest(ctx, ingestBatch)
+		return time.Since(start)
+	}
+	newFile := func(i int) string {
+		name := ingestName("cpu", time.Now().Add(time.Duration(i)*time.Microsecond))
+		if err := b.Write(ctx, dir+name, data); err != nil {
+			t.Fatal(err)
+		}
+		return dir + name
+	}
+	listings := func() int {
+		if o := src.order(); o != "" {
+			return strings.Count(o, ",") + 1
+		}
+		return 0
+	}
+
+	// The first export is a pass: it creates the table from a listing.
+	first := newFile(0)
+	sched.RequestIngestAppend("mydb", "cpu", first)
+	created := serve()
+	if got := len(liveFiles(t, exp)); got != seed+1 {
+		t.Fatalf("%d files after the first export, want %d", got, seed+1)
+	}
+	// What a pass costs for one new file on this table.
+	one := newFile(1)
+	start := time.Now()
+	if _, err := sched.reconcileOneRecovered(ctx, Measurement{Database: "mydb", Measurement: "cpu"}, "mydb\x00cpu"); err != nil {
+		t.Fatal(err)
+	}
+	pass := time.Since(start)
+	_ = one
+	before := listings()
+
+	// And an append, three times.
+	var appends []time.Duration
+	for i := 2; i < 5; i++ {
+		sched.RequestIngestAppend("mydb", "cpu", newFile(i))
+		appends = append(appends, serve())
+	}
+	if got := listings(); got != before {
+		t.Errorf("%d listings after three appends, want still %d", got, before)
+	}
+	// A file reported again is not added again.
+	sched.RequestIngestAppend("mydb", "cpu", first)
+	serve()
+	ictx := exp.withAWS(ctx)
+	lt, err := exp.catalog.LoadTable(ictx, exp.tableIdent("mydb", "cpu"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := lt.Scan().PlanFiles(ictx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]int{}
+	for _, task := range tasks {
+		seen[task.File.FilePath()]++
+	}
+	if len(tasks) != seed+5 || len(seen) != seed+5 {
+		t.Fatalf("%d entries for %d files, want %d each", len(tasks), len(seen), seed+5)
+	}
+	if got := tableRows(t, exp); got != int64(10*(seed+5)) {
+		t.Errorf("%d rows read through the S3 FileIO, want %d", got, 10*(seed+5))
+	}
+	t.Logf("S3, table of %d files: first export (create) %v; pass adding one file %v; appends %v", seed, created, pass, appends)
+}
