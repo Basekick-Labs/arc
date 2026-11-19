@@ -310,6 +310,7 @@ func (s *Scheduler) serviceIngest(ctx context.Context, max int) {
 			continue
 		}
 		mctx, cancel := context.WithTimeout(ctx, measurementTimeout)
+		began := time.Now()
 		outcome, err := s.exportIngest(mctx, m, key)
 		cancel()
 		s.noteOutcome(key, outcome)
@@ -318,6 +319,7 @@ func (s *Scheduler) serviceIngest(ctx context.Context, max int) {
 			event = logSchemaConflict(s.logger.Warn().Err(err), err)
 		}
 		event.Str("database", m.Database).Str("measurement", m.Measurement).Str("outcome", outcome.String()).
+			Dur("took", time.Since(began)). // an append or a pass, whichever it was (#1751)
 			Msg("Iceberg reconcile on request (an ingest flush)")
 		// Anything short of a settled reconcile comes back one interval
 		// later, whether or not another flush asks: a failure, a busy table,

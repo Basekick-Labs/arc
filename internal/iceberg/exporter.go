@@ -1344,9 +1344,31 @@ func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.T
 	if dirKey == "" || dirKey == "." {
 		return
 	}
-	keys, err := e.backend.List(ctx, dirKey+"/")
-	if err != nil {
-		return
+	// With a minimum age (#1751) the listing must carry each copy's write
+	// time, so it is the object listing; one listing either way. A store
+	// that cannot give write times cannot be judged by age, and nothing is
+	// deleted from it.
+	var keys []string
+	var written map[string]time.Time
+	if e.minVersionAge > 0 {
+		lister, ok := e.backend.(storage.ObjectLister)
+		if !ok {
+			return
+		}
+		objs, err := lister.ListObjects(ctx, dirKey+"/")
+		if err != nil {
+			return
+		}
+		written = make(map[string]time.Time, len(objs))
+		for _, o := range objs {
+			keys = append(keys, o.Path)
+			written[path.Base(filepath.ToSlash(o.Path))] = o.LastModified
+		}
+	} else {
+		var err error
+		if keys, err = e.backend.List(ctx, dirKey+"/"); err != nil {
+			return
+		}
 	}
 	// Collect version numbers of existing v<M>.metadata.json copies.
 	type vfile struct {
@@ -1384,25 +1406,9 @@ func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.T
 	// And keep a copy until minVersionAge after the NEXT version was published
 	// (#1751): that is when readers stopped being handed this one. Its own
 	// age says nothing: a version that was current for an hour is old the
-	// moment it is superseded. The successor's write time is read from the
-	// store, so it survives a restart and covers copies written by
-	// claimVersion. Without it nothing beyond the count can be judged, and
-	// nothing is deleted.
-	var written map[string]time.Time
-	if e.minVersionAge > 0 {
-		lister, ok := e.backend.(storage.ObjectLister)
-		if !ok {
-			return
-		}
-		objs, err := lister.ListObjects(ctx, dirKey+"/")
-		if err != nil {
-			return
-		}
-		written = make(map[string]time.Time, len(objs))
-		for _, o := range objs {
-			written[path.Base(filepath.ToSlash(o.Path))] = o.LastModified
-		}
-	}
+	// moment it is superseded. The successor's write time is the store's
+	// (written, above), so it survives a restart and covers copies written
+	// by claimVersion.
 	for i, v := range vs[keep:] {
 		if v.n == curN || (keepFrom >= 0 && v.n >= keepFrom) || slices.Contains(protect, v.n) {
 			continue
