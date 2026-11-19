@@ -74,3 +74,29 @@ func TestIcebergExportLagLabelsMatchBounds(t *testing.T) {
 		}
 	}
 }
+
+// The append path's counters (#1751), in both forms.
+func TestIcebergIngestAppendMetrics(t *testing.T) {
+	m := &Metrics{startTime: time.Now()}
+	m.AddIcebergIngestAppend(3)
+	m.AddIcebergIngestAppend(0) // an append that added nothing still ran
+	m.AddIcebergIngestAppend(28)
+	m.IncIcebergIngestAppendFallback()
+	out := m.PrometheusFormat()
+	for _, want := range []string{
+		"# TYPE arc_iceberg_ingest_appends_total counter\n",
+		"arc_iceberg_ingest_appends_total 3\n",
+		"# TYPE arc_iceberg_ingest_append_files_total counter\n",
+		"arc_iceberg_ingest_append_files_total 31\n",
+		"# TYPE arc_iceberg_ingest_append_fallbacks_total counter\n",
+		"arc_iceberg_ingest_append_fallbacks_total 1\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("Prometheus output is missing %q", want)
+		}
+	}
+	snap := m.Snapshot()
+	if snap["iceberg_ingest_appends"] != int64(3) || snap["iceberg_ingest_append_files"] != int64(31) || snap["iceberg_ingest_append_fallbacks"] != int64(1) {
+		t.Errorf("snapshot: appends=%v files=%v fallbacks=%v", snap["iceberg_ingest_appends"], snap["iceberg_ingest_append_files"], snap["iceberg_ingest_append_fallbacks"])
+	}
+}

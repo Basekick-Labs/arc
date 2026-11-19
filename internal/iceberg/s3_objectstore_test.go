@@ -459,3 +459,54 @@ func TestS3Append_AddsTheReportedFileWithoutListing(t *testing.T) {
 	}
 	t.Logf("S3, table of %d files: first export (create) %v; pass adding one file %v; appends %v", seed, created, pass, appends)
 }
+
+// #1751 on a real S3 API: published versions are kept by age through the
+// object listing's write times (the default in production: every prune takes
+// that branch once iceberg.min_version_age is set). A copy stays while the
+// version after it was published less than the minimum age ago, and goes once
+// that has passed.
+func TestS3Prune_KeepsVersionsByTheirSuccessorsAge(t *testing.T) {
+	b, _ := s3Rig(t)
+	ctx := context.Background()
+	exp, _, _ := s3Exporter(t, b)
+	exp.retain = 1
+	const age = 4 * time.Second
+	exp.SetVersionRetention(age, 0)
+	src := NewStorageWalkSource(b, "arc", zerolog.Nop())
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: src, Interval: time.Hour, Logger: zerolog.Nop()})
+	base := int64(1_700_000_000_000_000)
+	copies := func() []string {
+		keys, err := b.List(ctx, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var vs []string
+		for _, k := range keys {
+			if name := filepath.Base(k); strings.HasPrefix(name, "v") && strings.HasSuffix(name, ".metadata.json") {
+				vs = append(vs, name)
+			}
+		}
+		sort.Strings(vs)
+		return vs
+	}
+	for i := 0; i < 5; i++ {
+		putParquet(t, b, fmt.Sprintf("mydb/cpu/2023/11/14/22/cpu_%d.parquet", i), base+int64(i), 5)
+		sched.runPass(ctx)
+	}
+	young := copies()
+	if len(young) < 5 {
+		t.Fatalf("copies %v after 5 passes inside the minimum age, want every version still there", young)
+	}
+	time.Sleep(age + time.Second)
+	sched.runPass(ctx) // nothing new: the pass prunes what is old enough now
+	putParquet(t, b, "mydb/cpu/2023/11/14/22/cpu_last.parquet", base+99, 5)
+	sched.runPass(ctx)
+	old := copies()
+	if len(old) >= len(young) {
+		t.Fatalf("copies %v after the minimum age passed, was %v: nothing was pruned", old, young)
+	}
+	if got := tableRows(t, exp); got != 30 {
+		t.Errorf("%d rows after pruning, want 30", got)
+	}
+	t.Logf("copies inside the minimum age: %v; after it: %v", young, old)
+}
