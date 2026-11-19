@@ -59,3 +59,39 @@ func TestIcebergIngestIntervalIsOffOnAClusterNode(t *testing.T) {
 		}
 	}
 }
+
+// The append path (#1751): the export is told each file a flush REGISTERS, by
+// its key. With the append path on, the published hook must not also make
+// requests: it fires before the registration, and a request served in
+// between finds no file and lists the whole measurement.
+func TestIngestRegistrationIsReportedToTheIcebergAppendPath(t *testing.T) {
+	raw, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(raw)
+	for _, want := range []string{
+		"IngestAppend: cfg.Iceberg.IngestAppendEnabled,",
+		"icebergScheduler.RequestIngestAppend(database, measurement, storagePath)",
+		"arrowBuffer.SetOnFileRemoved(icebergScheduler.RequestReconcile)",
+		"exporter.SetVersionRetention(time.Duration(cfg.Iceberg.MinVersionAge)*time.Second,",
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("main.go no longer has %q", want)
+		}
+	}
+	on := strings.Index(src, "if cfg.Iceberg.IngestAppendEnabled {")
+	registered := strings.Index(src, "arrowBuffer.SetOnFileRegistered(")
+	otherwise := strings.Index(src, "arrowBuffer.AddOnFilePublished(func(database, measurement string, _ time.Time) {")
+	if on < 0 || registered < on || otherwise < registered {
+		t.Fatal("the registered hook and the published hook are not the two arms of iceberg.ingest_append_enabled")
+	}
+	if between := src[registered:otherwise]; !strings.Contains(between, "} else {") {
+		t.Error("the published hook is installed beside the registered one, not instead of it")
+	}
+	start := strings.Index(src, "icebergStart = func() {")
+	end := strings.Index(src, `shutdownCoordinator.RegisterHook("iceberg"`)
+	if start < 0 || registered < start || registered > end {
+		t.Error("the append receiver is not installed inside icebergStart")
+	}
+}

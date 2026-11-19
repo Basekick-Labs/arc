@@ -126,6 +126,22 @@ type Scheduler struct {
 	ingestDue      map[string]ingestRequest
 	ingestNext     map[string]time.Time
 	ingestPending  map[string]ingestReports
+	// The append path (scheduler_append.go, #1751). appendPending is the
+	// files ingest reported per table (under reqMu). The rest is the loop
+	// goroutine's: appendOK the tables whose last reconcile pass settled,
+	// recentAdds the recent files in each table or seen by a pass,
+	// appendFallback the last reason a table's append ran a pass instead.
+	appendEnabled  bool
+	started        time.Time
+	appendPending  map[string]pendingFiles
+	appendOK       map[string]bool
+	recentAdds     map[string]map[string]time.Time
+	appendFallback map[string]string
+	// passCommits is how many data commits the reconcile pass in progress (or
+	// the last one) made: reconcileOne sets it, reconcileOneRecovered reads it.
+	passCommits int
+	// appendsSince counts each table's appends since its last settled pass.
+	appendsSince map[string]int
 	// lastReconciled is when each measurement's table last changed, by a
 	// pass or a request. Loop goroutine only.
 	lastReconciled map[string]time.Time
@@ -229,6 +245,10 @@ type SchedulerConfig struct {
 	// that ingest flushes cause (iceberg.ingest_export_interval). Zero or
 	// less: RequestIngestReconcile does nothing.
 	IngestInterval time.Duration
+	// IngestAppend lets an ingest request add only the reported files
+	// (iceberg.ingest_append_enabled). Off: every ingest request is a
+	// reconcile pass of the measurement.
+	IngestAppend bool
 }
 
 // NewScheduler builds a reconcile scheduler.
@@ -253,6 +273,13 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		ingestDue:      make(map[string]ingestRequest),
 		ingestNext:     make(map[string]time.Time),
 		ingestPending:  make(map[string]ingestReports),
+		appendEnabled:  cfg.IngestAppend,
+		started:        time.Now(),
+		appendPending:  make(map[string]pendingFiles),
+		appendOK:       make(map[string]bool),
+		recentAdds:     make(map[string]map[string]time.Time),
+		appendFallback: make(map[string]string),
+		appendsSince:   make(map[string]int),
 		lastReconciled: make(map[string]time.Time),
 		drops:          make(map[string]struct{}),
 		dropRetry:      make(map[string]dropRetry),
@@ -891,6 +918,16 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 			delete(s.busySince, k)
 		}
 	}
+	for k := range s.appendOK {
+		if _, ok := seen[k]; !ok {
+			s.forgetAppend(k)
+		}
+	}
+	for k := range s.recentAdds {
+		if _, ok := seen[k]; !ok {
+			s.forgetAppend(k)
+		}
+	}
 	for k := range s.lastReconciled {
 		if _, ok := seen[k]; !ok {
 			delete(s.lastReconciled, k)
@@ -921,7 +958,11 @@ func (s *Scheduler) reconcileOneRecovered(ctx context.Context, m Measurement, ke
 	// the result into: whichever kind of reconcile this is, one that went
 	// through covers the ingest files reported before it started (#1750).
 	startedAt := time.Now()
-	defer func() { s.noteIngestCovered(key, startedAt, outcome, err) }()
+	defer func() {
+		s.notePassEnded(key, startedAt, outcome, err)
+		s.noteIngestCovered(key, startedAt, outcome, s.passCommits > 0, err)
+	}()
+	s.passCommits = 0
 	defer func() {
 		if r := recover(); r != nil {
 			// The stack is logged here, where it is; the returned error is
@@ -951,6 +992,8 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 		}
 		return outcomeUnchanged, err
 	}
+	// What this pass has seen is not offered to an append again (#1751).
+	s.noteListed(key, files)
 	if len(files) == 0 {
 		// Every data file is gone (retention/compaction/manual delete). We still reach this code
 		// because Arc's Delete only os.Remove()s the file — the {db}/{measurement}/… directory
@@ -979,6 +1022,7 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 			return outcomeUnchanged, nil
 		}
 		res, err := s.exporter.reconcile(ctx, reconcileRequest{database: m.Database, measurement: m.Measurement, canCommit: s.canRun})
+		s.passCommits = res.commits
 		if err != nil {
 			return outcomeUnchanged, err
 		}
@@ -995,6 +1039,9 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 			return outcomeReconciled, nil
 		}
 		s.state[key] = measurementState{fingerprint: fp}
+		if res.versionsHeld {
+			s.markAppended(key) // come back to prune them (see reconcileResult.versionsHeld)
+		}
 		return outcomeReconciled, nil
 	}
 	// Fingerprint the file set. Unchanged fingerprint + a cached schema => guaranteed no-op
@@ -1058,6 +1105,7 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 		canCommit:   s.canRun,
 		exists:      s.fileExists(),
 	})
+	s.passCommits = res.commits // before the error check: a pass can commit chunks and then fail
 	if res.droppedCold {
 		// A cold file vanished: its cached cold listing is stale until invalidated. Before the
 		// error check: a pass can drop a cold file and then fail a later chunk.
@@ -1117,6 +1165,13 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 	// The table's schema, not a union of footers: every listed file is now in the table, so it
 	// covers all of them, and it is exactly what the next pass's EnsureTable compares against.
 	s.state[key] = measurementState{fingerprint: fp, schema: res.schema, schemaFiles: schemaSet}
+	if res.versionsHeld {
+		// Published versions are waiting out iceberg.min_version_age: the
+		// next pass runs whatever the listing is, and prunes the ones old
+		// enough by then. Without this a table that goes quiet would keep
+		// them, since an unchanged table's pass is skipped.
+		s.markAppended(key)
+	}
 	return outcomeReconciled, nil
 }
 

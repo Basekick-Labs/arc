@@ -209,16 +209,19 @@ type IngestConfig struct {
 	MaxBufferedBytesAuto bool
 }
 
-// icebergMinVersionSpan is the least time, in seconds, that a published
-// version of an Iceberg table must stay on disk after the next one is
-// published, when ingest triggers exports: iceberg.ingest_export_interval x
-// iceberg.retain_snapshots must reach it. It has to outlast whatever still
-// names the older version: a reader between resolving a version and opening
-// it, and Glue, which keeps naming the older one after a failed update until
-// its retry (iceberg.glue.sync_interval, default 60 s). So: that interval
-// plus a minute with Glue on, and never under 120 s. The 120 is a margin,
-// not a measured limit: no reader was observed opening a version that long
-// after resolving it.
+// minIcebergIngestExportInterval is the shortest iceberg.ingest_export_interval
+// other than 0 (off), in seconds.
+const minIcebergIngestExportInterval = 5
+
+// icebergMinVersionSpan is the least iceberg.min_version_age, in seconds:
+// how long a published version of an Iceberg table must stay on disk after
+// the next one is published. It has to outlast whatever still names the older
+// version: a reader between resolving a version and opening it, and Glue,
+// which keeps naming the older one after a failed update until its retry
+// (iceberg.glue.sync_interval, default 60 s). So: that interval plus a minute
+// with Glue on, and never under 120 s. The 120 is a margin, not a measured
+// limit: no reader was observed opening a version that long after resolving
+// it.
 func icebergMinVersionSpan(glueEnabled bool, glueSyncInterval int) int {
 	span := 120
 	if glueEnabled && glueSyncInterval+60 > span {
@@ -707,8 +710,17 @@ type IcebergConfig struct {
 	// is exported after at most this long instead of at the next timed pass.
 	// 0 turns the ingest trigger off (timed passes only). Default 60.
 	IngestExportInterval int
-	CatalogDBPath        string // SQLite catalog path; defaults to the shared auth DB
-	RetainSnapshots      int    // Snapshots (and metadata versions) to keep per table; older are expired (default 10)
+	// MinVersionAge is how long, in seconds, a published table version
+	// (v<N>.metadata.json) is kept after the next one is published, on top
+	// of the newest retain_snapshots+1 (#1751). It is what lets ingest
+	// publish versions often without deleting one a reader still holds.
+	MinVersionAge int
+	// IngestAppendEnabled lets an ingest-triggered export add only the new
+	// files (no listing, no scan of the table). Off: every ingest-triggered
+	// export is a full pass of the measurement, as before #1751.
+	IngestAppendEnabled bool
+	CatalogDBPath       string // SQLite catalog path; defaults to the shared auth DB
+	RetainSnapshots     int    // Snapshots (and metadata versions) to keep per table; older are expired (default 10)
 	// OrphanSweepEnabled gates the metadata orphan sweep (#835): deleting the manifest
 	// lists and manifests under a table's metadata directory that no metadata.json still
 	// on disk can reach. Default true. It is the only deleter in the exporter whose work
@@ -1536,6 +1548,8 @@ func Load() (*Config, error) {
 			NamespaceMigrationDryRun: v.GetBool("iceberg.namespace_migration_dry_run"),
 			ReconcileInterval:        v.GetInt("iceberg.reconcile_interval"),
 			IngestExportInterval:     v.GetInt("iceberg.ingest_export_interval"),
+			MinVersionAge:            v.GetInt("iceberg.min_version_age"),
+			IngestAppendEnabled:      v.GetBool("iceberg.ingest_append_enabled"),
 			CatalogDBPath:            v.GetString("iceberg.catalog_db_path"),
 			RetainSnapshots:          v.GetInt("iceberg.retain_snapshots"),
 			OrphanSweepEnabled:       v.GetBool("iceberg.orphan_sweep_enabled"),
@@ -2079,39 +2093,33 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("iceberg.reconcile_interval must be >= 1 (got %d): "+
 				"it is the interval between reconcile passes, and values below 1 would not define a valid schedule", cfg.Iceberg.ReconcileInterval)
 		}
-		if cfg.Iceberg.IngestExportInterval < 0 {
-			return nil, fmt.Errorf("iceberg.ingest_export_interval must be >= 0 (got %d): it is the least time, in seconds, "+
-				"between two exports of a table that ingest causes; 0 turns that trigger off", cfg.Iceberg.IngestExportInterval)
+		// 0 turns the trigger off. Otherwise at least minIcebergIngestExportInterval:
+		// every export publishes a table version, and each stays on disk for
+		// min_version_age, so a shorter interval only piles up metadata.
+		if n := cfg.Iceberg.IngestExportInterval; n < 0 || (n > 0 && n < minIcebergIngestExportInterval) {
+			return nil, fmt.Errorf("iceberg.ingest_export_interval must be 0 or at least %d (got %d): it is the least time, in seconds, "+
+				"between two exports of a table that ingest causes; 0 turns that trigger off", minIcebergIngestExportInterval, n)
 		}
-		// Each export publishes a table version, and only retain_snapshots+1
-		// published versions are kept. A reader resolves a version and opens
-		// it later, and the version it resolved is deleted retain_snapshots
-		// publishes after the next one: the published versions must outlast
-		// the slowest reader (icebergMinVersionSpan). (retain_snapshots < 1
-		// is refused by its own check below.)
-		if n := cfg.Iceberg.IngestExportInterval; n > 0 && cfg.Iceberg.RetainSnapshots >= 1 {
-			span := icebergMinVersionSpan(cfg.Iceberg.Glue.Enabled, cfg.Iceberg.Glue.SyncInterval)
-			least := (span + cfg.Iceberg.RetainSnapshots - 1) / cfg.Iceberg.RetainSnapshots // rounded up
-			if n < least {
-				// An interval the operator wrote is refused. The default is
-				// raised instead, with a warning: an upgrade must not stop a
-				// node whose retain_snapshots was already low.
-				if v.InConfig("iceberg.ingest_export_interval") || os.Getenv("ARC_ICEBERG_INGEST_EXPORT_INTERVAL") != "" {
-					return nil, fmt.Errorf("iceberg.ingest_export_interval (%d s) times iceberg.retain_snapshots (%d) is %d s, under %d s: "+
-						"ingest would publish table versions faster than a reader that resolved one can open it before it is deleted. "+
-						"Raise ingest_export_interval to at least %d, raise retain_snapshots, or set ingest_export_interval to 0",
-						n, cfg.Iceberg.RetainSnapshots, n*cfg.Iceberg.RetainSnapshots, span, least)
-				}
-				cfg.Warnings = append(cfg.Warnings, LoadWarning{
-					Key:   "iceberg.ingest_export_interval",
-					Value: strconv.Itoa(n),
-					Message: fmt.Sprintf("iceberg.ingest_export_interval raised from its default %d s to %d s: with iceberg.retain_snapshots = %d, "+
-						"a shorter interval would delete a published table version before a reader that resolved it could open it "+
-						"(the versions kept must span %d s). Raise retain_snapshots to export sooner, or set ingest_export_interval to 0 "+
-						"to export on the timer only", n, least, cfg.Iceberg.RetainSnapshots, span),
-				})
-				cfg.Iceberg.IngestExportInterval = least
+		// A reader resolves a published version and opens it later; Glue names
+		// one until its next sync. A version must stay on disk that long after
+		// the next one is published (icebergMinVersionSpan).
+		if span := icebergMinVersionSpan(cfg.Iceberg.Glue.Enabled, cfg.Iceberg.Glue.SyncInterval); cfg.Iceberg.MinVersionAge < span {
+			// A value the operator wrote is refused. The default is raised
+			// instead, with a warning: an upgrade must not stop a node whose
+			// glue.sync_interval was already long.
+			if v.InConfig("iceberg.min_version_age") || os.Getenv("ARC_ICEBERG_MIN_VERSION_AGE") != "" {
+				return nil, fmt.Errorf("iceberg.min_version_age must be at least %d (got %d): it is how long, in seconds, a published "+
+					"table version stays on disk after the next one is published, and a reader that resolved a version "+
+					"(or Glue, until its next sync) must be able to open it", span, cfg.Iceberg.MinVersionAge)
 			}
+			cfg.Warnings = append(cfg.Warnings, LoadWarning{
+				Key:   "iceberg.min_version_age",
+				Value: strconv.Itoa(cfg.Iceberg.MinVersionAge),
+				Message: fmt.Sprintf("iceberg.min_version_age raised from its default %d s to %d s: with iceberg.glue.sync_interval = %d, "+
+					"Glue can name a published table version for that long after the next one is published",
+					cfg.Iceberg.MinVersionAge, span, cfg.Iceberg.Glue.SyncInterval),
+			})
+			cfg.Iceberg.MinVersionAge = span
 		}
 		// Reject rather than silently treat as "keep every snapshot forever": an
 		// operator setting 0 almost certainly means "keep no history", and the
@@ -2747,6 +2755,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("iceberg.namespace_migration_dry_run", true)
 	v.SetDefault("iceberg.reconcile_interval", 300)          // seconds
 	v.SetDefault("iceberg.ingest_export_interval", 60)       // seconds; 0 = export on the timer only (#1750)
+	v.SetDefault("iceberg.min_version_age", 300)             // seconds a published version outlives its successor (#1751)
+	v.SetDefault("iceberg.ingest_append_enabled", true)      // ingest exports add only the new files (#1751)
 	v.SetDefault("iceberg.catalog_db_path", "./data/arc.db") // shared SQLite DB with auth
 	v.SetDefault("iceberg.retain_snapshots", 10)
 	v.SetDefault("iceberg.orphan_sweep_enabled", true)

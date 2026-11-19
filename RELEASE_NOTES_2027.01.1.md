@@ -2,6 +2,69 @@
 
 > **Status:** Planned — January 2027 release.
 
+## New: ingest files are appended to their Iceberg table without re-reading it, and the export interval can go down to 5 s ([#1751](https://github.com/Basekick-Labs/arc/issues/1751))
+
+Since #1750 an ingest flush asks for an export of its table. Each of those exports was a full pass of the measurement: list its files, read every manifest of the table, commit, expire snapshots, prune and sweep. That work grows with the table, and the published versions were kept by count, which tied how often ingest could export to `retain_snapshots`. Both change here.
+
+- **Append path.** The flush now names the file it registered, and the export adds just the files named: a footer read per new file, one commit, one publish. No listing, and no read of the table's manifests. Anything that is not plainly an append (a file with a new column, a table that does not exist yet, a table whose last pass did not settle, a file older than 30 minutes) runs the full pass as before.
+- **New key `iceberg.min_version_age`** (seconds, default `300`): a published table version stays on disk for this long after the next one is published, on top of the newest `retain_snapshots + 1`. A reader that resolved a version, or Glue until its next sync, can still open it. It must be at least 120 s, and at least `iceberg.glue.sync_interval + 60` with Glue on. A value you set below that is refused at startup; the default is raised with a warning instead (to 660 s at `glue.sync_interval = 600`).
+- **`iceberg.ingest_export_interval` is no longer tied to `retain_snapshots`.** It must be `0` (off) or at least `5`. The rule from #1750 (`ingest_export_interval × retain_snapshots ≥ 120`) is gone: keeping versions by age gives the same guarantee directly. The default stays `60`.
+- **New key `iceberg.ingest_append_enabled`** (default `true`). `false` makes every ingest-triggered export a full pass, as in #1750.
+- **Standalone nodes only**, like the trigger itself ([#1756](https://github.com/Basekick-Labs/arc/issues/1756)). Keeping versions by age applies on every node.
+
+What one ingest export costs, as a full pass and as an append, through the scheduler on local disk (median of 7; `TestMeasure_AppendAgainstAPass`):
+
+| Files in the table | Full pass, 1 new file | Append, 1 new file | Full pass, 30 new files | Append, 30 new files |
+|---|---|---|---|---|
+| 1,000 | 43 ms | 30 ms | 43 ms | 34 ms |
+| 8,000 | 122 ms | 31 ms | 121 ms | 34 ms |
+| 20,000 | 251 ms | 28 ms | 266 ms | 34 ms |
+
+The full pass grows with the table; the append does not.
+
+On an S3 API (SeaweedFS on the same machine, so no network latency), a 400-file table: 35 ms as a pass, 10–17 ms as an append.
+
+On the running binary, 200 measurements written for 4 minutes, standalone, local storage:
+
+| `ingest_export_interval` | Append | Average export lag | Iceberg metadata written |
+|---|---|---|---|
+| 60 s (default) | on | 27.5 s | 26 MB |
+| 15 s | on | 7.3 s | 113 MB |
+| 10 s | on | 4.7 s | 188 MB |
+| 5 s | on | 1.0 s | 223 MB |
+| 5 s | off | 1.0 s | 252 MB |
+
+- **The interval is what shortens the lag** (on local disk; for object storage see the notes below). At 5 s a file is in its table about a second after it is written with 200 tables being written at once (one goroutine serves them all, so they queue), and 54 ms after with 10. At a given interval the append path does not change the lag.
+- **The append path is what keeps an export cheap as a table grows** (the table above). In these runs the tables held about 48 files each and a full pass was already cheap, so on and off look the same. One pair of runs with ten tables that grew to about 1,300 files, and about 28 new files per export, averaged 57 ms per export as an append and 70 ms as a pass; it was a single run of each on a machine also serving the test's queries, so read it as "no worse", not as a measured gain.
+- **A short interval costs metadata.** Every export writes a new table version, about 40 KB of metadata in these runs: about eight times as much at 5 s as at 60 s. (In this load each table got a new file about every 9 s, so 5 s and 10 s made nearly the same number of exports and wrote nearly the same amount; they differ in lag.)
+- **What stays on disk is bounded.** In a 75-minute run (20 tables, 5 s interval, `min_version_age = 120`, a full pass every 30 s; 9,778 appends, none fell back) the published versions held at 18–23 per table and iceberg-go's own metadata files at 25 per table throughout. Manifest files grew by about 15 per table per minute for the first hour and then levelled off at about 920 per table, once the orphan sweep began removing the ones older than an hour. At the end the 20 tables held 125 MB of Iceberg metadata, about 6 MB each, and an export took the same time as at the start (35 ms on average).
+- **A table that stops receiving data** drops back to `retain_snapshots + 1` published versions within a few minutes, and its passes are skipped again.
+- In every run the Iceberg row counts matched storage on the tables checked, no file was in a table twice, and no append fell back to a full pass.
+
+New counters: `arc_iceberg_ingest_appends_total`, `arc_iceberg_ingest_append_files_total`, and `arc_iceberg_ingest_append_fallbacks_total` (exports that had files to add and ran a full pass instead; the log names the reason once per table). The `/metrics` JSON form carries `iceberg_ingest_appends`, `iceberg_ingest_append_files` and `iceberg_ingest_append_fallbacks`.
+
+Notes:
+
+- **Snapshots are expired, versions pruned and orphans swept by the full pass**, which still runs every `iceberg.reconcile_interval`. Between two passes a table that is appended to carries the snapshots of those appends. A table also takes a full pass after 120 appends, so a long `reconcile_interval` does not let them pile up.
+- **Manifests:** each append adds one. Once there are four small ones the append merges them, up to about 4,000 files per manifest; a larger manifest is never rewritten by an append.
+- **A file ingest deletes after storing it** (the late-landed copy of a failed flush) now asks for an export of its table, so it leaves the table at once and not at the next timed pass.
+- **Also run on the binary:** S3 as primary storage (SeaweedFS in a container: appends, row counts equal, an export about 49 ms as an append and 63 ms as a pass); `iceberg.warehouse` in a subdirectory of the storage root and outside it; a three-node cluster on shared storage, where the append path is off: the compactor exported on its timer, no node appended, and published versions held at 11 per table across a restart of all three nodes.
+- **A three-node cluster with node-local storage** (EC2, writer, reader and compactor, each on its own disk): the compactor exported the replicated files on its timer, no node appended or took an ingest request, row counts matched and no file was in a table twice, and published versions held at 11 per table across a restart of all three nodes (1,238 files).
+- **On object storage the export is slower, and one goroutine serves every table.** Against AWS S3, standalone, 3-minute writes, `ingest_export_interval = 5` unless said otherwise:
+
+  | Where Arc ran | Tables written | Append | One export | Average export lag |
+  |---|---|---|---|---|
+  | EC2 in the bucket's region | 10 | on | 525 ms | 1.0 s |
+  | EC2 in the bucket's region | 10 | off | 846 ms | 2.9 s |
+  | EC2 in the bucket's region | 200 | on (no table reached it: every export was a full pass) | about 1 s | 61 s and still growing when the run ended |
+  | EC2 in the bucket's region, interval 60 s (default), 5 minutes | 200 | on | 954 ms | 116 s |
+  | The same, append off | 200 | off | 915 ms | 107 s |
+  | 77 ms from the bucket | 10 | on | 2.5 s | 15 s |
+  | 77 ms from the bucket | 10 | off | 3.1 s | 17.5 s |
+
+  An export on S3 is a few dozen requests made one after another, so it takes about half a second in the bucket's region and seconds from far away, and the tables queue behind each other. The interval you set is reached while `tables written at once × one export` fits in it: about ten tables at 5 s, and somewhere between 60 and 100 at the default 60 s, in the bucket's region. Past that the tables wait for each other and the interval no longer sets the lag. The timed pass before #1750 exported tables the same way, one after another; it was not measured on S3. With one new file the append took about 40% less than the pass in the bucket's region and about 20% less from far away (one run each); with many new files per export it reads each one in turn and cost the same as the pass. No 200-table run reached a steady state, so read their lag as "minutes", not as a figure. By these runs each further file in an export costs about 24 ms in the bucket's region (525 ms with one file, 954 ms with about 19), so a node exports at most about 40 files a second there, and the 200-table load (about 22 files a second) used about half of that: the estimate for its steady state is a cycle of about 3.5 minutes. Above about 40 files a second the queue would not be bounded. These are estimates from two runs, not measurements. Serving tables in parallel is [#1778](https://github.com/Basekick-Labs/arc/issues/1778).
+- In those S3 runs no append fell back, row counts matched storage and no file was in a table twice; on a table left quiet the published versions went from 26 to 11 within two minutes (the age rule reads S3's own timestamps).
+
 ## Fix: a day with few files gets a daily file, so it can move to the cold tier ([#1774](https://github.com/Basekick-Labs/arc/issues/1774))
 
 Daily compaction needed `compaction.daily_min_files` hour-level files in a day (default 12), and tiering moves only daily files to cold. A measurement that writes a few points a day ends up with one or two hour-level files per day, so those days never compacted and stayed on the hot tier for good. Lowering `daily_min_files` did not help: a day with a single file failed with `batch size 1 below minimum 2`, and a day that already had a daily file had it rewritten together with its stragglers.
@@ -28,8 +91,7 @@ What to expect:
 A file written by ingest used to reach its Iceberg table only at the next timed export pass: up to `iceberg.reconcile_interval` (default 300 s) plus the pass. Compaction, DELETE, retention and tiering already asked for an export when they changed files; ingest did not. Now an ingest flush asks for its measurement's table too.
 
 - **New key `iceberg.ingest_export_interval`** (seconds, default `60`): the least time between two exports of one table that ingest causes. A flushed file is exported after at most this long, plus the export itself. `0` turns the trigger off and leaves the timed passes only.
-- **Bound:** `ingest_export_interval × retain_snapshots` must be at least 120 s. Each export publishes a table version, and a published version is deleted `retain_snapshots` publishes after the next one. A reader that resolved it, or a catalog that still names it, must not find it gone: a failed Glue update leaves Glue naming the older version until its retry (`iceberg.glue.sync_interval`, default 60 s), so with Glue on the bound is that interval + 60 s when it is larger. The 120 s is a margin, not a measured limit. With the default `retain_snapshots = 10` the shortest interval is 12 s.
-- **How the bound is applied:** a value you set that is too short is refused at startup, with the values that would do. The default is not refused: on a node whose `retain_snapshots` is below 2, the default 60 s is raised to meet the bound (120 s at `retain_snapshots = 1`) and a startup warning says so, so an upgrade does not stop a node.
+- **Bound:** it must be `0` or at least `5`. (As first merged, #1750 also required `ingest_export_interval × retain_snapshots ≥ 120`; #1751, above, replaced that with `iceberg.min_version_age`.)
 - **Standalone nodes only for now.** On a cluster node the trigger is not installed and the export runs on its timer as before: the node that flushes is usually not the node that exports. Tracked in [#1756](https://github.com/Basekick-Labs/arc/issues/1756). The lag histogram and the backlog counter are still filled there, by the timed passes; the pending gauge stays at 0. Not run on a cluster.
 
 Measured on a standalone node, local storage, default buffer age:
@@ -54,7 +116,7 @@ Notes:
 
 - **What an export costs is unchanged:** it still lists the measurement, reads the table's manifests and commits. The trigger only changes when it runs, which is more often: about five times the table versions and three times the metadata in the run above. With Glue on, each export is also one Glue update for its table. With more measurements than the exports can keep up with they queue, one table at a time, and the real interval stretches; the pending gauge shows it. Requests from compaction, DELETE, retention and tiering are served first.
 - **Spacing counts from the attempt:** a table whose export fails, or commits and cannot publish, is tried again once per interval, with or without further flushes. An export of any kind that changes a table also restarts the interval, so an ingest-triggered export does not publish right behind a compaction's.
-- **More table versions, and more log lines:** a table written to continuously now gets a snapshot per interval instead of per timed pass, and one "Reconciled Iceberg table" line at Info each time. `retain_snapshots` still bounds what is kept.
+- **More table versions:** a table written to continuously now gets a snapshot per interval instead of per timed pass. With the append path of #1751 (above) most of those exports log at Debug; a full pass still logs one "Reconciled Iceberg table" line at Info. How long versions are kept is `retain_snapshots` and, since #1751, `iceberg.min_version_age`.
 - No labels: the metrics cover every table.
 
 ## Fix: a late or future-stamped row is read by queries as soon as its file is written ([#1757](https://github.com/Basekick-Labs/arc/issues/1757))

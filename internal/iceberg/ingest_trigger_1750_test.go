@@ -203,22 +203,22 @@ func TestScheduler_IngestPendingTracksUncoveredReports(t *testing.T) {
 	if got := pending(); got < 0.010 {
 		t.Fatalf("pending = %v s after a report 15 ms ago, want it counting", got)
 	}
-	r.sched.noteIngestCovered(key, time.Now().Add(-time.Hour), outcomeReconciled, nil) // started before the report
-	r.sched.noteIngestCovered(key, time.Now(), outcomeReconciled, errors.New("failed"))
-	r.sched.noteIngestCovered(key, time.Now(), outcomeBusy, nil)
-	r.sched.noteIngestCovered(key, time.Now(), outcomeInProgress, nil)
+	r.sched.noteIngestCovered(key, time.Now().Add(-time.Hour), outcomeReconciled, true, nil) // started before the report
+	r.sched.noteIngestCovered(key, time.Now(), outcomeReconciled, true, errors.New("failed"))
+	r.sched.noteIngestCovered(key, time.Now(), outcomeBusy, false, nil)
+	r.sched.noteIngestCovered(key, time.Now(), outcomeInProgress, false, nil)
 	// One that committed and could not publish (or lost the writer role)
 	// returns "reconciled" too, and leaves no cached state: the file is not
 	// readable yet.
 	delete(r.sched.state, key)
-	r.sched.noteIngestCovered(key, time.Now(), outcomeReconciled, nil)
+	r.sched.noteIngestCovered(key, time.Now(), outcomeReconciled, true, nil)
 	r.sched.state[key] = measurementState{}
 	if got := pending(); got == 0 {
 		t.Fatal("a reconcile that started before the report, failed, was busy, left files behind or did not publish cleared the pending report")
 	} else if got > 5 {
 		t.Fatalf("pending = %v s for a report made a moment ago: a reconcile that started before it moved its time back", got)
 	}
-	r.sched.noteIngestCovered(key, time.Now(), outcomeUnchanged, nil)
+	r.sched.noteIngestCovered(key, time.Now(), outcomeUnchanged, false, nil)
 	if got := pending(); got != 0 {
 		t.Errorf("pending = %v s after a reconcile that started after the report went through, want 0", got)
 	}
@@ -231,14 +231,14 @@ func TestScheduler_IngestPendingTracksUncoveredReports(t *testing.T) {
 	started := time.Now()
 	time.Sleep(5 * time.Millisecond)
 	r.sched.RequestIngestReconcile("mydb", "cpu") // ...and a flush reports another file while it runs
-	r.sched.noteIngestCovered(key, started, outcomeReconciled, nil)
+	r.sched.noteIngestCovered(key, started, outcomeReconciled, true, nil)
 	if _, queued := r.sched.nextIngestDue(); !queued {
 		t.Fatal("the request for a file reported during a reconcile was dropped when that reconcile finished")
 	}
 	if got := pending(); got == 0 {
 		t.Fatal("a file reported during a reconcile no longer counts as pending")
 	}
-	r.sched.noteIngestCovered(key, time.Now(), outcomeReconciled, nil)
+	r.sched.noteIngestCovered(key, time.Now(), outcomeReconciled, true, nil)
 	if _, queued := r.sched.nextIngestDue(); queued || pending() != 0 {
 		t.Fatal("a reconcile that started after every report left a request or a pending report")
 	}
@@ -250,7 +250,7 @@ func TestScheduler_IngestPendingTracksUncoveredReports(t *testing.T) {
 	if got := pending(); got < 0.3 {
 		t.Errorf("pending = %v s with a table waiting 300 ms, want the older table's wait", got)
 	}
-	r.sched.noteIngestCovered("mydb\x00aaa", time.Now(), outcomeReconciled, nil)
+	r.sched.noteIngestCovered("mydb\x00aaa", time.Now(), outcomeReconciled, true, nil)
 	if got := pending(); got == 0 || got >= 0.3 {
 		t.Errorf("pending = %v s after the older table was covered, want the newer table's wait", got)
 	}
@@ -363,7 +363,7 @@ func TestScheduler_AnIngestRequestWaitsBehindAnotherReconcilesPublish(t *testing
 	if due, ok := r.sched.nextIngestDue(); !ok || time.Until(due) > time.Second {
 		t.Fatalf("before the other reconcile ends the request is due in %v (queued=%v), want now", time.Until(due), ok)
 	}
-	r.sched.noteIngestCovered(key, started, outcomeReconciled, nil) // the other reconcile ends, having changed the table
+	r.sched.noteIngestCovered(key, started, outcomeReconciled, true, nil) // the other reconcile ends, having changed the table
 	due, ok := r.sched.nextIngestDue()
 	if !ok {
 		t.Fatal("the request was dropped: its file was reported after the reconcile started and may have missed it")
@@ -377,7 +377,7 @@ func TestScheduler_AnIngestRequestWaitsBehindAnotherReconcilesPublish(t *testing
 	started = time.Now()
 	time.Sleep(2 * time.Millisecond)
 	r2.sched.RequestIngestReconcile("mydb", "cpu")
-	r2.sched.noteIngestCovered(key, started, outcomeUnchanged, nil)
+	r2.sched.noteIngestCovered(key, started, outcomeUnchanged, false, nil)
 	if due, ok := r2.sched.nextIngestDue(); !ok || time.Until(due) > time.Second {
 		t.Errorf("after a reconcile that changed nothing the request is due in %v (queued=%v), want now", time.Until(due), ok)
 	}

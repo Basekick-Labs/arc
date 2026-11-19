@@ -88,6 +88,53 @@ func (b *ArrowBuffer) filePublished(database, measurement string, partitionTime 
 	}
 }
 
+// FileRegisteredFunc is told of a file an ingest flush has stored and kept:
+// it is called where the file is registered, so never for a write that
+// failed, and for an hour file that waits for the rest of its flush only once
+// the flush keeps it. A file adopted from an interrupted flush is reported
+// too. It runs on the flush's goroutine, so it must return at once; the flush
+// does not depend on what it does. The Iceberg export uses it to add the file
+// to its table without listing the measurement (#1751).
+type FileRegisteredFunc func(database, measurement, storagePath string, sizeBytes int64)
+
+// SetOnFileRegistered installs the function told about each file an ingest
+// flush registers (nil: none). It can be set while flushes run.
+func (b *ArrowBuffer) SetOnFileRegistered(fn FileRegisteredFunc) {
+	if fn == nil {
+		b.onFileRegistered.Store(nil)
+		return
+	}
+	b.onFileRegistered.Store(&fn)
+}
+
+func (b *ArrowBuffer) fileRegistered(database, measurement, storagePath string, sizeBytes int64) {
+	if fn := b.onFileRegistered.Load(); fn != nil {
+		(*fn)(database, measurement, storagePath, sizeBytes)
+	}
+}
+
+// FileRemovedFunc is told that ingest deleted a file it had stored: the
+// late-landed copy of a failed flush, whose rows were written again
+// (ambiguous_writes.go). Same rules as FileRegisteredFunc. The Iceberg export
+// uses it to take the file out of its table without waiting for its timer.
+type FileRemovedFunc func(database, measurement string)
+
+// SetOnFileRemoved installs the function told about each file ingest deletes
+// (nil: none).
+func (b *ArrowBuffer) SetOnFileRemoved(fn FileRemovedFunc) {
+	if fn == nil {
+		b.onFileRemoved.Store(nil)
+		return
+	}
+	b.onFileRemoved.Store(&fn)
+}
+
+func (b *ArrowBuffer) fileRemoved(database, measurement string) {
+	if fn := b.onFileRemoved.Load(); fn != nil {
+		(*fn)(database, measurement)
+	}
+}
+
 // DeleteScopeFunc returns the DELETE records holding batch cseq of
 // (instance, key) in their scope (#1207 d1). A file is rewritten with a
 // record as a whole, so batches with different answers never share one.

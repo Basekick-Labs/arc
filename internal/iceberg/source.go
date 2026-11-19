@@ -789,3 +789,63 @@ func isDataFile(p string) bool {
 	}
 	return strings.HasSuffix(base, ".parquet")
 }
+
+// AppendRefs resolves files an ingest flush reported (storage keys of m) for
+// the append path (#1751), applying to each the rules of a listing that can
+// be judged for one file: it is a data file of the measurement, Arc's reads
+// do not leave it out, the cluster has not deleted it, and it is in storage
+// (its size is read from there, not taken from the report). A key that fails
+// one is left out: the reconcile pass owns it.
+//
+// The rules that need the whole listing (hidden data files, a listing that
+// moved, compaction outputs still replacing their inputs) are not applied:
+// the caller appends only between reconcile passes that settled, and an
+// ingest file is never a compaction output.
+//
+// ok is false when this source cannot judge a single file: a shared-storage
+// cluster, where a file counts only once the replicated manifest knows it.
+func (s *StorageWalkSource) AppendRefs(ctx context.Context, m Measurement, keys []string) (refs []FileRef, ok bool, err error) {
+	if s.manifestKnows != nil {
+		return nil, false, nil
+	}
+	prefix := m.Database + "/" + m.Measurement + "/"
+	// The measurement's prefix, as the listing asks: a job is matched by its
+	// output's path, and a daily output has no hour directory.
+	var leaveOut map[string]struct{}
+	if s.exclusions != nil {
+		excluded, err := s.exclusions.ExcludedForStrict(ctx, prefix)
+		if err != nil {
+			return nil, false, fmt.Errorf("files Arc's reads leave out under %s/%s: %w", m.Database, m.Measurement, err)
+		}
+		leaveOut = make(map[string]struct{}, len(excluded))
+		for _, k := range excluded {
+			leaveOut[filepath.ToSlash(k)] = struct{}{}
+		}
+	}
+	for _, key := range keys {
+		key = filepath.ToSlash(key)
+		if !strings.HasPrefix(key, prefix) || !isDataFile(key) {
+			continue
+		}
+		if _, skip := leaveOut[key]; skip {
+			continue
+		}
+		if s.deletedHere != nil && s.deletedHere(key) {
+			continue
+		}
+		uri, err := s.resolver.Resolve(key)
+		if err != nil {
+			return nil, false, fmt.Errorf("reported file %q has no usable storage path: %w", key, err)
+		}
+		lp := s.resolver.LocalPath(key)
+		size, present, err := s.statSize(ctx, key, lp)
+		if err != nil {
+			return nil, false, fmt.Errorf("stat reported file %q: %w", key, err)
+		}
+		if !present {
+			continue
+		}
+		refs = append(refs, FileRef{PhysicalPath: uri, SizeBytes: size, Key: key, LocalPath: lp})
+	}
+	return refs, true, nil
+}

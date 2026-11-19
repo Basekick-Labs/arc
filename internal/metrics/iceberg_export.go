@@ -33,6 +33,27 @@ type icebergExport struct {
 	// oldestPendingNS is the Unix time, in nanoseconds, of the oldest ingest
 	// file reported to the export and not yet covered by one; 0: none.
 	oldestPendingNS atomic.Int64
+	// appends, appendFiles and appendFallbacks count the ingest-triggered
+	// exports that added only the new files, the files they added, and the
+	// ones that had to run a reconcile pass of the measurement instead (#1751).
+	appends         atomic.Int64
+	appendFiles     atomic.Int64
+	appendFallbacks atomic.Int64
+}
+
+// AddIcebergIngestAppend counts one ingest-triggered export that added only
+// its new files (no listing, no scan of the table), and how many it added.
+func (m *Metrics) AddIcebergIngestAppend(files int) {
+	m.icebergExport.appends.Add(1)
+	if files > 0 {
+		m.icebergExport.appendFiles.Add(int64(files))
+	}
+}
+
+// IncIcebergIngestAppendFallback counts one ingest-triggered export that had
+// files to add and ran a reconcile pass of the measurement instead.
+func (m *Metrics) IncIcebergIngestAppendFallback() {
+	m.icebergExport.appendFallbacks.Add(1)
 }
 
 // ObserveIcebergExportLag records, for one ingest file an export has just
@@ -107,5 +128,15 @@ func (m *Metrics) appendIcebergExport(b []byte) []byte {
 
 	b = append(b, "# HELP arc_iceberg_export_backlog_files_total Ingest files published in an Iceberg table that were written before this process started (not in arc_iceberg_export_lag_seconds)\n"...)
 	b = append(b, "# TYPE arc_iceberg_export_backlog_files_total counter\n"...)
-	return appendMetric(b, "arc_iceberg_export_backlog_files_total", float64(h.backlog.Load()))
+	b = appendMetric(b, "arc_iceberg_export_backlog_files_total", float64(h.backlog.Load()))
+
+	b = append(b, "# HELP arc_iceberg_ingest_appends_total Ingest-triggered Iceberg exports that added only the new files, without listing the measurement or reading the table's manifests\n"...)
+	b = append(b, "# TYPE arc_iceberg_ingest_appends_total counter\n"...)
+	b = appendMetric(b, "arc_iceberg_ingest_appends_total", float64(h.appends.Load()))
+	b = append(b, "# HELP arc_iceberg_ingest_append_files_total Files added to Iceberg tables by the exports counted in arc_iceberg_ingest_appends_total\n"...)
+	b = append(b, "# TYPE arc_iceberg_ingest_append_files_total counter\n"...)
+	b = appendMetric(b, "arc_iceberg_ingest_append_files_total", float64(h.appendFiles.Load()))
+	b = append(b, "# HELP arc_iceberg_ingest_append_fallbacks_total Ingest-triggered Iceberg exports that had files to add and ran a full reconcile pass of the measurement instead; the log names the reason\n"...)
+	b = append(b, "# TYPE arc_iceberg_ingest_append_fallbacks_total counter\n"...)
+	return appendMetric(b, "arc_iceberg_ingest_append_fallbacks_total", float64(h.appendFallbacks.Load()))
 }

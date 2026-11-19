@@ -142,6 +142,9 @@ type Exporter struct {
 	// passHints are the versions this pass wrote to version-hint.text (heals, evolutions, the
 	// end-of-pass publish). A reader may have resolved any of them, so none is pruned this pass.
 	passHints []int
+	// passVersionsHeld: this pass's prune kept a published version on disk only because of
+	// iceberg.min_version_age (versionsHeldByAge).
+	passVersionsHeld bool
 	// passGate, while a reconcile runs, is its canCommit: EnsureTable's heals check it before
 	// committing, so a node that lost the writer role mid-pass does not publish a heal (#1097).
 	// nil outside a reconcile (always allowed).
@@ -160,6 +163,16 @@ type Exporter struct {
 	// out of reach or lower it to 1 without a mutable package variable; nothing outside this
 	// package sets it.
 	collapseThreshold int
+	// minVersionAge is how long a published v<N>.metadata.json outlives the
+	// publish of the next version (iceberg.min_version_age); 0 keeps by count
+	// alone. ingestInterval is the least time between two ingest-triggered
+	// exports of a table, 0 when ingest triggers none. See SetVersionRetention.
+	minVersionAge  time.Duration
+	ingestInterval time.Duration
+	// hardened is, per metadata directory, the entries whose permissions were
+	// already tightened (hardenLocalMetadataPerms).
+	hardenedMu sync.Mutex
+	hardened   map[string]map[string]struct{}
 
 	// orphanSweepEnabled gates sweepOrphanMetadata (iceberg.orphan_sweep_enabled).
 	// orphanGrace is the minimum age an unreachable .avro must reach before the
@@ -175,9 +188,14 @@ type Exporter struct {
 	commitReserve time.Duration
 	// chunkMu guards chunkSize (a measurement's shrunk chunk size after a chunk that did not fit)
 	// and floorDue (tables whose #1092 history floor failed and is retried by later passes).
-	chunkMu   sync.Mutex
-	chunkSize map[string]int
-	floorDue  map[string]struct{}
+	chunkMu sync.Mutex
+	// expireOwed: the tables appends have added snapshots to since a pass
+	// last expired any (batched.go expiryOwed); under chunkMu.
+	expireOwed map[string]bool
+	// expirySeen: the tables that have had a pass in this process.
+	expirySeen map[string]struct{}
+	chunkSize  map[string]int
+	floorDue   map[string]struct{}
 }
 
 // resetHintFailure clears the per-reconcile discovery-file failure flag.
@@ -189,7 +207,16 @@ func (e *Exporter) resetHintFailure() {
 	e.passLoaded, e.passHint = -1, -1
 	e.passHintUnknown = false
 	e.passHints = e.passHints[:0]
+	e.passVersionsHeld = false
 	e.hintFailMu.Unlock()
+}
+
+// versionsHeldByAge reports that this pass's prune kept a published version
+// only because of iceberg.min_version_age (pruneOldVersionFilesFrom).
+func (e *Exporter) versionsHeldByAge() bool {
+	e.hintFailMu.Lock()
+	defer e.hintFailMu.Unlock()
+	return e.passVersionsHeld
 }
 
 // notePublishedHint records a version this pass wrote to version-hint.text.
@@ -508,6 +535,36 @@ func (e *Exporter) adoptBeforeLoad(ctx context.Context, database, measurement st
 	return err
 }
 
+// SetVersionRetention sets how long a published table version stays on disk
+// after the next one is published (minAge, iceberg.min_version_age), and the
+// least time between two ingest-triggered exports of one table
+// (ingestInterval, 0 when ingest triggers none). Call it before the scheduler
+// starts.
+//
+// Retention by count alone (retain_snapshots+1 published copies) holds a
+// version for as long as that many publishes take, which is seconds when
+// ingest publishes every few seconds (#1751). A reader resolves a version and
+// opens it later, and Glue names one until its next sync, so the copy is also
+// kept for minAge after it was superseded.
+func (e *Exporter) SetVersionRetention(minAge, ingestInterval time.Duration) {
+	e.minVersionAge, e.ingestInterval = minAge, ingestInterval
+}
+
+// previousVersionsMax is write.metadata.previous-versions-max: how many of
+// its own NNNNN-<uuid>.metadata.json files iceberg-go keeps behind the current
+// one. A reader that follows the catalog's pointer holds one of those, not a
+// v<N> copy, so they cover the same time: the count that ingest-triggered
+// commits take to span minVersionAge, and never under retain.
+func (e *Exporter) previousVersionsMax() int {
+	n := e.retain
+	if e.ingestInterval > 0 && e.minVersionAge > 0 {
+		if byAge := int((e.minVersionAge + e.ingestInterval - 1) / e.ingestInterval); byAge > n {
+			n = byAge
+		}
+	}
+	return n
+}
+
 // EnsureTable creates the Iceberg table for (database, measurement) if absent, using the
 // given schema and a day(time) partition spec. Idempotent: returns the existing table if the
 // namespace/table already exist. name-mapping is auto-set by iceberg-go on first AddFiles.
@@ -594,7 +651,7 @@ func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string
 	if e.retain > 0 {
 		createOpts = append(createOpts, icecatalog.WithProperties(iceberg.Properties{
 			icetable.MetadataDeleteAfterCommitEnabledKey: "true",
-			icetable.MetadataPreviousVersionsMaxKey:      strconv.Itoa(e.retain),
+			icetable.MetadataPreviousVersionsMaxKey:      strconv.Itoa(e.previousVersionsMax()),
 		}))
 	}
 
@@ -761,7 +818,7 @@ func (e *Exporter) healRetentionProperties(ctx context.Context, tbl *icetable.Ta
 
 	desired := iceberg.Properties{
 		icetable.MetadataDeleteAfterCommitEnabledKey: "true",
-		icetable.MetadataPreviousVersionsMaxKey:      strconv.Itoa(e.retain),
+		icetable.MetadataPreviousVersionsMaxKey:      strconv.Itoa(e.previousVersionsMax()),
 	}
 	updates := make(iceberg.Properties, len(desired))
 	for key, value := range desired {
@@ -1264,7 +1321,8 @@ func (e *Exporter) expireSnapshots(ctx context.Context, tbl *icetable.Table, dat
 	return expired, true
 }
 
-// pruneOldVersionFiles keeps only the newest `retain` v<M>.metadata.json copies and deletes
+// pruneOldVersionFiles keeps the newest `retain`+1 v<M>.metadata.json copies, and any older
+// one whose successor was published less than iceberg.min_version_age ago (#1751), and deletes
 // the rest. iceberg-go prunes its own NNNNN-*.metadata.json (via delete-after-commit) but does
 // not know about the v<N> copies we write for directory-based readers, so we prune them here.
 // Scan-based (not arithmetic) so it's robust to non-contiguous version numbers — a reconcile
@@ -1301,9 +1359,31 @@ func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.T
 	if dirKey == "" || dirKey == "." {
 		return
 	}
-	keys, err := e.backend.List(ctx, dirKey+"/")
-	if err != nil {
-		return
+	// With a minimum age (#1751) the listing must carry each copy's write
+	// time, so it is the object listing; one listing either way. A store
+	// that cannot give write times cannot be judged by age, and nothing is
+	// deleted from it.
+	var keys []string
+	var written map[string]time.Time
+	if e.minVersionAge > 0 {
+		lister, ok := e.backend.(storage.ObjectLister)
+		if !ok {
+			return
+		}
+		objs, err := lister.ListObjects(ctx, dirKey+"/")
+		if err != nil {
+			return
+		}
+		written = make(map[string]time.Time, len(objs))
+		for _, o := range objs {
+			keys = append(keys, o.Path)
+			written[path.Base(filepath.ToSlash(o.Path))] = o.LastModified
+		}
+	} else {
+		var err error
+		if keys, err = e.backend.List(ctx, dirKey+"/"); err != nil {
+			return
+		}
 	}
 	// Collect version numbers of existing v<M>.metadata.json copies.
 	type vfile struct {
@@ -1326,11 +1406,12 @@ func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.T
 	// If a commit lands in that window, keeping exactly `retain` can delete the
 	// version the reader just resolved — sharpest at retain=1, where every
 	// commit would invalidate the immediately-preceding version. The extra file
-	// is a few KB. It holds the window open for as long as one reconcile of
-	// the table to the next: a reconcile interval between timed passes; when
-	// compactions ask for reconciles, at retain 1 or 2 at least
+	// is a few KB. By count alone it holds the window open for as long as one
+	// reconcile of the table to the next: a reconcile interval between timed
+	// passes; when compactions ask for reconciles, at retain 1 or 2 at least
 	// requestMinSpacing, and at larger retain the extra kept versions
-	// (requestSpacing, scheduler.go).
+	// (requestSpacing, scheduler.go). Ingest publishes far more often than
+	// that, so beyond the count a copy is also kept by age (below, #1751).
 	keep := e.retain + 1
 	if len(vs) <= keep {
 		return
@@ -1338,9 +1419,25 @@ func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.T
 	// Keep the newest `keep`; delete the rest. Never delete the current version.
 	sort.Slice(vs, func(i, j int) bool { return vs[i].n > vs[j].n }) // descending
 	curN, _ := strconv.Atoi(cur)
-	for _, v := range vs[keep:] {
+	// And keep a copy until minVersionAge after the NEXT version was published
+	// (#1751): that is when readers stopped being handed this one. Its own
+	// age says nothing: a version that was current for an hour is old the
+	// moment it is superseded. The successor's write time is the store's
+	// (written, above), so it survives a restart and covers copies written
+	// by claimVersion.
+	for i, v := range vs[keep:] {
 		if v.n == curN || (keepFrom >= 0 && v.n >= keepFrom) || slices.Contains(protect, v.n) {
 			continue
+		}
+		if e.minVersionAge > 0 {
+			next := vs[keep+i-1] // the next version up that exists: vs is descending
+			at, ok := written[path.Base(next.key)]
+			if !ok || time.Since(at) < e.minVersionAge {
+				e.hintFailMu.Lock()
+				e.passVersionsHeld = true
+				e.hintFailMu.Unlock()
+				continue
+			}
 		}
 		if err := e.backend.Delete(ctx, v.key); err != nil {
 			e.logger.Debug().Err(err).Str("key", v.key).Msg("prune old v<N> (non-fatal)")
@@ -1669,8 +1766,9 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 	// iceberg-go writes metadata files and directories at umask permissions
 	// (its LocalFS uses 0o777-masked creates), while every Arc-written file
 	// is 0600 (#639 item 7). Harden the freshly committed table's metadata
-	// tree after each commit; bounded by the retain cap and snapshot expiry,
-	// so this walk is O(retained versions), not O(history).
+	// tree after each commit. The directory holds what the version prune and
+	// the orphan sweep have not reclaimed yet; only entries not tightened
+	// before are looked at (hardenLocalMetadataPerms).
 	e.hardenLocalMetadataPerms(metaLoc)
 	version, dirKey, ok := e.parseVersionAndMetaDir(metaLoc)
 	if !ok {
@@ -1863,19 +1961,41 @@ func (e *Exporter) hardenLocalMetadataPerms(metaLoc string) {
 	// operator's deliberately restrictive mode (or a test's read-only
 	// directory) must stay restrictive; the target is iceberg-go's
 	// umask-wide 0644/0755 creates, not modes someone chose.
-	tighten := func(path string, info os.FileMode) {
+	tighten := func(path string, info os.FileMode) bool {
 		hardened := info &^ 0o077
 		if hardened != info {
 			if err := os.Chmod(path, hardened); err != nil {
 				e.logger.Debug().Err(err).Str("path", path).Msg("Could not harden metadata permissions")
+				return false
 			}
 		}
+		return true
 	}
+	// Only entries not seen before: this runs on every publish, the directory
+	// holds every metadata file the orphan sweep has not reclaimed yet
+	// (thousands, when ingest publishes every few seconds, #1751), and a file
+	// tightened once is never loosened by iceberg-go. A file that left the
+	// directory leaves the set with it.
+	e.hardenedMu.Lock()
+	seen := e.hardened[metaDir]
+	e.hardenedMu.Unlock()
+	now := make(map[string]struct{}, len(entries))
 	for _, ent := range entries {
-		if info, err := ent.Info(); err == nil {
-			tighten(filepath.Join(metaDir, ent.Name()), info.Mode().Perm())
+		name := ent.Name()
+		now[name] = struct{}{}
+		if _, done := seen[name]; done {
+			continue
+		}
+		if info, err := ent.Info(); err != nil || !tighten(filepath.Join(metaDir, name), info.Mode().Perm()) {
+			delete(now, name) // not tightened: look again next time
 		}
 	}
+	e.hardenedMu.Lock()
+	if e.hardened == nil {
+		e.hardened = make(map[string]map[string]struct{})
+	}
+	e.hardened[metaDir] = now
+	e.hardenedMu.Unlock()
 	// The metadata dir, its table dir, and the namespace dir are all created
 	// by iceberg-go at umask permissions; the warehouse root itself is left
 	// alone (it may be shared or externally managed).
