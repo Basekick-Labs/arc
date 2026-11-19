@@ -2,7 +2,6 @@ package pruning
 
 import (
 	"context"
-	"hash/fnv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -31,11 +30,22 @@ import (
 // landed and is stored just after carries the old generation, and is never
 // read. Stamping at store time would let it live its whole TTL.
 //
-// Generations are striped: measurements share a stripe by hash. A collision
-// only makes an unrelated measurement list again once.
+// Generations are striped: measurements share a stripe by hash, so a file
+// published for one makes the few that share its stripe list again too.
+//
+// What this costs a measurement that is written outside the current hour all
+// the time (a source that always reports late): every file moves its
+// generation, so nothing cached for it survives the next flush and its
+// queries list storage each time, as queries on the current hour already do.
+// Moving the generation only for the first file of an hour would avoid that,
+// and is not done: the flush cannot tell that an hour's directory was emptied
+// in between (a rewrite, a removed duplicate), and guessing wrong is this bug
+// again.
 
 // publishStripes is the number of generation counters measurements hash onto.
-const publishStripes = 256
+// With one measurement written late at a time, another shares its stripe with
+// probability 1/4096.
+const publishStripes = 4096
 
 // listScope is a measurement's generation as read before a listing. The zero
 // value belongs to no measurement and never goes stale.
@@ -50,12 +60,20 @@ func (s listScope) current() bool {
 	return s.stripe == nil || s.stripe.Load() == s.gen
 }
 
+// publishStripe hashes "database\x00measurement" (FNV-1a) onto a stripe. It
+// runs for every table reference of every query, so it reads the strings in
+// place.
 func publishStripe(database, measurement string) int {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(database))
-	_, _ = h.Write([]byte{0})
-	_, _ = h.Write([]byte(measurement))
-	return int(h.Sum32() % publishStripes)
+	const offset32, prime32 = 2166136261, 16777619
+	h := uint32(offset32)
+	for i := 0; i < len(database); i++ {
+		h = (h ^ uint32(database[i])) * prime32
+	}
+	h *= prime32 // the separator byte, 0: h ^ 0 == h
+	for i := 0; i < len(measurement); i++ {
+		h = (h ^ uint32(measurement[i])) * prime32
+	}
+	return int(h % publishStripes)
 }
 
 // scopeFor reads the measurement's generation. Call it before listing.
@@ -117,34 +135,22 @@ func (p *PartitionPruner) FilePublished(database, measurement string, partitionT
 	p.published[publishStripe(database, measurement)].Add(1)
 }
 
-// PublishSnapshot is every measurement's generation at one moment.
-type PublishSnapshot [publishStripes]uint64
-
-// PublishSnapshot reads the generations. A caller that will cache something
-// derived from listings takes it BEFORE the work that lists, when it does not
-// yet know which measurements that work will read.
-func (p *PartitionPruner) PublishSnapshot() *PublishSnapshot {
-	var s PublishSnapshot
-	for i := range p.published {
-		s[i] = p.published[i].Load()
-	}
-	return &s
-}
-
-// PublishStamp is one measurement's generation out of a snapshot.
+// PublishStamp is a measurement's generation as read at one moment, for a
+// cache outside this package (the SQL transform cache).
 type PublishStamp struct {
 	stripe uint16
 	gen    uint64
 }
 
-// Stamp picks the measurement's generation out of a snapshot.
-func (s *PublishSnapshot) Stamp(database, measurement string) PublishStamp {
+// PublishStamp reads the measurement's generation. As with scopeFor, take it
+// BEFORE the work that lists the measurement's files.
+func (p *PartitionPruner) PublishStamp(database, measurement string) PublishStamp {
 	i := publishStripe(database, measurement)
-	return PublishStamp{stripe: uint16(i), gen: s[i]}
+	return PublishStamp{stripe: uint16(i), gen: p.published[i].Load()}
 }
 
-// StampsCurrent reports whether no file has been published, since the
-// snapshot the stamps came from, for any of their measurements.
+// StampsCurrent reports whether no file has been published, since the stamps
+// were taken, for any of their measurements.
 func (p *PartitionPruner) StampsCurrent(stamps []PublishStamp) bool {
 	for _, st := range stamps {
 		if p.published[st.stripe].Load() != st.gen {

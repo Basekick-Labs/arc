@@ -15,14 +15,15 @@ When a query finds an hour with no files, Arc remembers that so the next query d
 
 The times count from the query that found the hour empty. Measured on local storage and on S3 (SeaweedFS), with rows stamped 3 hours back and 2 hours ahead, 12 of 12 trials before and after.
 
-- **How:** each file an ingest flush writes outside the current hour marks its measurement, and anything the query caches hold for that measurement from before is not used again. Other measurements keep their cached plans, so a backfill of one measurement does not slow queries on the rest.
+- **How:** each file an ingest flush writes outside the current hour marks its measurement, and anything the query caches hold for that measurement from before is not used again. Nothing else is dropped: a backfill of one measurement leaves the cached plans of the others in place, apart from the few that share its marker (1 in 4,096).
 - **What triggers it:** every writer that goes through the ingest buffer: the write endpoints, imports, MQTT, continuous-query output and WAL replay.
-- **Cost:** one atomic increment per flushed file. Files in the current hour skip it, so a measurement being written to keeps its cached plans.
+- **Cost:** one atomic increment per flushed file. Files in the current hour skip it, so a measurement being written to keeps its cached plans. A measurement that is written outside the current hour all the time (a source that always reports late) no longer has its plans cached: each of its queries lists storage, as queries on the current hour already do.
 
 Notes:
 
 - **Clusters:** this covers the node that wrote the file. Another node still waits out the caches (30 s / 60 s as before): on node-local storage after it has pulled the file, on shared storage after the file is in the bucket.
 - **Not covered, unchanged:** files that arrive without an ingest flush on the node (a backup restore, files received by an edge-sync hub), and a measurement whose rows were all in the cold tier that gets its first local file.
+- **A write that failed and landed anyway** is reported like one that succeeded, so it does not leave a stale plan behind either.
 - **Rows stamped ahead of the clock inside the current hour** are still left out of queries whose range starts in that hour until the hour closes, when they are stamped more than `query.file_time_pruning_margin_seconds` (default 300) ahead. That is file-time pruning's documented limit, not this fix.
 ## New: a metric for how long ingested rows wait before their file is published, and a harness that measures freshness ([#1758](https://github.com/Basekick-Labs/arc/issues/1758))
 

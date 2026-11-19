@@ -161,14 +161,17 @@ func (c *SQLTransformCache) SetWithMetadataCheck(sql, transformed string, metada
 		maxPerShard = 1
 	}
 
-	// Check if we need to evict entries from this shard
-	if len(shard.entries) >= maxPerShard {
+	// Check if we need to evict entries from this shard. Replacing an entry
+	// that is already there never grows the shard, so it is always allowed:
+	// otherwise a stale entry in a full shard could not be refreshed, and its
+	// statement would be transformed again on every query until it expired.
+	if _, replacing := shard.entries[sql]; !replacing && len(shard.entries) >= maxPerShard {
 		// Probabilistic eviction: only check up to 10 random entries
 		// This avoids O(n) scan of entire map while holding lock
 		now := time.Now()
 		evicted := 0
 		for key, entry := range shard.entries {
-			if now.After(entry.expiresAt) {
+			if now.After(entry.expiresAt) || (entry.stale != nil && entry.stale()) {
 				delete(shard.entries, key)
 				evicted++
 				if evicted >= 10 {

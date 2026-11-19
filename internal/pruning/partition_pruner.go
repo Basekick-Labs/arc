@@ -81,12 +81,6 @@ func (c *globCache) get(pattern string) ([]string, bool) {
 	return result, true
 }
 
-// set stores a result that belongs to no measurement's listing (the layout
-// verdict): it is never made stale by a published file.
-func (c *globCache) set(pattern string, matches []string) {
-	c.setScoped(pattern, matches, listScope{})
-}
-
 // setScoped stores a listing with the scope it was made under: the
 // measurement's generation as read BEFORE the listing (publish.go). Stored
 // even when the generation has already moved; such an entry is never read.
@@ -892,16 +886,9 @@ func parseDateTime(timeStr string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("could not parse datetime: %s", timeStr)
 }
 
-// filterExistingPaths filters out paths that don't have any matching files
-// Uses a TTL cache to avoid repeated expensive filesystem operations
-// Handles both local and remote (object-store) paths
-func (p *PartitionPruner) filterExistingPaths(paths []string, basePath string) []string {
-	existing, _, _ := p.filterExistingPathsOpts(context.Background(), paths, basePath, 0)
-	return existing
-}
-
-// filterExistingPathsOpts is filterExistingPaths returning, besides the
-// existing paths, whether every absence was verified by a listing (false when
+// filterExistingPathsOpts filters out paths that have no matching files,
+// through the glob cache, for local and object-store paths. It returns,
+// besides the existing paths, whether every absence was verified by a listing (false when
 // any listing failed, which the plain filter treats as "assume present" for
 // directories and "drop" for day-level file checks) and how many answers
 // came from the cache. maxAge > 0 accepts only cache entries younger than it.
@@ -918,12 +905,6 @@ func (p *PartitionPruner) filterExistingPathsOpts(ctx context.Context, paths []s
 
 	// Local path filtering using filepath.Glob
 	return p.filterExistingLocalPathsOpts(ctx, paths, maxAge)
-}
-
-// filterExistingLocalPaths filters local paths using filepath.Glob
-func (p *PartitionPruner) filterExistingLocalPaths(paths []string) []string {
-	existing, _, _ := p.filterExistingLocalPathsOpts(context.Background(), paths, 0)
-	return existing
 }
 
 func (p *PartitionPruner) filterExistingLocalPathsOpts(ctx context.Context, paths []string, maxAge time.Duration) ([]string, bool, int) {
@@ -975,16 +956,10 @@ func (p *PartitionPruner) filterExistingLocalPathsOpts(ctx context.Context, path
 	return existingPaths, true, hits
 }
 
-// filterExistingRemotePaths filters object-store paths by checking which directories exist.
-//
-// basePath is the storage root the paths were generated against
-// ("s3://bucket/prefix"), and is what turns a full URL back into the
+// filterExistingRemotePathsOpts filters object-store paths by checking which
+// directories exist. basePath is the storage root the paths were generated
+// against ("s3://bucket/prefix"), and is what turns a full URL back into the
 // backend-relative key a listing needs. See extractStoragePrefix.
-func (p *PartitionPruner) filterExistingRemotePaths(paths []string, basePath string) []string {
-	existing, _, _ := p.filterExistingRemotePathsOpts(context.Background(), paths, basePath, 0)
-	return existing
-}
-
 func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, paths []string, basePath string, maxAge time.Duration) ([]string, bool, int) {
 	verified := true
 	hits := 0

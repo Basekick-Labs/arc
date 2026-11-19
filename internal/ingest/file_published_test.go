@@ -85,9 +85,10 @@ func midHour(t *testing.T) time.Time {
 	return now
 }
 
-// Each file a flush stores is reported once, with its measurement and the
-// hour its rows are in, and only after it is in storage: a report made before
-// the write would let a query list, miss the file, and cache that.
+// Each file a flush writes is reported once, with its measurement and the
+// hour its rows are in, and only after the write has returned: a report made
+// before it would let a query list, miss the file, and cache that. A write
+// that returned an error is reported too, because it can still have landed.
 func TestFilePublishedReportsEachStoredFile(t *testing.T) {
 	now := midHour(t)
 	late := now.Add(-3 * time.Hour)
@@ -128,16 +129,26 @@ func TestFilePublishedReportsEachStoredFile(t *testing.T) {
 		}
 	})
 
-	t.Run("a write that fails is not reported", func(t *testing.T) {
-		b, backend, reported := newFilePublishedBuffer(t)
-		backend.failFrom.Store(2) // the first hour file is stored, the second is not
-		writeAt(t, b, now, late)
-		_ = b.FlushAllAndWait(context.Background())
-		if backend.writes.Load() < 2 {
-			t.Fatalf("%d writes, want the second hour file attempted", backend.writes.Load())
-		}
-		if got := reported(); len(got) != 1 {
-			t.Errorf("reported %+v, want only the file that was stored", got)
+	t.Run("a write that fails is reported: it may have landed", func(t *testing.T) {
+		for name, hours := range map[string][]time.Time{"one hour": {late}, "two hours": {now, late}} {
+			t.Run(name, func(t *testing.T) {
+				b, backend, reported := newFilePublishedBuffer(t)
+				backend.failFrom.Store(int64(len(hours))) // the last file's write fails
+				writeAt(t, b, hours...)
+				_ = b.FlushAllAndWait(context.Background())
+				if got := backend.writes.Load(); got < int64(len(hours)) {
+					t.Fatalf("%d writes, want %d attempted", got, len(hours))
+				}
+				got := reported()
+				if len(got) != len(hours) {
+					t.Fatalf("reported %+v, want one report per attempted file", got)
+				}
+				// The failed one was reported after its write returned, with
+				// nothing more in storage than before it.
+				if last := got[len(got)-1]; last.stored != int64(len(hours)-1) {
+					t.Errorf("the failed write was reported with %d files in storage, want %d", last.stored, len(hours)-1)
+				}
+			})
 		}
 	})
 

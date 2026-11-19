@@ -2,9 +2,13 @@ package pruning
 
 import (
 	"context"
+	"hash/fnv"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/rs/zerolog"
 )
 
 var publishNow = time.Date(2026, 10, 17, 14, 20, 0, 0, time.UTC)
@@ -103,20 +107,39 @@ func TestFilePublishedOutsideTheCurrentHourIsSeenRemote(t *testing.T) {
 		}}, files: map[string][]string{}}
 		p := livePruner(publishNow)
 		tr := tierRange(t, "2026-10-17T10:00:00Z", "2026-10-17T15:00:00Z")
-		prune := func() []string {
-			paths, _ := p.PruneTierPaths(context.Background(), glob, "db", "cpu", tr, backend, false)
+		// The last argument marks the tier ingest writes to.
+		prune := func(ingestTier bool) []string {
+			paths, _ := p.PruneTierPaths(context.Background(), glob, "db", "cpu", tr, backend, ingestTier)
 			return paths
 		}
-		if paths := prune(); hasRemoteHour(paths, "11") || !hasRemoteHour(paths, "14") {
+		if paths := prune(true); hasRemoteHour(paths, "11") || !hasRemoteHour(paths, "14") {
 			t.Fatalf("before the file: %v", paths)
 		}
 		backend.existingDirs["db/cpu/2026/10/17/"] = []string{"11", "13", "14"}
-		if hasRemoteHour(prune(), "11") {
+		if hasRemoteHour(prune(true), "11") {
 			t.Fatal("the tier filter saw the file without being told: this test pins nothing")
 		}
 		p.FilePublished("db", "cpu", late)
-		if paths := prune(); !hasRemoteHour(paths, "11") {
+		if paths := prune(true); !hasRemoteHour(paths, "11") {
 			t.Errorf("the tier filter still leaves the hour out: %v", paths)
+		}
+	})
+
+	// A tier ingest does not write to (the cold tier) keeps its listings: a
+	// file ingest publishes changes nothing there, and listing it again on
+	// every late file would be object-store requests for nothing.
+	t.Run("another tier keeps its listings", func(t *testing.T) {
+		backend := &tierMock{mockS3Backend: &mockS3Backend{existingDirs: map[string][]string{
+			"db/cpu/2026/10/17/": {"13", "14"},
+		}}, files: map[string][]string{}}
+		p := livePruner(publishNow)
+		tr := tierRange(t, "2026-10-17T10:00:00Z", "2026-10-17T13:00:00Z")
+		p.PruneTierPaths(context.Background(), glob, "db", "cpu", tr, backend, false)
+		listed := len(backend.requested)
+		p.FilePublished("db", "cpu", late)
+		p.PruneTierPaths(context.Background(), glob, "db", "cpu", tr, backend, false)
+		if len(backend.requested) != listed {
+			t.Errorf("the other tier was listed again after an ingest file was published (%d -> %d requests)", listed, len(backend.requested))
 		}
 	})
 }
@@ -219,20 +242,35 @@ func TestFilePublishedLeavesOtherMeasurementsCached(t *testing.T) {
 	}
 }
 
-// Every listing the pruner caches while pruning a measurement carries that
-// measurement's generation. An entry stored without one would never go stale
-// when a file is published, which is the bug again for whatever stored it.
+// Every listing the pruner caches while pruning the tier ingest writes to
+// carries the measurement's generation. An entry stored without one would
+// never go stale when a file is published, which is the bug again for
+// whatever stored it. Run on the real clock: an open-ended range ends at now.
 func TestEveryCachedListingIsScoped(t *testing.T) {
-	check := func(t *testing.T, p *PartitionPruner) {
+	now := time.Now().UTC()
+	if now.Truncate(time.Hour).Add(time.Hour).Sub(now) < 10*time.Second {
+		t.Skip("too close to the end of the hour")
+	}
+	check := func(t *testing.T, p *PartitionPruner, families ...string) {
 		t.Helper()
 		p.globCache.mu.RLock()
 		defer p.globCache.mu.RUnlock()
-		if len(p.globCache.entries) == 0 {
-			t.Fatal("nothing was cached")
-		}
+		seen := map[string]bool{}
 		for key, e := range p.globCache.entries {
+			family := "glob"
+			for _, f := range []string{"layout:", "remote:parent:", "remote:dayfiles:", "tier:dirs:", "tier:dayfiles:"} {
+				if strings.HasPrefix(key, f) {
+					family = f
+				}
+			}
+			seen[family] = true
 			if e.scope.stripe == nil {
 				t.Errorf("cached without a measurement generation: %s", key)
+			}
+		}
+		for _, f := range families {
+			if !seen[f] {
+				t.Errorf("no %s entry was cached: this test no longer reaches that listing", f)
 			}
 		}
 		p.partitionCache.mu.RLock()
@@ -243,52 +281,69 @@ func TestEveryCachedListingIsScoped(t *testing.T) {
 			}
 		}
 	}
-	openEnded := "SELECT * FROM t WHERE time >= '2026-10-17T10:00:00Z'"
-	exact := "SELECT * FROM t WHERE time >= '2026-10-17T10:00:00Z' AND time < '2026-10-17T12:00:00Z'"
+	stamp := func(tm time.Time) string { return tm.Format("2006-01-02T15:04:05Z") }
+	hourStart := now.Truncate(time.Hour)
+	bounded := "SELECT * FROM t WHERE time >= '" + stamp(hourStart.Add(-4*time.Hour)) + "' AND time < '" + stamp(hourStart.Add(time.Hour)) + "'"
+	openEnded := "SELECT * FROM t WHERE time >= '" + stamp(hourStart.Add(-4*time.Hour)) + "'"
+	// An exact range two days back: day-level paths, and an empty-range proof.
+	exact := "SELECT * FROM t WHERE time >= '" + stamp(hourStart.Add(-50*time.Hour)) + "' AND time < '" + stamp(hourStart.Add(-48*time.Hour)) + "'"
+	day := now.Format("2006/01/02")
+	remoteDirs := func() map[string][]string {
+		dirs := map[string][]string{
+			"db/cpu/":                               {now.Format("2006")},
+			"db/cpu/" + now.Format("2006") + "/":    {now.Format("01")},
+			"db/cpu/" + now.Format("2006/01") + "/": {now.Format("02")},
+			"db/cpu/" + day + "/":                   {now.Format("15")},
+		}
+		// Every day of the bounded range exists, so its day-level paths are checked.
+		for h := -4; h <= 0; h++ {
+			d := hourStart.Add(time.Duration(h) * time.Hour)
+			key := "db/cpu/" + d.Format("2006/01") + "/"
+			if !containsString(dirs[key], d.Format("02")) {
+				dirs[key] = append(dirs[key], d.Format("02"))
+			}
+		}
+		return dirs
+	}
 
 	t.Run("local", func(t *testing.T) {
 		root := t.TempDir()
-		writeHour(t, root, publishNow)
-		p := livePruner(publishNow)
+		writeHour(t, root, now)
+		p := NewPartitionPruner(zerolog.Nop())
 		glob := filepath.Join(root, "db", "cpu") + "/**/*.parquet"
-		for _, sql := range []string{publishSQL, openEnded} {
-			p.OptimizeTablePath(context.Background(), glob, sql)
-		}
-		p.OptimizeTablePathVerdict(context.Background(), glob, exact) // the empty-range proof and its layout verdict
-		check(t, p)
-	})
-	t.Run("remote", func(t *testing.T) {
-		remote := &countingRemote{mockS3Backend: mockS3Backend{existingDirs: map[string][]string{
-			"db/cpu/":            {"2026"},
-			"db/cpu/2026/":       {"10"},
-			"db/cpu/2026/10/":    {"17"},
-			"db/cpu/2026/10/17/": {"13", "14"},
-		}}, dayFiles: map[string][]string{}}
-		p := livePruner(publishNow)
-		p.SetStorageBackend(remote)
-		glob := "s3://bucket/db/cpu/**/*.parquet"
-		for _, sql := range []string{publishSQL, openEnded} {
+		for _, sql := range []string{bounded, openEnded} {
 			p.OptimizeTablePath(context.Background(), glob, sql)
 		}
 		p.OptimizeTablePathVerdict(context.Background(), glob, exact)
-		check(t, p)
+		check(t, p, "glob", "layout:")
+	})
+	t.Run("remote", func(t *testing.T) {
+		remote := &countingRemote{mockS3Backend: mockS3Backend{existingDirs: remoteDirs()}, dayFiles: map[string][]string{}}
+		p := NewPartitionPruner(zerolog.Nop())
+		p.SetStorageBackend(remote)
+		glob := "s3://bucket/db/cpu/**/*.parquet"
+		for _, sql := range []string{bounded, openEnded} {
+			p.OptimizeTablePath(context.Background(), glob, sql)
+		}
+		check(t, p, "remote:parent:", "remote:dayfiles:")
 	})
 	t.Run("tier", func(t *testing.T) {
-		backend := &tierMock{mockS3Backend: &mockS3Backend{existingDirs: map[string][]string{
-			"db/cpu/":            {"2026"},
-			"db/cpu/2026/":       {"10"},
-			"db/cpu/2026/10/":    {"17"},
-			"db/cpu/2026/10/17/": {"13", "14"},
-		}}, files: map[string][]string{}}
-		p := livePruner(publishNow)
-		for _, tr := range []*TimeRange{
-			tierRange(t, "2026-10-17T10:00:00Z", "2026-10-17T15:00:00Z"),
-			p.ExtractTimeRange(openEnded),
-		} {
-			p.PruneTierPaths(context.Background(), "s3://bucket/db/cpu/**/*.parquet", "db", "cpu", tr, backend, false)
+		backend := &tierMock{mockS3Backend: &mockS3Backend{existingDirs: remoteDirs()}, files: map[string][]string{}}
+		p := NewPartitionPruner(zerolog.Nop())
+		for _, sql := range []string{bounded, openEnded} {
+			p.PruneTierPaths(context.Background(), "s3://bucket/db/cpu/**/*.parquet", "db", "cpu", p.ExtractTimeRange(sql), backend, true)
 		}
-		check(t, p)
+		check(t, p, "tier:dirs:", "tier:dayfiles:")
 	})
+}
+
+func containsString(xs []string, x string) bool {
+	for _, v := range xs {
+		if v == x {
+			return true
+		}
+	}
+	return false
 }
 
 // splitStorageGlob reads the same database and measurement as the pattern
@@ -322,12 +377,11 @@ func TestSplitStorageGlobAgreesWithThePattern(t *testing.T) {
 	}
 }
 
-// The transform cache's side: a stamp taken from a snapshot goes stale with
-// its measurement, and only with it.
+// The transform cache's side: a stamp goes stale with its measurement, and
+// only with it.
 func TestPublishStamps(t *testing.T) {
 	p := livePruner(publishNow)
-	snap := p.PublishSnapshot()
-	cpu, mem := snap.Stamp("db", "cpu"), snap.Stamp("db", "mem")
+	cpu, mem := p.PublishStamp("db", "cpu"), p.PublishStamp("db", "mem")
 	if !p.StampsCurrent([]PublishStamp{cpu, mem}) || !p.StampsCurrent(nil) {
 		t.Fatal("stamps are stale before anything was published")
 	}
@@ -339,8 +393,24 @@ func TestPublishStamps(t *testing.T) {
 	if p.StampsCurrent([]PublishStamp{mem, cpu}) || !p.StampsCurrent([]PublishStamp{mem}) {
 		t.Error("a published file must make its measurement's stamp stale and leave the other's")
 	}
-	// A snapshot taken after the file is current again.
-	if !p.StampsCurrent([]PublishStamp{p.PublishSnapshot().Stamp("db", "cpu")}) {
+	// A stamp taken after the file is current again.
+	if !p.StampsCurrent([]PublishStamp{p.PublishStamp("db", "cpu")}) {
 		t.Error("a stamp taken after the file was published is stale")
+	}
+}
+
+// The stripe is FNV-1a of "database\x00measurement": the separator keeps
+// ("ab", "c") and ("a", "bc") apart, and the hand-written loop agrees with
+// the library's.
+func TestPublishStripeHash(t *testing.T) {
+	for _, tc := range [][2]string{{"db", "cpu"}, {"", ""}, {"ab", "c"}, {"a", "bc"}, {"prod", "sensor.temp-1"}, {"d", "ñandú"}} {
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(tc[0] + "\x00" + tc[1]))
+		if got, want := publishStripe(tc[0], tc[1]), int(h.Sum32()%publishStripes); got != want {
+			t.Errorf("stripe(%q, %q) = %d, want %d", tc[0], tc[1], got, want)
+		}
+	}
+	if publishStripe("ab", "c") == publishStripe("a", "bc") {
+		t.Error("the database/measurement boundary does not enter the hash")
 	}
 }

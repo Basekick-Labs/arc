@@ -36,7 +36,9 @@ func (b *ArrowBuffer) SetClaimedBatch(fn ClaimedBatchFunc) {
 type claimedBatchPtr = atomic.Pointer[ClaimedBatchFunc]
 
 // FilePublishedFunc is told that a flush has stored a file of the
-// measurement, in the hour partitionTime falls in. It runs on the flush's
+// measurement, in the hour partitionTime falls in. It is also told of a write
+// that returned an error, because such a write can still have landed (#1635):
+// "a file may be there now", never "a file is there". It runs on the flush's
 // goroutine right after the write returns, so it must return at once and
 // cannot report an error: the flush does not wait for, or depend on, what it
 // does.

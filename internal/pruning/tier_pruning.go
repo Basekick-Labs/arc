@@ -111,8 +111,13 @@ func (p *PartitionPruner) pruneTierPaths(ctx context.Context, tierGlob, database
 		return nil, TierPruneFallback, nil
 	}
 	// Before anything is listed: every listing below is stored under the
-	// measurement's generation as it is now (publish.go).
-	ctx = withListScope(ctx, p.scopeFor(database, measurement))
+	// measurement's generation as it is now (publish.go). Only for the tier
+	// ingest writes to, which is the one allowFileTime is set for: a file
+	// ingest publishes cannot change what another tier holds, and a tier
+	// migration invalidates every cache when it finishes.
+	if allowFileTime {
+		ctx = withListScope(ctx, p.scopeFor(database, measurement))
+	}
 	suffix := database + "/" + measurement + "/**/*.parquet"
 	if !strings.HasSuffix(tierGlob, suffix) {
 		p.logger.Debug().Str("glob", tierGlob).Msg("Tier glob shape not recognized; not pruning")

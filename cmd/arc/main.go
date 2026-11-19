@@ -4086,7 +4086,8 @@ func main() {
 	// measurement; before, queries kept leaving that hour out until the
 	// cached lists expired (#1757). Set here, with flush workers already
 	// running: the setter is atomic, and a file flushed before this line has
-	// nothing cached to drop, the query routes not being registered yet.
+	// nothing cached to drop, because the caches belong to the handler
+	// created just above.
 	arrowBuffer.SetOnFilePublished(queryHandler.FilePublished)
 	queryHandler.SetCancelOnClientDisconnect(cfg.Query.CancelOnClientDisconnect)
 	if authManager != nil && rbacManager != nil {
