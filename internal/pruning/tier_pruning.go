@@ -47,6 +47,14 @@ const (
 // only: the live hour that feature targets exists only on the hot tier, and
 // the feature is documented for the local backend.
 //
+// allowFileTime is also how this function knows the tier is the one ingest
+// writes to: only then are its listings cached under the measurement's
+// publish generation, and dropped when ingest publishes a file outside the
+// current hour (publish.go, #1757). A caller MUST pass true for that tier:
+// with false, a late row's hour stays out of queries until the cached
+// listing expires. Pass false for any other tier, whose files ingest never
+// writes.
+//
 // Results are NOT cached at this layer (unlike OptimizeTablePath's
 // partitionCache): the SQL transform cache already dedupes repeated queries,
 // and the remote directory/file listings below are individually cached in
