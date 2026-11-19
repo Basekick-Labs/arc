@@ -1311,6 +1311,9 @@ type ArrowBuffer struct {
 	// claimedBatch splits flushes by claim (#1207 S4b1c2b, flush_split.go).
 	claimedBatch claimedBatchPtr
 	deleteScope  deleteScopePtr
+	// onFilePublished is told about each file a flush stores (#1757,
+	// flush_split.go).
+	onFilePublished atomic.Pointer[FilePublishedFunc]
 
 	// ingestGate refuses live writes on a fenced node (#1207).
 	ingestGate atomic.Pointer[func() error]
@@ -5469,8 +5472,15 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		b.recordFlushIntent(storagePath, int64(len(parquetData)), merged.flushIDs)
 		if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
 			// The write may still land (#1635): name the key for noteFailedWrite.
+			// And report it, as a file that is there would be: if it did
+			// land, queries must not keep a list made without it (#1757);
+			// if it did not, they list once more for nothing.
+			b.filePublished(database, measurement, minTime)
 			return &failedStorageWrite{err: fmt.Errorf("failed to write to storage: %w", err), path: storagePath, size: int64(len(parquetData))}
 		}
+		// The file is readable from here: tell the query layer before
+		// anything else, so no query plans without it for longer (#1757).
+		b.filePublished(database, measurement, minTime)
 		observePublishDelay(merged.bufferedAt)
 		b.registerFieldSchema(ctx, database, measurement, fileSchema, sorted.TagColumns, storagePath)
 
@@ -5686,7 +5696,10 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 				b.recordFlushIntent(storagePath, int64(len(parquetData)), ranges)
 			}
 			if err := b.storage.Write(ctx, storagePath, parquetData); err != nil {
-				// The write may still land (#1635). With the row map, name this
+				// The write may still land (#1635): reported as if it had
+				// (#1757, as on the single-hour path).
+				b.filePublished(database, measurement, bucketTime)
+				// With the row map, name this
 				// file's rows; without it the flush's identities cover them.
 				fw := &failedStorageWrite{err: fmt.Errorf("failed to write to storage for hour %d: %w", hourID, err), path: storagePath, size: int64(len(parquetData))}
 				if perHour {
@@ -5705,6 +5718,9 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 				}
 				return partial(fw)
 			}
+			// Readable from here, whether it is registered now or after the
+			// last hour (#1757).
+			b.filePublished(database, measurement, bucketTime)
 			b.registerFieldSchema(ctx, database, measurement, fileSchema, sorted.TagColumns, storagePath)
 
 			if early && !hp.deferred {

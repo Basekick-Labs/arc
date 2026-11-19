@@ -1758,6 +1758,15 @@ func (h *QueryHandler) SetFileTimePruning(enabled bool, margin time.Duration) {
 	h.pruner.SetFileTimePruning(enabled, margin)
 }
 
+// FilePublished tells the query caches that a file for the measurement, in
+// the hour partitionTime falls in, is now in storage: what they hold for that
+// measurement stops being used, unless the hour is the current one, whose
+// absence is never cached (pruning/publish.go, #1757). It is one atomic add:
+// safe to call from an ingest flush worker for every file it writes.
+func (h *QueryHandler) FilePublished(database, measurement string, partitionTime time.Time) {
+	h.pruner.FilePublished(database, measurement, partitionTime)
+}
+
 // InvalidateCaches clears all internal caches (partition pruner and SQL transform cache).
 // This should be called after compaction to prevent stale file references.
 func (h *QueryHandler) InvalidateCaches() {
@@ -3733,6 +3742,11 @@ func (h *QueryHandler) getTransformedSQLWithRefs(ctx context.Context, sql, heade
 	// reported by the rewriters through ctx, since they run inside regexp
 	// replacement closures that can only return a string.
 	ctx, pathFailure := withStoragePathFailure(ctx)
+	// Each measurement's publish generation is read when the transform first
+	// names it, before its files are listed: the cached SQL must go stale
+	// with a file published during the transform as well as after it
+	// (pruning/publish.go, #1757).
+	pathFailure.stampOf = h.pruner.PublishStamp
 
 	// Transform using appropriate method
 	var transformed string
@@ -3762,7 +3776,16 @@ func (h *QueryHandler) getTransformedSQLWithRefs(ctx context.Context, sql, heade
 	// cached: a raised query.max_sql_length would otherwise multiply its
 	// memory bound. Transforming is linear, so re-running it is cheap.
 	if !volatile.Volatile && len(sql) <= transformCacheMaxSQLLength && !storageFoldsNames(h.storage) {
-		h.queryCache.SetWithMetadata(cacheKey, transformed, encodeStoragePathReferences(refs))
+		// The entry is a miss once a file is published, outside the current
+		// hour, for any measurement the SQL reads: its path lists were made
+		// before that file existed.
+		stamps := make([]pruning.PublishStamp, 0, len(refs))
+		for _, ref := range refs {
+			stamps = append(stamps, pathFailure.stamps[ref])
+		}
+		pruner := h.pruner
+		h.queryCache.SetWithMetadataCheck(cacheKey, transformed, encodeStoragePathReferences(refs),
+			func() bool { return !pruner.StampsCurrent(stamps) })
 	}
 	return transformed, false, refs, nil
 }
@@ -4106,6 +4129,11 @@ func makeIdentResolver(identNames map[string]string) func(string) (string, bool)
 type storagePathFailure struct {
 	err     error
 	emitted map[TableReference]struct{}
+	// stampOf, when set, reads a measurement's publish generation; stamps
+	// holds it for each reference as read when the reference was first
+	// recorded, which is before any of its files are listed (#1757).
+	stampOf func(database, measurement string) pruning.PublishStamp
+	stamps  map[TableReference]pruning.PublishStamp
 }
 
 // errColdTierUnavailable refuses a read that needs the cold tier on a node
@@ -4321,7 +4349,17 @@ func recordStoragePathFailure(ctx context.Context, err error) {
 
 func recordStoragePathEmission(ctx context.Context, database, measurement string) {
 	if f, ok := ctx.Value(storagePathCtxKey{}).(*storagePathFailure); ok {
-		f.emitted[TableReference{Database: database, Measurement: measurement}] = struct{}{}
+		ref := TableReference{Database: database, Measurement: measurement}
+		if _, seen := f.emitted[ref]; !seen && f.stampOf != nil {
+			if f.stamps == nil {
+				f.stamps = make(map[TableReference]pruning.PublishStamp)
+			}
+			// The first time the reference is seen, never a later one: a
+			// file published between two uses of the same table must still
+			// make the cached SQL stale.
+			f.stamps[ref] = f.stampOf(database, measurement)
+		}
+		f.emitted[ref] = struct{}{}
 	}
 }
 

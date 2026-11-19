@@ -20,6 +20,14 @@ import (
 // cached pruned list is keyed by the current hour (liveEpoch), so a list made
 // before an hour started is never served after it.
 //
+// "Cached as before" holds until a file is written there. A row stamped in an
+// hour that is not live (late data past the grace, or a future stamp) used to
+// stay out of queries for as long as that cached absence lived (#1757). Now
+// the ingest flush reports the file (FilePublished, publish.go) and what was
+// cached for the measurement stops being used. The live window is still what
+// keeps the current hour's absence out of the caches in the first place; the
+// report covers every other hour, on the node that wrote the file.
+//
 // Day paths (compacted files of a whole day) are never live: compaction is
 // their only writer, and it invalidates every query cache when it finishes.
 

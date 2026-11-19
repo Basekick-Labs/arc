@@ -35,6 +35,34 @@ func (b *ArrowBuffer) SetClaimedBatch(fn ClaimedBatchFunc) {
 
 type claimedBatchPtr = atomic.Pointer[ClaimedBatchFunc]
 
+// FilePublishedFunc is told that a flush has stored a file of the
+// measurement, in the hour partitionTime falls in. It is also told of a write
+// that returned an error, because such a write can still have landed (#1635):
+// "a file may be there now", never "a file is there". It runs on the flush's
+// goroutine right after the write returns, so it must return at once and
+// cannot report an error: the flush does not wait for, or depend on, what it
+// does.
+type FilePublishedFunc func(database, measurement string, partitionTime time.Time)
+
+// SetOnFilePublished installs the function told about each file an ingest
+// flush stores (nil: none). The query layer uses it to stop serving path
+// lists cached before the file existed (#1757). It can be set while flushes
+// run.
+func (b *ArrowBuffer) SetOnFilePublished(fn FilePublishedFunc) {
+	if fn == nil {
+		b.onFilePublished.Store(nil)
+		return
+	}
+	b.onFilePublished.Store(&fn)
+}
+
+// filePublished reports a stored file to the installed function, if any.
+func (b *ArrowBuffer) filePublished(database, measurement string, partitionTime time.Time) {
+	if fn := b.onFilePublished.Load(); fn != nil {
+		(*fn)(database, measurement, partitionTime)
+	}
+}
+
 // DeleteScopeFunc returns the DELETE records holding batch cseq of
 // (instance, key) in their scope (#1207 d1). A file is rewritten with a
 // record as a whole, so batches with different answers never share one.

@@ -2,6 +2,29 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: a late or future-stamped row is read by queries as soon as its file is written ([#1757](https://github.com/Basekick-Labs/arc/issues/1757))
+
+A row stamped outside the current hour could be flushed to storage and still be missing from queries for up to a minute. That covers late data (a row for an hour that has already ended) and rows stamped ahead of the clock.
+
+When a query finds an hour with no files, Arc remembers that so the next query does not list the hour again. It never remembers it for the current hour, which fills as data arrives. For any other hour it did, and nothing told the query layer when an ingest flush then wrote the first file there. In a test, one row stamped 3 hours back was written into an hour a query had just found empty, then flushed:
+
+| | Repeating the same query | A query not sent before |
+|---|---|---|
+| Before | missing for up to 60 s | missing for up to 30 s |
+| Now | read at the next query (2–23 ms) | read at the next query (2–23 ms) |
+
+The "before" times count from the query that found the hour empty; the "now" times from the flush returning. Measured on a standalone node with rows stamped 3 hours back and 2 hours ahead. Before: 12 of 12 trials on local storage and 2 of 2 on S3 (SeaweedFS, late rows only). Now: 9 of 9 on local storage and 9 of 9 on S3, with a non-default `storage.s3_prefix` and with `query.enable_s3_cache` on.
+
+- **How:** each file an ingest flush writes outside the current hour marks its measurement, and anything the query caches hold for that measurement from before is not used again. Nothing else is dropped: a backfill of one measurement leaves the cached plans of the others in place, apart from the few that share its marker (1 in 4,096).
+- **What triggers it:** every writer that goes through the ingest buffer: the write endpoints, imports, MQTT, continuous-query output and WAL replay.
+- **Cost:** one atomic increment per flushed file. Files in the current hour skip it, so a measurement being written to keeps its cached plans. A measurement that is written outside the current hour all the time (a source that always reports late) no longer has its plans cached: each of its queries lists storage, as queries on the current hour already do.
+
+Notes:
+
+- **Clusters:** this covers the node that wrote the file. Another node still waits out the caches (30 s / 60 s as before): on node-local storage after it has pulled the file, on shared storage after the file is in the bucket.
+- **Not covered, unchanged:** files that arrive without an ingest flush on the node (a backup restore, files received by an edge-sync hub), and a measurement whose rows were all in the cold tier that gets its first local file.
+- **A write that returned an error** is reported like one that succeeded, in case it landed anyway. If it lands only after that report (a request that times out and completes later), the old wait applies to that file.
+- **Rows stamped ahead of the clock inside the current hour** are still left out of queries whose range starts in that hour until the hour closes, when they are stamped more than `query.file_time_pruning_margin_seconds` (default 300) ahead. That is file-time pruning's documented limit, not this fix.
 ## New: a metric for how long ingested rows wait before their file is published, and a harness that measures freshness ([#1758](https://github.com/Basekick-Labs/arc/issues/1758))
 
 Arc had no number for how long a row waits between being written and being readable. `arc_buffer_oldest_unflushed_seconds` reports the age of what is still buffered, not how long flushed rows had waited.
