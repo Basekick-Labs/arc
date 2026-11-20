@@ -95,7 +95,7 @@ func (m *Metrics) appendFlightSQLPrepare(b []byte) []byte {
 		b = appendMetricWithLabel(b, "arc_flight_sql_prepare_binds_total", "result", result, float64(p.results[i].Load()))
 	}
 
-	b = append(b, "# HELP arc_flight_sql_prepare_bind_duration_seconds Time a Flight SQL prepare spent binding its statement and reading the result schema\n"...)
+	b = append(b, "# HELP arc_flight_sql_prepare_bind_duration_seconds Time a Flight SQL prepare spent waiting for a bind slot, rewriting its SQL, binding it and reading the result schema\n"...)
 	b = append(b, "# TYPE arc_flight_sql_prepare_bind_duration_seconds histogram\n"...)
 	var cumulative int64
 	for i, label := range flightSQLBindLabels {

@@ -70,9 +70,84 @@ func (d *DuckDB) ArrowQueryContext(ctx context.Context, query string) (array.Rec
 }
 
 // ErrSchemaBind wraps DuckDB's error for a statement DescribeArrowSchema could
-// not bind: an unknown table or column, a type mismatch, files that cannot be
-// read.
+// not bind because of the statement itself: a syntax error, an unknown table
+// or column, a type mismatch (schemaBindErrorTypes).
 var ErrSchemaBind = errors.New("the statement does not bind")
+
+// ErrSchemaStorage wraps DuckDB's error for a bind that failed reading
+// storage (the files' listing or Parquet footers): an IO, HTTP or network
+// error. The statement may be right; a retry may bind it. Its text has no
+// quote: Arc's error logging masks quoted spans.
+var ErrSchemaStorage = errors.New("storage could not be read during the bind")
+
+// ErrSchemaMemory wraps DuckDB's out-of-memory error during a bind. A retry
+// may bind it once other queries have finished.
+var ErrSchemaMemory = errors.New("out of memory during the bind")
+
+// schemaBindErrorTypes are the DuckDB error types that blame the statement.
+// A bind error of another type wraps none of ErrSchemaBind, ErrSchemaStorage
+// and ErrSchemaMemory, unless schemaStorageErrorTypes has it or it is out of
+// memory. NotImplemented is the statement's: DuckDB has no implementation
+// for what it asks, and running it unprepared would fail the same way.
+var schemaBindErrorTypes = map[duckdb.ErrorType]bool{
+	duckdb.ErrorTypeParser:               true,
+	duckdb.ErrorTypeSyntax:               true,
+	duckdb.ErrorTypeBinder:               true,
+	duckdb.ErrorTypeCatalog:              true,
+	duckdb.ErrorTypeConversion:           true,
+	duckdb.ErrorTypeMismatchType:         true,
+	duckdb.ErrorTypeInvalidType:          true,
+	duckdb.ErrorTypeInvalidInput:         true,
+	duckdb.ErrorTypeOutOfRange:           true,
+	duckdb.ErrorTypeDivideByZero:         true,
+	duckdb.ErrorTypeDecimal:              true,
+	duckdb.ErrorTypeExpression:           true,
+	duckdb.ErrorTypeNotImplemented:       true,
+	duckdb.ErrorTypeParameterNotResolved: true,
+	duckdb.ErrorTypeParameterNotAllowed:  true,
+	duckdb.ErrorTypePermission:           true,
+	duckdb.ErrorTypeMissingExtension:     true,
+	duckdb.ErrorTypeAutoLoad:             true,
+}
+
+// schemaStorageErrorTypes are the DuckDB error types of a bind that could not
+// read what the statement names.
+var schemaStorageErrorTypes = map[duckdb.ErrorType]bool{
+	duckdb.ErrorTypeIO:         true,
+	duckdb.ErrorTypeHTTP:       true,
+	duckdb.ErrorTypeNetwork:    true,
+	duckdb.ErrorTypeConnection: true,
+}
+
+// corruptParquetMessage reports whether an Invalid Input error is DuckDB's
+// Parquet reader refusing a file in storage. Those texts were measured with
+// the duckdb-go Arc ships: a damaged file is not the statement's fault, and
+// a retry does not help, so it is left unclassified (the route's 500, which
+// logs DuckDB's text and answers without it). Matched from the start of
+// DuckDB's message, as duckdbMessage does: a user's error() text cannot
+// start there, and forging one would only turn a 400 into a 500.
+func corruptParquetMessage(msg string) bool {
+	return strings.HasPrefix(msg, "Invalid Input Error: No magic bytes found at end of file ") ||
+		strings.HasPrefix(msg, "Invalid Input Error: Footer length error in file ") ||
+		(strings.HasPrefix(msg, "Invalid Input Error: File ") && strings.Contains(msg, " too small to be a Parquet file"))
+}
+
+// bindError wraps a PrepareContext error by what its DuckDB type blames.
+func bindError(err error) error {
+	var de *duckdb.Error
+	if errors.As(err, &de) {
+		switch {
+		case de.Type == duckdb.ErrorTypeInvalidInput && corruptParquetMessage(de.Msg):
+		case de.Type == duckdb.ErrorTypeOutOfMemory:
+			return fmt.Errorf("%w: %w", ErrSchemaMemory, err)
+		case schemaBindErrorTypes[de.Type]:
+			return fmt.Errorf("%w: %w", ErrSchemaBind, err)
+		case schemaStorageErrorTypes[de.Type]:
+			return fmt.Errorf("%w: %w", ErrSchemaStorage, err)
+		}
+	}
+	return fmt.Errorf("bind: %w", err)
+}
 
 // ErrSchemaParameters refuses a statement with parameter placeholders:
 // DescribeArrowSchema describes statements that run as they are written.
@@ -95,7 +170,9 @@ var ErrSchemaUnsupported = errors.New("the result schema cannot be described wit
 // runs a query.
 //
 // A statement that does not bind is refused with DuckDB's error wrapped in
-// ErrSchemaBind, and one with parameters with ErrSchemaParameters. Once it has
+// ErrSchemaBind when the statement is at fault, in ErrSchemaStorage when
+// reading storage failed and in ErrSchemaMemory when memory ran out
+// (bindError), and one with parameters with ErrSchemaParameters. Once it has
 // bound, a failure wraps ErrSchemaUnsupported. When ctx has ended, ctx's
 // error is returned instead.
 //
@@ -137,20 +214,23 @@ func describeArrowSchemaOnConn(ctx context.Context, driverConn any, query string
 	// arguments of functions; the bind slots bound that. The setting is per
 	// connection, so it is restored before the connection goes back to the
 	// pool, and a connection it cannot be restored on is discarded.
-	if _, err := execer.ExecContext(ctx, "PRAGMA disable_optimizer", nil); err != nil {
-		return nil, describeFailure(ctx, err)
-	}
+	//
+	// The restore is registered first: a disable that fails after DuckDB
+	// applied it (an interrupt landing late) must not leave it off.
 	defer func() {
 		if _, restoreErr := execer.ExecContext(context.WithoutCancel(ctx), "PRAGMA enable_optimizer", nil); restoreErr != nil {
 			schema, err = nil, fmt.Errorf("restore optimizer: %w: %w", restoreErr, driver.ErrBadConn)
 		}
 	}()
+	if _, err := execer.ExecContext(ctx, "PRAGMA disable_optimizer", nil); err != nil {
+		return nil, describeFailure(ctx, err)
+	}
 	stmt, err := preparer.PrepareContext(ctx, query)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		return nil, fmt.Errorf("%w: %w", ErrSchemaBind, err)
+		return nil, bindError(err)
 	}
 	columns, err := schemaQueryFromStatement(stmt)
 	// Closed before anything else runs on the connection.

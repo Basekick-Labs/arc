@@ -112,26 +112,38 @@ func (h *QueryHandler) describeFlightSQLSchema(c *fiber.Ctx, binds chan struct{}
 	// waiting frees its place in the queue.
 	watchClientDisconnect(ctx, c.Context().Conn(), cancel)
 
+	// Counted from here, so a prepare that ends waiting for a slot or in the
+	// transform is in the bind metrics too, with the time it spent. The
+	// slow-bind log leaves the wait out: a queued prepare is not a slow one.
+	waitStart := time.Now()
 	select {
 	case binds <- struct{}{}:
 		defer func() { <-binds }()
 	case <-ctx.Done():
-		_, code, message := flightSQLContextEnded(parent, ctx)
+		result, code, message := flightSQLContextEnded(parent, ctx)
+		h.recordFlightSQLBind(result, time.Since(waitStart), 0, req.SQL)
 		return flightSQLSchemaRefusal(c, code, message)
 	}
+	waited := time.Since(waitStart)
+	start := time.Now()
 
 	convertedSQL, _, emittedRefs, err := h.getTransformedSQLWithRefs(ctx, req.SQL, headerDB)
 	if err != nil {
 		if errors.Is(err, errQueryTimedOut) {
 			h.logTransformTimeout(req.SQL, effectiveTimeout)
 		}
-		return flightSQLSchemaRefusal(c, transformErrorStatus(err), err.Error())
+		code := transformErrorStatus(err)
+		result := flightSQLTransformResult(code)
+		if ctx.Err() != nil {
+			result, _, _ = flightSQLContextEnded(parent, ctx)
+		}
+		h.recordFlightSQLBind(result, waited, time.Since(start), req.SQL)
+		return flightSQLSchemaRefusal(c, code, err.Error())
 	}
 	if err := h.checkEmittedQueryPermissions(c, "read", emittedRefs); err != nil {
 		return flightSQLSchemaRefusal(c, fiber.StatusForbidden, err.Error())
 	}
 
-	start := time.Now()
 	schema, err := h.db.DescribeArrowSchema(ctx, convertedSQL)
 	elapsed := time.Since(start)
 	if err != nil && ctx.Err() == nil {
@@ -141,17 +153,17 @@ func (h *QueryHandler) describeFlightSQLSchema(c *fiber.Ctx, binds chan struct{}
 		case noFilesEmpty:
 			schema, err = arrow.NewSchema(nil, nil), nil
 		case noFilesVanished:
-			h.recordFlightSQLBind(metrics.FlightSQLBindFailed, elapsed, req.SQL)
+			h.recordFlightSQLBind(metrics.FlightSQLBindFailed, waited, elapsed, req.SQL)
 			c.Set(fiber.HeaderRetryAfter, "1")
 			return flightSQLSchemaRefusal(c, fiber.StatusServiceUnavailable, vanishedPartitionMessage)
 		}
 	}
 	if err != nil {
 		result, code, message := h.flightSQLBindFailure(parent, ctx, err)
-		h.recordFlightSQLBind(result, elapsed, req.SQL)
+		h.recordFlightSQLBind(result, waited, elapsed, req.SQL)
 		return flightSQLSchemaRefusal(c, code, message)
 	}
-	h.recordFlightSQLBind(metrics.FlightSQLBindOK, elapsed, req.SQL)
+	h.recordFlightSQLBind(metrics.FlightSQLBindOK, waited, elapsed, req.SQL)
 
 	// As the Arrow route streams it (DoGet), decimals included.
 	if castInfo := normalizeDecimalSchema(schema); castInfo != nil {
@@ -165,9 +177,18 @@ func (h *QueryHandler) describeFlightSQLSchema(c *fiber.Ctx, binds chan struct{}
 	return c.Send(buf.Bytes())
 }
 
+// flightSQLBindStorageMessage answers a bind that could not read storage.
+const flightSQLBindStorageMessage = "the data could not be read from storage while preparing the statement; retry"
+
+// flightSQLBindMemoryMessage answers a bind that ran out of memory.
+const flightSQLBindMemoryMessage = "Arc ran out of memory while preparing the statement; retry"
+
 // flightSQLBindFailure maps a DescribeArrowSchema failure to its bind result,
 // status and message. A statement that bound but cannot be described is 501,
 // never 400: ADBC runs the statement unprepared only after Unimplemented.
+// A bind that could not read storage, or ran out of memory, is 503; only a
+// failure nothing classifies is 500 (a damaged Parquet file among them), and
+// its message is generic, as DuckDB's text names storage paths.
 func (h *QueryHandler) flightSQLBindFailure(parent, ctx context.Context, err error) (result string, code int, message string) {
 	if ctx.Err() != nil {
 		return flightSQLContextEnded(parent, ctx)
@@ -177,11 +198,33 @@ func (h *QueryHandler) flightSQLBindFailure(parent, ctx context.Context, err err
 		return metrics.FlightSQLBindInvalid, fiber.StatusBadRequest, "parameters not supported: Arc prepared statements run as written"
 	case errors.Is(err, database.ErrSchemaBind):
 		return metrics.FlightSQLBindInvalid, fiber.StatusBadRequest, err.Error()
+	case errors.Is(err, database.ErrSchemaStorage):
+		// Not the statement's fault, so not 400: ADBC would tell the user
+		// their SQL is wrong. DuckDB's text names storage paths, so it is
+		// logged, not returned.
+		h.logger.Warn().Err(err).Msg("Flight SQL prepare: the bind could not read storage")
+		return metrics.FlightSQLBindFailed, fiber.StatusServiceUnavailable, flightSQLBindStorageMessage
+	case errors.Is(err, database.ErrSchemaMemory):
+		h.logger.Warn().Err(err).Msg("Flight SQL prepare: out of memory during the bind")
+		return metrics.FlightSQLBindFailed, fiber.StatusServiceUnavailable, flightSQLBindMemoryMessage
 	case errors.Is(err, database.ErrSchemaUnsupported):
 		return metrics.FlightSQLBindUnimplemented, fiber.StatusNotImplemented, err.Error()
 	default:
 		h.logger.Error().Err(err).Msg("Flight SQL prepare: the bind failed")
 		return metrics.FlightSQLBindFailed, fiber.StatusInternalServerError, "the statement's result schema could not be read"
+	}
+}
+
+// flightSQLTransformResult is the bind result of a prepare whose SQL
+// transform failed with status code (transformErrorStatus).
+func flightSQLTransformResult(code int) string {
+	switch code {
+	case fiber.StatusBadRequest:
+		return metrics.FlightSQLBindInvalid
+	case fiber.StatusGatewayTimeout:
+		return metrics.FlightSQLBindTimeout
+	default:
+		return metrics.FlightSQLBindFailed
 	}
 }
 
@@ -199,14 +242,16 @@ func flightSQLContextEnded(parent, ctx context.Context) (result string, code int
 	}
 }
 
-// recordFlightSQLBind counts a bind and its duration, and logs one slower
-// than query.slow_query_threshold_ms.
-func (h *QueryHandler) recordFlightSQLBind(result string, elapsed time.Duration, sql string) {
-	metrics.Get().ObserveFlightSQLBind(result, elapsed)
-	if h.slowQueryThreshold > 0 && elapsed >= h.slowQueryThreshold {
+// recordFlightSQLBind counts a prepare and its duration, the wait for a bind
+// slot included, and logs one whose work (the SQL transform and the bind,
+// without the wait) took query.slow_query_threshold_ms or more.
+func (h *QueryHandler) recordFlightSQLBind(result string, waited, worked time.Duration, sql string) {
+	metrics.Get().ObserveFlightSQLBind(result, waited+worked)
+	if h.slowQueryThreshold > 0 && worked >= h.slowQueryThreshold {
 		h.logger.Warn().
 			Str("sql", sqlutil.ForLog(sql)).
-			Int64("bind_time_ms", elapsed.Milliseconds()).
+			Int64("bind_time_ms", worked.Milliseconds()).
+			Int64("wait_ms", waited.Milliseconds()).
 			Str("result", result).
 			Msg("Slow Flight SQL prepare bind")
 	}

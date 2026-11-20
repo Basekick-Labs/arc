@@ -51,12 +51,28 @@ type flightPreparedStatement struct {
 // a DISTINCT scan while DuckDB prepares it, so a prepare would run a query.
 var flightPivotPattern = regexp.MustCompile(`(?i)\bPIVOT(?:_WIDER)?\b`)
 
+// flightPivotRefusal is the PIVOT refusal. A JDBC client cannot run a
+// statement unprepared (the driver prepares everything), so it is pointed at
+// conditional aggregation, which prepares.
+const flightPivotRefusal = "a PIVOT statement cannot be prepared: its columns are known only once it runs. " +
+	"Write it with conditional aggregation instead, one column per value, e.g. sum(x) FILTER (WHERE k = 'v') AS v; " +
+	"a client that can run statements unprepared (ADBC) can also run the PIVOT that way"
+
+// flightMaskPlaceholder finds the placeholders MaskStringLiterals puts where
+// a literal or quoted identifier was. They are word characters, so
+// `PIVOT"c"` masks to `PIVOT__IDENT_0__`, where \b finds no boundary; DuckDB
+// still reads it as PIVOT "c". hasFlightPivot pads them with spaces first.
+var flightMaskPlaceholder = regexp.MustCompile(`__(?:STR|IDENT)_\d+__`)
+
 // hasFlightPivot reports whether sql has a PIVOT outside its string literals,
 // quoted identifiers and comments.
 func hasFlightPivot(sql string) bool {
 	features := scanSQLFeatures(sql)
 	masked, _ := sqlutil.MaskStringLiterals(sql, features.hasQuotes)
 	masked = stripSQLComments(masked, features.hasDashComment || features.hasBlockComment)
+	if features.hasQuotes {
+		masked = flightMaskPlaceholder.ReplaceAllString(masked, " $0 ")
+	}
 	return flightPivotPattern.MatchString(masked)
 }
 
@@ -99,7 +115,7 @@ func (s *flightSQLService) preparedSchema(ctx context.Context, sql, database str
 		return schema, nil
 	}
 	if hasFlightPivot(sql) {
-		return nil, status.Error(codes.Unimplemented, "a PIVOT statement cannot be prepared: its columns are known only once it runs; run it unprepared")
+		return nil, status.Error(codes.Unimplemented, flightPivotRefusal)
 	}
 
 	resp, err := s.query(ctx, flightSQLSchemaPath, sql, s.token(ctx), database)

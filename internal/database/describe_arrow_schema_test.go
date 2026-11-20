@@ -5,6 +5,7 @@ package database
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -102,6 +103,53 @@ func TestDescribeArrowSchemaRefusals(t *testing.T) {
 			t.Fatalf("err = %v, want ErrSchemaBind with DuckDB's message", err)
 		}
 	})
+	for _, query := range []string{`SELEC 1`, `SELECT * FROM no_such_table`, `SELECT 'x' + 1`} {
+		t.Run("the statement's fault "+query, func(t *testing.T) {
+			_, err := db.DescribeArrowSchema(context.Background(), query)
+			if !errors.Is(err, ErrSchemaBind) || errors.Is(err, ErrSchemaStorage) {
+				t.Fatalf("err = %v, want ErrSchemaBind only", err)
+			}
+		})
+	}
+	// Storage that cannot be read is not the statement's fault: not
+	// ErrSchemaBind, which the route answers 400.
+	t.Run("storage that cannot be read", func(t *testing.T) {
+		root := t.TempDir()
+		rooted, err := New(&Config{MaxConnections: 1, MemoryLimit: "256MB", ThreadCount: 1, LocalStorageRoot: root}, zerolog.Nop())
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		defer rooted.Close()
+		missing := strings.ReplaceAll(root, "'", "''") + "/missing.parquet"
+		_, err = rooted.DescribeArrowSchema(context.Background(), `SELECT * FROM read_parquet('`+missing+`')`)
+		if !errors.Is(err, ErrSchemaStorage) || errors.Is(err, ErrSchemaBind) {
+			t.Fatalf("err = %v, want ErrSchemaStorage only", err)
+		}
+	})
+	// A damaged Parquet file is neither the statement's fault nor fixed by a
+	// retry: unclassified, so the route answers it as a server failure.
+	t.Run("a damaged Parquet file", func(t *testing.T) {
+		root := t.TempDir()
+		rooted, err := New(&Config{MaxConnections: 1, MemoryLimit: "256MB", ThreadCount: 1, LocalStorageRoot: root}, zerolog.Nop())
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		defer rooted.Close()
+		garbage := make([]byte, 4096)
+		for i := range garbage {
+			garbage[i] = byte(i)
+		}
+		for name, data := range map[string][]byte{"empty": nil, "garbage": garbage, "footer": append(garbage, 0xff, 0xff, 0, 0, 'P', 'A', 'R', '1')} {
+			path := root + "/" + name + ".parquet"
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := rooted.DescribeArrowSchema(context.Background(), `SELECT * FROM read_parquet('`+strings.ReplaceAll(path, "'", "''")+`')`)
+			if err == nil || errors.Is(err, ErrSchemaBind) || errors.Is(err, ErrSchemaStorage) || errors.Is(err, ErrSchemaUnsupported) {
+				t.Fatalf("%s: err = %v, want an unclassified error", name, err)
+			}
+		}
+	})
 	t.Run("parameters", func(t *testing.T) {
 		_, err := db.DescribeArrowSchema(context.Background(), `SELECT ?::INTEGER AS p`)
 		if !errors.Is(err, ErrSchemaParameters) {
@@ -130,6 +178,37 @@ func TestDescribeArrowSchemaRefusals(t *testing.T) {
 			t.Fatalf("err = %v, want context.Canceled", err)
 		}
 	})
+}
+
+// The bind turns the optimizer off on its connection and back on before the
+// connection returns to the pool, whether it succeeds or fails: the next
+// query on a pool of one is planned as before. EXPLAIN's estimates differ
+// with the optimizer off.
+func TestDescribeArrowSchemaRestoresTheOptimizer(t *testing.T) {
+	db := newDescribeTestDB(t, 1)
+	explain := func() string {
+		rows, err := db.Query(`EXPLAIN SELECT 1 + 1 AS x`)
+		if err != nil {
+			t.Fatalf("EXPLAIN: %v", err)
+		}
+		defer rows.Close()
+		var out strings.Builder
+		for rows.Next() {
+			var k, v string
+			if err := rows.Scan(&k, &v); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			out.WriteString(v)
+		}
+		return out.String()
+	}
+	before := explain()
+	for _, query := range []string{`SELECT 1 AS a`, `SELECT no_such_column`} {
+		_, _ = db.DescribeArrowSchema(context.Background(), query)
+		if got := explain(); got != before {
+			t.Fatalf("after describing %q, EXPLAIN = %q, want %q", query, got, before)
+		}
+	}
 }
 
 // The bind and the schema query share one pool connection, so a pool of one

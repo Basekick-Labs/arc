@@ -25,6 +25,7 @@ import (
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/governance"
 	"github.com/basekick-labs/arc/internal/ingest"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/queryregistry"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
@@ -208,12 +209,29 @@ func (r *preparedRig) prepareAndRun(t *testing.T, sql string) (prepared, result 
 func TestFlightSQLPreparedStatementIsOneQuery(t *testing.T) {
 	rig := newPreparedRig(t, preparedRigOptions{policy: &governance.Policy{RateLimitPerMinute: 100}})
 
+	// A prepare alone moves no query metric.
+	queryMetrics := func() map[string]interface{} {
+		snapshot := metrics.Get().Snapshot()
+		out := map[string]interface{}{}
+		for _, key := range []string{"query_requests_total", "query_success_total", "query_errors_total", "query_rows_total"} {
+			out[key] = snapshot[key]
+		}
+		return out
+	}
+	before := queryMetrics()
+	ps, err := rig.client.Prepare(rig.ctx, `SELECT time, value FROM "sample"."cpu"`)
+	require.NoError(t, err)
+	require.NoError(t, ps.Close(rig.ctx))
+	require.Equal(t, before, queryMetrics())
+	require.Zero(t, rig.registry.HistoryLen())
+	require.Zero(t, rig.bridge.count("/api/v1/query/arrow"))
+
 	prepared, result, rows := rig.prepareAndRun(t, `SELECT time, value FROM "sample"."cpu"`)
 	require.EqualValues(t, 1, rows)
 	require.Equal(t, result.String(), prepared.String())
 
 	require.Equal(t, 1, rig.bridge.count("/api/v1/query/arrow"), "Arrow queries on the bridge")
-	require.Equal(t, 1, rig.bridge.count(flightSQLSchemaPath), "binds on the bridge")
+	require.Equal(t, 2, rig.bridge.count(flightSQLSchemaPath), "binds on the bridge: the bare prepare's and this one's")
 	for _, req := range rig.bridge.all() {
 		switch req.path {
 		case flightSQLSchemaPath:
@@ -287,6 +305,7 @@ func TestFlightSQLPreparedStatementRefusals(t *testing.T) {
 	}{
 		{"statement-leading PIVOT", `PIVOT "sample"."cpu" ON value USING count(*)`, codes.Unimplemented},
 		{"PIVOT in a FROM clause", `SELECT * FROM (PIVOT "sample"."cpu" ON value USING count(*)) p`, codes.Unimplemented},
+		{"PIVOT glued to a quoted name", `WITH "c" AS (SELECT * FROM "sample"."cpu") SELECT * FROM (PIVOT"c" ON value USING count(*))`, codes.Unimplemented},
 		{"unnamed struct", `SELECT (1, 2) AS s`, codes.Unimplemented},
 		{"unnamed struct from row()", `SELECT row(1, 'a') AS s`, codes.Unimplemented},
 		{"parameters", `SELECT value FROM "sample"."cpu" WHERE value > ?`, codes.InvalidArgument},
@@ -301,6 +320,39 @@ func TestFlightSQLPreparedStatementRefusals(t *testing.T) {
 	// None of them reached the query path.
 	require.Zero(t, rig.bridge.count("/api/v1/query/arrow"))
 	require.Zero(t, rig.registry.HistoryLen())
+
+	// The PIVOT refusal names a form a JDBC client, which cannot run a
+	// statement unprepared, can send.
+	_, err := rig.client.Prepare(rig.ctx, `PIVOT "sample"."cpu" ON value USING count(*)`)
+	require.Contains(t, status.Convert(err).Message(), "FILTER (WHERE")
+}
+
+// A bind is 400 only when the statement is at fault. Storage that could not
+// be read is 503, so a client does not report the user's SQL as wrong, with
+// a message that names no storage path; a failure nothing classifies is 500.
+func TestFlightSQLBindFailureStatus(t *testing.T) {
+	h := NewQueryHandler(nil, nil, zerolog.Nop(), 0, 0)
+	ctx := context.Background()
+	const path = "s3://bucket/sample/cpu/2026/11/20/10/x.parquet"
+	for _, tc := range []struct {
+		name string
+		err  error
+		code int
+	}{
+		{"the statement", fmt.Errorf("%w: Binder Error: no column", database.ErrSchemaBind), http.StatusBadRequest},
+		{"parameters", database.ErrSchemaParameters, http.StatusBadRequest},
+		{"storage", fmt.Errorf("%w: HTTP Error: reading '%s' (HTTP 503)", database.ErrSchemaStorage, path), http.StatusServiceUnavailable},
+		{"memory", fmt.Errorf("%w: Out of Memory Error: x", database.ErrSchemaMemory), http.StatusServiceUnavailable},
+		{"cannot be described", fmt.Errorf("%w: x", database.ErrSchemaUnsupported), http.StatusNotImplemented},
+		{"a damaged file", fmt.Errorf("bind: Invalid Input Error: No magic bytes found at end of file '%s'", path), http.StatusInternalServerError},
+		{"unclassified", fmt.Errorf("bind: Internal Error: x"), http.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, code, message := h.flightSQLBindFailure(ctx, ctx, tc.err)
+			require.Equal(t, tc.code, code)
+			require.NotContains(t, message, path)
+		})
+	}
 }
 
 // A token that may not read a table gets no schema for it.
@@ -361,7 +413,12 @@ func TestFlightSQLPreparedStatementOnANodeThatDoesNotServeQueries(t *testing.T) 
 
 // The schema route exists on the bridge only.
 func TestFlightSQLSchemaRouteIsNotOnThePublicApp(t *testing.T) {
-	qh := NewQueryHandler(nil, nil, zerolog.Nop(), 0, 0)
+	// A real database, so that the route, were it registered here, would
+	// answer the request rather than panic: the failure is the status code.
+	duck, err := database.New(&database.Config{MemoryLimit: "256MB", ThreadCount: 1, MaxConnections: 2, LocalStorageRoot: t.TempDir()}, zerolog.Nop())
+	require.NoError(t, err)
+	t.Cleanup(func() { duck.Close() })
+	qh := NewQueryHandler(duck, nil, zerolog.Nop(), 0, 0)
 	app := fiber.New(fiber.Config{DisableStartupMessage: true})
 	qh.RegisterRoutes(app)
 	req := httptest.NewRequest(http.MethodPost, flightSQLSchemaPath, strings.NewReader(`{"sql":"SELECT 1"}`))
@@ -441,6 +498,14 @@ func TestHasFlightPivot(t *testing.T) {
 		`SELECT 1 -- PIVOT`:                                       false,
 		`SELECT /* PIVOT */ 1`:                                    false,
 		`SELECT pivots FROM cpu`:                                  false,
+		// Glued to a quoted identifier, a literal or a comment, as DuckDB
+		// still parses them.
+		`WITH "c" AS (SELECT 1) SELECT * FROM (PIVOT"c" ON host USING sum(i))`: true,
+		`SELECT * FROM "x"PIVOT (sum(v) FOR host IN ('a'))`:                    true,
+		`SELECT * FROM cpu PIVOT('x')`:                                         true,
+		`PIVOT/**/cpu ON host`:                                                 true,
+		`SELECT "PIVOT"x FROM cpu`:                                             false,
+		`SELECT 'a'PIVOTS FROM cpu`:                                            false,
 	} {
 		require.Equal(t, want, hasFlightPivot(sql), sql)
 	}
