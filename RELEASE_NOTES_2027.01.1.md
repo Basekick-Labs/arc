@@ -2,6 +2,21 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: with two processes exporting one bucket, Iceberg tables could hold a data file twice, and then stop exporting ([#1795](https://github.com/Basekick-Labs/arc/issues/1795))
+
+When two Arc processes export the same bucket to Iceberg (two standalone nodes on one bucket and prefix: nothing can detect that without a cluster coordinator), a data file could be added to the table twice:
+
+1. node A's ingest writes a file and reports it to A;
+2. node B's timed pass lists the bucket, finds the file, adds it, and publishes that table version;
+3. node A's next ingest export takes over B's published version, then appends the file again. The append path does not check the table for the file (that check reads every manifest, the cost #1751 removed); what kept a file from being added twice was what A itself had added and listed, which says nothing about B's pass.
+
+Readers then counted that file's rows twice. And iceberg-go cannot remove a path the table holds twice: once that file left storage (a compaction's input, retention, a delete), every pass of the table failed with "cannot delete files that do not belong to the table", so the table stopped exporting and kept naming a file that was gone. Traced from a two-node run's own manifests and logs, and reproduced by tests; the evidence is on the issue.
+
+- **An ingest append now goes on only from the table version this process last left it at** (its own last append, or the end of its last settled pass). A version another process committed, or a catalog row recovered from a dead metadata file, makes that export a reconcile pass, which diffs the table and adds nothing it already holds. On a node with no election (no cluster coordinator) this is logged once per table at Warn, naming the cause: another process exports this bucket. With two exporters every ingest export after the other's commit is a full pass, which is the append path effectively off; run one exporter per bucket.
+- **A pass repairs a table that already holds a path more than once**: one commit removes every data entry and adds each live path back once (merged into one manifest), then history is floored to that snapshot, since every older one holds the paths twice. Logged at Warn with the count and examples. It is best-effort: if it fails, the pass goes on as before and the next pass tries again. It is refused, with an Error, on a table that has delete files (Arc writes none): the re-added entries would no longer be covered by them.
+- After a repair, the snapshot summary's running totals (`total-data-files`, `total-records`) stay high by the extra entries; iceberg-go carries them forward. Nothing in Arc reads them.
+- Not covered: two processes committing at the same moment are still kept apart only by the publish fence (#1609), as before.
+- No configuration changes.
 ## Fix: on a shared bucket, a database deleted on one node while another exported it could leave a broken Iceberg table ([#1792](https://github.com/Basekick-Labs/arc/issues/1792))
 
 On a shared bucket the node that handles a `DELETE` of a database (the primary writer) drops its Iceberg tables for every node, and the node that exports them (the compactor-lease holder) is usually another one. The lock that keeps a drop and an export apart ([#1789](https://github.com/Basekick-Labs/arc/issues/1789), below) is one process's, so a reconcile pass on the exporting node could commit and publish after the drop had listed what it would delete. What the pass wrote stayed, naming manifests that were gone, under a catalog row that still loaded: every later pass of that table failed (`could not open manifest file`), also once the database was written again.

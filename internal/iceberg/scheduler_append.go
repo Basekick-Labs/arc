@@ -24,7 +24,12 @@ import (
 // listing.
 //
 // The append commits with iceberg-go's duplicate check off, so THIS file is
-// what keeps a file from being added twice:
+// what keeps a file from being added twice, together with one rule in
+// appendFiles: an append goes on only from the table version this process
+// last left it at (its last append, or the end of its last settled pass). What
+// is below covers this process's own commits only; a version another process
+// committed, or a recovered row, makes the append a pass (errTableMoved,
+// #1795).
 //
 //   - One export of a table at a time, and never a pass while an append
 //     runs. Appends of different tables run at once on other goroutines
@@ -76,6 +81,8 @@ const (
 	// this bounds what a table carries when that interval is long: its
 	// snapshots, published versions and manifests.
 	appendMaxBetweenPasses = 120
+	// reasonTableMoved is the fallback reason for errTableMoved (#1795).
+	reasonTableMoved = "the table is not at the version this node last left it at: another writer committed to it, or its catalog row was recovered"
 )
 
 // pendingFile is one file an ingest flush reported and no export has covered.
@@ -373,8 +380,16 @@ func (s *Scheduler) noteAppendFallback(job *ingestJob) {
 		// Once per reason per table: a table that keeps falling back would
 		// otherwise say so at every interval.
 		s.appendFallback[job.key] = job.reason
-		s.logger.Info().Str("database", job.m.Database).Str("measurement", job.m.Measurement).Str("reason", job.reason).
-			Msg("Iceberg: ingest files not appended; running a reconcile pass of the measurement instead")
+		if job.reason == reasonTableMoved && s.gate == nil {
+			// No election runs on this node, so nothing hands the export over
+			// to it: another process committed to the table (#1795).
+			s.logger.Warn().Str("database", job.m.Database).Str("measurement", job.m.Measurement).
+				Msg("Iceberg: another process committed to this table, so another process exports this bucket. " +
+					"Run one exporter per bucket (one node, or a cluster with failover): with two, every ingest export of the table runs as a full pass")
+		} else {
+			s.logger.Info().Str("database", job.m.Database).Str("measurement", job.m.Measurement).Str("reason", job.reason).
+				Msg("Iceberg: ingest files not appended; running a reconcile pass of the measurement instead")
+		}
 	}
 }
 
@@ -468,9 +483,12 @@ func (s *Scheduler) runAppend(ctx context.Context, job *ingestJob, exp *Exporter
 	readSchemas := func(context.Context, []FileRef) (ArcSchema, error) { return sc, nil }
 	res, err := exp.appendFiles(ctx, m.Database, m.Measurement, refs, readSchemas, s.canRun)
 	if err != nil {
-		if errors.Is(err, errNeedsFullPass) {
+		switch {
+		case errors.Is(err, errNeedsFullPass):
 			job.reason = "the table does not exist or lacks a column of the new files"
-		} else {
+		case errors.Is(err, errTableMoved):
+			job.reason = reasonTableMoved
+		default:
 			job.reason = err.Error()
 		}
 		return

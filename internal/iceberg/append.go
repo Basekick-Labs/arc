@@ -21,7 +21,10 @@ import (
 //
 // What it gives up, and who covers it:
 //   - iceberg-go's duplicate check is off (it scans every manifest). The
-//     scheduler never hands a file over twice (scheduler_append.go).
+//     scheduler never hands a file over twice (scheduler_append.go), and an
+//     append goes on only from the table version this process last left it
+//     at (errTableMoved, duplicates.go): what the scheduler remembers covers
+//     this process's commits, not another's (#1795).
 //   - It evolves nothing and heals nothing: a file with a column the table
 //     lacks, or a missing table, is errNeedsFullPass.
 //   - It does not expire snapshots, prune version files or sweep orphans.
@@ -152,6 +155,16 @@ func (e *Exporter) appendFiles(ctx context.Context, database, measurement string
 	if err != nil {
 		return res, err
 	}
+	// Only onto the table as this process left it (#1795). What keeps a file
+	// from being added twice is what this process remembers adding and
+	// listing (scheduler_append.go), which says nothing about commits made by
+	// another process. The adopt check above, or the recovery of a dead row in
+	// the load, can have moved the row onto such a commit: then a pass diffs
+	// the table instead. A process that has no record (no settled pass of the
+	// table since it started) appends nothing either.
+	if left, ok := e.leftAtLoc(tkey); !ok || left != tbl.MetadataLocation() {
+		return res, errTableMoved
+	}
 	e.notePassStart(ctx, tbl)
 	add, err := readSchemas(ctx, files)
 	if err != nil {
@@ -224,6 +237,7 @@ func (e *Exporter) appendFiles(ctx context.Context, database, measurement string
 	for _, df := range built {
 		res.added = append(res.added, df.FilePath())
 	}
+	e.noteLeftAt(tkey, committed.MetadataLocation())
 	// What the next append of this table starts from. A merge packs the small
 	// manifests into one, which is counted as small: if it is not, the next
 	// merge is staged one append early and iceberg-go, which applies the

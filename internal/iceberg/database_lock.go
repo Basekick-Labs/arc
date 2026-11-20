@@ -188,6 +188,11 @@ func (e *Exporter) forgetDatabaseMemory(database string) {
 			delete(e.floorDue, k)
 		}
 	}
+	for k := range e.leftAt {
+		if match(k) {
+			delete(e.leftAt, k)
+		}
+	}
 	e.chunkMu.Unlock()
 }
 
