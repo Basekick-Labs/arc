@@ -68,8 +68,9 @@ type FileRef struct {
 // It is two parts. exporterShared is the process's one copy of everything
 // that is not about the export in progress. passState is the flags and
 // versions of one reconcile pass or one append: the scheduler's Exporter
-// carries the pass's, and an append that runs beside others gets its own
-// through forAppend, over the same exporterShared (#1778).
+// carries those of the export the loop goroutine runs itself, and an append
+// or a pass that runs beside others gets its own through forExport, over the
+// same exporterShared (#1778, #1786).
 type Exporter struct {
 	*exporterShared
 	passState
@@ -108,9 +109,11 @@ type passState struct {
 	// passHints are the versions this pass wrote to version-hint.text (heals, evolutions, the
 	// end-of-pass publish). A reader may have resolved any of them, so none is pruned this pass.
 	passHints []int
-	// passVersionsHeld: this pass's prune kept a published version on disk only because of
-	// iceberg.min_version_age (versionsHeldByAge).
-	passVersionsHeld bool
+	// passPruneDue: when the table's version files need pruning again though
+	// nothing else about it changes: this pass's prune kept a published
+	// version only because of iceberg.min_version_age, or could not finish
+	// (pruneAgainAt). Zero: nothing is waiting.
+	passPruneDue time.Time
 	// passGate, while a reconcile runs, is its canCommit: EnsureTable's heals check it before
 	// committing, so a node that lost the writer role mid-pass does not publish a heal (#1097).
 	// nil outside a reconcile (always allowed).
@@ -122,15 +125,16 @@ func newPassState() passState {
 	return passState{passLoaded: -1, passHint: -1}
 }
 
-// forAppend returns an Exporter for one append: the same shared state, its
-// own pass state, so several appends of different tables can run at once.
-func (e *Exporter) forAppend() *Exporter {
+// forExport returns an Exporter for one append or one reconcile pass: the
+// same shared state, its own pass state, so the exports of several tables
+// can run at once.
+func (e *Exporter) forExport() *Exporter {
 	return &Exporter{exporterShared: e.exporterShared, passState: newPassState()}
 }
 
 // exporterShared is the part of an Exporter every export of the process
-// uses. What a reconcile pass touches from the scheduler's loop goroutine
-// alone is marked so; everything an append reaches is guarded.
+// uses. Exports of different tables run at once, so everything in it that
+// changes after construction is guarded.
 type exporterShared struct {
 	db          *sql.DB
 	catalog     *sqlcat.Catalog
@@ -180,6 +184,9 @@ type exporterShared struct {
 	// retention properties). Tests only: it is how a failing heal commit is reproduced without
 	// a failing catalog. nil in production.
 	propsCommit func(context.Context, *icetable.Transaction) (*icetable.Table, error)
+	// expireCommit, when set, replaces the commit of a snapshot-expiry
+	// transaction (expireSnapshots). Tests fail it; nothing else sets it.
+	expireCommit func(context.Context, *icetable.Transaction) (*icetable.Table, error)
 
 	// warehouseAuthoritative, published: see adopt.go.
 	warehouseAuthoritative bool
@@ -188,6 +195,10 @@ type exporterShared struct {
 	markerCleared     map[string]struct{}
 	publishedMu       sync.Mutex
 	published         map[string]string
+	// hinted: per table, the metadata location this process last wrote to
+	// version-hint.text (writeVersionHint); under publishedMu. See
+	// alreadyPublished.
+	hinted map[string]string
 
 	// collapseThreshold is the manifest count at which a pass also collapses the manifest set
 	// (see manifestCollapseThreshold). A field rather than a bare constant so a test can raise it
@@ -220,18 +231,17 @@ type exporterShared struct {
 	// chunkMu guards chunkSize (a measurement's shrunk chunk size after a chunk that did not fit)
 	// and floorDue (tables whose #1092 history floor failed and is retried by later passes).
 	chunkMu sync.Mutex
-	// expireOwed: the tables appends have added snapshots to since a pass
-	// last expired any (batched.go expiryOwed); under chunkMu.
-	expireOwed map[string]bool
+	// dbLocks keeps a database's tables from being exported and dropped at
+	// once, and onDatabaseDropped is told after a drop (database_lock.go).
+	dbLocks           databaseLocks
+	onDatabaseDropped func(database string)
 	// appendSmall: per table, the small data manifests its current snapshot
 	// holds, as the last append left them; absent when not known (a pass
 	// ran, an append failed, the process started). Under chunkMu.
 	// See appendMergeDue.
 	appendSmall map[string]int
-	// expirySeen: the tables that have had a pass in this process.
-	expirySeen map[string]struct{}
-	chunkSize  map[string]int
-	floorDue   map[string]struct{}
+	chunkSize   map[string]int
+	floorDue    map[string]struct{}
 }
 
 // resetHintFailure clears the per-reconcile discovery-file failure flag.
@@ -243,16 +253,37 @@ func (e *Exporter) resetHintFailure() {
 	e.passLoaded, e.passHint = -1, -1
 	e.passHintUnknown = false
 	e.passHints = e.passHints[:0]
-	e.passVersionsHeld = false
+	e.passPruneDue = time.Time{}
 	e.hintFailMu.Unlock()
 }
 
-// versionsHeldByAge reports that this pass's prune kept a published version
-// only because of iceberg.min_version_age (pruneOldVersionFilesFrom).
-func (e *Exporter) versionsHeldByAge() bool {
+// pruneAgainAt is when this pass's prune left work that only time or a retry
+// finishes (pruneOldVersionFilesFrom), or zero. It is the latest of:
+//
+//   - for each published version kept only because of iceberg.min_version_age,
+//     the moment the version after it has been published that long. The
+//     latest, so that one later prune removes them all; the ones that come of
+//     age earlier wait for it, less than min_version_age more.
+//   - now plus min_version_age, for a version kept only for this pass (one
+//     it claimed, or one a reader may have resolved when it started), and
+//     when the metadata directory could not be listed or a delete failed:
+//     a store that keeps refusing costs one pass of the table per
+//     min_version_age, not one per reconcile interval.
+//
+// Never later than now plus min_version_age.
+func (e *Exporter) pruneAgainAt() time.Time {
 	e.hintFailMu.Lock()
 	defer e.hintFailMu.Unlock()
-	return e.passVersionsHeld
+	return e.passPruneDue
+}
+
+// notePruneDue records a time the table's prune has to run again by.
+func (e *Exporter) notePruneDue(at time.Time) {
+	e.hintFailMu.Lock()
+	if at.After(e.passPruneDue) {
+		e.passPruneDue = at
+	}
+	e.hintFailMu.Unlock()
 }
 
 // notePublishedHint records a version this pass wrote to version-hint.text.
@@ -1038,7 +1069,9 @@ func (e *Exporter) buildDataFiles(ctx context.Context, tbl *icetable.Table, path
 	g.SetLimit(unionSchemaConcurrency)
 	for i := range paths {
 		g.Go(func() error {
+			release := acquireRead(gctx) // one of the batch's storage reads, in a batch (#1786)
 			df, err := icetable.FileToDataFile(gctx, ios[i], paths[i], tbl.Schema(), tbl.Spec(), 0, tbl.Properties())
+			release()
 			if err != nil {
 				if isPartitionInferenceError(err) {
 					errs[i] = err
@@ -1266,9 +1299,6 @@ func isPartitionInferenceError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "more than one value for partition field")
 }
 
-// expireSnapshots keeps the last `retain` snapshots for the table (0 = keep all → no-op),
-// deleting older snapshots and their orphaned manifests/data files. Best-effort: on any
-// failure it logs and returns the input table unchanged.
 // floorHistory asks expireSnapshots to keep ONLY the snapshot this pass committed,
 // overriding iceberg.retain_snapshots. The caller passes it when the pass removed any
 // path, because such a path is gone from the primary backend and every older snapshot
@@ -1280,9 +1310,12 @@ const (
 	floorHistory     expireMode = true
 )
 
-// expireSnapshots trims snapshot history. It returns the possibly-newer table and
-// whether the trim it was asked for actually landed; a caller that asked to floor and
-// got false must not treat the pass as settled (see ReconcileMeasurementWithHint).
+// expireSnapshots trims snapshot history to the last retain_snapshots (0 = keep all, a
+// no-op), or to the current one for a floor. It removes snapshots from the metadata only:
+// no data file, and no manifest either (WithPostCommit(false), below). On a failure it
+// logs and returns the input table unchanged. It returns the possibly-newer table and
+// whether the trim did not fail; a caller that got false must not treat the pass as settled
+// (see ReconcileMeasurementWithHint), which is what has the next pass try again.
 //
 // mode is load-bearing for BOTH gates below, not just the iceberg-go call. The
 // pointless-commit guard compares against the SAME effective value: checking a floor
@@ -1349,7 +1382,11 @@ func (e *Exporter) expireSnapshots(ctx context.Context, tbl *icetable.Table, dat
 			Msg("Iceberg ExpireSnapshots failed (non-fatal) — snapshot history grows until it recovers")
 		return tbl, false
 	}
-	expired, err := txn.Commit(ctx)
+	commit := txn.Commit
+	if e.expireCommit != nil {
+		commit = func(ctx context.Context) (*icetable.Table, error) { return e.expireCommit(ctx, txn) }
+	}
+	expired, err := commit(ctx)
 	if err != nil {
 		e.logger.Error().Err(err).Str("database", database).Str("measurement", measurement).
 			Bool("floor_history", mode == floorHistory).
@@ -1421,6 +1458,8 @@ func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.T
 		}
 		objs, err := lister.ListObjects(ctx, dirKey+"/")
 		if err != nil {
+			e.logger.Warn().Err(err).Str("dir", dirKey).Msg("Iceberg: could not list the metadata directory to prune old published versions; retried after iceberg.min_version_age")
+			e.notePruneDue(time.Now().Add(e.minVersionAge)) // not pruned: retried then (pruneAgainAt)
 			return
 		}
 		written = make(map[string]time.Time, len(objs))
@@ -1431,6 +1470,8 @@ func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.T
 	} else {
 		var err error
 		if keys, err = e.backend.List(ctx, dirKey+"/"); err != nil {
+			e.logger.Warn().Err(err).Str("dir", dirKey).Msg("Iceberg: could not list the metadata directory to prune old published versions; retried after iceberg.min_version_age")
+			e.notePruneDue(time.Now().Add(e.minVersionAge))
 			return
 		}
 	}
@@ -1475,21 +1516,41 @@ func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.T
 	// (written, above), so it survives a restart and covers copies written
 	// by claimVersion.
 	for i, v := range vs[keep:] {
-		if v.n == curN || (keepFrom >= 0 && v.n >= keepFrom) || slices.Contains(protect, v.n) {
+		if v.n == curN {
+			continue
+		}
+		if (keepFrom >= 0 && v.n >= keepFrom) || slices.Contains(protect, v.n) {
+			// Kept for this pass only (a version it claimed, or one a reader
+			// may have resolved when it started): a later pass removes it,
+			// and a table that goes quiet has no later pass unless one is
+			// asked for.
+			e.notePruneDue(time.Now().Add(e.minVersionAge))
 			continue
 		}
 		if e.minVersionAge > 0 {
 			next := vs[keep+i-1] // the next version up that exists: vs is descending
 			at, ok := written[path.Base(next.key)]
-			if !ok || time.Since(at) < e.minVersionAge {
-				e.hintFailMu.Lock()
-				e.passVersionsHeld = true
-				e.hintFailMu.Unlock()
+			if !ok {
+				// No write time for the successor: kept, and looked at
+				// again once a successor written now would be old enough.
+				e.notePruneDue(time.Now().Add(e.minVersionAge))
+				continue
+			}
+			if time.Since(at) < e.minVersionAge {
+				// Never later than a successor written now would give: a
+				// write time ahead of this node's clock (skew, a restore
+				// that keeps them) must not put the prune off for good.
+				due := at.Add(e.minVersionAge)
+				if latest := time.Now().Add(e.minVersionAge); due.After(latest) {
+					due = latest
+				}
+				e.notePruneDue(due)
 				continue
 			}
 		}
-		if err := e.backend.Delete(ctx, v.key); err != nil {
-			e.logger.Debug().Err(err).Str("key", v.key).Msg("prune old v<N> (non-fatal)")
+		if err := e.backend.Delete(ctx, v.key); err != nil && !storage.IsNotFound(err) {
+			e.logger.Warn().Err(err).Str("key", v.key).Msg("Iceberg: could not delete an old published version; retried after iceberg.min_version_age")
+			e.notePruneDue(time.Now().Add(e.minVersionAge))
 		}
 	}
 }
@@ -1886,6 +1947,7 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 		// that no earlier publish did (#1750).
 		e.drainExportLag(tbl.Identifier())
 		e.markPublished(tbl.Identifier(), metaLoc)
+		e.markHinted(tbl.Identifier(), metaLoc)
 		e.clearDropMarker(ctx, tbl.Identifier())
 		// Glue sync (#1690): report the publish. The callee must not block.
 		if e.onPublished != nil {
@@ -2208,9 +2270,11 @@ func isAlreadyExists(err error) bool {
 // (#639 item 3): each table in its namespace, the namespace itself, and the
 // warehouse metadata files under the namespace directory. Called from the
 // database-delete API after the data files are gone; that ordering is
-// load-bearing — with no files left, a racing reconcile pass can only empty
-// tables, never recreate them, whereas catalog-first would let EnsureTable
-// resurrect residue mid-cleanup. Idempotent: a database that was never
+// load-bearing: an export of one of the tables that starts after the drop
+// lists no files and creates nothing, whereas catalog-first would let it
+// recreate a table from files the DELETE had yet to remove. Exports of the
+// database's tables do not overlap the drop at all in this process (below).
+// Idempotent: a database that was never
 // exported (or already cleaned) returns nil, so a re-run of the delete
 // converges.
 //
@@ -2225,14 +2289,40 @@ func isAlreadyExists(err error) bool {
 // with it, catalog rows, markers and warehouse directories alike (#1730; see
 // spokeSubNamespaces). A single spoke database ("{spoke}/{db}") is refused: the
 // API never sends one, and its namespace naming does not follow this mapping.
+//
+// It waits for the exports of the database's tables that are running, and
+// none starts until it is done (database_lock.go, #1789); if they do not end
+// in time it drops nothing and says so.
 func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 	ctx = e.withAWS(ctx)
 	if strings.ContainsAny(database, "/\\") {
 		return fmt.Errorf("refusing to drop namespaced database %q from the Iceberg catalog", database)
 	}
+	release, err := e.lockDatabaseForDrop(ctx, database)
+	if err != nil {
+		return err
+	}
+	defer release()
+	// Whatever the drop gets through, and before the lock is released: a
+	// drop that fails part way has still removed tables, and forgetting what
+	// was known of a table that is there after all only costs its next pass
+	// a look at the table itself.
+	defer func() {
+		e.countDatabaseDrop(database)
+		e.forgetDatabaseMemory(database)
+		if e.onDatabaseDropped != nil {
+			e.onDatabaseDropped(database)
+		}
+	}()
+	return e.dropDatabase(ctx, database)
+}
+
+// dropDatabase is DropDatabase's work, with the database's lock held.
+func (e *Exporter) dropDatabase(ctx context.Context, database string) error {
 	ns := icetable.Identifier{e.nsPrefix + "_" + database}
 	nsKey := catalogNamespaceKey(ns)
 	e.forgetExportLagNamespace(ns) // its tables' unpublished files will never be published (export_lag.go)
+	e.forgetHintedNamespace(ns)    // its tables', and a spoke's databases' (alreadyPublished)
 
 	// This node's tables. A node that never exported the database has no
 	// namespace in its own catalog, but on a shared bucket another node's
@@ -2397,9 +2487,10 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 		}
 	}
 
-	// List again: a reconcile pass that loaded a table before the catalog
-	// drop can still have committed into its directory since the first
-	// listing, and that residue would keep the database listed.
+	// List again: on a shared bucket another node's reconcile pass, which
+	// this node's database lock does not hold (#1792), can have committed
+	// into the directory since the first listing, and that residue would
+	// keep the database listed.
 	if e.backend != nil && colocated != nil {
 		if again, err := e.colocatedMetadataByTable(ctx, database); err == nil {
 			for dir, keys := range again {
@@ -2446,8 +2537,9 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 	}
 	for _, sub := range subs {
 		for dir := range sub.dirs {
-			// Listed again now: a reconcile that loaded the table before the
-			// catalog drop may have committed into it since.
+			// Listed again now: another node's reconcile that loaded the
+			// table before the catalog drop may have committed into it since
+			// (#1792).
 			dkeys, err := e.backend.List(ctx, dir+"/")
 			if err != nil {
 				if firstErr == nil {

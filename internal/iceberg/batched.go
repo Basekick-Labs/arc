@@ -82,12 +82,13 @@ type reconcileResult struct {
 	// floor owed has landed and no heal commit failed (#1098). Only then may the scheduler cache
 	// the fingerprint.
 	settled bool
-	// versionsHeld: the pass's prune left published versions on disk only
-	// because the version after each was published too recently
-	// (iceberg.min_version_age). The scheduler runs the table's next pass
-	// whatever its listing, so they are pruned once old enough even if the
-	// table has gone quiet by then.
-	versionsHeld bool
+	// pruneAgainAt: the pass's prune left published versions on disk that
+	// only time or a retry removes: the version after each was published too
+	// recently (iceberg.min_version_age), or the prune could not finish. It
+	// is when a pass of the table next has something to prune even if the
+	// table has gone quiet (Exporter.pruneAgainAt); zero when the prune left
+	// nothing it could remove later.
+	pruneAgainAt time.Time
 	// partial: new files remain unregistered because the pass ran out of time or lost the
 	// writer role. Not an error: what was committed stays, and the next pass continues.
 	partial bool
@@ -108,11 +109,11 @@ type reconcileResult struct {
 
 // ReconcileMeasurementWithHint is ReconcileMeasurement plus whether the pass fully
 // SETTLED: the reader discovery files (version-hint.text, v<N>.metadata.json) were
-// published, any snapshot-history floor this pass owed actually committed, AND no heal commit
-// (name mapping, retention properties) failed (#1098).
+// published, the snapshot expiry (by retention, or the history floor this pass owed) did not
+// fail, AND no heal commit (name mapping, retention properties) failed (#1098).
 //
-// The scheduler needs this separately from the error. Both steps are best-effort with
-// respect to the committed snapshot, but if either fails the caller must NOT cache the
+// The scheduler needs this separately from the error. None of these steps undoes the
+// committed snapshot, but if one fails the caller must NOT cache the
 // measurement's fingerprint, or a file set that then goes quiet is never revisited: the
 // hint would stay stale forever, and metadata that names deleted data files would stay
 // published (#1092).
@@ -289,9 +290,10 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 	sort.Strings(toRemove)
 
 	if len(toAdd) == 0 && len(toRemove) == 0 {
-		// Already converged — no new snapshot. Still republish the discovery
-		// files: a previous pass may have committed the snapshot but failed to
-		// write them, and this is the path that pass's retry lands on.
+		// Already converged — no new snapshot. Still publish the discovery
+		// files unless they are in place (alreadyPublished): a previous pass
+		// may have committed the snapshot but failed to write them, and this
+		// is the path that pass's retry lands on.
 		//
 		// Sweep here too. A measurement whose file set has stopped changing is
 		// skipped by the scheduler's fingerprint gate before it ever reaches this
@@ -311,7 +313,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 		if err != nil {
 			return reconcileResult{}, err
 		}
-		return reconcileResult{settled: ok && hintOK && !e.healFailed(), schema: arcSchemaOf(tbl), versionsHeld: e.versionsHeldByAge()}, nil
+		return reconcileResult{settled: ok && hintOK && !e.healFailed(), schema: arcSchemaOf(tbl), pruneAgainAt: e.pruneAgainAt()}, nil
 	}
 
 	// Metadata-only: files are dropped and added as DataFiles. (Transaction.Delete is a
@@ -624,14 +626,15 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 		commits:      commits,
 		droppedCold:  droppedCold,
 		writerLost:   writerGone && !partial && !moved,
-		versionsHeld: e.versionsHeldByAge(),
+		pruneAgainAt: e.pruneAgainAt(),
 	}
 	if loopErr != nil {
 		return res, loopErr
 	}
-	// A failed floor must not be cached as settled. The scheduler keys its skip gate on this
-	// value; reporting not-settled keeps the fingerprint uncached so the next tick re-drives the
-	// measurement, and finishPass retries the owed floor there even if that pass removes nothing.
+	// A failed expiry, floor or retention, must not be cached as settled. The scheduler keys its
+	// skip gate on this value; reporting not-settled keeps the fingerprint uncached so the next
+	// tick re-drives the measurement, and finishPass retries there even if that pass removes and
+	// commits nothing.
 	res.settled = !partial && !moved && hintOK && finishedOK && !e.healFailed()
 	return res, nil
 }
@@ -653,27 +656,31 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 // older snapshots' record_count and bounds describe content that no longer exists there — the
 // original #1092 symptom.
 //
-// Best-effort for the retention case: a failure doesn't undo the successful reconcile, and the
-// next pass retries. NOT best-effort for the floor: only a pass that removes something asks to
-// floor, so the next pass may well remove nothing. A failed floor is remembered (floorOwed) and
-// retried by every later pass until it lands, including a pass with nothing to commit; before
-// #1686 the retry pass took the converged branch, which never expired, and the floor was lost.
-// The memory is per process: a restart in between forgets it. The floor itself is taken
-// straight after the commit that removed the paths (reconcile), so here it is only the retry.
+// A failed expiry doesn't undo the successful reconcile, but it leaves the pass unsettled, so
+// the scheduler runs the table's next pass. For the retention case that pass retries by itself:
+// every pass that gets here as the writer tries to expire down to retain_snapshots, committed
+// or not (#1791; before, a pass that committed nothing did not, and a failed expiry was lost
+// once the table went quiet). The floor
+// needs a memory: only a pass that removes something asks to floor, so the next pass may well
+// remove nothing. A failed floor is remembered (floorOwed) and retried by every later pass until
+// it lands, including a pass with nothing to commit; before #1686 the retry pass took the
+// converged branch, which never expired, and the floor was lost. The memory is per process: a
+// restart in between forgets it. The floor itself is taken straight after the commit that
+// removed the paths (reconcile), so here it is only the retry.
 //
 // passStart is the first version this pass committed (-1: none). Pruning keeps it and every
 // later v<N> copy, so the versions a multi-commit pass claimed (claimVersion) stay on disk for
 // the fence until the next pass.
 //
-// ok reports that the discovery files were published and any owed floor landed. (A failed heal
-// also leaves the pass unsettled; the callers read that from healFailed, #1098.)
+// ok reports that the discovery files were published and the expiry, floor or retention, did
+// not fail. (A failed heal also leaves the pass unsettled; the callers read that from
+// healFailed, #1098.)
 func (e *Exporter) finishPass(ctx context.Context, tbl *icetable.Table, tkey, database, measurement string, commits, passStart int) (*icetable.Table, bool, error) {
 	// The writer role can be lost after the pass's last commit check. Then the pass still
 	// publishes what it committed (its own commits are the table's head), but makes no expiry
 	// commit and does not prune or sweep: its view is stale, and the new writer's pass does those.
 	mayCommit := e.passMayCommit()
 	floor := e.floorOwed(tkey)
-	appended := e.expiryOwed(tkey) // read on every pass: it also notes the table's first one
 	expireOK := true
 	switch {
 	case !mayCommit:
@@ -681,17 +688,28 @@ func (e *Exporter) finishPass(ctx context.Context, tbl *icetable.Table, tkey, da
 	case floor:
 		tbl, expireOK = e.expireSnapshots(ctx, tbl, database, measurement, floorHistory)
 		e.setFloorOwed(tkey, !expireOK)
-	case commits > 0 || appended:
-		// Also on a pass that committed nothing, after appends (append.go):
-		// they add snapshots and expire none, and the pass that follows them
-		// finds every appended file in the table already. And on a table's
-		// first pass in this process, for the appends of the last one.
+	default:
+		// Every pass, whether or not it committed (#1791). What can leave a
+		// table over retain_snapshots is not only this pass's commits:
+		// appends add snapshots and expire none (append.go), an earlier
+		// pass's expiry can have failed, and another process or node can
+		// have committed and stopped before expiring. The table says how
+		// many snapshots it has, so nothing has to remember that an expiry
+		// is owed. Within retain_snapshots this reads the loaded metadata
+		// and commits nothing (expireSnapshots).
 		tbl, expireOK = e.expireSnapshots(ctx, tbl, database, measurement, retainConfigured)
-		if expireOK {
-			e.setExpiryOwed(tkey, false)
-		}
 	}
-	wrote := e.writeVersionHint(ctx, tbl)
+	// Not when the discovery files already name this metadata (#1787): a pass
+	// that committed nothing would refuse its own v<N> copy, read it back to
+	// compare and write the hint it just read. What a publish does besides
+	// the two files and still applies is done here.
+	wrote := e.alreadyPublished(tbl)
+	if wrote {
+		e.hardenLocalMetadataPerms(tbl.MetadataLocation())
+		e.drainExportLag(tbl.Identifier())
+	} else {
+		wrote = e.writeVersionHint(ctx, tbl)
+	}
 	published := wrote && !e.hintFailed()
 	if err := e.fencedErr(); err != nil {
 		return tbl, false, err
@@ -1007,36 +1025,4 @@ func (e *Exporter) setFloorOwed(tkey string, owed bool) {
 	} else {
 		delete(e.floorDue, tkey)
 	}
-}
-
-// expiryOwed reports that appends may have added snapshots to the table
-// since a pass last expired any (append.go): one did in this process, or this
-// is the table's first pass in this process and what the last process left is
-// not known. The flag is per process, like floorOwed; the first-pass rule is
-// what covers a restart, after which a table that goes quiet would otherwise
-// keep the snapshots of its appends until its next commit.
-func (e *Exporter) expiryOwed(tkey string) bool {
-	e.chunkMu.Lock()
-	defer e.chunkMu.Unlock()
-	if _, seen := e.expirySeen[tkey]; !seen {
-		if e.expirySeen == nil {
-			e.expirySeen = make(map[string]struct{})
-		}
-		e.expirySeen[tkey] = struct{}{}
-		return true
-	}
-	return e.expireOwed[tkey]
-}
-
-func (e *Exporter) setExpiryOwed(tkey string, owed bool) {
-	e.chunkMu.Lock()
-	defer e.chunkMu.Unlock()
-	if !owed {
-		delete(e.expireOwed, tkey)
-		return
-	}
-	if e.expireOwed == nil {
-		e.expireOwed = make(map[string]bool)
-	}
-	e.expireOwed[tkey] = true
 }

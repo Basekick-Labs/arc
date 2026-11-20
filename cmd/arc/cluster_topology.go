@@ -188,6 +188,37 @@ func icebergIngestInterval(seconds int, hasCoordinator bool) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+// icebergReconcileConcurrency is how many tables' reconcile passes this node
+// runs at once (#1786).
+//
+// One on a node of a cluster, whatever is configured. There a pass crosses
+// the replicated manifest (the barrier before a listing, the files the
+// cluster has deleted) and runs under the exporter's lease, none of which
+// has been run from several goroutines; and a node with no election on a
+// shared bucket (noElection) may not even be the only exporter.
+//
+// On a standalone node, iceberg.reconcile_concurrency, where 0 (the default)
+// picks by the storage: icebergReconcileOnObjectStore on an object store,
+// where a pass is mostly waiting on requests and overlapping them cut the
+// export lag and a timed pass's length to a quarter, and one on local
+// storage, where a pass is tens of milliseconds and running several at once
+// measured little gain in lag and a higher p95 on writes.
+func icebergReconcileConcurrency(configured int, hasCoordinator, noElection, objectStore bool) int {
+	switch {
+	case hasCoordinator || noElection || configured < 0:
+		return 1
+	case configured == 0 && objectStore:
+		return icebergReconcileOnObjectStore
+	case configured == 0:
+		return 1
+	}
+	return configured
+}
+
+// icebergReconcileOnObjectStore is the reconcile passes a standalone node on
+// an object store runs at once when iceberg.reconcile_concurrency is 0.
+const icebergReconcileOnObjectStore = 4
+
 // icebergNoElectionWarning is logged on a compactor-role node of a shared
 // bucket with no compactor failover: nothing elects the Iceberg exporter.
 const icebergNoElectionWarning = "Iceberg export on a shared bucket without compactor failover (cluster.failover_enabled and the writer_failover licence feature): " +

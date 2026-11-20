@@ -210,8 +210,8 @@ func (e *Exporter) appendFiles(ctx context.Context, database, measurement string
 	if err != nil {
 		return res, fmt.Errorf("iceberg append commit (%d files): %w", len(built), err)
 	}
-	// The pass that follows expires what this added (finishPass).
-	e.setExpiryOwed(database+"\x00"+measurement, true)
+	// The table's next pass expires what this added (finishPass); an append
+	// expires nothing.
 	// Before the publish, which is where the lag is observed (export_lag.go).
 	e.noteExported(committed.Identifier(), built, nil)
 	wrote := e.writeVersionHint(ctx, committed)

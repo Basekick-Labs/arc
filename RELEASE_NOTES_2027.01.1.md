@@ -2,6 +2,96 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: an Iceberg snapshot expiry that failed is retried: every pass tries to expire down to `retain_snapshots` ([#1791](https://github.com/Basekick-Labs/arc/issues/1791))
+
+A reconcile pass expired snapshots over `iceberg.retain_snapshots` only when it had committed something, when an ingest append had come in since the last expiry, or on a table's first pass after a restart. So a table could stay over the bound once it went quiet:
+
+- **An expiry that failed was not tried again.** The pass that failed was left unsettled and the next one ran, but it committed nothing and so did not expire; it settled, and the extra snapshots stayed until the table's next commit.
+- **The same for an expiry that never ran**: a node that lost the writer role between its last commit and the end of its pass, or another node that appended or committed and stopped before expiring, when the node that took over had already reconciled the table in its process.
+
+Every pass that reaches its end as the writer now tries to expire down to `retain_snapshots`, whether or not it committed. A table within the bound costs nothing more: the count is read from the metadata the pass already loaded, and no commit is made. The exporter no longer keeps a record of which tables are owed an expiry.
+
+- **While an expiry keeps failing** the table's pass stays unsettled and runs in full at every `iceberg.reconcile_interval`, logging the failure at Error each time, and its ingest exports run as passes. That was already so for a table that keeps receiving data; for a quiet one it used to stop after one pass, with the snapshots left in place.
+- A node without the writer role still makes no expiry commit.
+- No configuration changes. Found by reading during #1787; the failing sequence is reproduced by the new tests, not seen in a deployment.
+## Fix: a database deleted while its Iceberg tables were being exported could leave them broken ([#1789](https://github.com/Basekick-Labs/arc/issues/1789))
+
+A `DELETE` of a database drops its Iceberg tables from the request itself, and nothing kept that from landing in the middle of a reconcile pass or an append of one of those tables. The pass had loaded its table before the drop and committed or published after it, and the catalog ended with a table whose metadata named files the drop had deleted. Such a table still loads, so nothing treated it as gone: every later pass of it failed (`could not open manifest file`), and a database written again under the same name was exported into it. It did not heal.
+
+- **Reproduced:** a test that deletes a database (its files, then its tables) while a timed pass runs and then writes it again ended with broken or missing tables in 19 of 30 runs with passes one at a time and 25 of 30 with four at once. With the fix, 0 of 30 at both.
+- **On the running binary** (S3 API with 30 ms added per request, 20 tables under ingest, the database deleted every 20 s while ingest kept writing it): the build without the fix logged 26, 47 and 79 failed passes in three runs (tables naming deleted manifests and metadata); the build with it logged none in six, at the default and at 8 passes at once. In the four of those where the writes outlasted the deletes, every table matched storage at the end (as it did in the one such run without the fix, where later deletes had cleared the broken tables). The `DELETE` took the same 8 to 15 s in both.
+- **The fix:** every export of a table holds its database's lock from before it lists the measurement to its end, and the drop holds it alone. A drop waits for the exports of that database that are running, and none starts until it is done. An export does not wait for a drop: it gives way at once and its table is tried again shortly, so a database being dropped does not hold up the export of the others.
+- **A pass does not trust what was remembered of a dropped table.** A database written again with other columns, or with a column of another type, is exported with the new schema; before, a pass that was already queued built the new table from the old one's.
+- **A `DELETE` can wait** for an export of the database's tables in progress: usually milliseconds, at most 150 s or the request's own budget (the delete's hold on tiering lasts that much longer). If the export does not end in time the tables are left as they are, the data is deleted all the same, and the response says so: `"iceberg_cleanup": "pending: ... repeat the DELETE to drop them"`. Repeating the `DELETE` drops them; it answers 404, since the database no longer exists, and carries the same note if the drop is refused again.
+- **Not covered: a shared bucket.** There the node that handles the `DELETE` is usually not the node that exports, and one node's lock does not hold another's pass ([#1792](https://github.com/Basekick-Labs/arc/issues/1792)). A standalone node, and each node of a cluster with node-local warehouses, is covered.
+- No new configuration.
+
+## Fix: a quiet Iceberg table no longer repeats its pass and re-publishes while old versions wait out `min_version_age` ([#1787](https://github.com/Basekick-Labs/arc/issues/1787))
+
+A pass that kept published versions on disk only because of `iceberg.min_version_age` marked the table so that every later pass ran in full, whatever its listing, until those versions were old enough to prune. Each of those passes committed nothing, yet read the table's manifests and wrote `v<N>.metadata.json` (refused as existing, then read back to compare) and `version-hint.text` again: 15 requests on S3, at every `iceberg.reconcile_interval`.
+
+- **The table now gets one pass, when the versions are due.** The prune reports when the last version it kept for its age can go; until then an unchanged table is skipped like any other (the listing only, 3 requests in the trace), and the pass at that time prunes them all. The versions that come of age earlier wait for it, less than one `min_version_age` more.
+- **A pass that finds its own publish in place writes nothing.** When this process already wrote that exact metadata file to `version-hint.text` and the hint read at the start of the pass still names it, the pass no longer writes the copy and the hint again. The first pass of a process, a pass after any commit, a pass that finds the hint missing, behind or unreadable, and every pass of a table still on an adopted row publish as before.
+- **Given up:** a pass that commits nothing no longer puts back a `v<N>.metadata.json` deleted from outside Arc while the hint still names it. The next commit or restart writes it.
+- **A prune that could not finish is retried.** When the metadata directory cannot be listed, or a copy cannot be deleted, the table gets a pass one `min_version_age` later that tries again, and the failure is logged at Warn (it was at Debug, or not logged). Before, a table that then went quiet kept those copies until its files next changed. While the failure lasts that is one full pass of the table per `min_version_age`.
+- **Copies a pass of several commits keeps for itself are removed by the next pass.** They used to stay over `retain_snapshots + 1` on a table that went quiet.
+- **Measured** with the built binary on SeaweedFS, `reconcile_interval = 15`, `min_version_age = 120`, 30 writes and then nothing: before, `version-hint.text` was written again at each of the 7 passes that followed the last commit; after, not once: the six passes that followed the last publish skipped the table, and the seventh, 105 s after it, pruned the table from 10 copies to `retain_snapshots + 1`. One run before, two after.
+- No configuration changes.
+
+## New: reconcile passes of several Iceberg tables run at once ([#1786](https://github.com/Basekick-Labs/arc/issues/1786))
+
+After #1778 the appends of different tables overlap, but a reconcile pass still ran for one table at a time, and every table gets one: at its first export, every `iceberg.reconcile_interval`, and after 120 appends. On object storage a pass is about half a second of waiting on storage requests (14 to 16 of them for a table that only took appends), so a timed pass over 200 tables took minutes, during which those tables' appends were served one batch per table visited. The passes of different tables now overlap too.
+
+- **New key `iceberg.reconcile_concurrency`** (1 to 16; default `0`, which picks by the storage: `4` on an object store, `1` on local storage). `1` reconciles one table at a time, as before. The value in effect is logged at startup. Azure and GCS count as object stores and so default to 4; they were not run.
+- **Where it applies:** the timed pass's walk of the tables, and the passes ingest requests need (a table's first export when its data arrives after the node started, a fallback, every request with `ingest_append_enabled = false`) when `iceberg.ingest_export_concurrency` is above 1. Passes asked for by compaction, DELETE, retention or tiering still run one at a time.
+- **Standalone nodes only.** A node of a cluster, and a node on a shared bucket with no election of the exporter, runs one at a time whatever the key says, and logs it when the key was set higher.
+- As with the appends, the scheduler starts a batch, waits for all of it, and only then records what each pass did: a table is still exported by one thing at a time.
+
+Measured on AWS S3, standalone on EC2 in the bucket's region, 200 tables written at once with `ingest_export_interval = 5` and 16 appends at once, over 10 minutes after a 6-minute warm-up (two timed passes by the timer; the instance's logs were not kept); one run each:
+
+| Passes at once | Average export lag | Appends per second | Longest wait at the end of the run |
+|---|---|---|---|
+| 1 | 5.1 s | 16.2 | 28 s |
+| 4 | 3.2 s | 19.5 | 2 s |
+| 8 | 2.1 s | 21.0 | 1 s |
+
+A second set on the final build, the same load over minutes 5 to 10 of the run (a timed pass is due at minute 5), and how long the first export of the 200 tables took after the node started (their data arrives after the start, so those are passes ingest requests ask for):
+
+| `reconcile_concurrency` | Average export lag | First export of all 200 tables |
+|---|---|---|
+| 1 | 7.9 s | 2 min 38 s |
+| not set (4 on object storage) | 3.5 s | 48 s |
+| 8 | 2.0 s | 27 s |
+
+The same load through a local S3 server with 30 ms added to every request, where the logs give the lengths:
+
+| Passes at once | The timed pass's walk of 200 tables | First export of all 200 tables after start |
+|---|---|---|
+| 1 | about 5 minutes | 5 min 10 s |
+| 4 | 77 s | 83 s |
+| 8 | 45 s | 46 s |
+
+(The lag in those local runs is not comparable across rows: the 4-minute window lay inside the walk at 1, overlapped it by seconds at 4, and came after it at 8.)
+
+- **At the default `ingest_export_interval` of 60 s nothing changes**: 30.3 s at one pass at a time and 29.9 s at 4 on AWS, which is what a 60 s interval gives. The gain is at short intervals, in how long a timed pass takes, and at start-up.
+- In every run no append fell back, there were no Iceberg warnings or errors, row counts matched storage on the tables checked and no file was in a table twice.
+- **Why the default is 1 on local storage:** a pass there is tens of milliseconds, and running several at once bought little and cost write latency. 200 tables at 5 s on a laptop that also ran the load, two runs each:
+
+  | Appends / passes at once | Average export lag | Write round trip p95 | p99 |
+  |---|---|---|---|
+  | 1 / 1 | 1.00, 0.86 s | 4.8, 4.2 ms | 68, 58 ms |
+  | 8 / 1 | 0.78, 0.77 s | 7.5, 6.8 ms | 73, 72 ms |
+  | 8 / 4 | 0.66, 0.46 s | 13.9, 9.9 ms | 96, 81 ms |
+
+Notes:
+
+- **A timed pass now serves compaction requests, drops and ingest once per batch of tables**, not once per table.
+- **The passes of a batch share** 16 storage reads in flight (footers and existence checks) and the 64 MiB of footers one pass alone may hold. Their listings, metadata reads and commits are not bounded together.
+- Each pass in a batch has the two minutes a pass always had; the batch ends when its slowest pass does.
+- **Not run on the binary:** `reconcile_concurrency = 16` on AWS (it ran on a local S3 server), a cold tier, Glue sync, a warehouse outside the storage root, Azure and GCS.
+- **A database deleted during a reconcile pass** could leave a table missing or broken, with one pass at a time as with several; fixed in [#1789](https://github.com/Basekick-Labs/arc/issues/1789), above.
+- While a table's published versions were held by `iceberg.min_version_age`, each of its passes repeated its requests and re-published without having committed anything; fixed in [#1787](https://github.com/Basekick-Labs/arc/issues/1787), above.
+
 ## New: ingest appends of several Iceberg tables run at once ([#1778](https://github.com/Basekick-Labs/arc/issues/1778))
 
 On object storage an ingest-triggered export is a few hundred milliseconds of waiting on storage requests, and Arc exported one table at a time: under three tables a second in a bucket's region. With many tables being written the tables queued behind each other, and the lag was the length of the queue, whatever `ingest_export_interval` said. The appends of different tables now overlap.

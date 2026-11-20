@@ -27,12 +27,13 @@ import (
 // what keeps a file from being added twice:
 //
 //   - One export of a table at a time, and never a pass while an append
-//     runs. The loop goroutine runs every reconcile pass itself. Appends of
-//     different tables can run at once on other goroutines (#1778,
-//     scheduler_ingest_batch.go), but the loop starts them and waits for all
-//     of them before it does anything else, a table is in one of them at
-//     most, and everything below is read before they start and written after
-//     they end, by the loop.
+//     runs. Appends of different tables run at once on other goroutines
+//     (#1778, scheduler_ingest_batch.go), and so do reconcile passes of
+//     different tables (#1786, scheduler_pass.go), in batches of one kind:
+//     the loop goroutine starts a batch and waits for all of it before it
+//     does anything else, a table is in a batch once at most, and everything
+//     below is read before a batch starts and written after it ends, by the
+//     loop.
 //   - A table takes appends only between reconcile passes that settled
 //     (appendOK). A settled pass means every listed file is in the table, and
 //     that every rule a listing enforces as a whole held: no hidden data
@@ -195,22 +196,6 @@ func (s *Scheduler) noteRecent(key string, storageKeys []string) {
 	for _, k := range storageKeys {
 		set[k] = now
 	}
-}
-
-// noteListed records the recent files of a pass's listing in recentAdds. Only
-// files an append could still take: the rest cannot be reported in time.
-func (s *Scheduler) noteListed(key string, files []FileRef) {
-	if !s.appendEnabled || s.ingestInterval <= 0 {
-		return
-	}
-	now := time.Now()
-	var recent []string
-	for _, f := range files {
-		if t, ok := storage.IngestFileTime(path.Base(f.Key)); ok && now.Sub(t) < recentAddsKeep {
-			recent = append(recent, f.Key)
-		}
-	}
-	s.noteRecent(key, recent)
 }
 
 // notePassEnded is the append path's bookkeeping after a reconcile pass of the
@@ -416,8 +401,9 @@ func (s *Scheduler) exportIngest(ctx context.Context, m Measurement, key string)
 }
 
 // markAppended replaces the table's cached fingerprint with one no listing
-// produces, so its next pass runs whatever the listing is: after an append,
-// and while published versions wait out their minimum age.
+// produces, so its next pass runs whatever the listing is: after an append.
+// (A table whose published versions wait out their minimum age gets its pass
+// when they are due: measurementState.pruneAt.)
 func (s *Scheduler) markAppended(key string) {
 	if st, ok := s.state[key]; ok {
 		st.fingerprint = appendedFingerprint
@@ -450,6 +436,14 @@ func (s *Scheduler) runAppend(ctx context.Context, job *ingestJob, exp *Exporter
 	}()
 	// What this export reads of the new files is read once (export_reads.go).
 	ctx = withExportReads(ctx)
+	// The database's tables are not dropped while this appends to one
+	// (database_lock.go, #1789).
+	release, err := exp.holdDatabase(m.Database)
+	if err != nil {
+		job.reason = err.Error() // the pass that follows gives way too, and the request comes back
+		return
+	}
+	defer release()
 	refs, ok, err := job.resolver.AppendRefs(ctx, m, job.keys, job.sizes)
 	if err != nil {
 		job.reason = err.Error()

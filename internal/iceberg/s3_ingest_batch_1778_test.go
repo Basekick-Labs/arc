@@ -33,7 +33,9 @@ func TestS3IngestBatch_SeveralTablesAtOnce(t *testing.T) {
 	exp.SetWarehouseAuthoritative(true)
 	src := &recordingSource{StorageWalkSource: NewStorageWalkSource(b, "arc", zerolog.Nop()), fail: map[string]bool{}}
 	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: src, Interval: time.Hour, Logger: zerolog.Nop(),
-		IngestInterval: time.Millisecond, IngestAppend: true, IngestConcurrency: tables})
+		IngestInterval: time.Millisecond, IngestAppend: true, IngestConcurrency: tables,
+		// The tables' first exports, which are reconcile passes, run at once too (#1786).
+		ReconcileConcurrency: 4})
 	sched.started = time.Now().Add(-time.Second)
 	seq := 0
 	want := map[string][]string{}

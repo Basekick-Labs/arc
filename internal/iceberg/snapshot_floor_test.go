@@ -166,10 +166,11 @@ func TestExpireModeFor(t *testing.T) {
 	}
 }
 
-// TestExpireSnapshots_ReportsFailureSoThePassIsNotCached is the retry contract. A failed floor
-// cannot be left best-effort the way a failed retention expiry can: only a pass that REMOVES
-// something asks to floor, so once the file set goes quiet the scheduler skips the measurement
-// and there is no next pass to retry on. Published metadata would keep naming deleted files.
+// TestExpireSnapshots_ReportsFailureSoThePassIsNotCached is the retry contract. A failed
+// expiry is reported, so the pass is not cached and the next one retries. For a floor that
+// matters most: only a pass that REMOVES something asks to floor, so once the file set goes
+// quiet the scheduler skips the measurement and there is no next pass to retry on. Published
+// metadata would keep naming deleted files.
 func TestExpireSnapshots_ReportsFailureSoThePassIsNotCached(t *testing.T) {
 	ctx := context.Background()
 	r := newCostRig(t, 10)
