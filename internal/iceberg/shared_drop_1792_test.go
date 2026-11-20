@@ -253,6 +253,8 @@ func TestSharedDrop1792_TheNextPassRemovesATableFromBeforeTheDrop(t *testing.T) 
 	if _, rowExists, err := b.catalogRow(ctx, "arc_mydb", "cpu"); err != nil || rowExists {
 		t.Fatalf("the exporting node still has a row for the dropped table (exists=%v, err=%v)", rowExists, err)
 	}
+	// No drop follows this removal to sweep the directories it emptied.
+	r.goneFromStorage("arc_mydb.db")
 	// Written again.
 	r.addFile()
 	r.addFile()
@@ -732,5 +734,45 @@ func TestSharedDrop1792_EmptiedDirectoriesAreRemoved(t *testing.T) {
 	// Never above the database: the storage root's other directories stay.
 	if _, err := os.Stat(r.root); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A pass that commits and then fails still looks at its end: what its first
+// commit wrote into the dropped table goes, though the pass returns an error
+// of its own.
+func TestSharedDrop1792_APassThatCommitsAndThenFailsStillLooks(t *testing.T) {
+	r, a, b := sharedDropRig(t)
+	ctx := context.Background()
+	sc := r.schemaNow()
+	r.addFile()
+	current := r.addFile()
+	unread := current[len(current)-2:]
+	b.chunkMu.Lock()
+	if b.chunkSize == nil {
+		b.chunkSize = make(map[string]int)
+	}
+	b.chunkSize["mydb\x00cpu"] = 1 // one new file per commit
+	b.chunkMu.Unlock()
+	boom := errors.New("the second commit's files could not be read")
+	reads := 0
+	err := r.overlap(a, func(canCommit func() bool) error {
+		_, err := b.reconcile(ctx, reconcileRequest{database: "mydb", measurement: "cpu", schema: sc, current: current, unread: unread,
+			readSchemas: func(context.Context, []FileRef) (ArcSchema, error) {
+				if reads++; reads > 1 {
+					return ArcSchema{}, boom
+				}
+				return sc, nil
+			}, canCommit: canCommit})
+		return err
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("the pass ended with %v, want its own error", err)
+	}
+	if reads < 2 {
+		t.Fatalf("the pass read schemas %d times: it did not commit once and then fail", reads)
+	}
+	r.goneFromStorage("arc_mydb.db")
+	if _, rowExists, err := b.catalogRow(ctx, "arc_mydb", "cpu"); err != nil || rowExists {
+		t.Fatalf("the exporting node kept its row for the dropped table (exists=%v, err=%v)", rowExists, err)
 	}
 }
