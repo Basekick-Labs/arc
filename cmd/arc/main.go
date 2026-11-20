@@ -4764,6 +4764,9 @@ func main() {
 			// How many tables' ingest appends run at once (#1778). Without the
 			// ingest trigger (a cluster node, interval 0) nothing reads it.
 			IngestConcurrency: cfg.Iceberg.IngestExportConcurrency,
+			// How many tables' reconcile passes run at once (#1786): one on a
+			// cluster node.
+			ReconcileConcurrency: icebergReconcileConcurrency(cfg.Iceberg.ReconcileConcurrency, clusterCoordinator != nil, icebergTopo.warnNoElection),
 		})
 		// #1731: with node-local warehouses (not icebergTopo.barrier, which is a shared bucket or
 		// shared_storage_mode), a database DELETE on the writer drops only the writer's tables.

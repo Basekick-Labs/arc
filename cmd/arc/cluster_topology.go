@@ -188,6 +188,20 @@ func icebergIngestInterval(seconds int, hasCoordinator bool) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+// icebergReconcileConcurrency is how many tables' reconcile passes this node
+// runs at once: iceberg.reconcile_concurrency on a standalone node, and one
+// on a node of a cluster. There a pass crosses the replicated manifest (the
+// barrier before a listing, the files the cluster has deleted) and runs
+// under the exporter's lease, none of which has been run from several
+// goroutines; and a node with no election on a shared bucket (noElection)
+// may not even be the only exporter. #1786.
+func icebergReconcileConcurrency(configured int, hasCoordinator, noElection bool) int {
+	if hasCoordinator || noElection || configured < 1 {
+		return 1
+	}
+	return configured
+}
+
 // icebergNoElectionWarning is logged on a compactor-role node of a shared
 // bucket with no compactor failover: nothing elects the Iceberg exporter.
 const icebergNoElectionWarning = "Iceberg export on a shared bucket without compactor failover (cluster.failover_enabled and the writer_failover licence feature): " +

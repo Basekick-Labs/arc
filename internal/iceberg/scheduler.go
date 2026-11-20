@@ -134,11 +134,14 @@ type Scheduler struct {
 	// ingestConcurrency is how many tables' appends run at once (1: one
 	// request at a time, start to end, on the loop goroutine).
 	ingestConcurrency int
-	started           time.Time
-	appendPending     map[string]pendingFiles
-	appendOK          map[string]bool
-	recentAdds        map[string]map[string]time.Time
-	appendFallback    map[string]string
+	// passConcurrency is how many tables' reconcile passes run at once in
+	// a timed pass and after an ingest batch (1: one at a time).
+	passConcurrency int
+	started         time.Time
+	appendPending   map[string]pendingFiles
+	appendOK        map[string]bool
+	recentAdds      map[string]map[string]time.Time
+	appendFallback  map[string]string
 	// passCommits is how many data commits the reconcile pass in progress (or
 	// the last one) made: reconcileOne sets it, reconcileOneRecovered reads it.
 	passCommits int
@@ -255,6 +258,10 @@ type SchedulerConfig struct {
 	// (iceberg.ingest_export_concurrency). One or less: one ingest request
 	// at a time, as before #1778.
 	IngestConcurrency int
+	// ReconcileConcurrency is how many tables' reconcile passes run at once
+	// (iceberg.reconcile_concurrency). One or less: one at a time, on the
+	// loop goroutine, as before #1786.
+	ReconcileConcurrency int
 }
 
 // NewScheduler builds a reconcile scheduler.
@@ -281,6 +288,7 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		ingestPending:     make(map[string]ingestReports),
 		appendEnabled:     cfg.IngestAppend,
 		ingestConcurrency: max(1, cfg.IngestConcurrency),
+		passConcurrency:   max(1, cfg.ReconcileConcurrency),
 		started:           time.Now(),
 		appendPending:     make(map[string]pendingFiles),
 		appendOK:          make(map[string]bool),
@@ -827,45 +835,9 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 	s.lastBlocked = blocked
 	var ok, failed, skipped, awaitingMigration, inProgress, busy int
 	seen := make(map[string]struct{}, len(measurements))
-	for _, m := range measurements {
-		if ctx.Err() != nil { // shutdown mid-pass
-			return false
-		}
-		// A compaction that finished while this pass runs is served before the
-		// next measurement, not after the whole pass (#1722). A database
-		// dropped in this pass (#1731) is not reconciled again in it: a drop
-		// between measurements happened after the listing, and one at pass
-		// start leaves nothing to list.
-		s.serviceDrops(ctx)
-		s.serviceRequests(ctx)
-		// One ingest request at most, so a backlog of them cannot hold the
-		// pass (scheduler_ingest.go).
-		s.serviceIngest(ctx, 1)
-		if s.droppedThisPass(m.Database) {
-			continue
-		}
-		key := m.Database + "\x00" + m.Measurement
-		seen[key] = struct{}{}
-		if _, blocked := blocked[key]; blocked {
-			// Counted apart from `skipped`, which means "fingerprint unchanged, nothing to do".
-			// Folding the two together would report a permanently unexported measurement in the
-			// same number as a healthy no-op, and the pass summary would look clean. The
-			// per-measurement reason is logged by MigrateDottedNamespaces, which has it; this
-			// layer only counts (one log line per fact -- SQLite checklist item 7).
-			awaitingMigration++
-			continue
-		}
-		// Re-checked per measurement, not only per pass: a pass over many measurements on
-		// object storage takes minutes, and a lease that moved meanwhile would otherwise leave
-		// two nodes writing the same tables until this one finished (#939).
-		if s.gate != nil && !s.gate.CanRun() {
-			s.logger.Info().Msg("Iceberg reconcile: this node stopped being the active writer mid-pass; stopping the pass")
-			clear(s.busySince)
-			return false
-		}
-		mctx, cancel := context.WithTimeout(ctx, measurementTimeout)
-		outcome, err := s.reconcileOneRecovered(mctx, m, key)
-		cancel()
+	// What follows a table's pass: when it last changed, its busy stretch,
+	// the pass's counters and the log line.
+	afterPass := func(m Measurement, key string, outcome reconcileOutcome, err error) {
 		if outcome == outcomeReconciled || outcome == outcomeInProgress {
 			s.lastReconciled[key] = time.Now()
 		}
@@ -883,7 +855,7 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 					Dur("retry_in", s.partialRetryInterval()).
 					Msg("Iceberg reconcile: this measurement's files are changing under the export (compaction, delete or retention running); retrying soon")
 				busy++
-				continue
+				return
 			}
 			// Escalated: still not an error in the export itself, but nothing has landed for this
 			// measurement for too long to keep calling it transient. Counted as failed, and it no
@@ -893,7 +865,7 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 				Time("busy_since", since).Dur("busy_for", time.Since(since).Round(time.Second)).
 				Msg("Iceberg reconcile: this measurement's files have kept changing under the export without anything committed or settled; counting it as failed")
 			failed++
-			continue
+			return
 		} else {
 			delete(s.busySince, key)
 		}
@@ -912,6 +884,78 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 			ok++
 		default:
 			skipped++ // fingerprint unchanged — nothing to do (the cheap common case)
+		}
+	}
+	for next := 0; next < len(measurements); {
+		if ctx.Err() != nil { // shutdown mid-pass
+			return false
+		}
+		// A compaction that finished while this pass runs is served before the
+		// next measurement, not after the whole pass (#1722). A database
+		// dropped in this pass (#1731) is not reconciled again in it: a drop
+		// between measurements happened after the listing, and one at pass
+		// start leaves nothing to list.
+		s.serviceDrops(ctx)
+		s.serviceRequests(ctx)
+		// One ingest request that needs a pass at most (and one batch of
+		// appends), so a backlog of them cannot hold the pass
+		// (scheduler_ingest.go).
+		s.serviceIngest(ctx, 1)
+		// The next tables to reconcile, up to passConcurrency of them. Taken
+		// after the services above and right before they run: a service can
+		// reconcile one of them, and what the pass starts from must be what
+		// that left (preparePass).
+		var batch []Measurement
+		for next < len(measurements) && len(batch) < s.passConcurrency {
+			m := measurements[next]
+			next++
+			if s.droppedThisPass(m.Database) {
+				continue
+			}
+			key := m.Database + "\x00" + m.Measurement
+			seen[key] = struct{}{}
+			if _, blocked := blocked[key]; blocked {
+				// Counted apart from `skipped`, which means "fingerprint unchanged, nothing to do".
+				// Folding the two together would report a permanently unexported measurement in the
+				// same number as a healthy no-op, and the pass summary would look clean. The
+				// per-measurement reason is logged by MigrateDottedNamespaces, which has it; this
+				// layer only counts (one log line per fact -- SQLite checklist item 7).
+				awaitingMigration++
+				continue
+			}
+			batch = append(batch, m)
+		}
+		if len(batch) == 0 {
+			continue
+		}
+		// Re-checked per batch, not only per pass: a pass over many measurements on
+		// object storage takes minutes, and a lease that moved meanwhile would otherwise leave
+		// two nodes writing the same tables until this one finished (#939).
+		if s.gate != nil && !s.gate.CanRun() {
+			s.logger.Info().Msg("Iceberg reconcile: this node stopped being the active writer mid-pass; stopping the pass")
+			clear(s.busySince)
+			return false
+		}
+		if len(batch) == 1 {
+			// One table: on this goroutine, start to end, as always.
+			m := batch[0]
+			key := m.Database + "\x00" + m.Measurement
+			mctx, cancel := context.WithTimeout(ctx, measurementTimeout)
+			outcome, err := s.reconcileOneRecovered(mctx, m, key)
+			cancel()
+			afterPass(m, key, outcome, err)
+			continue
+		}
+		// Several at once (scheduler_pass.go): this goroutine waits for all
+		// of them, then records each in the order of the listing.
+		jobs := make([]*passJob, len(batch))
+		for i, m := range batch {
+			jobs[i] = s.preparePass(m, m.Database+"\x00"+m.Measurement)
+		}
+		s.runPasses(ctx, jobs)
+		for _, job := range jobs {
+			s.finishPass(job)
+			afterPass(job.m, job.key, job.outcome, job.err)
 		}
 	}
 	// Drop cache entries for measurements that no longer exist (bounded memory).

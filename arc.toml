@@ -397,6 +397,8 @@ s3_cache_ttl_seconds = 3600
 # ingest_export_interval = 60        # seconds: a flushed file is exported after at
 #                                    # most this long, not at the next timed pass.
 #                                    # 0 = timed passes only; otherwise >= 5.
+# reconcile_concurrency = 4          # tables whose reconcile passes run at once (1-16);
+#                                    # standalone nodes only, a cluster node runs one
 # ingest_export_concurrency = 8      # tables whose ingest appends run at once (1-32);
 #                                    # 1 exports one table at a time
 # ingest_append_enabled = true       # those exports add only the new files, without

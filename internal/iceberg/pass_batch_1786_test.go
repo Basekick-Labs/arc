@@ -1,0 +1,491 @@
+package iceberg
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/rs/zerolog"
+)
+
+// #1786: reconcile passes of several tables at once.
+
+// passSource is the storage source with a hook on a pass's first call, its
+// listing, which is where a batch's workers are observed and steered.
+type passSource struct {
+	*StorageWalkSource
+	mu       sync.Mutex
+	listed   map[string]int
+	inside   int
+	most     int
+	entered  chan struct{}
+	hold     chan struct{}
+	failFor  map[string]error
+	panicFor map[string]bool
+	onList   func(m Measurement)
+	coldGone []string // databases whose cold listing was invalidated
+}
+
+func (p *passSource) FilesAndLocal(ctx context.Context, m Measurement) ([]FileRef, []string, error) {
+	p.mu.Lock()
+	p.listed[m.Measurement]++
+	p.inside++
+	if p.inside > p.most {
+		p.most = p.inside
+	}
+	entered, hold, onList := p.entered, p.hold, p.onList
+	fail, panics := p.failFor[m.Measurement], p.panicFor[m.Measurement]
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		p.inside--
+		p.mu.Unlock()
+	}()
+	if onList != nil {
+		onList(m)
+	}
+	if entered != nil {
+		entered <- struct{}{}
+	}
+	if hold != nil {
+		<-hold
+	}
+	if panics {
+		panic("injected panic in a reconcile pass")
+	}
+	if fail != nil {
+		return nil, nil, fail
+	}
+	return p.StorageWalkSource.FilesAndLocal(ctx, m)
+}
+
+func (p *passSource) InvalidateCold(database string) {
+	p.mu.Lock()
+	p.coldGone = append(p.coldGone, database)
+	p.mu.Unlock()
+}
+
+func (p *passSource) passes(measurement string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.listed[measurement]
+}
+
+// passRig is n measurements of one database on local storage, each with one
+// file and no table yet, and a scheduler that runs `passes` reconcile passes
+// and `appends` appends at once. The catalog database is opened as
+// production opens it: WAL, a busy timeout and ONE connection.
+type passRig struct {
+	t      *testing.T
+	root   string
+	exp    *Exporter
+	src    *passSource
+	sched  *Scheduler
+	tables []string
+	files  map[string][]string
+	seq    int
+}
+
+func newPassRig(t *testing.T, n, passes, appends int) *passRig {
+	t.Helper()
+	withSpacing(t, 0)
+	root := t.TempDir()
+	be, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(root, "arc.db")+"?_journal_mode=WAL&_busy_timeout=5000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { db.Close() })
+	exp, err := NewExporter(db, be, "file://"+root, "arc", 0, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := &passSource{StorageWalkSource: NewStorageWalkSource(be, "arc", zerolog.Nop()), listed: map[string]int{}}
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: src, Interval: time.Hour, Logger: zerolog.Nop(),
+		IngestInterval: time.Millisecond, IngestAppend: true, IngestConcurrency: appends, ReconcileConcurrency: passes})
+	sched.started = time.Now().Add(-time.Second)
+	t.Cleanup(func() { metrics.Get().SetIcebergOldestPendingExport(time.Time{}) })
+	r := &passRig{t: t, root: root, exp: exp, src: src, sched: sched, files: map[string][]string{}}
+	for i := 0; i < n; i++ {
+		m := fmt.Sprintf("p%02d", i)
+		r.tables = append(r.tables, m)
+		r.newFile(m)
+	}
+	return r
+}
+
+func (r *passRig) path(measurement, name string) string {
+	return filepath.Join(r.root, "mydb", measurement, "2026", "07", "14", "15", name)
+}
+
+func (r *passRig) newFile(measurement string) string {
+	r.t.Helper()
+	r.seq++
+	name := ingestName(measurement, time.Now().Add(time.Duration(r.seq)*time.Microsecond))
+	writeArcStyleParquet(r.t, r.path(measurement, name), 1_700_000_000_000_000, 5)
+	r.files[measurement] = append(r.files[measurement], name)
+	return name
+}
+
+func (r *passRig) report(measurement, name string) {
+	r.sched.RequestIngestAppend("mydb", measurement, "mydb/"+measurement+"/2026/07/14/15/"+name, 0)
+}
+
+func (r *passRig) entries(measurement string) map[string]int {
+	r.t.Helper()
+	ctx := context.Background()
+	tbl, err := r.exp.catalog.LoadTable(ctx, r.exp.tableIdent("mydb", measurement))
+	if err != nil {
+		r.t.Fatalf("table %s: %v", measurement, err)
+	}
+	tasks, err := tbl.Scan().PlanFiles(ctx)
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	out := map[string]int{}
+	for _, task := range tasks {
+		out[filepath.Base(task.File.FilePath())]++
+	}
+	return out
+}
+
+func (r *passRig) wantEachOnce(tables ...string) {
+	r.t.Helper()
+	if len(tables) == 0 {
+		tables = r.tables
+	}
+	for _, m := range tables {
+		got := r.entries(m)
+		want := append([]string(nil), r.files[m]...)
+		sort.Strings(want)
+		if len(got) != len(want) {
+			r.t.Fatalf("table %s has %d files %v, want %d", m, len(got), got, len(want))
+		}
+		for _, f := range want {
+			if got[f] != 1 {
+				r.t.Fatalf("table %s holds %s %d times, want once", m, f, got[f])
+			}
+		}
+	}
+}
+
+// gate lets groups of `atOnce` listings go, each only once it is full: a
+// scheduler that ran fewer at once than asked would stop here.
+func (r *passRig) gate(total, atOnce int) (done chan struct{}) {
+	entered, hold := make(chan struct{}, total), make(chan struct{})
+	r.src.mu.Lock()
+	r.src.entered, r.src.hold, r.src.most = entered, hold, 0
+	r.src.mu.Unlock()
+	done = make(chan struct{})
+	go func() {
+		defer close(done)
+		for served := 0; served < total; {
+			n := min(atOnce, total-served)
+			for i := 0; i < n; i++ {
+				select {
+				case <-entered:
+				case <-time.After(10 * time.Second):
+					r.t.Errorf("only %d of %d passes started together", i, n)
+					close(hold)
+					return
+				}
+			}
+			for i := 0; i < n; i++ {
+				hold <- struct{}{}
+			}
+			served += n
+		}
+	}()
+	return done
+}
+
+func (r *passRig) ungate() int {
+	r.src.mu.Lock()
+	defer r.src.mu.Unlock()
+	r.src.entered, r.src.hold = nil, nil
+	return r.src.most
+}
+
+// The timed pass reconciles several tables at once: every pass of a group is
+// inside before any is let go. With one at a time, never two. The tables are
+// new and in one database, so their creation, and the namespace's, overlap.
+func TestPassBatch_TheTimedPassReconcilesSeveralTablesAtOnce(t *testing.T) {
+	for _, tc := range []struct{ tables, passes, wantAtOnce int }{
+		{8, 4, 4},
+		{6, 6, 6},
+		{4, 1, 1},
+	} {
+		t.Run(fmt.Sprintf("%d tables, %d at once", tc.tables, tc.passes), func(t *testing.T) {
+			r := newPassRig(t, tc.tables, tc.passes, 1)
+			done := r.gate(tc.tables, tc.wantAtOnce)
+			r.sched.runPass(context.Background())
+			<-done
+			if most := r.ungate(); most != tc.wantAtOnce {
+				t.Errorf("%d passes at once, want %d", most, tc.wantAtOnce)
+			}
+			r.wantEachOnce()
+			for _, m := range r.tables {
+				key := "mydb\x00" + m
+				if _, settled := r.sched.state[key]; !settled {
+					t.Errorf("table %s has no cached state after a pass that settled", m)
+				}
+				if !r.sched.appendOK[key] {
+					t.Errorf("table %s does not take appends after a pass that settled", m)
+				}
+				if r.sched.lastReconciled[key].IsZero() {
+					t.Errorf("table %s has no time of last change", m)
+				}
+				if got := r.src.passes(m); got != 1 {
+					t.Errorf("table %s was listed %d times, want 1", m, got)
+				}
+			}
+			// A second pass finds every table as it left it.
+			r.sched.runPass(context.Background())
+			r.wantEachOnce()
+		})
+	}
+}
+
+// One table failing, or panicking, in a batch: that table is counted failed
+// and keeps the state it had; the others are reconciled and remembered.
+func TestPassBatch_OneTableFailingDoesNotTouchTheOthers(t *testing.T) {
+	for _, how := range []string{"an error", "a panic"} {
+		t.Run(how, func(t *testing.T) {
+			r := newPassRig(t, 4, 4, 1)
+			r.sched.runPass(context.Background()) // all four exported
+			bad := r.tables[1]
+			before := r.sched.state["mydb\x00"+bad].fingerprint
+			for _, m := range r.tables {
+				r.newFile(m)
+			}
+			r.src.mu.Lock()
+			if how == "a panic" {
+				r.src.panicFor = map[string]bool{bad: true}
+			} else {
+				r.src.failFor = map[string]error{bad: errors.New("injected listing failure")}
+			}
+			r.src.mu.Unlock()
+			r.sched.runPass(context.Background())
+			for _, m := range r.tables {
+				if m == bad {
+					continue
+				}
+				r.wantEachOnce(m)
+			}
+			if got := len(r.entries(bad)); got != 1 {
+				t.Fatalf("the table whose pass failed has %d files, want the 1 it had", got)
+			}
+			if got := r.sched.state["mydb\x00"+bad].fingerprint; got != before {
+				t.Errorf("the table whose pass failed lost or changed its cached state (%q, was %q)", got, before)
+			}
+			// Healed by the next pass.
+			r.src.mu.Lock()
+			r.src.failFor, r.src.panicFor = nil, nil
+			r.src.mu.Unlock()
+			r.sched.runPass(context.Background())
+			r.wantEachOnce()
+		})
+	}
+}
+
+// What a pass starts from is what the loop left right before it ran. An
+// append served between two groups marks its table so that the table's pass
+// runs whatever its listing is; a pass that started from a copy taken before
+// that append would find the listing unchanged and skip, and a file the
+// append added that has since left storage would stay in the table.
+func TestPassBatch_APassStartsFromWhatTheLoopLeftRightBeforeIt(t *testing.T) {
+	r := newPassRig(t, 4, 4, 2)
+	r.sched.runPass(context.Background())
+	r.wantEachOnce()
+	// A new file of the first table, reported: the timed pass serves the
+	// append before the group that holds the table.
+	target := r.tables[0]
+	late := r.newFile(target)
+	r.report(target, late)
+	time.Sleep(5 * time.Millisecond)
+	// The file leaves storage after the append and before the pass lists.
+	var once sync.Once
+	r.src.mu.Lock()
+	r.src.onList = func(m Measurement) {
+		if m.Measurement == target {
+			once.Do(func() {
+				if got := r.entries(target)[late]; got != 1 {
+					t.Errorf("the append did not run before the table's pass (the file is in the table %d times)", got)
+				}
+				if err := os.Remove(r.path(target, late)); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+	}
+	r.src.mu.Unlock()
+	r.sched.runPass(context.Background())
+	if got := r.entries(target)[late]; got != 0 {
+		t.Fatalf("a file that left storage is still in the table after a timed pass: the pass started from what the scheduler remembered before the append")
+	}
+}
+
+// The passes an ingest batch leaves to run (here: appends that failed) run
+// at once too.
+func TestPassBatch_ThePassesAfterAnIngestBatchRunAtOnce(t *testing.T) {
+	r := newPassRig(t, 4, 4, 4)
+	r.sched.runPass(context.Background())
+	fail := errors.New("injected append failure")
+	src := &failingAppends{passSource: r.src, fail: fail}
+	r.sched.source = src
+	for _, m := range r.tables {
+		r.report(m, r.newFile(m))
+	}
+	time.Sleep(5 * time.Millisecond)
+	done := r.gate(4, 4)
+	r.sched.serviceIngest(context.Background(), ingestBatch)
+	<-done
+	if most := r.ungate(); most != 4 {
+		t.Errorf("%d fallback passes at once, want 4", most)
+	}
+	r.wantEachOnce()
+	for _, m := range r.tables {
+		if !r.sched.appendOK["mydb\x00"+m] {
+			t.Errorf("table %s does not take appends after the pass that followed its failed append", m)
+		}
+	}
+}
+
+type failingAppends struct {
+	*passSource
+	fail error
+}
+
+func (f *failingAppends) AppendRefs(context.Context, Measurement, []string, map[string]int64) ([]FileRef, bool, error) {
+	return nil, false, f.fail
+}
+
+// The loop does not go on while a pass is running, whatever the context says.
+func TestPassBatch_TheLoopWaitsForEveryPass(t *testing.T) {
+	r := newPassRig(t, 4, 4, 1)
+	entered, hold := make(chan struct{}, 4), make(chan struct{})
+	r.src.mu.Lock()
+	r.src.entered, r.src.hold = entered, hold
+	r.src.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		r.sched.runPass(ctx)
+	}()
+	for i := 0; i < 4; i++ {
+		select {
+		case <-entered:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the batch did not start")
+		}
+	}
+	cancel()
+	select {
+	case <-returned:
+		t.Fatal("the timed pass returned with passes still running")
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(hold)
+	select {
+	case <-returned:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the timed pass did not return after its passes ended")
+	}
+	r.src.mu.Lock()
+	inside := r.src.inside
+	r.src.entered, r.src.hold = nil, nil
+	r.src.mu.Unlock()
+	if inside != 0 {
+		t.Fatalf("%d passes still running after the timed pass returned", inside)
+	}
+}
+
+// A cold listing a pass found stale is invalidated by the loop, after the
+// batch, not by the pass: another pass of the same database may be listing
+// the cold tier at that moment and would write its stale listing back.
+func TestPassBatch_AStaleColdListingIsInvalidatedByTheLoop(t *testing.T) {
+	r := newPassRig(t, 1, 4, 1)
+	job := r.sched.preparePass(Measurement{Database: "mydb", Measurement: r.tables[0]}, "mydb\x00"+r.tables[0])
+	job.droppedCold, job.commits = true, 2
+	r.sched.finishPass(job)
+	r.src.mu.Lock()
+	gone := append([]string(nil), r.src.coldGone...)
+	r.src.mu.Unlock()
+	if len(gone) != 1 || gone[0] != "mydb" {
+		t.Fatalf("cold listings invalidated: %v, want mydb once", gone)
+	}
+	if r.sched.passCommits != 2 {
+		t.Errorf("passCommits = %d after finishing a pass that committed twice", r.sched.passCommits)
+	}
+}
+
+// What a pass decided about its table's cached state: set, dropped, or left.
+func TestPassBatch_FinishAppliesTheStateThePassDecided(t *testing.T) {
+	r := newPassRig(t, 3, 4, 1)
+	keyOf := func(i int) string { return "mydb\x00" + r.tables[i] }
+	for i := range r.tables {
+		r.sched.state[keyOf(i)] = measurementState{fingerprint: "old"}
+	}
+	jobs := make([]*passJob, 3)
+	for i := range jobs {
+		jobs[i] = r.sched.preparePass(Measurement{Database: "mydb", Measurement: r.tables[i]}, keyOf(i))
+		if !jobs[i].cached || jobs[i].prev.fingerprint != "old" {
+			t.Fatalf("job %d started from %+v, cached=%v", i, jobs[i].prev, jobs[i].cached)
+		}
+	}
+	jobs[0].setState(measurementState{fingerprint: "new"})
+	jobs[0].appended = true
+	jobs[1].dropState()
+	// jobs[2] decides nothing (a listing error keeps what was cached).
+	for _, job := range jobs {
+		r.sched.finishPass(job)
+	}
+	if got := r.sched.state[keyOf(0)].fingerprint; got != appendedFingerprint {
+		t.Errorf("a pass that set its state and asked for the next pass to run left fingerprint %q", got)
+	}
+	if _, cached := r.sched.state[keyOf(1)]; cached {
+		t.Error("a pass that dropped its state left it cached")
+	}
+	if got := r.sched.state[keyOf(2)].fingerprint; got != "old" {
+		t.Errorf("a pass that decided nothing left fingerprint %q, want the one it had", got)
+	}
+}
+
+// Two passes of one table in one batch would be two exports of it at once.
+func TestPassBatch_ATableTwiceInABatchIsRefused(t *testing.T) {
+	r := newPassRig(t, 1, 4, 1)
+	m := Measurement{Database: "mydb", Measurement: r.tables[0]}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("a batch holding one table twice ran")
+		}
+	}()
+	r.sched.runPasses(context.Background(), []*passJob{r.sched.preparePass(m, "mydb\x00"+m.Measurement), r.sched.preparePass(m, "mydb\x00"+m.Measurement)})
+}
+
+// The footers the passes of a batch hold share what one pass alone may hold.
+func TestExportReads_ABudgetBoundsTheTails(t *testing.T) {
+	r := exportReadsFrom(withExportReadsBudget(context.Background(), 10))
+	r.putTail("a", fileTail{data: make([]byte, 8)})
+	r.putTail("b", fileTail{data: make([]byte, 3)}) // 11 > 10
+	if _, ok := r.takeTail("b"); ok {
+		t.Error("a tail past the export's own budget was kept")
+	}
+	if _, ok := r.takeTail("a"); !ok {
+		t.Error("a tail within the budget was not kept")
+	}
+}

@@ -73,6 +73,7 @@ func TestIngestRegistrationIsReportedToTheIcebergAppendPath(t *testing.T) {
 	for _, want := range []string{
 		"IngestAppend: cfg.Iceberg.IngestAppendEnabled,",
 		"IngestConcurrency: cfg.Iceberg.IngestExportConcurrency,",
+		"ReconcileConcurrency: icebergReconcileConcurrency(cfg.Iceberg.ReconcileConcurrency, clusterCoordinator != nil, icebergTopo.warnNoElection),",
 		"icebergScheduler.RequestIngestAppend(database, measurement, storagePath, sizeBytes)",
 		"arrowBuffer.SetOnFileRemoved(icebergScheduler.RequestReconcile)",
 		"exporter.SetVersionRetention(time.Duration(cfg.Iceberg.MinVersionAge)*time.Second,",
@@ -94,5 +95,28 @@ func TestIngestRegistrationIsReportedToTheIcebergAppendPath(t *testing.T) {
 	end := strings.Index(src, `shutdownCoordinator.RegisterHook("iceberg"`)
 	if start < 0 || registered < start || registered > end {
 		t.Error("the append receiver is not installed inside icebergStart")
+	}
+}
+
+// #1786: reconcile passes of several tables at once are a standalone node's;
+// a node of a cluster, or one that may not be the only exporter, runs one.
+func TestIcebergReconcileConcurrencyIsOneOnAClusterNode(t *testing.T) {
+	for _, tc := range []struct {
+		configured                 int
+		hasCoordinator, noElection bool
+		want                       int
+	}{
+		{4, false, false, 4},
+		{16, false, false, 16},
+		{1, false, false, 1},
+		{4, true, false, 1},
+		{4, false, true, 1},
+		{4, true, true, 1},
+		{0, false, false, 1},
+	} {
+		if got := icebergReconcileConcurrency(tc.configured, tc.hasCoordinator, tc.noElection); got != tc.want {
+			t.Errorf("icebergReconcileConcurrency(%d, coordinator=%v, noElection=%v) = %d, want %d",
+				tc.configured, tc.hasCoordinator, tc.noElection, got, tc.want)
+		}
 	}
 }

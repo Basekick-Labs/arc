@@ -123,7 +123,7 @@ func (s *Scheduler) serviceIngestBatches(ctx context.Context, maxRequests, maxPa
 		if pass != nil {
 			passesDue = append(passesDue, pass)
 		}
-		for i, job := range passesDue {
+		for len(passesDue) > 0 {
 			if ctx.Err() != nil || !s.gateOpen() {
 				// Shutting down, or another node exports now (an append that
 				// lost the writer role is one way to get here): its passes
@@ -136,23 +136,43 @@ func (s *Scheduler) serviceIngestBatches(ctx context.Context, maxRequests, maxPa
 			if passes >= maxPasses {
 				// No more passes in this service (between two measurements
 				// of a timed pass, one at most): they are due at once.
-				for _, later := range passesDue[i:] {
+				for _, later := range passesDue {
 					s.ingestDueNow(later.m, later.key)
 				}
 				return
 			}
-			passes++
-			// What was asked for while the batch or the last pass ran: a
+			// What was asked for while the batch or the last passes ran: a
 			// compaction's request must not wait behind these passes.
 			if s.otherRequestsQueued() {
 				s.serviceDrops(ctx)
 				s.serviceRequests(ctx)
 			}
-			mctx, cancel := context.WithTimeout(ctx, measurementTimeout)
-			began := time.Now()
-			outcome, err := s.reconcileOneRecovered(mctx, job.m, job.key)
-			cancel()
-			s.afterIngest(job.m, job.key, outcome, err, job.took+time.Since(began))
+			// Up to passConcurrency of them at once (scheduler_pass.go),
+			// within this service's budget of passes.
+			n := min(len(passesDue), s.passConcurrency, maxPasses-passes)
+			group := passesDue[:n]
+			passesDue = passesDue[n:]
+			passes += n
+			if n == 1 {
+				job := group[0]
+				mctx, cancel := context.WithTimeout(ctx, measurementTimeout)
+				began := time.Now()
+				outcome, err := s.reconcileOneRecovered(mctx, job.m, job.key)
+				cancel()
+				s.afterIngest(job.m, job.key, outcome, err, job.took+time.Since(began))
+				continue
+			}
+			// Prepared after the services above: one of them can have
+			// reconciled a table of the group.
+			jobs := make([]*passJob, n)
+			for i, job := range group {
+				jobs[i] = s.preparePass(job.m, job.key)
+			}
+			s.runPasses(ctx, jobs)
+			for i, pj := range jobs {
+				s.finishPass(pj)
+				s.afterIngest(pj.m, pj.key, pj.outcome, pj.err, group[i].took+pj.took)
+			}
 		}
 		if passes >= maxPasses {
 			return
