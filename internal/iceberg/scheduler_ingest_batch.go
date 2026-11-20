@@ -71,8 +71,8 @@ func (s *Scheduler) serviceIngestBatches(ctx context.Context, maxRequests, maxPa
 		// Take requests until the batch is full or one needs a pass.
 		var batch []*ingestJob
 		var pass *ingestJob
-		took, stop := 0, false
-		for len(batch) < s.ingestConcurrency && served < maxRequests && pass == nil && !stop {
+		took := 0
+		for len(batch) < s.ingestConcurrency && served < maxRequests && pass == nil {
 			m, key, ok := s.takeDueIngest(time.Now())
 			if !ok {
 				break // none due yet: the loop's timer comes back for it
@@ -99,14 +99,9 @@ func (s *Scheduler) serviceIngestBatches(ctx context.Context, maxRequests, maxPa
 				if job.kind == ingestFallback {
 					s.noteAppendFallback(job)
 				}
-				if passes >= maxPasses {
-					// This service has run its passes: the request is due
-					// at once, for the next one.
-					s.ingestDueNow(m, key)
-					stop = true
-				} else {
-					pass = job
-				}
+				// Within its budget: the service returns as soon as it has
+				// run maxPasses passes (below), so one is left here.
+				pass = job
 			}
 		}
 		if took == 0 {
@@ -158,7 +153,7 @@ func (s *Scheduler) serviceIngestBatches(ctx context.Context, maxRequests, maxPa
 			cancel()
 			s.afterIngest(job.m, job.key, outcome, err, job.took+time.Since(began))
 		}
-		if stop || passes >= maxPasses {
+		if passes >= maxPasses {
 			return
 		}
 	}

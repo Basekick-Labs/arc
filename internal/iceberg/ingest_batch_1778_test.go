@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -545,5 +546,60 @@ func TestIngestBatch_AWedgedAppendIsCutOffAndRunsAPass(t *testing.T) {
 		if got := r.src.passes(m); got != want {
 			t.Errorf("table %s had %d passes, want %d", m, got, want)
 		}
+	}
+}
+
+// A request whose files are all in the table already is closed in a batch as
+// it is one at a time: nothing is left waiting for it.
+func TestIngestBatch_ARequestWithNothingToAddIsClosed(t *testing.T) {
+	r := newBatchRig(t, 4, 4, true)
+	r.reportOneEach()
+	r.serve(8)
+	// The same files again: every one is in its table.
+	for _, m := range r.tables {
+		r.report(m, r.files[m][len(r.files[m])-1])
+	}
+	r.serve(8)
+	r.sched.reqMu.Lock()
+	waiting, due := len(r.sched.ingestPending), len(r.sched.ingestDue)
+	r.sched.reqMu.Unlock()
+	if waiting != 0 || due != 0 {
+		t.Fatalf("%d tables with files counted as waiting and %d requests queued after reports of files already in their tables", waiting, due)
+	}
+	r.wantEachOnce()
+	for _, m := range r.tables {
+		if got := r.src.passes(m); got != 1 {
+			t.Errorf("table %s had %d passes, want only its first export", m, got)
+		}
+	}
+}
+
+type closingGate struct{ closed atomic.Bool }
+
+func (g *closingGate) CanRun() bool { return !g.closed.Load() }
+
+// The writer role lost while a batch runs: the appends that failed for it do
+// not each run a pass on a node that no longer exports, and its requests are
+// dropped for the node that does.
+func TestIngestBatch_TheGateClosingDuringABatchRunsNoPass(t *testing.T) {
+	r := newBatchRig(t, 4, 4, true)
+	gate := &closingGate{}
+	r.sched.gate = gate
+	r.src.mu.Lock()
+	r.src.failFor = map[string]error{r.tables[0]: errors.New("injected"), r.tables[2]: errors.New("injected")}
+	r.src.onEnter = func(Measurement) { gate.closed.Store(true) }
+	r.src.mu.Unlock()
+	r.reportOneEach()
+	r.serve(8)
+	for _, m := range r.tables {
+		if got := r.src.passes(m); got != 1 {
+			t.Errorf("table %s had %d passes, want only its first export: a pass ran after the gate closed", m, got)
+		}
+	}
+	r.sched.reqMu.Lock()
+	due, pending := len(r.sched.ingestDue), len(r.sched.appendPending)
+	r.sched.reqMu.Unlock()
+	if due != 0 || pending != 0 {
+		t.Errorf("%d requests and %d tables' files kept on a node that no longer exports", due, pending)
 	}
 }
