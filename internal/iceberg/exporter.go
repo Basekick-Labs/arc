@@ -2268,9 +2268,11 @@ func isAlreadyExists(err error) bool {
 // (#639 item 3): each table in its namespace, the namespace itself, and the
 // warehouse metadata files under the namespace directory. Called from the
 // database-delete API after the data files are gone; that ordering is
-// load-bearing — with no files left, a racing reconcile pass can only empty
-// tables, never recreate them, whereas catalog-first would let EnsureTable
-// resurrect residue mid-cleanup. Idempotent: a database that was never
+// load-bearing: an export of one of the tables that starts after the drop
+// lists no files and creates nothing, whereas catalog-first would let it
+// recreate a table from files the DELETE had yet to remove. Exports of the
+// database's tables do not overlap the drop at all in this process (below).
+// Idempotent: a database that was never
 // exported (or already cleaned) returns nil, so a re-run of the delete
 // converges.
 //
@@ -2483,9 +2485,10 @@ func (e *Exporter) dropDatabase(ctx context.Context, database string) error {
 		}
 	}
 
-	// List again: a reconcile pass that loaded a table before the catalog
-	// drop can still have committed into its directory since the first
-	// listing, and that residue would keep the database listed.
+	// List again: on a shared bucket another node's reconcile pass, which
+	// this node's database lock does not hold (#1792), can have committed
+	// into the directory since the first listing, and that residue would
+	// keep the database listed.
 	if e.backend != nil && colocated != nil {
 		if again, err := e.colocatedMetadataByTable(ctx, database); err == nil {
 			for dir, keys := range again {
@@ -2532,8 +2535,9 @@ func (e *Exporter) dropDatabase(ctx context.Context, database string) error {
 	}
 	for _, sub := range subs {
 		for dir := range sub.dirs {
-			// Listed again now: a reconcile that loaded the table before the
-			// catalog drop may have committed into it since.
+			// Listed again now: another node's reconcile that loaded the
+			// table before the catalog drop may have committed into it since
+			// (#1792).
 			dkeys, err := e.backend.List(ctx, dir+"/")
 			if err != nil {
 				if firstErr == nil {

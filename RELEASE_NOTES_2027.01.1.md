@@ -2,6 +2,17 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: a database deleted while its Iceberg tables were being exported could leave them broken ([#1789](https://github.com/Basekick-Labs/arc/issues/1789))
+
+A `DELETE` of a database drops its Iceberg tables from the request itself, and nothing kept that from landing in the middle of a reconcile pass or an append of one of those tables. The pass had loaded its table before the drop and committed or published after it, and the catalog ended with a table whose metadata named files the drop had deleted. Such a table still loads, so nothing treated it as gone: every later pass of it failed (`could not open manifest file`), and a database written again under the same name was exported into it. It did not heal.
+
+- **Reproduced:** a test that deletes a database (its files, then its tables) while a timed pass runs and then writes it again ended with broken or missing tables in 19 of 30 runs with passes one at a time and 25 of 30 with four at once. With the fix, 0 of 30 at both.
+- **The fix:** every export of a table holds its database's lock from before it lists the measurement to its end, and the drop holds it alone. A drop waits for the exports of that database that are running, and none starts until it is done; one that had to wait then lists what the `DELETE` left.
+- **A pass does not trust what was remembered of a dropped table.** A database written again with other columns, or with a column of another type, is exported with the new schema; before, a pass that was already queued built the new table from the old one's.
+- **A `DELETE` can wait** for an export of the database's tables in progress: usually milliseconds, at most 150 s or the request's own budget. If the export does not end in time the tables are left as they are, the data is deleted all the same, and the response says so: `"iceberg_cleanup": "pending: ... repeat the DELETE to drop them"`. Repeating the `DELETE` drops them.
+- **Not covered: a shared bucket.** There the node that handles the `DELETE` is usually not the node that exports, and one node's lock does not hold another's pass ([#1792](https://github.com/Basekick-Labs/arc/issues/1792)). A standalone node, and each node of a cluster with node-local warehouses, is covered.
+- No new configuration.
+
 ## Fix: a quiet Iceberg table no longer repeats its pass and re-publishes while old versions wait out `min_version_age` ([#1787](https://github.com/Basekick-Labs/arc/issues/1787))
 
 A pass that kept published versions on disk only because of `iceberg.min_version_age` marked the table so that every later pass ran in full, whatever its listing, until those versions were old enough to prune. Each of those passes committed nothing, yet read the table's manifests and wrote `v<N>.metadata.json` (refused as existing, then read back to compare) and `version-hint.text` again: 15 requests on S3, at every `iceberg.reconcile_interval`.
@@ -65,7 +76,7 @@ Notes:
 - **The passes of a batch share** 16 storage reads in flight (footers and existence checks) and the 64 MiB of footers one pass alone may hold. Their listings, metadata reads and commits are not bounded together.
 - Each pass in a batch has the two minutes a pass always had; the batch ends when its slowest pass does.
 - **Not run on the binary:** `reconcile_concurrency = 16` on AWS (it ran on a local S3 server), a cold tier, Glue sync, a warehouse outside the storage root, Azure and GCS.
-- **A database deleted during a reconcile pass** ([#1789](https://github.com/Basekick-Labs/arc/issues/1789)): on a standalone node the delete does not wait for a pass in progress, and a table whose pass it lands in can be left missing or pointing at metadata the delete removed. That was so with one pass at a time (5 of 30 runs of a test that forces the overlap); with several at once more tables of the database can be in a pass at that moment (10 of 30 at six at once). Not fixed here.
+- **A database deleted during a reconcile pass** could leave a table missing or broken, with one pass at a time as with several; fixed in [#1789](https://github.com/Basekick-Labs/arc/issues/1789), above.
 - While a table's published versions were held by `iceberg.min_version_age`, each of its passes repeated its requests and re-published without having committed anything; fixed in [#1787](https://github.com/Basekick-Labs/arc/issues/1787), above.
 
 ## New: ingest appends of several Iceberg tables run at once ([#1778](https://github.com/Basekick-Labs/arc/issues/1778))

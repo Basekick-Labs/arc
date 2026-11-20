@@ -18,8 +18,10 @@ package iceberg
 //     dropped. A database emptied by retention loses its (empty) table the
 //     same way; new data recreates it.
 //
-// Drops run on the loop goroutine, so a drop never overlaps a reconcile, and
-// regardless of the gate: a node that does not export is exactly the one
+// These drops run on the loop goroutine and regardless of the gate. What
+// keeps any drop, these and the API's own DELETE on its request's goroutine,
+// from overlapping an export of the same tables is the exporter's database
+// lock (database_lock.go, #1789). Regardless of the gate: a node that does not export is exactly the one
 // whose stale tables nothing else removes. A drop is skipped while the
 // cluster's manifest has files under the database (SetDropGuard, read after
 // a Raft barrier): an old notice replayed at restart after the database was
@@ -125,8 +127,10 @@ func (s *Scheduler) backstopDrops(ctx context.Context) {
 // dropped, from whichever goroutine dropped them (the API's DELETE, or this
 // scheduler's own loop). The loop forgets what it remembers of the database
 // at its next service of drops: before its next batch of exports. Until then
-// what it remembers is stale and harmless: a pass of a table that is gone
-// finds it gone, and an append to one falls back to a pass. Never blocks.
+// what it remembers is stale, and a pass does not trust it: the cached state
+// carries the exporter's count of the database's drops, and a pass that finds
+// another count starts from the table (passRunner.reconcile). An append to a
+// table that is gone falls back to a pass. Never blocks.
 func (s *Scheduler) noteDatabaseDropped(database string) {
 	if s == nil || database == "" {
 		return
