@@ -569,6 +569,21 @@ func (m *Manager) Admit(tokenID int64) *EnforcementResult {
 // its cluster policy only when tokenFP is the cluster token's; otherwise this
 // node's defaults.
 func (m *Manager) AdmitToken(tokenID int64, tokenFP string) *EnforcementResult {
+	return m.admit(tokenID, tokenFP, true)
+}
+
+// Peek is AdmitToken without counting anything: whether the token's next
+// query would be admitted now, and the limits it would run under. A request
+// that is not a query but must not run when the token's queries would be
+// refused calls it, such as a Flight SQL prepare, which binds the statement
+// the execute that follows it is counted for.
+func (m *Manager) Peek(tokenID int64, tokenFP string) *EnforcementResult {
+	return m.admit(tokenID, tokenFP, false)
+}
+
+// admit checks every limit the token's policy sets and, when every one admits
+// the query and record is true, counts it against all of them.
+func (m *Manager) admit(tokenID int64, tokenFP string, record bool) *EnforcementResult {
 	m.admitMu.Lock()
 	defer m.admitMu.Unlock()
 
@@ -612,11 +627,13 @@ func (m *Manager) AdmitToken(tokenID int64, tokenFP string) *EnforcementResult {
 		refused.RetryAfterSec = max(longest, 1)
 		return refused
 	}
-	if m.afterAdmitCheckForTest != nil {
-		m.afterAdmitCheckForTest()
-	}
-	for i := range gates {
-		gates[i].record()
+	if record {
+		if m.afterAdmitCheckForTest != nil {
+			m.afterAdmitCheckForTest()
+		}
+		for i := range gates {
+			gates[i].record()
+		}
 	}
 
 	result := &EnforcementResult{Allowed: true}

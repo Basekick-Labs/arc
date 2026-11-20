@@ -277,6 +277,17 @@ func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter)
 		return outcomeBusy, err
 	}
 	defer release()
+	// The same on a shared bucket, for a drop running on another node, and a
+	// table that drop meant to remove is removed: before anything of the
+	// table is read, and only in a pass that will read it, not in one that
+	// finds its files unchanged (shared_drop.go, #1792).
+	settle := func() (reconcileOutcome, error) {
+		err := exp.settleDroppedTable(ctx, m.Database, m.Measurement, r.canRun)
+		if errors.Is(err, errDatabaseBeingDropped) {
+			return outcomeBusy, err
+		}
+		return outcomeUnchanged, err
+	}
 	// What the scheduler remembered of the table was copied before this pass
 	// had the database. If the database was dropped since it was cached (at
 	// any time before the loop got to forget it, a drop that ended a moment
@@ -320,6 +331,9 @@ func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter)
 		// Only for a table that already exists: an empty directory that never held data must not
 		// mint a zero-column table (EnsureTable would create one with no fields and no partition
 		// spec). Schema is irrelevant when emptying — the existing table's schema is preserved.
+		if out, err := settle(); err != nil {
+			return out, err
+		}
 		exists, err := exp.tableExists(ctx, m.Database, m.Measurement)
 		if err != nil {
 			return outcomeUnchanged, err
@@ -330,7 +344,7 @@ func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter)
 			job.setState(measurementState{fingerprint: fp})
 			return outcomeUnchanged, nil
 		}
-		res, err := exp.reconcile(ctx, reconcileRequest{database: m.Database, measurement: m.Measurement, canCommit: r.canRun})
+		res, err := exp.reconcile(ctx, reconcileRequest{database: m.Database, measurement: m.Measurement, canCommit: r.canRun, dropChecked: true})
 		job.commits = res.commits
 		if err != nil {
 			return outcomeUnchanged, err
@@ -356,6 +370,9 @@ func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter)
 	prev, cached := job.prev, job.cached
 	if cached && prev.unchanged(fp, time.Now()) {
 		return outcomeUnchanged, nil
+	}
+	if out, err := settle(); err != nil {
+		return out, err
 	}
 
 	// The set changed (or first sight): work out which files' footers are not already accounted
@@ -404,6 +421,7 @@ func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter)
 	res, err := exp.reconcile(ctx, reconcileRequest{
 		database:    m.Database,
 		measurement: m.Measurement,
+		dropChecked: true,
 		schema:      base,
 		current:     files,
 		unread:      unread,

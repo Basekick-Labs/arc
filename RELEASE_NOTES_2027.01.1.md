@@ -12,6 +12,34 @@ Flight SQL metadata names a database as a catalog with one empty-named schema. T
 - **Tested** with Tableau Desktop 2026.3 and `flight-sql-jdbc-driver` 19.0.0. `docs/operations/flight-sql.md` has a Tableau section, including the cast that makes `time` a date in Tableau.
 - Flight SQL is off by default (`flight_sql.enabled = false`); nothing here runs unless it is on and the header is sent.
 
+## Fix: with two processes exporting one bucket, Iceberg tables could hold a data file twice, and then stop exporting ([#1795](https://github.com/Basekick-Labs/arc/issues/1795))
+
+When two Arc processes export the same bucket to Iceberg (two standalone nodes on one bucket and prefix: nothing can detect that without a cluster coordinator), a data file could be added to the table twice:
+
+1. node A's ingest writes a file and reports it to A;
+2. node B's timed pass lists the bucket, finds the file, adds it, and publishes that table version;
+3. node A's next ingest export takes over B's published version, then appends the file again. The append path does not check the table for the file (that check reads every manifest, the cost #1751 removed); what kept a file from being added twice was what A itself had added and listed, which says nothing about B's pass.
+
+Readers then counted that file's rows twice. And iceberg-go cannot remove a path the table holds twice: once that file left storage (a compaction's input, retention, a delete), every pass of the table failed with "cannot delete files that do not belong to the table", so the table stopped exporting and kept naming a file that was gone. Traced from a two-node run's own manifests and logs, and reproduced by tests; the evidence is on the issue.
+
+- **An ingest append now goes on only from the table version this process last left it at** (its own last append, or the end of its last settled pass). A version another process committed, or a catalog row recovered from a dead metadata file, makes that export a reconcile pass, which diffs the table and adds nothing it already holds. On a node with no election (no cluster coordinator) this is logged at Warn once per table and process, naming the two causes: another process exports this bucket, or this node recovered the table's catalog row because its metadata file was gone. With two exporters every ingest export after the other's commit is a full pass, which is the append path effectively off; run one exporter per bucket.
+- **A pass repairs a table that already holds a path more than once**: one commit removes every data entry and adds each live path back once (merged into one manifest), then history is floored to that snapshot, since every older one holds the paths twice. Logged at Warn with the count and examples. It is best-effort where nothing was committed: if it cannot be staged or the catalog refuses it cleanly, the pass goes on as before and the next pass tries again; if the commit's outcome is unknown, the pass ends, as with any other commit. The repair rewrites the table's whole manifest set in one commit, the same cost as the manifest collapse (#1106): a table too large to rewrite within one pass's deadline is not repaired. It is refused, with an Error, on a table that has delete files (Arc writes none): the re-added entries would no longer be covered by them.
+- After a repair, the snapshot summary's running totals (`total-data-files`, `total-records`) stay high by the extra entries; iceberg-go carries them forward. Nothing in Arc reads them.
+- Not covered: two processes committing at the same moment are still kept apart only by the publish fence (#1609), as before.
+- No configuration changes.
+## Fix: on a shared bucket, a database deleted on one node while another exported it could leave a broken Iceberg table ([#1792](https://github.com/Basekick-Labs/arc/issues/1792))
+
+On a shared bucket the node that handles a `DELETE` of a database (the primary writer) drops its Iceberg tables for every node, and the node that exports them (the compactor-lease holder) is usually another one. The lock that keeps a drop and an export apart ([#1789](https://github.com/Basekick-Labs/arc/issues/1789), below) is one process's, so a reconcile pass on the exporting node could commit and publish after the drop had listed what it would delete. What the pass wrote stayed, naming manifests that were gone, under a catalog row that still loaded: every later pass of that table failed (`could not open manifest file`), also once the database was written again.
+
+- **Reproduced** with two exporters on one storage root, the pass held at its commit while the other node's drop listed the table: the table was left broken every time. The order needs the commit to land in the short gap between the drop's listing and its deletes. Runs of a three-node cluster on S3 with the database deleted every 12 to 20 s under ingest (three valid runs, 20 and 60 tables) did not hit it on the build without the fix, where the existing recovery (the exporter forgetting its row for a dropped table) coped.
+- **The fix: a drop record per database, in the bucket.** The dropping node writes it before it lists anything and marks it done at its end. The exporting node reads it in each pass that is about to read or write one of the database's tables: while a drop is running it gives way, as it does for a drop in its own process. Each table carries the id of the record it was created under, so a table from before the latest drop is recognised, also after a restart or by a node that takes over the export, and removed (its metadata and its catalog row) at the end of the pass the drop overlapped or in the table's next pass. A table's first export overlapping the `DELETE` is covered the same way.
+- **On the running binary** (three nodes on one S3 bucket with 30 ms added per request): with 60 tables and the database deleted 8 times under ingest, the build with the fix logged no failed pass and ended with all 60 tables matching storage, the exporter giving way to each drop. With a finished drop record put in the bucket under steady ingest and no `DELETE` (what a restore or a mixed-version drop looks like), the exporter removed all 20 tables that predated it and exported them again: all 20 matched storage, and no metadata of the old tables was left. A standalone node wrote no record and behaved as before.
+- **Cost:** on a shared bucket, one small read per pass that has work to do (none for a table whose files are unchanged) and one at its end. Nothing on a standalone node or a cluster with node-local warehouses.
+- **A drop that fails or is cut short** leaves its record saying "running": the export of that database (written again under the same name) waits for it, up to 15 minutes, or until the `DELETE` is repeated. The drop itself stops deleting after 7.5 minutes and reports `"iceberg_cleanup": "pending: ... repeat the DELETE to drop them"`.
+- **A table older than its database's latest drop is removed and exported again from its data, without its snapshot history.** That is what a broken table needs. It also happens, once per table, to a healthy one: a database restored from a backup made before it was dropped (the record is in the bucket, not in the backup), and tables created by an exporter still running an older version after an upgraded writer dropped the database. Upgrade every node before deleting databases.
+- **Clocks:** nodes of a shared bucket must agree to within 7.5 minutes, or an exporter could take a running drop for a dead one.
+- Ingest-triggered appends are not involved: they do not run on a cluster's shared bucket. No new configuration.
+
 ## Fix: an Iceberg snapshot expiry that failed is retried: every pass tries to expire down to `retain_snapshots` ([#1791](https://github.com/Basekick-Labs/arc/issues/1791))
 
 A reconcile pass expired snapshots over `iceberg.retain_snapshots` only when it had committed something, when an ingest append had come in since the last expiry, or on a table's first pass after a restart. So a table could stay over the bound once it went quiet:
@@ -33,7 +61,7 @@ A `DELETE` of a database drops its Iceberg tables from the request itself, and n
 - **The fix:** every export of a table holds its database's lock from before it lists the measurement to its end, and the drop holds it alone. A drop waits for the exports of that database that are running, and none starts until it is done. An export does not wait for a drop: it gives way at once and its table is tried again shortly, so a database being dropped does not hold up the export of the others.
 - **A pass does not trust what was remembered of a dropped table.** A database written again with other columns, or with a column of another type, is exported with the new schema; before, a pass that was already queued built the new table from the old one's.
 - **A `DELETE` can wait** for an export of the database's tables in progress: usually milliseconds, at most 150 s or the request's own budget (the delete's hold on tiering lasts that much longer). If the export does not end in time the tables are left as they are, the data is deleted all the same, and the response says so: `"iceberg_cleanup": "pending: ... repeat the DELETE to drop them"`. Repeating the `DELETE` drops them; it answers 404, since the database no longer exists, and carries the same note if the drop is refused again.
-- **Not covered: a shared bucket.** There the node that handles the `DELETE` is usually not the node that exports, and one node's lock does not hold another's pass ([#1792](https://github.com/Basekick-Labs/arc/issues/1792)). A standalone node, and each node of a cluster with node-local warehouses, is covered.
+- **A shared bucket** is covered separately: there the node that handles the `DELETE` is usually not the node that exports, and one node's lock does not hold another's pass ([#1792](https://github.com/Basekick-Labs/arc/issues/1792), above).
 - No new configuration.
 
 ## Fix: a quiet Iceberg table no longer repeats its pass and re-publishes while old versions wait out `min_version_age` ([#1787](https://github.com/Basekick-Labs/arc/issues/1787))
@@ -271,6 +299,21 @@ Notes:
   An export on S3 is a few dozen requests made one after another, so it takes about half a second in the bucket's region and seconds from far away, and the tables queue behind each other. The interval you set is reached while `tables written at once × one export` fits in it: about ten tables at 5 s, and somewhere between 60 and 100 at the default 60 s, in the bucket's region. Past that the tables wait for each other and the interval no longer sets the lag. The timed pass before #1750 exported tables the same way, one after another; it was not measured on S3. With one new file the append took about 40% less than the pass in the bucket's region and about 20% less from far away (one run each); with many new files per export it reads each one in turn and cost the same as the pass. No 200-table run reached a steady state, so read their lag as "minutes", not as a figure. By these runs each further file in an export costs about 24 ms in the bucket's region (525 ms with one file, 954 ms with about 19), so a node exports at most about 40 files a second there, and the 200-table load (about 22 files a second) used about half of that: the estimate for its steady state is a cycle of about 3.5 minutes. Above about 40 files a second the queue would not be bounded. These are estimates from two runs, not measurements. Serving tables in parallel is [#1778](https://github.com/Basekick-Labs/arc/issues/1778).
 - In those S3 runs no append fell back, row counts matched storage and no file was in a table twice; on a table left quiet the published versions went from 26 to 11 within two minutes (the age rule reads S3's own timestamps).
 
+## New: Flight SQL prepared statements, so the JDBC driver and Tableau can run queries ([#1645](https://github.com/Basekick-Labs/arc/issues/1645))
+
+The Flight SQL listener now takes prepared statements without parameters. The Arrow Flight SQL JDBC driver, which Tableau, DBeaver and DataGrip use, prepares every query, even a plain `Statement.executeQuery`, so until now it could connect and browse tables but every query failed with `UNIMPLEMENTED`. With JDBC 19.0.0, `executeQuery` and `PreparedStatement` now return results. The ADBC drivers, which prepare before each execute when the server allows it, now take the prepared path too.
+
+- **A prepare binds the statement; the execute runs it.** DuckDB resolves the statement's tables and columns, which lists the files and reads their Parquet footers but scans no data, and the result schema comes from that. It is the schema the execute streams, with Arc's decimal handling. The execute then runs as an unprepared statement does. The bind is not free of work: DuckDB's optimizer is off during it, but the binder still evaluates constant arguments of functions (`SELECT length(repeat('x', 500000000))` costs a large part of what running it does), and DuckDB does not interrupt a bind, so the query timeout applies when it ends.
+- **One query per execute.** The prepare is not counted as a query: it does not appear in `/api/v1/queries`, the query metrics or the slow-query log, and it does not spend governance rate limits or quotas. But it is refused with `RESOURCE_EXHAUSTED` when the token's next query would be. It runs the query's checks: SQL validation, RBAC on every table (no schema for a table the token cannot read), and the query or governance timeout.
+- **Each prepare costs one bind**, one per `executeQuery` with JDBC, and one per execute with ADBC. The bind lists the measurement's files, so it grows with their number: on a measurement of 2,000 Parquet files on local disk it took about 43 ms, and an ADBC execute of an aggregate over them went from about 110 ms to about 155 ms; on a measurement of a few files it is about 1 ms. (One machine; on a loopback S3 server the same execute went from about 410 ms to about 590 ms.) At most a quarter of `database.max_connections` binds run at once (at least one; one when it is 0 or less, unlimited); more wait for a slot. New metrics: `arc_flight_sql_prepare_binds_total{result}` and `arc_flight_sql_prepare_bind_duration_seconds`. A bind that takes `query.slow_query_threshold_ms` or more, not counting the wait for a slot, is logged as a warning. With audit logging on, a prepare is an `api.post` event with the detail `{"operation": "flight_sql.prepare"}`, not a `data.query`.
+- **No server state.** The handle carries the SQL and the `x-arc-database` header the prepare saw, so closing a statement frees nothing.
+- **`UNIMPLEMENTED`, so ADBC runs the statement unprepared:** a `PIVOT` (over JDBC, write it as `sum(x) FILTER (WHERE k = 'v')`, which prepares), a result column Arc cannot describe without running the query (a struct with unnamed fields, such as `(1, 2)`), and any prepare on a node that does not run queries (a compactor; the JDBC driver cannot run queries there).
+- **`INVALID_ARGUMENT`:** parameters (`?`), and a statement that does not bind because of the statement itself (a syntax error, an unknown column). A bind that could not read storage, or ran out of memory, is `UNAVAILABLE`, to be retried; a damaged Parquet file is `INTERNAL`. A query on a measurement with no data yet has a result without columns, which JDBC 19.0.0 reads as an update; that execute is refused with a message that says so.
+- **Documentation:** `docs/operations/flight-sql.md` has a prepared-statements section.
+
+No new configuration keys.
+
+Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in [#1779](https://github.com/Basekick-Labs/arc/pull/1779).
 
 ## Fix: a day with few files gets a daily file, so it can move to the cold tier ([#1774](https://github.com/Basekick-Labs/arc/issues/1774))
 
@@ -4208,8 +4251,8 @@ tables for ADBC clients. Results stopped at a governance row cap end with a
 Flight queries are audited and logged like HTTP queries, with the client's
 address. Metadata calls run one query per database, plus one per measurement
 when schemas are requested, and count against governance limits. Prepared
-statements are not implemented yet, so JDBC-based BI tools cannot run queries;
-the ADBC drivers are the tested clients. See
+statements without parameters are supported (see the entry above), so the
+JDBC driver and the BI tools built on it can run queries. See
 `docs/operations/flight-sql.md`.
 
 Both Helm charts can turn it on: `flightSql.enabled` (default `false`),
@@ -4237,8 +4280,8 @@ with it (`adbc_get_info()` in Python), and with the Arrow Flight SQL JDBC driver
 every `DatabaseMetaData` call that reads SqlInfo threw, such as
 `getDatabaseProductName()` and `getIdentifierQuoteString()`. A request that
 includes IDs Arc has no value for, as ADBC's does for the Substrait version
-range, is answered with the rest. Queries through the JDBC driver still need
-prepared statements, which are not implemented yet. See
+range, is answered with the rest. Queries through the JDBC driver need
+prepared statements, which are in this release too (see the entry above). See
 `docs/operations/flight-sql.md`.
 
 Contributed by [@officialasishkumar](https://github.com/officialasishkumar) in [#1657](https://github.com/Basekick-Labs/arc/pull/1657); the query-grammar values were added in review.

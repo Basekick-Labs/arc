@@ -159,8 +159,16 @@ func TestDropDatabase_NeverExportedLeavesNoMarker(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(r.root, "arc_neverexported.db")); !os.IsNotExist(err) {
 		t.Fatalf("a never-exported database left a warehouse directory (stat err %v)", err)
 	}
-	if _, err := os.Stat(filepath.Join(r.root, droppedMarkerRoot)); !os.IsNotExist(err) {
-		t.Fatalf("a never-exported database left a drop marker (stat err %v)", err)
+	// No table marker. The database's drop record is kept all the same: a
+	// first export may be about to create one of its tables (#1792).
+	entries, err := os.ReadDir(filepath.Join(r.root, droppedMarkerRoot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != "%drop" {
+			t.Fatalf("a never-exported database left a drop marker: %s", e.Name())
+		}
 	}
 }
 

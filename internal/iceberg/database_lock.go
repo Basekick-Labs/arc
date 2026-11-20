@@ -39,7 +39,8 @@ import (
 //
 // The lock is this process's. On a shared bucket the node that handles the
 // DELETE is usually not the node that exports, and that node's passes are
-// not held by it.
+// not held by it: the database's drop record is what they go by
+// (shared_drop.go, #1792).
 
 // databaseLockShares is how many exports of one database may hold its lock
 // together: more than can ever run at once. A drop takes all of them.
@@ -61,9 +62,12 @@ type databaseLocks struct {
 }
 
 // databaseDrops is how many times the database's tables have been dropped in
-// this process. A pass reads it while it holds the database, so the number
-// cannot change under it; what the scheduler cached for a table under
-// another number describes a table that is gone, whatever now has its name.
+// this process, a table removed because another node dropped its database
+// included (shared_drop.go). A pass reads it while it holds the database, so
+// no drop in this process changes it under the pass (the pass itself can,
+// by removing such a table, and then it ends with an error and caches
+// nothing); what the scheduler cached for a table under another number
+// describes a table that is gone, whatever now has its name.
 func (e *Exporter) databaseDrops(database string) uint64 {
 	e.dbLocks.mu.Lock()
 	defer e.dbLocks.mu.Unlock()
@@ -157,6 +161,13 @@ func (e *Exporter) forgetDatabaseMemory(database string) {
 		}
 		e.publishedMu.Unlock()
 	}
+	e.dropSeenMu.Lock()
+	for k := range e.dropSeen {
+		if strings.HasPrefix(k, database+"\x00") || strings.HasPrefix(k, database+"/") {
+			delete(e.dropSeen, k)
+		}
+	}
+	e.dropSeenMu.Unlock()
 	// By "<db>\x00<measurement>", and "<spoke>/<db>\x00<measurement>" under a spoke.
 	match := func(k string) bool {
 		return strings.HasPrefix(k, database+"\x00") || strings.HasPrefix(k, database+"/")
@@ -175,6 +186,11 @@ func (e *Exporter) forgetDatabaseMemory(database string) {
 	for k := range e.floorDue {
 		if match(k) {
 			delete(e.floorDue, k)
+		}
+	}
+	for k := range e.leftAt {
+		if match(k) {
+			delete(e.leftAt, k)
 		}
 	}
 	e.chunkMu.Unlock()

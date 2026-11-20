@@ -158,8 +158,11 @@ type Scheduler struct {
 	appendOK        map[string]bool
 	recentAdds      map[string]map[string]time.Time
 	appendFallback  map[string]string
-	// passCommits is how many data commits the reconcile pass in progress (or
-	// the last one) made: reconcileOne sets it, reconcileOneRecovered reads it.
+	// otherExporter: the tables another process was found committing to, on
+	// a node with no election; warned about once each (#1795). Loop goroutine.
+	otherExporter map[string]struct{}
+	// passCommits is how many commits the reconcile pass in progress (or the
+	// last one) made, a repair of entries held twice included (#1795): reconcileOne sets it, reconcileOneRecovered reads it.
 	passCommits int
 	// appendsSince counts each table's appends since its last settled pass.
 	appendsSince map[string]int
@@ -313,6 +316,7 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		appendOK:          make(map[string]bool),
 		recentAdds:        make(map[string]map[string]time.Time),
 		appendFallback:    make(map[string]string),
+		otherExporter:     make(map[string]struct{}),
 		appendsSince:      make(map[string]int),
 		lastReconciled:    make(map[string]time.Time),
 		drops:             make(map[string]struct{}),

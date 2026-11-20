@@ -16,8 +16,8 @@ The port must differ from `server.port`. The listener uses `server.host`; when
 that setting is empty, it binds to the wildcard address. Set
 `server.tls_enabled = true` to enable TLS with the same certificate and key as
 the HTTP API. When Arc authentication is enabled, provide an Arc API token with
-read permission. SQL writes, transactions and prepared statements are not
-supported.
+read permission. SQL writes, transactions and prepared statements with
+parameters are not supported.
 
 Flight SQL metadata maps Arc databases to catalogs, the empty schema to each
 catalog, and measurements to tables. Table metadata can include the Arrow
@@ -51,29 +51,37 @@ A client can present the token in two ways:
   name and password options and the JDBC driver's `user` and `password`
   properties.
 
-With the Arrow Flight SQL JDBC driver, for example:
+With the Arrow Flight SQL JDBC driver, set the `user` and `password`
+connection properties, with the token as the password; this is what a tool's
+user name and password fields send (DBeaver, DataGrip, Tableau):
 
 ```text
-jdbc:arrow-flight-sql://localhost:50051?useEncryption=false&token=<token>
+URL:      jdbc:arrow-flight-sql://localhost:50051?useEncryption=false
+user:     arc        (not checked)
+password: <token>
 ```
 
+The token can also go in the URL, as `token=<token>` (or `password=<token>`).
 An Arc token ends in `=`, which driver 19.0.0 does not accept inside a URL
-value: write it as `%3D`, or pass `token` (or `password`) as a connection
-property instead of in the URL. Left as `=`, the connection is refused with
-`must authenticate first` (`token`) or `invalid Arc token` (`password`).
+value: there, write it as `%3D`. Left as `=`, the connection is refused with
+`must authenticate first` (`token`) or `invalid Arc token` (`password`). As a
+connection property it needs no escaping.
 
-The driver turns TLS on unless `useEncryption=false` is set, so leave it out
-when `server.tls_enabled = true`. Prepared statements are not implemented yet,
-so the JDBC driver can connect and browse catalogs and tables but cannot run
-queries (see below).
+The driver turns TLS on unless `useEncryption=false` is set, so leave that out
+when `server.tls_enabled = true`. If Arc's certificate is not signed by a CA
+the JVM already trusts, give the driver a trust store with it:
+`trustStore=<path to the .jks>` and `trustStorePassword=<its password>`.
+
+The driver runs every query as a prepared statement, `Statement.executeQuery`
+included; see [Prepared statements](#prepared-statements).
 
 ## What is supported
 
-Statement queries (`SELECT`, `SHOW DATABASES`, `SHOW TABLES`), the catalog,
-schema, table and table-type metadata calls, and SqlInfo. Prepared statements,
-transactions and writes are not implemented. Clients that require prepared
-statements, which includes the Arrow Flight SQL JDBC driver and the BI tools
-built on it, cannot run queries yet; the ADBC drivers are the tested clients.
+Statement queries (`SELECT`, `SHOW DATABASES`, `SHOW TABLES`), prepared
+statements without parameters, the catalog, schema, table and table-type
+metadata calls, and SqlInfo. Parameters, transactions and writes are not
+implemented. The ADBC drivers and the Arrow Flight SQL JDBC driver (19.0.0)
+are the tested clients.
 
 SqlInfo describes the server without running a query. The JDBC driver answers
 `DatabaseMetaData` from it, and ADBC's `GetInfo` reads the vendor name and
@@ -112,6 +120,69 @@ reports `supportsOuterJoins()` as `true` but `supportsFullOuterJoins()` as
 
 A request for IDs Arc has no value for is answered with the ones it has; the
 rest are left out rather than failing the call.
+
+## Prepared statements
+
+The JDBC driver prepares every query, even a plain `Statement.executeQuery`,
+and the ADBC drivers prepare before each execute when the server allows it.
+Arc prepares a statement without parameters by **binding** it: DuckDB resolves
+its tables and columns, which lists the measurement's files and reads their
+Parquet footers but scans no data, and the result schema comes from that. The
+query runs when the client executes the statement, exactly as an unprepared
+one does.
+
+The bind is not free of work, though. DuckDB's optimizer is off while it
+binds, but the binder itself still evaluates constant arguments of functions,
+so a statement such as `SELECT length(repeat('x', 500000000))` costs a large
+part of what running it does to prepare. DuckDB does not interrupt a bind: the query
+timeout is applied when it ends. The bind slots below bound how many run at
+once.
+
+- **One query per execute.** The prepare is not a query: it is not in
+  `/api/v1/queries`, the query metrics or the slow-query log, and it does not
+  count against the token's governance limits. It is refused, though, with
+  `RESOURCE_EXHAUSTED`, when those limits would refuse the token's next query.
+  The execute is the query, counted, registered and audited once.
+- **Same checks as a query.** The SQL is validated, RBAC checks every table it
+  reads (a token gets no schema for a table it cannot read), and the bind runs
+  under the query timeout or the token's governance timeout.
+- **Each prepare costs one bind.** With JDBC that is one per `executeQuery`,
+  and ADBC prepares before each execute. The bind lists the measurement's
+  files, so its cost grows with their number: on 2,000 Parquet files on local
+  disk it took about 43 ms, against about 110 ms for the query itself; on a
+  few files, about 1 ms.
+  At most a quarter of `database.max_connections` binds (at least one, and
+  one when `database.max_connections` is 0 or less, unlimited) run at once; more wait
+  for a slot. `arc_flight_sql_prepare_binds_total{result}` and
+  `arc_flight_sql_prepare_bind_duration_seconds` measure them (the wait for a
+  slot included), and a bind that takes `query.slow_query_threshold_ms` or
+  more, not counting the wait, is logged as a warning. When
+  audit logging is on, a prepare is recorded as an `api.post` event on
+  `/internal/flight-sql/schema` with the detail
+  `{"operation": "flight_sql.prepare"}`, not as a `data.query`.
+- **No server state.** The prepared statement handle carries the SQL (and the
+  `x-arc-database` header the prepare saw, with the same rules as a statement
+  ticket), so closing it frees nothing and a handle survives a restart.
+
+What answers `UNIMPLEMENTED`, so the ADBC drivers run the statement unprepared
+instead (the JDBC driver reports the error):
+
+- a `PIVOT` (or `PIVOT_WIDER`), whose columns DuckDB finds only by reading the
+  data. Over JDBC, write it as conditional aggregation instead, one column per
+  value: `sum(x) FILTER (WHERE k = 'v') AS v`, which prepares;
+- a result column of a type Arc cannot describe without running the query,
+  such as a struct with unnamed fields (`(1, 2)`, `row(...)`);
+- any prepare on a node that does not run queries (a compactor). The JDBC
+  driver cannot run anything there: point it at a node that runs queries.
+
+Parameters (`?`) are refused with `INVALID_ARGUMENT`, as is a statement that
+does not bind because of the statement itself (a syntax error, an unknown
+column). A bind that could not read storage (an IO or object-store error) or
+ran out of memory is `UNAVAILABLE`, to be retried; a damaged Parquet file is
+`INTERNAL`. A query on a measurement with
+no data yet has a result without columns; JDBC 19.0.0 reads that as an update
+and the execute is refused with `INVALID_ARGUMENT`, explaining why. A `SHOW`
+statement is prepared without a bind: its schema is fixed.
 
 ## Choosing a database
 
