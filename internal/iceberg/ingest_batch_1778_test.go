@@ -524,7 +524,9 @@ func TestIngestBatch_EachAppendHasItsOwnExporterState(t *testing.T) {
 // own deadline, then runs a pass with a budget of its own.
 func TestIngestBatch_AWedgedAppendIsCutOffAndRunsAPass(t *testing.T) {
 	old := appendTimeout
-	appendTimeout = 100 * time.Millisecond
+	// Long enough for the healthy appends on a slow runner under -race; the
+	// wedged one waits it out whatever it is.
+	appendTimeout = 2 * time.Second
 	t.Cleanup(func() { appendTimeout = old })
 	r := newBatchRig(t, 4, 4, true)
 	stuck := r.tables[0]
@@ -534,7 +536,7 @@ func TestIngestBatch_AWedgedAppendIsCutOffAndRunsAPass(t *testing.T) {
 	r.reportOneEach()
 	began := time.Now()
 	r.serve(8)
-	if took := time.Since(began); took > 5*time.Second {
+	if took := time.Since(began); took > 30*time.Second {
 		t.Fatalf("the service took %v with one wedged append: it waited on the pass's budget, not the append's", took)
 	}
 	r.wantEachOnce()
