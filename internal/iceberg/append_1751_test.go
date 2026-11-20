@@ -52,7 +52,7 @@ func (r *appendRig) newFile() string {
 
 func (r *appendRig) report(names ...string) {
 	for _, n := range names {
-		r.sched.RequestIngestAppend("mydb", "cpu", appendDir+n)
+		r.sched.RequestIngestAppend("mydb", "cpu", appendDir+n, 0)
 	}
 }
 
@@ -291,7 +291,7 @@ func TestAppend_FallsBackToAPass(t *testing.T) {
 		writeArcStyleParquet4Col(t, filepath.Join(r.root, filepath.FromSlash(appendDir+wide)), 1_700_000_000_000_000, 1)
 		// The append itself says why, before anything is read from the file
 		// to build its entry.
-		refs, _, err := r.src.AppendRefs(context.Background(), Measurement{Database: "mydb", Measurement: "cpu"}, []string{appendDir + wide})
+		refs, _, err := r.src.AppendRefs(context.Background(), Measurement{Database: "mydb", Measurement: "cpu"}, []string{appendDir + wide}, nil)
 		if err != nil || len(refs) != 1 {
 			t.Fatalf("AppendRefs: %v, %d refs", err, len(refs))
 		}

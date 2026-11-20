@@ -130,6 +130,8 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 	e.passLag = 0 // the largest export lag this pass publishes (export_lag.go)
 	database, measurement := req.database, req.measurement
 	tkey := database + "\x00" + measurement
+	// A pass can rewrite the table's manifests: the append path counts them again (append.go).
+	delete(e.appendSmall, tkey)
 	canCommit := req.canCommit
 	if canCommit == nil {
 		canCommit = func() bool { return true }

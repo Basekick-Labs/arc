@@ -981,6 +981,8 @@ func (s *Scheduler) reconcileOneRecovered(ctx context.Context, m Measurement, ke
 // the (data-file set + local-file set) lets us skip the expensive per-file footer reads and the
 // no-op diff entirely when nothing changed — the common steady-state case.
 func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string) (outcome reconcileOutcome, err error) {
+	// What this pass reads of the store is not read twice (export_reads.go, #1778).
+	ctx = withExportReads(ctx)
 	// One backend listing yields both the data-file URIs and the local paths (Files + LocalFiles
 	// would list the same prefix twice).
 	files, localFiles, err := s.source.FilesAndLocal(ctx, m)

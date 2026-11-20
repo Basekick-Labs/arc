@@ -192,6 +192,11 @@ type Exporter struct {
 	// expireOwed: the tables appends have added snapshots to since a pass
 	// last expired any (batched.go expiryOwed); under chunkMu.
 	expireOwed map[string]bool
+	// appendSmall: per table, the small data manifests its current snapshot
+	// holds, as the last append left them; absent when not known (a pass
+	// ran, an append failed, the process started). Loop goroutine only.
+	// See appendMergeDue.
+	appendSmall map[string]int
 	// expirySeen: the tables that have had a pass in this process.
 	expirySeen map[string]struct{}
 	chunkSize  map[string]int
@@ -273,7 +278,8 @@ func (e *Exporter) healFailed() bool {
 }
 
 // notePassStart records, the first time this reconcile loads the table, its version and the
-// version version-hint.text names (one GET; -1 when there is none or it cannot be read).
+// version version-hint.text names (-1 when there is none or it cannot be read): the adopt
+// check's read of it when this export just made one (export_reads.go), else one GET.
 func (e *Exporter) notePassStart(ctx context.Context, tbl *icetable.Table) {
 	e.hintFailMu.Lock()
 	seen := e.passLoaded >= 0
@@ -284,8 +290,13 @@ func (e *Exporter) notePassStart(ctx context.Context, tbl *icetable.Table) {
 	loaded, hint, unknown := e.metadataVersion(tbl), -1, false
 	if e.backend != nil {
 		if _, dirKey, ok := e.parseVersionAndMetaDir(tbl.MetadataLocation()); ok && dirKey != "" && dirKey != "." {
-			n, err := e.readHint(ctx, dirKey) // -1, nil when there is no hint
-			hint, unknown = n, err != nil
+			// The adopt check read it a moment ago in this export (#1778).
+			if n, ok := exportReadsFrom(ctx).takeHint(dirKey); ok {
+				hint = n
+			} else {
+				n, err := e.readHint(ctx, dirKey) // -1, nil when there is no hint
+				hint, unknown = n, err != nil
+			}
 		}
 	}
 	e.hintFailMu.Lock()
@@ -969,6 +980,10 @@ func (e *Exporter) addFilesMerging(ctx context.Context, txn *icetable.Transactio
 // AddFiles used to compute, with the same table schema, spec and properties. want gives each path's size
 // from the listing; a footer that disagrees (the file was replaced since it was listed) fails
 // the pass rather than register stats for bytes that are no longer there.
+// A file whose tail this export already read (export_reads.go) is built from that tail, whose
+// read checked the stored length against the same size; for such a file the check here compares
+// the size with itself, and a replacement between that read and this build is seen by the next
+// pass's listing.
 //
 // A file whose day() partition cannot be inferred (its rows straddle a UTC day) is returned in
 // skipped instead of failing the pass, so one such file does not wedge the measurement. Any
@@ -983,6 +998,11 @@ func (e *Exporter) buildDataFiles(ctx context.Context, tbl *icetable.Table, path
 	for i, p := range paths {
 		if ios[i], err = e.fileIOFor(ctx, tbl, p); err != nil {
 			return nil, nil, err
+		}
+		// The footer this export already read for the file's schema: iceberg-go
+		// reads the file from it, not from the store again (#1778).
+		if tail, ok := exportReadsFrom(ctx).takeTail(p); ok {
+			ios[i] = &tailIO{path: p, tail: tail, under: ios[i]}
 		}
 	}
 	g, gctx := errgroup.WithContext(ctx)
@@ -1757,6 +1777,10 @@ func (e *Exporter) reachableManifestNames(ctx context.Context, tbl *icetable.Tab
 //
 // Returns true when there was nothing to do (no backend) or everything was written.
 func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bool {
+	// The hint is about to change. Nothing reads a recorded hint after a
+	// publish today (notePassStart takes it right after the adopt check that
+	// recorded it); this keeps that true for a caller added later.
+	exportReadsFrom(ctx).dropHints()
 	if e.backend == nil {
 		// No discovery files to write: the catalog commit is the publish.
 		e.drainExportLag(tbl.Identifier())

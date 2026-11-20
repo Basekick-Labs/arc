@@ -404,7 +404,13 @@ func (s *StorageWalkSource) FileSchema(ctx context.Context, f FileRef) (ArcSchem
 		}
 		return SchemaFromParquet(f.LocalPath)
 	}
-	return SchemaFromBackend(ctx, s.backend, f.Key, f.SizeBytes)
+	sc, tail, err := schemaAndTailFromBackend(ctx, s.backend, f.Key, f.SizeBytes)
+	if err != nil {
+		return ArcSchema{}, err
+	}
+	// The same bytes iceberg-go needs to register the file (#1778).
+	exportReadsFrom(ctx).putTail(f.PhysicalPath, tail)
+	return sc, nil
 }
 
 // objectLister is the backend's sized listing when the backend is an object
@@ -793,9 +799,11 @@ func isDataFile(p string) bool {
 // AppendRefs resolves files an ingest flush reported (storage keys of m) for
 // the append path (#1751), applying to each the rules of a listing that can
 // be judged for one file: it is a data file of the measurement, Arc's reads
-// do not leave it out, the cluster has not deleted it, and it is in storage
-// (its size is read from there, not taken from the report). A key that fails
-// one is left out: the reconcile pass owns it.
+// do not leave it out, the cluster has not deleted it, and it is in storage.
+// A key that fails one is left out: the reconcile pass owns it. sizes holds
+// the size the flush reported for each key; on an object store it is used
+// as given and the footer read is what finds a file gone or of another
+// length (#1778), while a local file is stat'ed.
 //
 // The rules that need the whole listing (hidden data files, a listing that
 // moved, compaction outputs still replacing their inputs) are not applied:
@@ -804,7 +812,7 @@ func isDataFile(p string) bool {
 //
 // ok is false when this source cannot judge a single file: a shared-storage
 // cluster, where a file counts only once the replicated manifest knows it.
-func (s *StorageWalkSource) AppendRefs(ctx context.Context, m Measurement, keys []string) (refs []FileRef, ok bool, err error) {
+func (s *StorageWalkSource) AppendRefs(ctx context.Context, m Measurement, keys []string, sizes map[string]int64) (refs []FileRef, ok bool, err error) {
 	if s.manifestKnows != nil {
 		return nil, false, nil
 	}
@@ -838,9 +846,16 @@ func (s *StorageWalkSource) AppendRefs(ctx context.Context, m Measurement, keys 
 			return nil, false, fmt.Errorf("reported file %q has no usable storage path: %w", key, err)
 		}
 		lp := s.resolver.LocalPath(key)
-		size, present, err := s.statSize(ctx, key, lp)
-		if err != nil {
-			return nil, false, fmt.Errorf("stat reported file %q: %w", key, err)
+		// On an object store the flush's own size is used and the file is
+		// not asked for (#1778): a HEAD per file, one after another, was a
+		// fifth of an append's requests. A file that is gone, or whose
+		// stored length differs, is found by the read of its footer, which
+		// checks the length (readTail). A local file is still stat'ed.
+		size, present := sizes[key], true
+		if lp != "" || size <= 0 {
+			if size, present, err = s.statSize(ctx, key, lp); err != nil {
+				return nil, false, fmt.Errorf("stat reported file %q: %w", key, err)
+			}
 		}
 		if !present {
 			continue

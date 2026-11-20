@@ -4817,8 +4817,8 @@ func main() {
 					// at registration and not at the write: a request served
 					// between the two would find no file and list the whole
 					// measurement.
-					arrowBuffer.SetOnFileRegistered(func(database, measurement, storagePath string, _ int64) {
-						icebergScheduler.RequestIngestAppend(database, measurement, storagePath)
+					arrowBuffer.SetOnFileRegistered(func(database, measurement, storagePath string, sizeBytes int64) {
+						icebergScheduler.RequestIngestAppend(database, measurement, storagePath, sizeBytes)
 					})
 				} else {
 					arrowBuffer.AddOnFilePublished(func(database, measurement string, _ time.Time) {
