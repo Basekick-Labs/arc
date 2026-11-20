@@ -26,6 +26,9 @@ measurement permission checks; a measurement the token cannot read is left
 out of a table listing that includes schemas. Any other failure of a schema
 query fails the listing.
 
+Tools that cannot work with an empty schema, such as Tableau, can ask for
+databases as schemas instead: see [Databases as schemas](#databases-as-schemas-x-arc-metadata).
+
 Metadata calls run ordinary queries: listing tables runs one per database,
 and including schemas adds one per measurement. Each counts against the
 token's governance rate limits and quotas like any other query, so a client
@@ -287,3 +290,80 @@ must check the final stream error (for example, `reader.Err()` in Go). This
 makes the HTTP Arrow endpoint's `Arc-Rows-Capped` signal visible to ordinary
 Flight SQL clients without requiring custom application metadata. Use an
 explicit SQL `LIMIT` below the configured cap when a bounded result is wanted.
+
+## Databases as schemas (`x-arc-metadata`)
+
+By default a database is a catalog with one empty-named schema. Some tools
+cannot use that: Tableau's JDBC connection cannot select an empty schema, so
+it never reaches a table. A client can send the call header
+`x-arc-metadata: schemas` to get the other shape:
+
+| Call | Default (no header, or `catalogs`) | `x-arc-metadata: schemas` |
+| --- | --- | --- |
+| `GetCatalogs` | one row per database | no rows |
+| `GetDbSchemas` | database as catalog, schema `""` | catalog null, database as schema |
+| `GetTables` | database as catalog, schema `""` | catalog null, database as schema |
+| `GetPrimaryKeys`, `GetImportedKeys`, `GetExportedKeys`, `GetCrossReference` | unimplemented | empty (Arc has no keys) |
+
+- **The catalog filter is ignored** in the schemas shape: Arc has no catalogs,
+  and Tableau sends a catalog it remembers from earlier connections. The schema
+  filter is a pattern over database names; `_` matches any one character, so
+  `w0_sales` also matches `w0-sales`. The database named exactly as the
+  pattern is listed first.
+- **Everything else is the same:** permissions, governance limits and the
+  `x-arc-database` header behave as in the default shape, statements ignore
+  the header, and `GetSqlInfo` answers the same in both shapes (catalog term
+  `database`).
+- Any other value, or the header sent twice, is `INVALID_ARGUMENT`.
+- **Send it on every call**, the `DoGet` included: each call answers in the
+  shape its own header asks for. The JDBC and ADBC drivers send it on every
+  call.
+- **Sending it:** the JDBC driver passes any URL property it does not know as
+  a call header, so add `x-arc-metadata=schemas` to the URL. With ADBC, set the
+  connection option `adbc.flight.sql.rpc.call_header.x-arc-metadata`.
+- Names in SQL stay two-part, `"database"."measurement"`, in both shapes.
+  `Connection.setCatalog` and the JDBC `catalog` URL property are not
+  supported.
+
+## Tableau
+
+Tableau Desktop connects through **Other Databases (JDBC)** with the Arrow
+Flight SQL JDBC driver (tested with `flight-sql-jdbc-driver` 19.0.0 and
+Tableau Desktop 2026.3). It needs prepared statements, see
+[Prepared statements](#prepared-statements).
+
+1. Copy the driver jar to Tableau's drivers folder
+   (`C:\Program Files\Tableau\Drivers` on Windows) and restart Tableau.
+2. **URL:** `jdbc:arrow-flight-sql://<host>:<flight_sql.port>?useEncryption=false&x-arc-metadata=schemas`.
+   Without `x-arc-metadata=schemas` Tableau lists the databases but its
+   Schema list stays empty.
+3. **Dialect:** PostgreSQL (the one tested). **Username:** any value, for
+   example `arc`. **Password:** an Arc token with read permission.
+4. Pick the database under **Schema**, then drag measurements in.
+
+**TLS** (`server.tls_enabled = true`): use `useEncryption=true`. With a
+certificate the JVM does not trust, add the CA to a JKS truststore and pass
+`trustStore=<path>&trustStorePassword=<password>&useSystemTrustStore=false`;
+use forward slashes in the path. Without them the connection is refused with a
+certificate (PKIX) error.
+
+**Timestamps:** Arc's `time` column is a timestamp with time zone (UTC), and
+Tableau's JDBC connection shows that type as text; converting it to a date in
+Tableau fails. Use **New Custom SQL** with a cast:
+
+```sql
+SELECT "time"::TIMESTAMP AS "time", region, amount
+FROM "mydb"."orders"
+```
+
+The column is then a date, and Tableau's date parts (year, month, day, hour)
+work. Times are UTC. In an **Extract**, Tableau reads these timestamps in the
+computer's time zone, so hours shift unless the computer runs in UTC; a
+**Live** connection is not affected.
+
+**Expected refusals:** when it connects, Tableau probes the server with
+`CREATE LOCAL TEMPORARY TABLE`, `DROP TABLE` and `SELECT TOP 1`. Arc refuses
+them (it is read-only, and DuckDB uses `LIMIT`), and Tableau then uses
+subqueries and `LIMIT`. The refusals appear in Arc's log as `400` responses
+on the bridge and are harmless.
+
