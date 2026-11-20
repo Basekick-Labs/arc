@@ -2,6 +2,19 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: Arc no longer keeps one DuckDB connection busy from startup ([#1782](https://github.com/Basekick-Labs/arc/issues/1782))
+
+The DuckDB check Arc runs at startup (`SELECT 'Hello from Arc in Go!' …`) left its result set open until the process exited, so one connection of the pool (`database.max_connections`) was never available to queries. With `database.max_connections = 1` no query was answered at all: HTTP and Flight SQL requests waited for a connection that never came free. With any other positive value, queries had one connection fewer than configured, which is 3 instead of 4 on small machines (the default is at least 4). Releases since at least v26.01.1 are affected.
+
+The check now gives its connection back as soon as it has read its row.
+
+- With `database.max_connections = 1`, queries over HTTP (JSON, Arrow, MessagePack, profiled) and Flight SQL are answered.
+- With 2 connections and 2 concurrent queries (5 rounds of a ~1 s query), the pool waited 5 times for 5.5 s before this fix and not at all after it; the 5 rounds took 11.4 s before and 6.4 s after.
+- **Visible change in the pool gauges.** At idle, `arc_db_connections_in_use` (`db_connections_in_use` in the JSON metrics, `connections_in_use` in the `pool` block of `GET /api/v1/metrics/query-pool`) is now 0 instead of 1, and the idle count is 1 higher. `arc_db_connections_open` (`connections_open`) can now drop to 0 after 10 minutes without queries, when idle connections are closed; before, the held connection kept it at 1 or more. The startup line `Database connection pool stats` shows `in_use: 0`. Dashboards that subtracted the idle 1, or alerts on no open connections, need adjusting.
+- The log messages of the startup check are unchanged.
+
+No configuration change.
+
 ## Improvement: an Iceberg export on object storage makes fewer requests ([#1778](https://github.com/Basekick-Labs/arc/issues/1778))
 
 On S3 an export is a chain of requests made one after another, and the runs for #1751 showed that this, not CPU, is what an export costs there: about half a second per table in the bucket's region. A trace of those requests showed several that were not needed.
