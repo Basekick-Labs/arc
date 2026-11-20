@@ -21,8 +21,19 @@ Requests for one export, counted through a proxy in front of an S3 server (`Test
 
 Of the 11 requests left in an append, five are writes that must follow one another, and three are reads of the table's `metadata.json` (the load, iceberg-go's check before the commit, and the copy published as `v<N>.metadata.json`).
 
-- **Not measured on AWS.** With the proxy an append of one file took 657 ms before this change, where #1751 measured 525 ms on AWS in the bucket's region, so the proxy is somewhat slower than that link; expect the ratio to carry over, not the milliseconds. Azure and GCS take the same code path and were not run.
-- **Tables are still exported one at a time.** This makes each export cheaper; it does not let several tables export at once, which is what many tables at a short `ingest_export_interval` need on object storage. That remains open in #1778.
+On AWS S3, the build before this change and the build with it, on the same instance and bucket (standalone, append on, 3 to 5 minutes of writes):
+
+| Where Arc ran | Tables, interval | One export before | After | Average lag before | After |
+|---|---|---|---|---|---|
+| EC2 in the bucket's region | 10, 5 s (two runs each) | 494, 491 ms | 357, 354 ms | 0.94, 0.97 s | 0.60, 0.56 s |
+| EC2 in the bucket's region | 50, 15 s | 598 ms | 417 ms | 18.8 s | 13.3 s |
+| EC2 in the bucket's region | 200, 60 s (default) | 901 ms | 572 ms | 122 s | 82 s |
+| 77 ms from the bucket | 10, 5 s (two runs each) | 2.44, 2.48 s | 1.50, 1.52 s | 15.6, 15.5 s | 10.8, 10.4 s |
+
+An export takes 28 to 39% less time. No append fell back, row counts matched storage on the tables checked and no file was in a table twice. With 200 tables the build before still had files waiting 216 s when the run ended; this one had none. The 50- and 200-table rows are one run each.
+
+- Azure and GCS take the same code path and were not run.
+- **Tables are still exported one at a time.** This makes each export cheaper; it does not let several tables export at once, which is what many tables at a short `ingest_export_interval` need on object storage: with 200 tables at the default interval the lag is still over a minute. That remains open in #1778.
 - No change on local storage, and no new configuration. On the running binary (S3 API, 10 tables at a 5 s interval): 120 appends, none fell back, row counts matched storage and no file was in a table twice; an export averaged 41 ms against 57 ms on the previous build, in one run of each with no network in between and no repeat to show the spread.
 - The footers held for one export are bounded at 64 MiB (about a thousand new files); past that, the remaining files of that export are read by iceberg-go as before.
 
