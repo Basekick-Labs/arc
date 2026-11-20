@@ -109,11 +109,11 @@ type reconcileResult struct {
 
 // ReconcileMeasurementWithHint is ReconcileMeasurement plus whether the pass fully
 // SETTLED: the reader discovery files (version-hint.text, v<N>.metadata.json) were
-// published, any snapshot-history floor this pass owed actually committed, AND no heal commit
-// (name mapping, retention properties) failed (#1098).
+// published, the snapshot expiry (by retention, or the history floor this pass owed) did not
+// fail, AND no heal commit (name mapping, retention properties) failed (#1098).
 //
-// The scheduler needs this separately from the error. Both steps are best-effort with
-// respect to the committed snapshot, but if either fails the caller must NOT cache the
+// The scheduler needs this separately from the error. None of these steps undoes the
+// committed snapshot, but if one fails the caller must NOT cache the
 // measurement's fingerprint, or a file set that then goes quiet is never revisited: the
 // hint would stay stale forever, and metadata that names deleted data files would stay
 // published (#1092).
@@ -658,8 +658,9 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 //
 // A failed expiry doesn't undo the successful reconcile, but it leaves the pass unsettled, so
 // the scheduler runs the table's next pass. For the retention case that pass retries by itself:
-// every pass expires down to retain_snapshots, committed or not (#1791; before, a pass that
-// committed nothing did not, and a failed expiry was lost once the table went quiet). The floor
+// every pass that gets here as the writer tries to expire down to retain_snapshots, committed
+// or not (#1791; before, a pass that committed nothing did not, and a failed expiry was lost
+// once the table went quiet). The floor
 // needs a memory: only a pass that removes something asks to floor, so the next pass may well
 // remove nothing. A failed floor is remembered (floorOwed) and retried by every later pass until
 // it lands, including a pass with nothing to commit; before #1686 the retry pass took the
@@ -672,8 +673,8 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 // the fence until the next pass.
 //
 // ok reports that the discovery files were published and the expiry, floor or retention, did
-// not fail. (A failed heal
-// also leaves the pass unsettled; the callers read that from healFailed, #1098.)
+// not fail. (A failed heal also leaves the pass unsettled; the callers read that from
+// healFailed, #1098.)
 func (e *Exporter) finishPass(ctx context.Context, tbl *icetable.Table, tkey, database, measurement string, commits, passStart int) (*icetable.Table, bool, error) {
 	// The writer role can be lost after the pass's last commit check. Then the pass still
 	// publishes what it committed (its own commits are the table's head), but makes no expiry

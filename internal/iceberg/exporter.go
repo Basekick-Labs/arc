@@ -1299,9 +1299,6 @@ func isPartitionInferenceError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "more than one value for partition field")
 }
 
-// expireSnapshots keeps the last `retain` snapshots for the table (0 = keep all → no-op),
-// deleting older snapshots and their orphaned manifests/data files. Best-effort: on any
-// failure it logs and returns the input table unchanged.
 // floorHistory asks expireSnapshots to keep ONLY the snapshot this pass committed,
 // overriding iceberg.retain_snapshots. The caller passes it when the pass removed any
 // path, because such a path is gone from the primary backend and every older snapshot
@@ -1313,9 +1310,12 @@ const (
 	floorHistory     expireMode = true
 )
 
-// expireSnapshots trims snapshot history. It returns the possibly-newer table and
-// whether the trim it was asked for actually landed; a caller that asked to floor and
-// got false must not treat the pass as settled (see ReconcileMeasurementWithHint).
+// expireSnapshots trims snapshot history to the last retain_snapshots (0 = keep all, a
+// no-op), or to the current one for a floor. It removes snapshots from the metadata only:
+// no data file, and no manifest either (WithPostCommit(false), below). On a failure it
+// logs and returns the input table unchanged. It returns the possibly-newer table and
+// whether the trim did not fail; a caller that got false must not treat the pass as settled
+// (see ReconcileMeasurementWithHint), which is what has the next pass try again.
 //
 // mode is load-bearing for BOTH gates below, not just the iceberg-go call. The
 // pointless-commit guard compares against the SAME effective value: checking a floor

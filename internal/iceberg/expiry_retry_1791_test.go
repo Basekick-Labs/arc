@@ -66,7 +66,9 @@ func TestExpiry1791_AFailedExpiryIsRetriedByAPassThatCommitsNothing(t *testing.T
 }
 
 // An expiry commit that landed but reported an error: the next pass finds
-// the table within retain_snapshots and settles without another commit.
+// the table within retain_snapshots and settles without another commit. (On
+// the code before #1791 this fails earlier, for the first test's reason: the
+// pass did not try to expire at all.)
 func TestExpiry1791_AnExpiryThatLandedButReportedAnErrorIsNotRepeated(t *testing.T) {
 	r, files, sc := overRetention(t)
 	r.exp.expireCommit = func(ctx context.Context, txn *icetable.Transaction) (*icetable.Table, error) {
@@ -100,8 +102,12 @@ func TestExpiry1791_AnExpirySkippedWithoutTheWriterRoleIsMadeUpLater(t *testing.
 	// The role goes after the pass's own check and before its end.
 	calls := 0
 	lost := func() bool { calls++; return calls <= 1 }
-	if res := r.passResult1791(files, sc, lost); res.settled {
+	gated := r.passResult1791(files, sc, lost)
+	if gated.settled {
 		t.Fatal("a pass that ended without the writer role is settled")
+	}
+	if gated.writerLost {
+		t.Fatal("the pass stopped at its own check of the writer role: it did not get to its end without the role, the test shows nothing")
 	}
 	if got := r.snapshots(); got != before {
 		t.Fatalf("%d snapshots, was %d: a node without the writer role committed an expiry", got, before)
