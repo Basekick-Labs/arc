@@ -162,19 +162,9 @@ func (e *Exporter) forgetDatabaseMemory(database string) {
 		return strings.HasPrefix(k, database+"\x00") || strings.HasPrefix(k, database+"/")
 	}
 	e.chunkMu.Lock()
-	for k := range e.expireOwed {
-		if match(k) {
-			delete(e.expireOwed, k)
-		}
-	}
 	for k := range e.appendSmall {
 		if match(k) {
 			delete(e.appendSmall, k)
-		}
-	}
-	for k := range e.expirySeen {
-		if match(k) {
-			delete(e.expirySeen, k)
 		}
 	}
 	for k := range e.chunkSize {
