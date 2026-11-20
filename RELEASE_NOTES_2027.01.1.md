@@ -2,6 +2,57 @@
 
 > **Status:** Planned — January 2027 release.
 
+## New: reconcile passes of several Iceberg tables run at once ([#1786](https://github.com/Basekick-Labs/arc/issues/1786))
+
+After #1778 the appends of different tables overlap, but a reconcile pass still ran for one table at a time, and every table gets one: at its first export, every `iceberg.reconcile_interval`, and after 120 appends. On object storage a pass is about half a second of waiting on storage requests (14 to 16 of them for a table that only took appends), so a timed pass over 200 tables took minutes, during which those tables' appends were served one batch per table visited. The passes of different tables now overlap too.
+
+- **New key `iceberg.reconcile_concurrency`** (1 to 16; default `0`, which picks by the storage: `4` on an object store, `1` on local storage). `1` reconciles one table at a time, as before.
+- **Where it applies:** the timed pass's walk of the tables, and the passes ingest requests need (a table's first export when its data arrives after the node started, a fallback) when `iceberg.ingest_export_concurrency` is above 1. Passes asked for by compaction, DELETE, retention or tiering still run one at a time.
+- **Standalone nodes only.** A node of a cluster, and a node on a shared bucket with no election of the exporter, runs one at a time whatever the key says, and logs it when the key was set higher.
+- As with the appends, the scheduler starts a batch, waits for all of it, and only then records what each pass did: a table is still exported by one thing at a time.
+
+Measured on AWS S3, standalone on EC2 in the bucket's region, 200 tables written at once with `ingest_export_interval = 5` and 16 appends at once, over 10 minutes (two timed passes) after a 6-minute warm-up; one run each:
+
+| Passes at once | Average export lag | Appends per second | Longest wait at the end of the run |
+|---|---|---|---|
+| 1 | 5.1 s | 16.2 | 28 s |
+| 4 | 3.2 s | 19.5 | 2 s |
+| 8 | 2.1 s | 21.0 | 1 s |
+
+A second set on the final build, the same load with a 5-minute window that held one timed pass, and how long the first export of the 200 tables took after the node started (their data arrives after the start, so those are passes ingest requests ask for):
+
+| `reconcile_concurrency` | Average export lag | First export of all 200 tables |
+|---|---|---|
+| 1 | 7.9 s | 2 min 38 s |
+| not set (4 on object storage) | 3.5 s | 48 s |
+| 8 | 2.0 s | 27 s |
+
+The same load through a local S3 server with 30 ms added to every request, over a window that held a timed pass:
+
+| Passes at once | Average export lag | The timed pass's walk of 200 tables | First export of all 200 tables after start |
+|---|---|---|---|
+| 1 | 9.1 s | about 5 minutes | 5 min 10 s |
+| 4 | 2.6 s | 77 s | 83 s |
+| 8 | 1.8 s | 45 s | 46 s |
+
+- **At the default `ingest_export_interval` of 60 s nothing changes**: 30.3 s at one pass at a time and 29.9 s at 4 on AWS, which is what a 60 s interval gives. The gain is at short intervals, in how long a timed pass takes, and at start-up.
+- In every run no append fell back, there were no Iceberg warnings or errors, row counts matched storage on the tables checked and no file was in a table twice.
+- **Why the default is 1 on local storage:** a pass there is tens of milliseconds, and running several at once bought little and cost write latency. 200 tables at 5 s on a laptop that also ran the load, two runs each:
+
+  | Appends / passes at once | Average export lag | Write round trip p95 | p99 |
+  |---|---|---|---|
+  | 1 / 1 | 1.00, 0.86 s | 4.8, 4.2 ms | 68, 58 ms |
+  | 8 / 1 | 0.78, 0.77 s | 7.5, 6.8 ms | 73, 72 ms |
+  | 8 / 4 | 0.66, 0.46 s | 13.9, 9.9 ms | 96, 81 ms |
+
+Notes:
+
+- **A timed pass now serves compaction requests, drops and ingest once per batch of tables**, not once per table.
+- **The passes of a batch share** 16 storage reads in flight (footers and existence checks) and the 64 MiB of footers one pass alone may hold. Their listings, metadata reads and commits are not bounded together.
+- Each pass in a batch has the two minutes a pass always had; the batch ends when its slowest pass does.
+- **Not run on the binary:** `reconcile_concurrency = 16` on AWS (it ran on a local S3 server), a cold tier, Glue sync, a warehouse outside the storage root, Azure and GCS.
+- While a table's published versions are held by `iceberg.min_version_age`, each of its passes still repeats its requests and re-publishes without having committed anything; that is not changed here.
+
 ## New: ingest appends of several Iceberg tables run at once ([#1778](https://github.com/Basekick-Labs/arc/issues/1778))
 
 On object storage an ingest-triggered export is a few hundred milliseconds of waiting on storage requests, and Arc exported one table at a time: under three tables a second in a bucket's region. With many tables being written the tables queued behind each other, and the lag was the length of the queue, whatever `ingest_export_interval` said. The appends of different tables now overlap.
