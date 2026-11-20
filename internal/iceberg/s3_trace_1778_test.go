@@ -213,6 +213,7 @@ func TestMeasure_S3RequestsPerExport(t *testing.T) {
 	exp, _, _ := s3Exporter(t, b)
 	exp.SetVersionRetention(120*time.Second, 5*time.Second)
 	exp.SetWarehouseAuthoritative(true) // as every production node is (main.go)
+	exp.retain = 10                     // iceberg.retain_snapshots' default: passes expire snapshots
 	src := NewStorageWalkSource(b, "arc", zerolog.Nop())
 	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: src, Interval: time.Hour, Logger: zerolog.Nop(),
 		IngestInterval: time.Millisecond, IngestAppend: true})
@@ -250,13 +251,14 @@ func TestMeasure_S3RequestsPerExport(t *testing.T) {
 		}
 		took := time.Since(start)
 		setDelay(0)
+		reqs, peak := tr.take()
 		// A file left out (rows across a UTC day, say) would make the trace
-		// that of an export that committed nothing.
+		// that of an export that committed nothing. After the trace is taken:
+		// the check reads the table through the store itself.
 		files += n
 		if got := len(liveFiles(t, exp)); got != files {
 			t.Fatalf("%s: %d files in the table, want %d", label, got, files)
 		}
-		reqs, peak := tr.take()
 		t.Logf("%-28s %4d requests, %7.0f ms at +%d ms each, most at once %d\n    %s", label, len(reqs), float64(took.Microseconds())/1000, delayMS, peak, summarize(reqs))
 		if os.Getenv("ARC_TEST_S3_TRACE_ORDER") != "" {
 			t.Logf("    in order: %s", strings.Join(reqs, " | "))
@@ -275,6 +277,15 @@ func TestMeasure_S3RequestsPerExport(t *testing.T) {
 	serve("pass, 1 new file", 1, true)
 	serve("pass, 19 new files", 19, true)
 	serve("pass, nothing new", 0, true)
+	// The timed pass of a table that only took appends (#1786): the appends
+	// mark it so that this pass always runs.
+	for round := 0; round < 3; round++ {
+		for i := 0; i < 5; i++ {
+			serve(fmt.Sprintf("  (append %d)", i), 1, false)
+		}
+		serve("pass after 5 appends, nothing new", 0, true)
+	}
+	serve("pass right after a pass", 0, true)
 }
 
 func traceRows() int {
