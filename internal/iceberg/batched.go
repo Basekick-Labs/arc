@@ -126,11 +126,34 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 	return res.settled, err
 }
 
-func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconcileResult, error) {
+func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res reconcileResult, err error) {
 	ctx = e.withAWS(ctx)
 	e.passLag = 0 // the largest export lag this pass publishes (export_lag.go)
 	database, measurement := req.database, req.measurement
 	tkey := database + "\x00" + measurement
+	// On a shared bucket: give way to a drop of the database running on
+	// another node, and remove a table that drop meant to remove
+	// (shared_drop.go, #1792). The scheduler does this before it reads the
+	// table; a caller that has not is covered here.
+	if !e.dropSettled {
+		if err := e.settleDroppedTable(ctx, database, measurement); err != nil {
+			return reconcileResult{}, err
+		}
+	}
+	e.dropSettled = false
+	// And at the end of a pass that wrote something: if the database was
+	// dropped on another node meanwhile, what was written goes.
+	defer func() {
+		if res.commits == 0 && len(e.passHints) == 0 {
+			return
+		}
+		if e.droppedUnderPass(ctx, database, measurement, req.canCommit) {
+			res.settled = false
+			if err == nil {
+				err = fmt.Errorf("%s.%s: %w", database, measurement, errDroppedUnderPass)
+			}
+		}
+	}()
 	// A pass can rewrite the table's manifests: the append path counts them again (append.go).
 	e.forgetSmallManifests(tkey)
 	canCommit := req.canCommit
@@ -617,7 +640,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 			Int("registered", registered).Int("left_for_next_pass", deferredNew).
 			Msg("Iceberg: source files disappeared during this pass (a compaction, delete or retention is rewriting this measurement); what they touched is left for the next pass")
 	}
-	res := reconcileResult{
+	res = reconcileResult{
 		partial:      partial,
 		registered:   registered,
 		remaining:    remaining,

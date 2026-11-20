@@ -114,6 +114,11 @@ type passState struct {
 	// version only because of iceberg.min_version_age, or could not finish
 	// (pruneAgainAt). Zero: nothing is waiting.
 	passPruneDue time.Time
+	// dropID is the id of the database's drop record as this pass found it
+	// ("" when there is none), and dropSettled that settleDroppedTable has
+	// run for the pass (shared_drop.go).
+	dropID      string
+	dropSettled bool
 	// passGate, while a reconcile runs, is its canCommit: EnsureTable's heals check it before
 	// committing, so a node that lost the writer role mid-pass does not publish a heal (#1097).
 	// nil outside a reconcile (always allowed).
@@ -724,11 +729,18 @@ func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string
 	// Bound iceberg-go's own metadata-file history so NNNNN-*.metadata.json don't accumulate
 	// forever: enable delete-after-commit and cap previous versions at `retain`. (Our own
 	// v<N>.metadata.json copies are pruned separately in pruneOldVersionFiles.)
+	props := iceberg.Properties{}
 	if e.retain > 0 {
-		createOpts = append(createOpts, icecatalog.WithProperties(iceberg.Properties{
-			icetable.MetadataDeleteAfterCommitEnabledKey: "true",
-			icetable.MetadataPreviousVersionsMaxKey:      strconv.Itoa(e.previousVersionsMax()),
-		}))
+		props[icetable.MetadataDeleteAfterCommitEnabledKey] = "true"
+		props[icetable.MetadataPreviousVersionsMaxKey] = strconv.Itoa(e.previousVersionsMax())
+	}
+	// The database's drop record when the table is created (shared_drop.go,
+	// #1792): what tells this table from one a later drop meant to remove.
+	if e.dropID != "" {
+		props[tableDropIDProp] = e.dropID
+	}
+	if len(props) > 0 {
+		createOpts = append(createOpts, icecatalog.WithProperties(props))
 	}
 
 	if e.colocatedLayout() {
@@ -2308,6 +2320,13 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 		return err
 	}
 	defer release()
+	// On a shared bucket, tell the other nodes first (shared_drop.go, #1792):
+	// the exporting node gives way while this runs, and what it wrote into
+	// these tables before it saw the record is recognised as dropped.
+	rec, recorded, err := e.beginDropRecord(ctx, database)
+	if err != nil {
+		return err
+	}
 	// Whatever the drop gets through, and before the lock is released: a
 	// drop that fails part way has still removed tables, and forgetting what
 	// was known of a table that is there after all only costs its next pass
@@ -2319,11 +2338,26 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 			e.onDatabaseDropped(database)
 		}
 	}()
-	return e.dropDatabase(ctx, database)
+	var found bool
+	if err := e.dropDatabase(ctx, database, &found); err != nil {
+		return err // the record stays "not done": the export waits for the DELETE to be repeated
+	}
+	if !recorded {
+		return nil
+	}
+	if !found {
+		// Nothing of this database was ever exported: no table can be from
+		// before this drop, so no record is kept for it.
+		return e.removeDropRecord(ctx, database, rec)
+	}
+	rec.Done = true
+	return e.writeDropRecord(ctx, database, rec)
 }
 
-// dropDatabase is DropDatabase's work, with the database's lock held.
-func (e *Exporter) dropDatabase(ctx context.Context, database string) error {
+// dropDatabase is DropDatabase's work, with the database's lock held. found
+// is set to whether there was anything of the database to drop: a table in
+// this node's catalog, or an object in the warehouse.
+func (e *Exporter) dropDatabase(ctx context.Context, database string, found *bool) error {
 	ns := icetable.Identifier{e.nsPrefix + "_" + database}
 	nsKey := catalogNamespaceKey(ns)
 	e.forgetExportLagNamespace(ns) // its tables' unpublished files will never be published (export_lag.go)
@@ -2434,6 +2468,7 @@ func (e *Exporter) dropDatabase(ctx context.Context, database string) error {
 		}
 	}
 
+	*found = len(localTables) > 0 || len(keys) > 0 || len(colocated) > 0 || len(subs) > 0
 	if e.dropAfterListing != nil {
 		e.dropAfterListing()
 	}

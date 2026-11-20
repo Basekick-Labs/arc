@@ -277,6 +277,15 @@ func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter)
 		return outcomeBusy, err
 	}
 	defer release()
+	// The same on a shared bucket, for a drop running on another node, and a
+	// table that drop meant to remove is removed here, before anything of it
+	// is read (shared_drop.go, #1792).
+	if err := exp.settleDroppedTable(ctx, m.Database, m.Measurement); err != nil {
+		if errors.Is(err, errDatabaseBeingDropped) {
+			return outcomeBusy, err
+		}
+		return outcomeUnchanged, err
+	}
 	// What the scheduler remembered of the table was copied before this pass
 	// had the database. If the database was dropped since it was cached (at
 	// any time before the loop got to forget it, a drop that ended a moment
