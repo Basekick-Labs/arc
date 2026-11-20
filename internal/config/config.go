@@ -222,8 +222,9 @@ const maxIcebergIngestExportConcurrency = 32
 // maxIcebergReconcileConcurrency bounds iceberg.reconcile_concurrency. A
 // pass is heavier than an append: it lists the measurement, can read
 // thousands of footers, and prunes and sweeps. The passes that run at once
-// share the footer reads (8 at once) and the footers held in memory (64 MiB)
-// that one pass alone may use.
+// share 16 storage reads in flight (footers and existence checks) and the
+// 64 MiB of footers one pass alone may hold; their listings, metadata reads
+// and commits are not bounded together.
 const maxIcebergReconcileConcurrency = 16
 
 // icebergMinVersionSpan is the least iceberg.min_version_age, in seconds:
@@ -734,15 +735,16 @@ type IcebergConfig struct {
 	IngestAppendEnabled bool
 	// IngestExportConcurrency is how many tables' ingest appends run at once
 	// (#1778). An append is mostly waiting on storage requests, so on object
-	// storage the tables' appends overlap; reconcile passes still run one
-	// table at a time. 1 is one export at a time, as before.
+	// storage the tables' appends overlap (reconcile passes have their own
+	// key, ReconcileConcurrency). 1 is one append at a time, as before.
 	IngestExportConcurrency int
 	// ReconcileConcurrency is how many tables' reconcile passes run at once
-	// (#1786): in the timed pass every reconcile_interval, and for the
-	// passes ingest requests need (a table's first export, a fallback). A
-	// pass is mostly waiting on storage requests, so on object storage the
-	// tables' passes overlap. 1 is one table at a time, as before. Standalone
-	// nodes only: a cluster node runs one at a time whatever this says.
+	// (#1786): in the timed pass every reconcile_interval (which is also
+	// where every table gets its first export after a start), and for the
+	// passes one batch of ingest appends falls back to. A pass is mostly
+	// waiting on storage requests, so on object storage the tables' passes
+	// overlap. 1 is one table at a time, as before. Standalone nodes only: a
+	// cluster node runs one at a time whatever this says.
 	ReconcileConcurrency int
 	CatalogDBPath        string // SQLite catalog path; defaults to the shared auth DB
 	RetainSnapshots      int    // Snapshots (and metadata versions) to keep per table; older are expired (default 10)

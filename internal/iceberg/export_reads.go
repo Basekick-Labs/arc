@@ -26,8 +26,9 @@ type exportReads struct {
 	// for their schema; buildDataFiles hands each to iceberg-go and drops it.
 	tails     map[string]fileTail
 	tailBytes int64
-	// maxTailBytes bounds tailBytes; 0 means exportReadsMaxTailBytes.
-	maxTailBytes int64
+	// batch, when set, is the budget this export shares with the exports
+	// that run beside it (withBatchReads).
+	batch *batchReads
 	// hints is version-hint.text as the adopt check read it, by metadata
 	// directory, for notePassStart, which would read it again a moment later.
 	hints map[string]int
@@ -59,11 +60,62 @@ func withExportReads(ctx context.Context) context.Context {
 	return context.WithValue(ctx, exportReadsKey{}, &exportReads{})
 }
 
-// withExportReadsBudget is withExportReads for an export that runs beside
-// others: it may hold maxTailBytes of tails, its share of what one export
-// alone holds (#1786).
-func withExportReadsBudget(ctx context.Context, maxTailBytes int64) context.Context {
-	return context.WithValue(ctx, exportReadsKey{}, &exportReads{maxTailBytes: maxTailBytes})
+// batchReads is what the exports of one batch share (#1786): together they
+// hold the tails one export alone may hold, and make the storage reads the
+// object-store client has idle connections for. A pass with many new files
+// that shares a batch with tables that have none gets all of both.
+type batchReads struct {
+	mu        sync.Mutex
+	tailBytes int64
+	// gate bounds the footer reads and existence checks in flight.
+	gate chan struct{}
+}
+
+// batchReadsAtOnce is the storage reads the exports of a batch make at once:
+// the object-store client's idle connections per host.
+const batchReadsAtOnce = 16
+
+func newBatchReads() *batchReads {
+	return &batchReads{gate: make(chan struct{}, batchReadsAtOnce)}
+}
+
+// withBatchReads is withExportReads for an export that runs beside others.
+func withBatchReads(ctx context.Context, b *batchReads) context.Context {
+	return context.WithValue(ctx, exportReadsKey{}, &exportReads{batch: b})
+}
+
+// acquireRead waits for one of the batch's storage reads, when the export
+// runs in a batch, and returns its release. Outside a batch it does not
+// wait: the caller's own limit is the bound.
+func acquireRead(ctx context.Context) (release func()) {
+	r := exportReadsFrom(ctx)
+	if r == nil || r.batch == nil {
+		return func() {}
+	}
+	select {
+	case r.batch.gate <- struct{}{}:
+		return func() { <-r.batch.gate }
+	case <-ctx.Done():
+		return func() {} // the read fails on the context
+	}
+}
+
+// reserve counts n more tail bytes against the batch's budget, and reports
+// whether they fit; release gives them back.
+func (b *batchReads) reserve(n int64) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.tailBytes+n > exportReadsMaxTailBytes {
+		return false
+	}
+	b.tailBytes += n
+	return true
+}
+
+func (b *batchReads) release(n int64) {
+	b.mu.Lock()
+	b.tailBytes -= n
+	b.mu.Unlock()
 }
 
 // exportReadsFrom returns the export's reads, or nil outside an export.
@@ -80,14 +132,12 @@ func (r *exportReads) putTail(physicalPath string, t fileTail) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if old, ok := r.tails[physicalPath]; ok {
-		r.tailBytes -= int64(len(old.data))
-		delete(r.tails, physicalPath)
+		r.dropLocked(physicalPath, old)
 	}
-	limit := r.maxTailBytes
-	if limit <= 0 {
-		limit = exportReadsMaxTailBytes
+	if r.tailBytes+int64(len(t.data)) > exportReadsMaxTailBytes {
+		return
 	}
-	if r.tailBytes+int64(len(t.data)) > limit {
+	if r.batch != nil && !r.batch.reserve(int64(len(t.data))) {
 		return
 	}
 	if r.tails == nil {
@@ -106,10 +156,18 @@ func (r *exportReads) takeTail(physicalPath string) (fileTail, bool) {
 	defer r.mu.Unlock()
 	t, ok := r.tails[physicalPath]
 	if ok {
-		r.tailBytes -= int64(len(t.data))
-		delete(r.tails, physicalPath)
+		r.dropLocked(physicalPath, t)
 	}
 	return t, ok
+}
+
+// dropLocked forgets a held tail; r.mu is held.
+func (r *exportReads) dropLocked(physicalPath string, t fileTail) {
+	r.tailBytes -= int64(len(t.data))
+	delete(r.tails, physicalPath)
+	if r.batch != nil {
+		r.batch.release(int64(len(t.data)))
+	}
 }
 
 // putHint records the version version-hint.text named in a metadata

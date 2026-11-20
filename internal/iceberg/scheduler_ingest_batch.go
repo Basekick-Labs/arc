@@ -26,9 +26,12 @@ import (
 //   - recentAdds, appendOK and the pending files are read before the appends
 //     start and written after they end.
 //
-// Reconcile passes are not run at once. A request that needs one (a table's
-// first export, a fallback, the pass after appendMaxBetweenPasses appends)
-// runs it on the loop goroutine after the batch, as before.
+// Reconcile passes are never part of a batch of appends. A request that
+// needs one (a table's first export, a fallback, the pass after
+// appendMaxBetweenPasses appends) has it run after the batch: the passes one
+// batch of appends leaves run at once among themselves (scheduler_pass.go,
+// #1786), which in practice is that batch's fallbacks, since the collection
+// above stops at the first request that needs a pass.
 
 // appendTimeout bounds one append of a batch. The loop waits for the whole
 // batch, so a wedged append holds the others' bookkeeping and every other
@@ -192,7 +195,7 @@ func (s *Scheduler) runAppends(ctx context.Context, batch []*ingestJob) {
 	run := func(job *ingestJob) {
 		actx, cancel := context.WithTimeout(ctx, appendTimeout)
 		defer cancel()
-		s.runAppend(actx, job, s.exporter.forAppend(), fileReads)
+		s.runAppend(actx, job, s.exporter.forExport(), fileReads)
 	}
 	if len(batch) == 1 {
 		run(batch[0])

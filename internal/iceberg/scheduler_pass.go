@@ -106,7 +106,9 @@ func (r *passRunner) unionFileSchemas(ctx context.Context, files []FileRef) (Arc
 			if err := gctx.Err(); err != nil {
 				return err
 			}
+			release := acquireRead(gctx)
 			sc, err := r.source.FileSchema(gctx, f)
+			release()
 			if err != nil {
 				return fmt.Errorf("file %q: %w", f.PhysicalPath, err)
 			}
@@ -134,7 +136,7 @@ func (r *passRunner) unionFileSchemas(ctx context.Context, files []FileRef) (Arc
 }
 
 // recentIngestKeys returns the listed files an append could still be offered:
-// ingest files written less than recentAddsKeep ago (noteListed).
+// ingest files written less than recentAddsKeep ago.
 func recentIngestKeys(files []FileRef) []string {
 	now := time.Now()
 	var recent []string
@@ -222,28 +224,41 @@ func (s *Scheduler) runPasses(ctx context.Context, batch []*passJob) {
 	if len(batch) == 0 {
 		return
 	}
-	seen := make(map[string]struct{}, len(batch))
-	for _, job := range batch {
-		if _, dup := seen[job.key]; dup {
-			panic("iceberg: a table is twice in one batch of reconcile passes: " + job.key)
-		}
-		seen[job.key] = struct{}{}
+	// The storage reads the whole batch has in flight, and the tails it
+	// holds, are shared (batchReads): a pass with a backlog beside tables
+	// with nothing new reads as fast as it would alone.
+	runner := s.passRunner(unionSchemaConcurrency)
+	shared := newBatchReads()
+	run := func(job *passJob) {
+		pctx, cancel := context.WithTimeout(withBatchReads(ctx, shared), measurementTimeout)
+		defer cancel()
+		runner.run(pctx, job, s.exporter.forExport())
 	}
-	// The footers the whole batch reads at once, and the tails it holds,
-	// stay what one pass alone may use.
-	runner := s.passRunner(max(2, unionSchemaConcurrency/len(batch)))
-	tailBytes := int64(exportReadsMaxTailBytes / len(batch))
+	// A table twice in a batch must not be two exports of it at once. No
+	// caller builds such a batch (a listing names a measurement once, and a
+	// table has one ingest request); if one ever does, the repeats run after
+	// the batch, one by one, as they would have before passes ran at once.
+	seen := make(map[string]struct{}, len(batch))
+	var repeats []*passJob
 	var wg sync.WaitGroup
 	for _, job := range batch {
+		if _, dup := seen[job.key]; dup {
+			repeats = append(repeats, job)
+			continue
+		}
+		seen[job.key] = struct{}{}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			pctx, cancel := context.WithTimeout(withExportReadsBudget(ctx, tailBytes), measurementTimeout)
-			defer cancel()
-			runner.run(pctx, job, s.exporter.forAppend())
+			run(job)
 		}()
 	}
 	wg.Wait()
+	for _, job := range repeats {
+		s.logger.Error().Str("database", job.m.Database).Str("measurement", job.m.Measurement).
+			Msg("Iceberg reconcile: a table was twice in one batch of passes; its second pass ran after the batch")
+		run(job)
+	}
 }
 
 // reconcile is one reconcile pass of the job's table: list, compare with
@@ -381,9 +396,9 @@ func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter)
 	if res.droppedCold {
 		// A cold file vanished: its cached cold listing is stale until invalidated. Before the
 		// error check: a pass can drop a cold file and then fail a later chunk.
-		// Done by the loop (applyPassEffects): two passes of one database can
-		// run at once, and an invalidation made while the other is listing the
-		// cold tier would be overwritten by that listing (#1786).
+		// Done by the loop once the pass has ended (applyPassEffects), like
+		// everything else a pass changes outside its own table (#1786). Nothing
+		// in this pass lists the cold tier again.
 		job.droppedCold = true
 	}
 	if err != nil {

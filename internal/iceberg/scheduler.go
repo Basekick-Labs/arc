@@ -1001,8 +1001,8 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 
 // reconcileOneRecovered runs reconcileOne and returns a panic on this
 // goroutine as the measurement's error, so one measurement whose files trip a
-// bug fails its pass instead of ending the process (the reconcile loop has no
-// other recover). Footer reads recover their own panics too (schemaFromReader),
+// bug fails its pass instead of ending the process (a pass that runs beside
+// others recovers its own, passRunner.run). Footer reads recover their own panics too (schemaFromReader),
 // including on worker goroutines this cannot reach.
 func (s *Scheduler) reconcileOneRecovered(ctx context.Context, m Measurement, key string) (outcome reconcileOutcome, err error) {
 	// Deferred first, so it runs last and sees what a recovered panic turned
@@ -1035,8 +1035,8 @@ func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string)
 	// One table, start to end, on the loop goroutine: the three steps a
 	// batch runs for several tables at once (scheduler_pass.go, #1786).
 	job := s.preparePass(m, key)
-	// Deferred: a pass can commit and then panic, and the commits it made
-	// and the cold listing it found stale are true either way.
+	// Deferred so that reconcileOneRecovered's own deferred bookkeeping,
+	// which reads the pass's commits, always runs after it.
 	defer s.applyPassEffects(job)
 	job.outcome, job.err = s.passRunner(unionSchemaConcurrency).reconcile(ctx, job, s.exporter)
 	s.applyPassState(job)

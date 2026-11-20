@@ -23,16 +23,17 @@ import (
 // listing, which is where a batch's workers are observed and steered.
 type passSource struct {
 	*StorageWalkSource
-	mu       sync.Mutex
-	listed   map[string]int
-	inside   int
-	most     int
-	entered  chan struct{}
-	hold     chan struct{}
-	failFor  map[string]error
-	panicFor map[string]bool
-	onList   func(m Measurement)
-	coldGone []string // databases whose cold listing was invalidated
+	mu        sync.Mutex
+	listed    map[string]int
+	inside    int
+	most      int
+	entered   chan struct{}
+	hold      chan struct{}
+	failFor   map[string]error
+	panicFor  map[string]bool
+	onList    func(m Measurement)
+	onListCtx func(ctx context.Context, m Measurement)
+	coldGone  []string // databases whose cold listing was invalidated
 }
 
 func (p *passSource) FilesAndLocal(ctx context.Context, m Measurement) ([]FileRef, []string, error) {
@@ -42,7 +43,7 @@ func (p *passSource) FilesAndLocal(ctx context.Context, m Measurement) ([]FileRe
 	if p.inside > p.most {
 		p.most = p.inside
 	}
-	entered, hold, onList := p.entered, p.hold, p.onList
+	entered, hold, onList, onListCtx := p.entered, p.hold, p.onList, p.onListCtx
 	fail, panics := p.failFor[m.Measurement], p.panicFor[m.Measurement]
 	p.mu.Unlock()
 	defer func() {
@@ -52,6 +53,9 @@ func (p *passSource) FilesAndLocal(ctx context.Context, m Measurement) ([]FileRe
 	}()
 	if onList != nil {
 		onList(m)
+	}
+	if onListCtx != nil {
+		onListCtx(ctx, m)
 	}
 	if entered != nil {
 		entered <- struct{}{}
@@ -501,27 +505,163 @@ func TestPassBatch_FinishAppliesTheStateThePassDecided(t *testing.T) {
 	}
 }
 
-// Two passes of one table in one batch would be two exports of it at once.
-func TestPassBatch_ATableTwiceInABatchIsRefused(t *testing.T) {
-	r := newPassRig(t, 1, 4, 1)
-	m := Measurement{Database: "mydb", Measurement: r.tables[0]}
-	defer func() {
-		if recover() == nil {
-			t.Fatal("a batch holding one table twice ran")
+// A table twice in one batch is never two exports of it at once: the repeat
+// runs after the batch.
+func TestPassBatch_ATableTwiceInABatchRunsOneAfterTheOther(t *testing.T) {
+	r := newPassRig(t, 2, 4, 1)
+	a := Measurement{Database: "mydb", Measurement: r.tables[0]}
+	b := Measurement{Database: "mydb", Measurement: r.tables[1]}
+	var mu sync.Mutex
+	insideA, mostA := 0, 0
+	r.src.mu.Lock()
+	r.src.onListCtx = func(_ context.Context, m Measurement) {
+		if m.Measurement != a.Measurement {
+			return
 		}
-	}()
-	r.sched.runPasses(context.Background(), []*passJob{r.sched.preparePass(m, "mydb\x00"+m.Measurement), r.sched.preparePass(m, "mydb\x00"+m.Measurement)})
+		mu.Lock()
+		insideA++
+		mostA = max(mostA, insideA)
+		mu.Unlock()
+		time.Sleep(30 * time.Millisecond)
+		mu.Lock()
+		insideA--
+		mu.Unlock()
+	}
+	r.src.mu.Unlock()
+	jobs := []*passJob{
+		r.sched.preparePass(a, "mydb\x00"+a.Measurement),
+		r.sched.preparePass(b, "mydb\x00"+b.Measurement),
+		r.sched.preparePass(a, "mydb\x00"+a.Measurement),
+	}
+	r.sched.runPasses(context.Background(), jobs)
+	if mostA != 1 {
+		t.Fatalf("%d passes of one table at once", mostA)
+	}
+	if got := r.src.passes(a.Measurement); got != 2 {
+		t.Fatalf("the table that was twice in the batch was listed %d times, want 2", got)
+	}
+	for _, job := range jobs {
+		if job.err != nil {
+			t.Fatalf("pass of %s: %v", job.key, job.err)
+		}
+		r.sched.finishPass(job)
+	}
+	r.wantEachOnce()
 }
 
-// The footers the passes of a batch hold share what one pass alone may hold.
-func TestExportReads_ABudgetBoundsTheTails(t *testing.T) {
-	r := exportReadsFrom(withExportReadsBudget(context.Background(), 10))
-	r.putTail("a", fileTail{data: make([]byte, 8)})
-	r.putTail("b", fileTail{data: make([]byte, 3)}) // 11 > 10
-	if _, ok := r.takeTail("b"); ok {
-		t.Error("a tail past the export's own budget was kept")
+// The passes of a batch share their storage reads and the footers they
+// hold; a pass on the loop goroutine has neither limit beyond its own.
+func TestPassBatch_TheBatchSharesItsReadsAndItsFooters(t *testing.T) {
+	r := newPassRig(t, 3, 4, 1)
+	var mu sync.Mutex
+	var seen []*batchReads
+	r.src.mu.Lock()
+	r.src.onListCtx = func(ctx context.Context, _ Measurement) {
+		mu.Lock()
+		defer mu.Unlock()
+		if er := exportReadsFrom(ctx); er != nil {
+			seen = append(seen, er.batch)
+		} else {
+			seen = append(seen, nil)
+		}
 	}
-	if _, ok := r.takeTail("a"); !ok {
-		t.Error("a tail within the budget was not kept")
+	r.src.mu.Unlock()
+	r.sched.runPass(context.Background())
+	if len(seen) != 3 || seen[0] == nil || seen[0] != seen[1] || seen[1] != seen[2] {
+		t.Fatalf("the three passes of one batch saw budgets %v, want one shared by all", seen)
 	}
+	if got := cap(seen[0].gate); got != batchReadsAtOnce {
+		t.Errorf("the batch may make %d storage reads at once, want %d", got, batchReadsAtOnce)
+	}
+	// One table at a time: no shared budget.
+	seen = nil
+	r.sched.passConcurrency = 1
+	r.newFile(r.tables[0])
+	r.sched.runPass(context.Background())
+	for _, b := range seen {
+		if b != nil {
+			t.Fatal("a pass that ran alone was given a batch's budget")
+		}
+	}
+}
+
+// The footers the exports of a batch hold together are bounded by what one
+// export alone may hold, and a tail taken gives its bytes back.
+func TestExportReads_ABatchSharesOneFooterBudget(t *testing.T) {
+	shared := newBatchReads()
+	a := exportReadsFrom(withBatchReads(context.Background(), shared))
+	b := exportReadsFrom(withBatchReads(context.Background(), shared))
+	big := make([]byte, exportReadsMaxTailBytes-10)
+	a.putTail("a", fileTail{data: big})
+	b.putTail("b", fileTail{data: make([]byte, 11)}) // 1 over, together
+	if _, ok := b.takeTail("b"); ok {
+		t.Error("a tail past the batch's budget was kept")
+	}
+	b.putTail("c", fileTail{data: make([]byte, 10)})
+	if _, ok := b.takeTail("c"); !ok {
+		t.Error("a tail that fits the batch's budget was not kept")
+	}
+	if _, ok := a.takeTail("a"); !ok {
+		t.Fatal("the first tail was not kept")
+	}
+	if shared.tailBytes != 0 {
+		t.Errorf("%d bytes still counted against the batch after every tail was taken", shared.tailBytes)
+	}
+	// A read waits for one of the batch's slots and gives it back.
+	ctx := withBatchReads(context.Background(), shared)
+	releases := make([]func(), 0, batchReadsAtOnce)
+	for i := 0; i < batchReadsAtOnce; i++ {
+		releases = append(releases, acquireRead(ctx))
+	}
+	blocked := make(chan struct{})
+	go func() { acquireRead(ctx)(); close(blocked) }()
+	select {
+	case <-blocked:
+		t.Fatal("a read past the batch's limit did not wait")
+	case <-time.After(50 * time.Millisecond):
+	}
+	releases[0]()
+	select {
+	case <-blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a waiting read did not get the slot that was released")
+	}
+	for _, rel := range releases[1:] {
+		rel()
+	}
+	acquireRead(context.Background())() // outside a batch: no wait
+}
+
+// A database deleted through the API (the exporter's DropDatabase, on the
+// request's goroutine) while passes of its tables run at once: no race, no
+// panic, and the next pass leaves every table that still has files right.
+func TestPassBatch_ADatabaseDroppedWhileItsTablesReconcile(t *testing.T) {
+	r := newPassRig(t, 6, 6, 1)
+	r.sched.runPass(context.Background())
+	for _, m := range r.tables {
+		r.newFile(m)
+	}
+	var once sync.Once
+	dropped := make(chan error, 1)
+	r.src.mu.Lock()
+	r.src.onListCtx = func(context.Context, Measurement) {
+		once.Do(func() {
+			go func() { dropped <- r.exp.DropDatabase(context.Background(), "mydb") }()
+		})
+	}
+	r.src.mu.Unlock()
+	r.sched.runPass(context.Background())
+	select {
+	case <-dropped: // whatever it returned: the passes and the drop did not corrupt each other
+	case <-time.After(30 * time.Second):
+		t.Fatal("the drop did not return")
+	}
+	r.src.mu.Lock()
+	r.src.onListCtx = nil
+	r.src.mu.Unlock()
+	// The files are still in storage (only the tables were dropped): two
+	// more passes bring every table back with its files once.
+	r.sched.runPass(context.Background())
+	r.sched.runPass(context.Background())
+	r.wantEachOnce()
 }
