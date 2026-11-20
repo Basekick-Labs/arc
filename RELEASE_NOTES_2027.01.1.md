@@ -2,6 +2,18 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: a quiet Iceberg table no longer repeats its pass and re-publishes while old versions wait out `min_version_age` ([#1787](https://github.com/Basekick-Labs/arc/issues/1787))
+
+A pass that kept published versions on disk only because of `iceberg.min_version_age` marked the table so that every later pass ran in full, whatever its listing, until those versions were old enough to prune. Each of those passes committed nothing, yet read the table's manifests and wrote `v<N>.metadata.json` (refused as existing, then read back to compare) and `version-hint.text` again: 15 requests on S3, at every `iceberg.reconcile_interval`.
+
+- **The table now gets one pass, when the versions are due.** The prune reports when the last version it kept for its age can go; until then an unchanged table is skipped like any other (the listing only, 3 requests in the trace), and the pass at that time prunes them all. The versions that come of age earlier wait for it, less than one `min_version_age` more.
+- **A pass that finds its own publish in place writes nothing.** When this process already wrote that exact metadata file to `version-hint.text` and the hint read at the start of the pass still names it, the pass no longer writes the copy and the hint again. The first pass of a process, a pass after any commit, a pass that finds the hint missing, behind or unreadable, and every pass of a table still on an adopted row publish as before.
+- **Given up:** a pass that commits nothing no longer puts back a `v<N>.metadata.json` deleted from outside Arc while the hint still names it. The next commit or restart writes it.
+- **A prune that could not finish is retried.** When the metadata directory cannot be listed, or a copy cannot be deleted, the table's next pass runs and tries again, and the failure is logged at Warn (it was at Debug, or not logged). Before, a table that then went quiet kept those copies until its files next changed. While the failure lasts that is one full pass of the table per `reconcile_interval`.
+- **Copies a pass of several commits keeps for itself are removed by the next pass.** They used to stay over `retain_snapshots + 1` on a table that went quiet.
+- **Measured** with the built binary on SeaweedFS, `reconcile_interval = 15`, `min_version_age = 120`, 30 writes and then nothing: before, `version-hint.text` was written again at each of the 7 passes that followed the last commit; after, not once, and one pass about 130 s after the last publish pruned the table to `retain_snapshots + 1` copies. One run each.
+- No configuration changes.
+
 ## New: reconcile passes of several Iceberg tables run at once ([#1786](https://github.com/Basekick-Labs/arc/issues/1786))
 
 After #1778 the appends of different tables overlap, but a reconcile pass still ran for one table at a time, and every table gets one: at its first export, every `iceberg.reconcile_interval`, and after 120 appends. On object storage a pass is about half a second of waiting on storage requests (14 to 16 of them for a table that only took appends), so a timed pass over 200 tables took minutes, during which those tables' appends were served one batch per table visited. The passes of different tables now overlap too.
@@ -54,7 +66,7 @@ Notes:
 - Each pass in a batch has the two minutes a pass always had; the batch ends when its slowest pass does.
 - **Not run on the binary:** `reconcile_concurrency = 16` on AWS (it ran on a local S3 server), a cold tier, Glue sync, a warehouse outside the storage root, Azure and GCS.
 - **A database deleted during a reconcile pass** ([#1789](https://github.com/Basekick-Labs/arc/issues/1789)): on a standalone node the delete does not wait for a pass in progress, and a table whose pass it lands in can be left missing or pointing at metadata the delete removed. That was so with one pass at a time (5 of 30 runs of a test that forces the overlap); with several at once more tables of the database can be in a pass at that moment (10 of 30 at six at once). Not fixed here.
-- While a table's published versions are held by `iceberg.min_version_age`, each of its passes still repeats its requests and re-publishes without having committed anything ([#1787](https://github.com/Basekick-Labs/arc/issues/1787)); that is not changed here.
+- While a table's published versions were held by `iceberg.min_version_age`, each of its passes repeated its requests and re-published without having committed anything; fixed in [#1787](https://github.com/Basekick-Labs/arc/issues/1787), above.
 
 ## New: ingest appends of several Iceberg tables run at once ([#1778](https://github.com/Basekick-Labs/arc/issues/1778))
 
