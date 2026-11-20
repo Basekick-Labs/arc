@@ -163,7 +163,7 @@ func TestAppend_TheSmallManifestCountFollowsTheTable(t *testing.T) {
 	r := newAppendRig(t)
 	const key = "mydb\x00cpu"
 	names := []string{r.settled()}
-	if _, known := r.exp.appendSmall[key]; known {
+	if _, known := r.exp.smallManifests(key); known {
 		t.Fatal("a count is held before any append")
 	}
 	smallNow := func() int {
@@ -180,7 +180,7 @@ func TestAppend_TheSmallManifestCountFollowsTheTable(t *testing.T) {
 		names = append(names, f)
 		r.report(f)
 		r.serve()
-		held, known := r.exp.appendSmall[key]
+		held, known := r.exp.smallManifests(key)
 		if !known {
 			t.Fatalf("append %d left no count", i+1)
 		}
@@ -199,7 +199,7 @@ func TestAppend_TheSmallManifestCountFollowsTheTable(t *testing.T) {
 	if _, err := r.pass(); err != nil {
 		t.Fatal(err)
 	}
-	if _, known := r.exp.appendSmall[key]; known {
+	if _, known := r.exp.smallManifests(key); known {
 		t.Error("the count survived a reconcile pass")
 	}
 	// An append that does not finish forgets it too.
@@ -207,7 +207,7 @@ func TestAppend_TheSmallManifestCountFollowsTheTable(t *testing.T) {
 	names = append(names, f)
 	r.report(f)
 	r.serve()
-	if _, known := r.exp.appendSmall[key]; !known {
+	if _, known := r.exp.smallManifests(key); !known {
 		t.Fatal("no count after an append that followed the pass")
 	}
 	refs, _, err := r.src.AppendRefs(context.Background(), Measurement{Database: "mydb", Measurement: "cpu"}, []string{appendDir + r.newFile()}, nil)
@@ -217,7 +217,7 @@ func TestAppend_TheSmallManifestCountFollowsTheTable(t *testing.T) {
 	if _, err := r.exp.appendFiles(context.Background(), "mydb", "cpu", refs, r.sched.unionFileSchemas, func() bool { return false }); !errors.Is(err, errWriterLost) {
 		t.Fatalf("append with the gate closed: %v, want errWriterLost", err)
 	}
-	if _, known := r.exp.appendSmall[key]; known {
+	if _, known := r.exp.smallManifests(key); known {
 		t.Error("the count survived an append that did not commit")
 	}
 }
@@ -240,7 +240,7 @@ func TestAppend_PresentFileSchemasLeavesOutAFileThatIsGone(t *testing.T) {
 			}
 		}
 	}
-	present, sc, err := r.sched.presentFileSchemas(context.Background(), refs)
+	present, sc, err := r.sched.presentFileSchemas(context.Background(), refs, unionSchemaConcurrency)
 	if err != nil {
 		t.Fatalf("a file that is gone failed the read: %v", err)
 	}

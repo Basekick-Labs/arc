@@ -28,8 +28,9 @@ import (
 //     publish right behind a compaction's or a timed pass's version.
 //   - Served after every other kind. A compaction's request takes deleted
 //     inputs out of a table and must not queue behind a backlog of ingest
-//     ones; inside a timed pass only one ingest request is served between two
-//     measurements, so the pass still finishes.
+//     ones; inside a timed pass, between two measurements, at most one
+//     ingest request runs a reconcile pass (and, with several appends at
+//     once, one batch of appends), so the pass still finishes.
 //   - Timed by the loop's one timer (ingestDue holds when each is due), not by
 //     a timer per table.
 //
@@ -280,13 +281,26 @@ func (s *Scheduler) noteIngestCovered(key string, startedAt time.Time, outcome r
 }
 
 // serviceIngest reconciles the ingest requests that are due, the one due the
-// longest first, at most max of them. Requests of the other kinds
+// longest first, at most limit of them. Requests of the other kinds
 // and database drops go first, before each one.
-func (s *Scheduler) serviceIngest(ctx context.Context, max int) {
+func (s *Scheduler) serviceIngest(ctx context.Context, limit int) {
 	if s.ingestInterval <= 0 {
 		return
 	}
-	for served := 0; ctx.Err() == nil && served < max; served++ {
+	if s.ingestConcurrency > 1 {
+		// Appends of several tables at once (scheduler_ingest_batch.go). Idle
+		// (limit > 1), up to limit requests may run a pass, as before, and a
+		// whole batch of appends is served even when it is larger than that;
+		// between the measurements of a timed pass (limit == 1) one request
+		// may run a pass, as before, and one batch of appends is served.
+		if limit > 1 {
+			s.serviceIngestBatches(ctx, max(limit, s.ingestConcurrency), limit)
+		} else {
+			s.serviceIngestBatches(ctx, s.ingestConcurrency, 1)
+		}
+		return
+	}
+	for served := 0; ctx.Err() == nil && served < limit; served++ {
 		if s.otherRequestsQueued() {
 			s.serviceDrops(ctx)
 			s.serviceRequests(ctx)
@@ -315,26 +329,33 @@ func (s *Scheduler) serviceIngest(ctx context.Context, max int) {
 		began := time.Now()
 		outcome, err := s.exportIngest(mctx, m, key)
 		cancel()
-		s.noteOutcome(key, outcome)
-		event := s.logger.Debug()
-		if err != nil && outcome != outcomeBusy {
-			event = logSchemaConflict(s.logger.Warn().Err(err), err)
+		s.afterIngest(m, key, outcome, err, time.Since(began))
+	}
+}
+
+// afterIngest is what follows every served ingest request, whatever it ran:
+// the outcome's bookkeeping, the log line, and the request's return when the
+// table did not settle. Loop goroutine only.
+func (s *Scheduler) afterIngest(m Measurement, key string, outcome reconcileOutcome, err error, took time.Duration) {
+	s.noteOutcome(key, outcome)
+	event := s.logger.Debug()
+	if err != nil && outcome != outcomeBusy {
+		event = logSchemaConflict(s.logger.Warn().Err(err), err)
+	}
+	event.Str("database", m.Database).Str("measurement", m.Measurement).Str("outcome", outcome.String()).
+		Dur("took", took). // an append or a pass, whichever it was (#1751)
+		Msg("Iceberg reconcile on request (an ingest flush)")
+	// Anything short of a settled reconcile comes back one interval
+	// later, whether or not another flush asks: a failure, a busy table,
+	// files left behind, a publish that did not land. Except a table the
+	// timed passes have escalated as busy for too long: they own it now,
+	// as for the other kinds of request (serviceRequests).
+	if outcome == outcomeBusy {
+		if since, started := s.busySince[key]; started && time.Since(since) >= busyEscalateAfter {
+			return
 		}
-		event.Str("database", m.Database).Str("measurement", m.Measurement).Str("outcome", outcome.String()).
-			Dur("took", time.Since(began)). // an append or a pass, whichever it was (#1751)
-			Msg("Iceberg reconcile on request (an ingest flush)")
-		// Anything short of a settled reconcile comes back one interval
-		// later, whether or not another flush asks: a failure, a busy table,
-		// files left behind, a publish that did not land. Except a table the
-		// timed passes have escalated as busy for too long: they own it now,
-		// as for the other kinds of request (serviceRequests).
-		if outcome == outcomeBusy {
-			if since, started := s.busySince[key]; started && time.Since(since) >= busyEscalateAfter {
-				continue
-			}
-		}
-		if _, settled := s.state[key]; err != nil || !settled || outcome == outcomeInProgress || outcome == outcomeBusy {
-			s.requeueIngest(m, key)
-		}
+	}
+	if _, settled := s.state[key]; err != nil || !settled || outcome == outcomeInProgress || outcome == outcomeBusy {
+		s.requeueIngest(m, key)
 	}
 }

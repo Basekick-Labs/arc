@@ -131,7 +131,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 	database, measurement := req.database, req.measurement
 	tkey := database + "\x00" + measurement
 	// A pass can rewrite the table's manifests: the append path counts them again (append.go).
-	delete(e.appendSmall, tkey)
+	e.forgetSmallManifests(tkey)
 	canCommit := req.canCommit
 	if canCommit == nil {
 		canCommit = func() bool { return true }

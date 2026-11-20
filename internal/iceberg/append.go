@@ -75,7 +75,7 @@ func appendMergeOn() iceberg.Properties {
 // can stand than with a count read every time, until the table's next pass,
 // which comes after appendMaxBetweenPasses appends at the latest.
 func (e *Exporter) appendMergeDue(ctx context.Context, tkey string, tbl *icetable.Table) (merge bool, small int) {
-	if n, ok := e.appendSmall[tkey]; ok {
+	if n, ok := e.smallManifests(tkey); ok {
 		return n+1 >= appendMergeMinCount, n + 1
 	}
 	snap := tbl.CurrentSnapshot()
@@ -129,7 +129,7 @@ func (e *Exporter) appendFiles(ctx context.Context, database, measurement string
 	// the next one (appendMergeDue).
 	defer func() {
 		if err != nil {
-			delete(e.appendSmall, tkey)
+			e.forgetSmallManifests(tkey)
 		}
 	}()
 	e.setPassGate(canCommit)
@@ -189,7 +189,7 @@ func (e *Exporter) appendFiles(ctx context.Context, database, measurement string
 	merge, small := e.appendMergeDue(ctx, tkey, tbl)
 	// Not known again until this append has finished (a panic past this point
 	// skips the deferred delete's err check).
-	delete(e.appendSmall, tkey)
+	e.forgetSmallManifests(tkey)
 	if merge {
 		if err := txn.SetProperties(appendMergeOn()); err != nil {
 			return res, fmt.Errorf("iceberg append: enable manifest merge: %w", err)
@@ -233,10 +233,7 @@ func (e *Exporter) appendFiles(ctx context.Context, database, measurement string
 		if merge {
 			small = 1
 		}
-		if e.appendSmall == nil {
-			e.appendSmall = make(map[string]int)
-		}
-		e.appendSmall[tkey] = small
+		e.setSmallManifests(tkey, small)
 	}
 	e.logger.Debug().
 		Str("database", database).Str("measurement", measurement).
@@ -244,4 +241,29 @@ func (e *Exporter) appendFiles(ctx context.Context, database, measurement string
 		Dur("took", time.Since(start)).Dur("oldest_ingest_file_lag", e.passLag).
 		Msg("Appended ingest files to the Iceberg table")
 	return res, nil
+}
+
+// smallManifests, setSmallManifests and forgetSmallManifests are the count
+// appendMergeDue carries per table. Under chunkMu: appends of different
+// tables run at once (#1778), and a reconcile pass forgets a table's count.
+func (e *Exporter) smallManifests(tkey string) (int, bool) {
+	e.chunkMu.Lock()
+	defer e.chunkMu.Unlock()
+	n, ok := e.appendSmall[tkey]
+	return n, ok
+}
+
+func (e *Exporter) setSmallManifests(tkey string, n int) {
+	e.chunkMu.Lock()
+	defer e.chunkMu.Unlock()
+	if e.appendSmall == nil {
+		e.appendSmall = make(map[string]int)
+	}
+	e.appendSmall[tkey] = n
+}
+
+func (e *Exporter) forgetSmallManifests(tkey string) {
+	e.chunkMu.Lock()
+	defer e.chunkMu.Unlock()
+	delete(e.appendSmall, tkey)
 }
