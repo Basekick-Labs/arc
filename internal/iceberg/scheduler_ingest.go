@@ -28,8 +28,9 @@ import (
 //     publish right behind a compaction's or a timed pass's version.
 //   - Served after every other kind. A compaction's request takes deleted
 //     inputs out of a table and must not queue behind a backlog of ingest
-//     ones; inside a timed pass only one ingest request is served between two
-//     measurements, so the pass still finishes.
+//     ones; inside a timed pass, between two measurements, at most one
+//     ingest request runs a reconcile pass (and, with several appends at
+//     once, one batch of appends), so the pass still finishes.
 //   - Timed by the loop's one timer (ingestDue holds when each is due), not by
 //     a timer per table.
 //
@@ -280,26 +281,26 @@ func (s *Scheduler) noteIngestCovered(key string, startedAt time.Time, outcome r
 }
 
 // serviceIngest reconciles the ingest requests that are due, the one due the
-// longest first, at most max of them. Requests of the other kinds
+// longest first, at most limit of them. Requests of the other kinds
 // and database drops go first, before each one.
-func (s *Scheduler) serviceIngest(ctx context.Context, max int) {
+func (s *Scheduler) serviceIngest(ctx context.Context, limit int) {
 	if s.ingestInterval <= 0 {
 		return
 	}
 	if s.ingestConcurrency > 1 {
 		// Appends of several tables at once (scheduler_ingest_batch.go). Idle
-		// (max > 1), any due request may run a pass; between the measurements
-		// of a timed pass (max == 1) one may, as before, and the appends of
-		// one batch ride along.
-		if max > 1 {
-			max = maxInt(max, s.ingestConcurrency)
-			s.serviceIngestBatches(ctx, max, max)
+		// (limit > 1), up to limit requests may run a pass, as before, and a
+		// whole batch of appends is served even when it is larger than that;
+		// between the measurements of a timed pass (limit == 1) one request
+		// may run a pass, as before, and one batch of appends is served.
+		if limit > 1 {
+			s.serviceIngestBatches(ctx, max(limit, s.ingestConcurrency), limit)
 		} else {
 			s.serviceIngestBatches(ctx, s.ingestConcurrency, 1)
 		}
 		return
 	}
-	for served := 0; ctx.Err() == nil && served < max; served++ {
+	for served := 0; ctx.Err() == nil && served < limit; served++ {
 		if s.otherRequestsQueued() {
 			s.serviceDrops(ctx)
 			s.serviceRequests(ctx)

@@ -32,22 +32,21 @@ import (
 
 // appendTimeout bounds one append of a batch. The loop waits for the whole
 // batch, so a wedged append holds the others' bookkeeping and every other
-// request for this long; an append is a handful of requests, and one that
-// runs out of time falls back to a reconcile pass with its own budget
-// (measurementTimeout).
-var appendTimeout = 30 * time.Second // a var for tests
+// request for this long. An append is a handful of requests plus one read per
+// new file, appendFileReads at a time: the most files one append takes
+// (appendMaxFiles, 256) at 200 ms a read is 13 s. One that runs out of time
+// falls back to a reconcile pass with its own budget (measurementTimeout).
+var appendTimeout = 60 * time.Second // a var for tests
 
-// batchFileReads is how many footers the appends of one batch read at once,
-// all together: the object store client keeps 16 idle connections per host,
-// and more than that at once means opening new ones.
-const batchFileReads = 16
-
-func maxInt(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
+// batchFileReads is how many footers the appends of one batch aim to read at
+// once, all together: the object store client keeps 16 idle connections per
+// host, and more than that at once means opening new ones. appendFileReads
+// is the least one append reads at once whatever the batch's size, so a full
+// batch of 8 reads up to 32 at once and one of 32 up to 128.
+const (
+	batchFileReads  = 16
+	appendFileReads = 4
+)
 
 // serviceIngestBatches serves the due ingest requests, the one due the
 // longest first: at most maxRequests of them, of which at most maxPasses may
@@ -143,7 +142,9 @@ func (s *Scheduler) serviceIngestBatches(ctx context.Context, maxRequests, maxPa
 				return
 			}
 			passes++
-			if i > 0 && s.otherRequestsQueued() {
+			// What was asked for while the batch or the last pass ran: a
+			// compaction's request must not wait behind these passes.
+			if s.otherRequestsQueued() {
 				s.serviceDrops(ctx)
 				s.serviceRequests(ctx)
 			}
@@ -167,7 +168,7 @@ func (s *Scheduler) runAppends(ctx context.Context, batch []*ingestJob) {
 	if len(batch) == 0 {
 		return
 	}
-	fileReads := maxInt(2, batchFileReads/len(batch))
+	fileReads := max(appendFileReads, batchFileReads/len(batch))
 	run := func(job *ingestJob) {
 		actx, cancel := context.WithTimeout(ctx, appendTimeout)
 		defer cancel()
@@ -188,12 +189,16 @@ func (s *Scheduler) runAppends(ctx context.Context, batch []*ingestJob) {
 	wg.Wait()
 }
 
-// ingestDueNow puts back a taken ingest request so that the next service
-// takes it first: one whose reconcile pass could not run in this service.
+// ingestDueNow puts back a taken ingest request, due at once: one whose
+// reconcile pass could not run in this service. A flush that reported a file
+// for the table meanwhile has queued a request one interval out (the spacing
+// was stamped when this one was taken); that one is brought forward, or the
+// table, which takes no append until its pass, would wait a whole interval.
 func (s *Scheduler) ingestDueNow(m Measurement, key string) {
+	now := time.Now()
 	s.reqMu.Lock()
-	if _, queued := s.ingestDue[key]; !queued {
-		s.ingestDue[key] = ingestRequest{m: m, due: time.Now()}
+	if r, queued := s.ingestDue[key]; !queued || r.due.After(now) {
+		s.ingestDue[key] = ingestRequest{m: m, due: now}
 	}
 	s.reqMu.Unlock()
 }

@@ -26,8 +26,13 @@ import (
 // The append commits with iceberg-go's duplicate check off, so THIS file is
 // what keeps a file from being added twice:
 //
-//   - One goroutine (the loop) owns every commit: a pass and an append never
-//     interleave.
+//   - One export of a table at a time, and never a pass while an append
+//     runs. The loop goroutine runs every reconcile pass itself. Appends of
+//     different tables can run at once on other goroutines (#1778,
+//     scheduler_ingest_batch.go), but the loop starts them and waits for all
+//     of them before it does anything else, a table is in one of them at
+//     most, and everything below is read before they start and written after
+//     they end, by the loop.
 //   - A table takes appends only between reconcile passes that settled
 //     (appendOK). A settled pass means every listed file is in the table, and
 //     that every rule a listing enforces as a whole held: no hidden data

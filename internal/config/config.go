@@ -214,8 +214,9 @@ type IngestConfig struct {
 const minIcebergIngestExportInterval = 5
 
 // maxIcebergIngestExportConcurrency bounds iceberg.ingest_export_concurrency.
-// Each append at once is a goroutine holding a few storage connections and
-// one turn on the catalog's single SQLite connection.
+// Each append at once is a goroutine with a few storage requests in flight,
+// the footers of its new files in memory (a few MiB for a large append, 64
+// MiB at most) and a turn on the catalog's single SQLite connection.
 const maxIcebergIngestExportConcurrency = 32
 
 // icebergMinVersionSpan is the least iceberg.min_version_age, in seconds:

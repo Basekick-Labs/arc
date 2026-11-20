@@ -61,8 +61,9 @@ type FileRef struct {
 	Cold bool
 }
 
-// Exporter maintains Iceberg tables that mirror Arc's Parquet file set. One Exporter per
-// process; ReconcileMeasurement is the unit of work (one measurement's table).
+// Exporter maintains Iceberg tables that mirror Arc's Parquet file set. One per process
+// (NewExporter), plus the short-lived ones forAppend makes over the same shared state;
+// ReconcileMeasurement is the unit of work (one measurement's table).
 //
 // It is two parts. exporterShared is the process's one copy of everything
 // that is not about the export in progress. passState is the flags and
@@ -77,16 +78,15 @@ type Exporter struct {
 // passState is what one reconcile pass or append records about itself. One
 // export of one table at a time uses it.
 type passState struct {
-	// hintFailure records that a discovery-file write failed anywhere during the
-	// current ReconcileMeasurementWithHint call, including inside EnsureTable
-	// (which publishes on table creation and schema evolution). The reconciler
-	// is single-writer and reconciles one measurement at a time, so a plain flag
-	// reset at the start of each call is sufficient; the mutex only guards
-	// against a future concurrent caller.
 	// passLag is the largest export lag this pass or append observed, for
 	// its log line (export_lag.go, #1750).
 	passLag time.Duration
 
+	// hintFailure records that a discovery-file write failed anywhere during the
+	// current reconcile or append, including inside EnsureTable (which publishes
+	// on table creation and schema evolution). A passState belongs to one export
+	// of one table, so a plain flag reset at the start of each call is
+	// sufficient; the mutex only guards against a concurrent caller within it.
 	hintFailMu  sync.Mutex
 	hintFailure bool
 	// fenced is set when a publish found another writer's v<N> (adopt.go); cleared with

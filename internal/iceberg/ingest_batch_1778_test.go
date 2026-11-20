@@ -603,3 +603,113 @@ func TestIngestBatch_TheGateClosingDuringABatchRunsNoPass(t *testing.T) {
 		t.Errorf("%d requests and %d tables' files kept on a node that no longer exports", due, pending)
 	}
 }
+
+// A fallback pass put off to the next service is due at once even when a
+// flush queued the table's next request, one interval out, during the batch.
+func TestIngestBatch_ADeferredPassIsNotHeldBackByALaterReport(t *testing.T) {
+	r := newBatchRig(t, 4, 4, true)
+	r.sched.ingestInterval = time.Hour // a request queued during the batch is far off
+	fail := errors.New("injected append failure")
+	bad := []string{r.tables[1], r.tables[3]}
+	var once sync.Once
+	r.src.mu.Lock()
+	r.src.failFor = map[string]error{bad[0]: fail, bad[1]: fail}
+	r.src.onEnter = func(Measurement) {
+		once.Do(func() {
+			for _, m := range bad {
+				r.report(m, r.newFile(m))
+			}
+		})
+	}
+	r.src.mu.Unlock()
+	// Due now, whatever the hour-long spacing says.
+	r.reportOneEach()
+	r.sched.reqMu.Lock()
+	for k, req := range r.sched.ingestDue {
+		req.due = time.Now()
+		r.sched.ingestDue[k] = req
+	}
+	r.sched.reqMu.Unlock()
+	r.sched.serviceIngest(context.Background(), 1) // between two measurements: one pass
+	ran := 0
+	for _, m := range bad {
+		if r.src.passes(m) == 2 {
+			ran++
+		}
+	}
+	if ran != 1 {
+		t.Fatalf("%d of the two failed tables ran their pass, want 1", ran)
+	}
+	r.sched.reqMu.Lock()
+	defer r.sched.reqMu.Unlock()
+	for _, m := range bad {
+		if r.src.passes(m) == 2 {
+			continue
+		}
+		req, queued := r.sched.ingestDue["mydb\x00"+m]
+		if !queued {
+			t.Fatalf("table %s, whose pass was put off, has no request waiting", m)
+		}
+		if wait := time.Until(req.due); wait > time.Second {
+			t.Fatalf("table %s takes no append until its pass, and its pass is due in %v", m, wait.Round(time.Second))
+		}
+	}
+}
+
+// Between two measurements, a request that needs a pass and is due the
+// longest runs that pass, and the service ends there.
+func TestIngestBatch_BetweenMeasurementsNothingFollowsThePass(t *testing.T) {
+	r := newBatchRig(t, 5, 4, true)
+	first := r.tables[0]
+	delete(r.sched.appendOK, "mydb\x00"+first) // its next export is a pass
+	before := snapshotInt(t, "iceberg_ingest_appends")
+	r.report(first, r.newFile(first))
+	time.Sleep(3 * time.Millisecond) // due the longest
+	for _, m := range r.tables[1:] {
+		r.report(m, r.newFile(m))
+	}
+	r.serve(1)
+	if got := r.src.passes(first); got != 2 {
+		t.Fatalf("the table due the longest had %d passes, want its second", got)
+	}
+	if got := snapshotInt(t, "iceberg_ingest_appends") - before; got != 0 {
+		t.Fatalf("%d appends ran after the one pass this service may run", got)
+	}
+	r.serve(1)
+	if got := snapshotInt(t, "iceberg_ingest_appends") - before; got != 4 {
+		t.Fatalf("%d appends in the next service, want the 4 waiting", got)
+	}
+	r.wantEachOnce()
+}
+
+// A batch larger than the idle loop's request budget is still served whole.
+func TestIngestBatch_ABatchLargerThanTheIdleBudgetIsServedWhole(t *testing.T) {
+	n := ingestBatch + 4
+	r := newBatchRig(t, n, n, true)
+	before := snapshotInt(t, "iceberg_ingest_appends")
+	r.reportOneEach()
+	r.serve(ingestBatch)
+	if got := snapshotInt(t, "iceberg_ingest_appends") - before; got != int64(n) {
+		t.Fatalf("%d appends in one idle service with %d at once, want %d", got, n, n)
+	}
+	r.wantEachOnce()
+}
+
+// The idle loop's budget of reconcile passes per service is the same however
+// many appends may run at once: the timed pass still gets its turn.
+func TestIngestBatch_TheIdlePassBudgetDoesNotGrowWithTheConcurrency(t *testing.T) {
+	n := ingestBatch + 4
+	r := newBatchRig(t, n, n, false) // append off: every request is a pass
+	passes := func() (total int) {
+		for _, m := range r.tables {
+			total += r.src.passes(m)
+		}
+		return total
+	}
+	before := passes()
+	r.reportOneEach()
+	r.serve(ingestBatch)
+	if got := passes() - before; got != ingestBatch {
+		t.Fatalf("%d passes in one idle service, want %d", got, ingestBatch)
+	}
+}
