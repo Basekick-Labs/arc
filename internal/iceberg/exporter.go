@@ -68,8 +68,9 @@ type FileRef struct {
 // It is two parts. exporterShared is the process's one copy of everything
 // that is not about the export in progress. passState is the flags and
 // versions of one reconcile pass or one append: the scheduler's Exporter
-// carries the pass's, and an append that runs beside others gets its own
-// through forAppend, over the same exporterShared (#1778).
+// carries those of the export the loop goroutine runs itself, and an append
+// or a pass that runs beside others gets its own through forExport, over the
+// same exporterShared (#1778, #1786).
 type Exporter struct {
 	*exporterShared
 	passState
@@ -122,15 +123,16 @@ func newPassState() passState {
 	return passState{passLoaded: -1, passHint: -1}
 }
 
-// forAppend returns an Exporter for one append: the same shared state, its
-// own pass state, so several appends of different tables can run at once.
-func (e *Exporter) forAppend() *Exporter {
+// forExport returns an Exporter for one append or one reconcile pass: the
+// same shared state, its own pass state, so the exports of several tables
+// can run at once.
+func (e *Exporter) forExport() *Exporter {
 	return &Exporter{exporterShared: e.exporterShared, passState: newPassState()}
 }
 
 // exporterShared is the part of an Exporter every export of the process
-// uses. What a reconcile pass touches from the scheduler's loop goroutine
-// alone is marked so; everything an append reaches is guarded.
+// uses. Exports of different tables run at once, so everything in it that
+// changes after construction is guarded.
 type exporterShared struct {
 	db          *sql.DB
 	catalog     *sqlcat.Catalog
@@ -1038,7 +1040,9 @@ func (e *Exporter) buildDataFiles(ctx context.Context, tbl *icetable.Table, path
 	g.SetLimit(unionSchemaConcurrency)
 	for i := range paths {
 		g.Go(func() error {
+			release := acquireRead(gctx) // one of the batch's storage reads, in a batch (#1786)
 			df, err := icetable.FileToDataFile(gctx, ios[i], paths[i], tbl.Schema(), tbl.Spec(), 0, tbl.Properties())
+			release()
 			if err != nil {
 				if isPartitionInferenceError(err) {
 					errs[i] = err

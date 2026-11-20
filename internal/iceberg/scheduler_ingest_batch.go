@@ -26,9 +26,12 @@ import (
 //   - recentAdds, appendOK and the pending files are read before the appends
 //     start and written after they end.
 //
-// Reconcile passes are not run at once. A request that needs one (a table's
-// first export, a fallback, the pass after appendMaxBetweenPasses appends)
-// runs it on the loop goroutine after the batch, as before.
+// Reconcile passes are never part of a batch of appends. A request that
+// needs one (a table's first export, a fallback, the pass after
+// appendMaxBetweenPasses appends) has it run after the batch: the requests
+// collected that need a pass and the batch's fallbacks run at once among
+// themselves (scheduler_pass.go, #1786), within the service's budget of
+// passes.
 
 // appendTimeout bounds one append of a batch. The loop waits for the whole
 // batch, so a wedged append holds the others' bookkeeping and every other
@@ -67,11 +70,15 @@ func (s *Scheduler) serviceIngestBatches(ctx context.Context, maxRequests, maxPa
 			s.dropIngest() // another node exports
 			return
 		}
-		// Take requests until the batch is full or one needs a pass.
+		// Take requests until the batch of appends is full, or as many need
+		// a pass as may run at once within this service's budget of passes
+		// (a node's tables get their first export this way when their data
+		// arrives after it started: many of them at once, #1786).
 		var batch []*ingestJob
-		var pass *ingestJob
+		var needPass []*ingestJob
+		passRoom := min(s.passConcurrency, maxPasses-passes)
 		took := 0
-		for len(batch) < s.ingestConcurrency && served < maxRequests && pass == nil {
+		for len(batch) < s.ingestConcurrency && served < maxRequests && len(needPass) < passRoom {
 			m, key, ok := s.takeDueIngest(time.Now())
 			if !ok {
 				break // none due yet: the loop's timer comes back for it
@@ -98,9 +105,7 @@ func (s *Scheduler) serviceIngestBatches(ctx context.Context, maxRequests, maxPa
 				if job.kind == ingestFallback {
 					s.noteAppendFallback(job)
 				}
-				// Within its budget: the service returns as soon as it has
-				// run maxPasses passes (below), so one is left here.
-				pass = job
+				needPass = append(needPass, job)
 			}
 		}
 		if took == 0 {
@@ -120,10 +125,8 @@ func (s *Scheduler) serviceIngestBatches(ctx context.Context, maxRequests, maxPa
 			}
 			s.afterIngest(job.m, job.key, outcome, nil, job.took)
 		}
-		if pass != nil {
-			passesDue = append(passesDue, pass)
-		}
-		for i, job := range passesDue {
+		passesDue = append(passesDue, needPass...)
+		for len(passesDue) > 0 {
 			if ctx.Err() != nil || !s.gateOpen() {
 				// Shutting down, or another node exports now (an append that
 				// lost the writer role is one way to get here): its passes
@@ -136,23 +139,43 @@ func (s *Scheduler) serviceIngestBatches(ctx context.Context, maxRequests, maxPa
 			if passes >= maxPasses {
 				// No more passes in this service (between two measurements
 				// of a timed pass, one at most): they are due at once.
-				for _, later := range passesDue[i:] {
+				for _, later := range passesDue {
 					s.ingestDueNow(later.m, later.key)
 				}
 				return
 			}
-			passes++
-			// What was asked for while the batch or the last pass ran: a
+			// What was asked for while the batch or the last passes ran: a
 			// compaction's request must not wait behind these passes.
 			if s.otherRequestsQueued() {
 				s.serviceDrops(ctx)
 				s.serviceRequests(ctx)
 			}
-			mctx, cancel := context.WithTimeout(ctx, measurementTimeout)
-			began := time.Now()
-			outcome, err := s.reconcileOneRecovered(mctx, job.m, job.key)
-			cancel()
-			s.afterIngest(job.m, job.key, outcome, err, job.took+time.Since(began))
+			// Up to passConcurrency of them at once (scheduler_pass.go),
+			// within this service's budget of passes.
+			n := min(len(passesDue), s.passConcurrency, maxPasses-passes)
+			group := passesDue[:n]
+			passesDue = passesDue[n:]
+			passes += n
+			if n == 1 {
+				job := group[0]
+				mctx, cancel := context.WithTimeout(ctx, measurementTimeout)
+				began := time.Now()
+				outcome, err := s.reconcileOneRecovered(mctx, job.m, job.key)
+				cancel()
+				s.afterIngest(job.m, job.key, outcome, err, job.took+time.Since(began))
+				continue
+			}
+			// Prepared after the services above: one of them can have
+			// reconciled a table of the group.
+			jobs := make([]*passJob, n)
+			for i, job := range group {
+				jobs[i] = s.preparePass(job.m, job.key)
+			}
+			s.runPasses(ctx, jobs)
+			for i, pj := range jobs {
+				s.finishPass(pj)
+				s.afterIngest(pj.m, pj.key, pj.outcome, pj.err, group[i].took+pj.took)
+			}
 		}
 		if passes >= maxPasses {
 			return
@@ -172,7 +195,7 @@ func (s *Scheduler) runAppends(ctx context.Context, batch []*ingestJob) {
 	run := func(job *ingestJob) {
 		actx, cancel := context.WithTimeout(ctx, appendTimeout)
 		defer cancel()
-		s.runAppend(actx, job, s.exporter.forAppend(), fileReads)
+		s.runAppend(actx, job, s.exporter.forExport(), fileReads)
 	}
 	if len(batch) == 1 {
 		run(batch[0])

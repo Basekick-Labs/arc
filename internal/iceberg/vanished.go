@@ -107,7 +107,9 @@ func newProbe(exists func(context.Context, FileRef) (bool, error), current []Fil
 				continue
 			}
 			g.Go(func() error {
+				release := acquireRead(gctx) // one of the batch's storage reads, in a batch (#1786)
 				ok, err := exists(gctx, f)
+				release()
 				if err != nil {
 					return fmt.Errorf("check whether %s still exists: %w", p, err)
 				}

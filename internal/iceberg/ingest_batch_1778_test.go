@@ -494,7 +494,7 @@ func TestIngestBatch_AFileReportedDuringABatchIsAppendedOnce(t *testing.T) {
 // (its gate closes) does not mark the others, which publish.
 func TestIngestBatch_EachAppendHasItsOwnExporterState(t *testing.T) {
 	e := newBatchRig(t, 1, 1, true).exp
-	a, b := e.forAppend(), e.forAppend()
+	a, b := e.forExport(), e.forExport()
 	if a.exporterShared != e.exporterShared || b.exporterShared != e.exporterShared {
 		t.Fatal("an append's exporter does not share the process's state")
 	}

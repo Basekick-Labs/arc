@@ -219,6 +219,14 @@ const minIcebergIngestExportInterval = 5
 // MiB at most) and a turn on the catalog's single SQLite connection.
 const maxIcebergIngestExportConcurrency = 32
 
+// maxIcebergReconcileConcurrency bounds iceberg.reconcile_concurrency. A
+// pass is heavier than an append: it lists the measurement, can read
+// thousands of footers, and prunes and sweeps. The passes that run at once
+// share 16 storage reads in flight (footers and existence checks) and the
+// 64 MiB of footers one pass alone may hold; their listings, metadata reads
+// and commits are not bounded together.
+const maxIcebergReconcileConcurrency = 16
+
 // icebergMinVersionSpan is the least iceberg.min_version_age, in seconds:
 // how long a published version of an Iceberg table must stay on disk after
 // the next one is published. It has to outlast whatever still names the older
@@ -727,11 +735,21 @@ type IcebergConfig struct {
 	IngestAppendEnabled bool
 	// IngestExportConcurrency is how many tables' ingest appends run at once
 	// (#1778). An append is mostly waiting on storage requests, so on object
-	// storage the tables' appends overlap; reconcile passes still run one
-	// table at a time. 1 is one export at a time, as before.
+	// storage the tables' appends overlap (reconcile passes have their own
+	// key, ReconcileConcurrency). 1 is one append at a time, as before.
 	IngestExportConcurrency int
-	CatalogDBPath           string // SQLite catalog path; defaults to the shared auth DB
-	RetainSnapshots         int    // Snapshots (and metadata versions) to keep per table; older are expired (default 10)
+	// ReconcileConcurrency is how many tables' reconcile passes run at once
+	// (#1786): in the timed pass every reconcile_interval, and for the
+	// passes ingest requests need (a table's first export, a fallback) when
+	// ingest_export_concurrency is above 1. A pass is mostly
+	// waiting on storage requests, so on object storage the tables' passes
+	// overlap. 0 (the default) picks by the storage: 4 on an object store, 1
+	// on local storage, where a pass is tens of milliseconds and overlapping
+	// them gains little. 1 is one table at a time, as before. Standalone
+	// nodes only: a cluster node runs one at a time whatever this says.
+	ReconcileConcurrency int
+	CatalogDBPath        string // SQLite catalog path; defaults to the shared auth DB
+	RetainSnapshots      int    // Snapshots (and metadata versions) to keep per table; older are expired (default 10)
 	// OrphanSweepEnabled gates the metadata orphan sweep (#835): deleting the manifest
 	// lists and manifests under a table's metadata directory that no metadata.json still
 	// on disk can reach. Default true. It is the only deleter in the exporter whose work
@@ -1562,6 +1580,7 @@ func Load() (*Config, error) {
 			MinVersionAge:            v.GetInt("iceberg.min_version_age"),
 			IngestAppendEnabled:      v.GetBool("iceberg.ingest_append_enabled"),
 			IngestExportConcurrency:  v.GetInt("iceberg.ingest_export_concurrency"),
+			ReconcileConcurrency:     v.GetInt("iceberg.reconcile_concurrency"),
 			CatalogDBPath:            v.GetString("iceberg.catalog_db_path"),
 			RetainSnapshots:          v.GetInt("iceberg.retain_snapshots"),
 			OrphanSweepEnabled:       v.GetBool("iceberg.orphan_sweep_enabled"),
@@ -2115,6 +2134,10 @@ func Load() (*Config, error) {
 		if n := cfg.Iceberg.IngestExportConcurrency; n < 1 || n > maxIcebergIngestExportConcurrency {
 			return nil, fmt.Errorf("iceberg.ingest_export_concurrency must be between 1 and %d, got %d: how many tables' ingest "+
 				"appends run at once; 1 exports one table at a time", maxIcebergIngestExportConcurrency, n)
+		}
+		if n := cfg.Iceberg.ReconcileConcurrency; n < 0 || n > maxIcebergReconcileConcurrency {
+			return nil, fmt.Errorf("iceberg.reconcile_concurrency must be between 0 and %d, got %d: how many tables' reconcile "+
+				"passes run at once; 0 picks by the storage (4 on an object store, 1 on local storage), 1 reconciles one table at a time", maxIcebergReconcileConcurrency, n)
 		}
 		// A reader resolves a published version and opens it later; Glue names
 		// one until its next sync. A version must stay on disk that long after
@@ -2774,6 +2797,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("iceberg.min_version_age", 300)             // seconds a published version outlives its successor (#1751)
 	v.SetDefault("iceberg.ingest_append_enabled", true)      // ingest exports add only the new files (#1751)
 	v.SetDefault("iceberg.ingest_export_concurrency", 8)     // tables whose ingest appends run at once (#1778)
+	v.SetDefault("iceberg.reconcile_concurrency", 0)         // tables whose reconcile passes run at once; 0 = 4 on object storage, 1 on local (#1786)
 	v.SetDefault("iceberg.catalog_db_path", "./data/arc.db") // shared SQLite DB with auth
 	v.SetDefault("iceberg.retain_snapshots", 10)
 	v.SetDefault("iceberg.orphan_sweep_enabled", true)
