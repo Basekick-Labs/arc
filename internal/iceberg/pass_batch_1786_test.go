@@ -635,13 +635,9 @@ func TestExportReads_ABatchSharesOneFooterBudget(t *testing.T) {
 	acquireRead(context.Background())() // outside a batch: no wait
 }
 
-// A database deleted through the API (the exporter's DropDatabase, on the
-// request's goroutine) while passes of its tables run at once: no data race
-// and no panic. It does NOT check what the tables look like afterwards: a
-// drop that lands in the middle of a pass can leave that table missing or
-// pointing at metadata the drop deleted, with passes one at a time as much
-// as with several (#1789); several at once only puts more tables of the
-// database in a pass at that moment.
+// A database's tables dropped (the exporter's DropDatabase, on the caller's
+// goroutine) while passes of them run at once: no data race, no panic, and
+// the drop waits for those passes, so it leaves no table half there.
 func TestPassBatch_ADatabaseDroppedWhileItsTablesReconcile(t *testing.T) {
 	r := newPassRig(t, 6, 6, 1)
 	r.sched.runPass(context.Background())
@@ -666,8 +662,11 @@ func TestPassBatch_ADatabaseDroppedWhileItsTablesReconcile(t *testing.T) {
 	r.src.mu.Lock()
 	r.src.onListCtx = nil
 	r.src.mu.Unlock()
-	// The scheduler goes on: another pass does not panic either.
+	// The files are still in storage here (only the tables were dropped), so
+	// the next passes export them again: every table whole (#1789).
 	r.sched.runPass(context.Background())
+	r.sched.runPass(context.Background())
+	r.wantEachOnce()
 }
 
 // Tables whose data arrives after the node started get their first export
@@ -820,4 +819,63 @@ func TestPassBatch_ACommittingPassRestartsTheSpacing(t *testing.T) {
 			t.Errorf("a pass that committed nothing restarted the table's export spacing (next %v)", next)
 		}
 	}
+}
+
+// #1789, in the order a database DELETE does it: the data files go first,
+// then the tables are dropped; the database is then written again under the
+// same name. Whatever the drop overlapped, the recreated tables must hold
+// exactly the new files.
+func TestDrop1789_ADeleteDuringAPassLeavesARecreatedDatabaseRight(t *testing.T) {
+	for _, passes := range []int{1, 4} {
+		t.Run(fmt.Sprintf("%d passes at once", passes), func(t *testing.T) {
+			r := newPassRig(t, 6, passes, 1)
+			r.sched.runPass(context.Background())
+			for _, m := range r.tables {
+				r.newFile(m)
+			}
+			var once sync.Once
+			dropped := make(chan error, 1)
+			r.src.mu.Lock()
+			r.src.onListCtx = func(context.Context, Measurement) {
+				once.Do(func() {
+					go func() {
+						// The DELETE: files, then the Iceberg drop.
+						if err := os.RemoveAll(filepath.Join(r.root, "mydb")); err != nil {
+							dropped <- err
+							return
+						}
+						dropped <- r.drop("mydb")
+					}()
+				})
+			}
+			r.src.mu.Unlock()
+			r.sched.runPass(context.Background())
+			select {
+			case err := <-dropped:
+				if err != nil {
+					t.Fatalf("the delete: %v", err)
+				}
+			case <-time.After(30 * time.Second):
+				t.Fatal("the delete did not return")
+			}
+			r.src.mu.Lock()
+			r.src.onListCtx = nil
+			r.src.mu.Unlock()
+			r.sched.runPass(context.Background()) // the database is gone
+			// Written again under the same name.
+			for _, m := range r.tables {
+				r.files[m] = nil
+				r.newFile(m)
+				r.newFile(m)
+			}
+			r.sched.runPass(context.Background())
+			r.sched.runPass(context.Background())
+			r.wantEachOnce()
+		})
+	}
+}
+
+// drop is how the API drops a database's tables.
+func (r *passRig) drop(database string) error {
+	return r.exp.DropDatabase(context.Background(), database)
 }

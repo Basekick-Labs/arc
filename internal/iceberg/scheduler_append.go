@@ -436,6 +436,14 @@ func (s *Scheduler) runAppend(ctx context.Context, job *ingestJob, exp *Exporter
 	}()
 	// What this export reads of the new files is read once (export_reads.go).
 	ctx = withExportReads(ctx)
+	// The database's tables are not dropped while this appends to one
+	// (database_lock.go, #1789).
+	release, err := exp.holdDatabase(m.Database)
+	if err != nil {
+		job.reason = err.Error() // the pass that follows gives way too, and the request comes back
+		return
+	}
+	defer release()
 	refs, ok, err := job.resolver.AppendRefs(ctx, m, job.keys, job.sizes)
 	if err != nil {
 		job.reason = err.Error()

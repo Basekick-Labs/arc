@@ -885,13 +885,21 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		// repeating the DELETE clears the residue; the 404 contract stands.
 		// That residue includes the empty directories an earlier version's
 		// delete left on local storage, which keep the database listed (#1425).
-		h.dropIcebergCatalog(ctx, name)
+		icebergErr := h.dropIcebergCatalog(ctx, name)
 		h.noticeIcebergDatabaseDropped(ctx, name)
 		removeEmptyDirectories(ctx, h.storage, name, h.logger)
 		removeDatabaseStateDirectories(ctx, h.storage, name, h.logger)
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+		notFound := fiber.Map{
 			"error": "Database '" + name + "' not found",
-		})
+		}
+		if icebergErr != nil {
+			// A repeat after a drop that could not run (#1789), refused
+			// again: still a 404, since there is no such database, with what
+			// is left of it.
+			notFound["iceberg_cleanup"] = "pending: the database's Iceberg tables were not dropped (" + icebergErr.Error() +
+				"); repeat the DELETE to drop them"
+		}
+		return c.Status(fiber.StatusNotFound).JSON(notFound)
 	}
 
 	// Rows acknowledged before the deletion and not in a file yet are flushed
@@ -1129,8 +1137,8 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	// A delete that stops part-way returns below without dropping the
 	// catalog, leaving the export's tables naming what it removed; the
 	// scheduler maps the database's directory onto them (#1727). A delete
-	// that completes drops the tables below: no request then, as a reconcile
-	// racing that drop could recreate a table it is removing.
+	// that completes drops the tables below: no request then, since there is
+	// nothing left to reconcile.
 	if len(deleteErrors) > 0 && h.onPathsChanged != nil {
 		h.onPathsChanged([]string{name + "/"})
 	}
@@ -1149,16 +1157,18 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
-	// Iceberg catalog cleanup AFTER file deletion (#639 item 3): with the
-	// files gone, a racing reconcile pass can only empty tables, never
-	// recreate them. Failures are logged, not returned: the files are already
-	// deleted and catalog residue equals the pre-fix status quo.
+	// Iceberg catalog cleanup AFTER file deletion (#639 item 3): an export
+	// that starts after the drop then lists a database with no files. The
+	// drop waits for the exports of the database's tables that are running
+	// and none starts until it is done (#1789). A failure does not fail the
+	// request, since the files are already deleted, but the response says the
+	// tables are still there and that repeating the DELETE drops them.
 	//
 	// Now reached only on a fully successful deletion. A partial failure keeps
 	// the database -- marker, anchors and catalog -- so the retry finds it and
 	// finishes the job, rather than stranding a catalog entry for a database
 	// whose files are half gone.
-	h.dropIcebergCatalog(ctx, name)
+	icebergErr := h.dropIcebergCatalog(ctx, name)
 	h.noticeIcebergDatabaseDropped(ctx, name)
 	// The colocated Iceberg metadata DropDatabase just removed kept its
 	// measurement directories, and so the database, listed (#1676, #1425).
@@ -1183,6 +1193,11 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	if len(unflushed) > 0 {
 		// allow_unreachable: the rows these nodes hold were left.
 		resp["unflushed_nodes"] = unflushed
+	}
+	if icebergErr != nil {
+		// The data is deleted; the database's Iceberg tables are not.
+		resp["iceberg_cleanup"] = "pending: the database's Iceberg tables were not dropped (" + icebergErr.Error() +
+			"); repeat the DELETE to drop them"
 	}
 	return c.JSON(resp)
 }
@@ -1845,17 +1860,22 @@ func extractSubdirectories(files []string, prefix string) []string {
 }
 
 // dropIcebergCatalog is the nil-safe, logged wrapper around the wired
-// catalog dropper.
-func (h *DatabasesHandler) dropIcebergCatalog(ctx context.Context, name string) {
+// catalog dropper. It returns the dropper's error for the caller to report:
+// the files are deleted either way, and the database's Iceberg tables are
+// not (the drop waits for an export of them in progress and gives up when
+// that does not end in time, #1789, or it failed part way).
+func (h *DatabasesHandler) dropIcebergCatalog(ctx context.Context, name string) error {
 	if h.icebergDropper == nil {
-		return
+		return nil
 	}
-	if err := h.icebergDropper.DropDatabase(ctx, name); err != nil {
+	err := h.icebergDropper.DropDatabase(ctx, name)
+	if err != nil {
 		h.logger.Warn().Err(err).Str("database", name).
 			Msg("Iceberg catalog cleanup after database drop failed; re-running the DELETE retries it")
 	} else {
 		h.logger.Info().Str("database", name).Msg("Iceberg catalog artifacts removed for dropped database")
 	}
+	return err
 }
 
 // icebergDropNotifier is the coordinator's database-drop notice (#1731).

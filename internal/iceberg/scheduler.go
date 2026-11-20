@@ -32,6 +32,10 @@ type measurementState struct {
 	// unchanged table is skipped like any other; without it a table that
 	// goes quiet would keep them for good (#1751, #1787).
 	pruneAt time.Time
+	// drops is how many drops of the table's database the exporter had
+	// counted when this was cached (Exporter.databaseDrops). A pass that
+	// finds another number starts from the table, not from this (#1789).
+	drops uint64
 }
 
 // unchanged reports that a pass that listed fp has nothing to do: the
@@ -172,7 +176,10 @@ type Scheduler struct {
 	// Database drops (#1731, scheduler_drop.go): requested names (reqMu),
 	// their retry state, the guard, and the databases dropped during the
 	// running pass. Loop goroutine only, except drops.
-	drops       map[string]struct{}
+	drops map[string]struct{}
+	// dropped is the databases whose tables were dropped since the loop last
+	// forgot what it remembers of them (noteDatabaseDropped; under reqMu).
+	dropped     map[string]struct{}
 	dropRetry   map[string]dropRetry
 	dropGuard   func(ctx context.Context, database string) (bool, error)
 	passDrops   map[string]struct{}
@@ -281,7 +288,7 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 	if cfg.Interval <= 0 {
 		cfg.Interval = 5 * time.Minute
 	}
-	return &Scheduler{
+	s := &Scheduler{
 		exporter:          cfg.Exporter,
 		source:            cfg.Source,
 		interval:          cfg.Interval,
@@ -309,8 +316,15 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		appendsSince:      make(map[string]int),
 		lastReconciled:    make(map[string]time.Time),
 		drops:             make(map[string]struct{}),
+		dropped:           make(map[string]struct{}),
 		dropRetry:         make(map[string]dropRetry),
 	}
+	if cfg.Exporter != nil {
+		// A database's tables dropped by anyone (the API's DELETE runs on
+		// its own goroutine): the loop forgets what it remembers of them.
+		cfg.Exporter.SetOnDatabaseDropped(s.noteDatabaseDropped)
+	}
+	return s
 }
 
 // requestMinSpacing is the least time between two reconciles of one table

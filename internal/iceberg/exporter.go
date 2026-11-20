@@ -231,6 +231,10 @@ type exporterShared struct {
 	// expireOwed: the tables appends have added snapshots to since a pass
 	// last expired any (batched.go expiryOwed); under chunkMu.
 	expireOwed map[string]bool
+	// dbLocks keeps a database's tables from being exported and dropped at
+	// once, and onDatabaseDropped is told after a drop (database_lock.go).
+	dbLocks           databaseLocks
+	onDatabaseDropped func(database string)
 	// appendSmall: per table, the small data manifests its current snapshot
 	// holds, as the last append left them; absent when not known (a pass
 	// ran, an append failed, the process started). Under chunkMu.
@@ -2264,9 +2268,11 @@ func isAlreadyExists(err error) bool {
 // (#639 item 3): each table in its namespace, the namespace itself, and the
 // warehouse metadata files under the namespace directory. Called from the
 // database-delete API after the data files are gone; that ordering is
-// load-bearing — with no files left, a racing reconcile pass can only empty
-// tables, never recreate them, whereas catalog-first would let EnsureTable
-// resurrect residue mid-cleanup. Idempotent: a database that was never
+// load-bearing: an export of one of the tables that starts after the drop
+// lists no files and creates nothing, whereas catalog-first would let it
+// recreate a table from files the DELETE had yet to remove. Exports of the
+// database's tables do not overlap the drop at all in this process (below).
+// Idempotent: a database that was never
 // exported (or already cleaned) returns nil, so a re-run of the delete
 // converges.
 //
@@ -2281,11 +2287,36 @@ func isAlreadyExists(err error) bool {
 // with it, catalog rows, markers and warehouse directories alike (#1730; see
 // spokeSubNamespaces). A single spoke database ("{spoke}/{db}") is refused: the
 // API never sends one, and its namespace naming does not follow this mapping.
+//
+// It waits for the exports of the database's tables that are running, and
+// none starts until it is done (database_lock.go, #1789); if they do not end
+// in time it drops nothing and says so.
 func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 	ctx = e.withAWS(ctx)
 	if strings.ContainsAny(database, "/\\") {
 		return fmt.Errorf("refusing to drop namespaced database %q from the Iceberg catalog", database)
 	}
+	release, err := e.lockDatabaseForDrop(ctx, database)
+	if err != nil {
+		return err
+	}
+	defer release()
+	// Whatever the drop gets through, and before the lock is released: a
+	// drop that fails part way has still removed tables, and forgetting what
+	// was known of a table that is there after all only costs its next pass
+	// a look at the table itself.
+	defer func() {
+		e.countDatabaseDrop(database)
+		e.forgetDatabaseMemory(database)
+		if e.onDatabaseDropped != nil {
+			e.onDatabaseDropped(database)
+		}
+	}()
+	return e.dropDatabase(ctx, database)
+}
+
+// dropDatabase is DropDatabase's work, with the database's lock held.
+func (e *Exporter) dropDatabase(ctx context.Context, database string) error {
 	ns := icetable.Identifier{e.nsPrefix + "_" + database}
 	nsKey := catalogNamespaceKey(ns)
 	e.forgetExportLagNamespace(ns) // its tables' unpublished files will never be published (export_lag.go)
@@ -2454,9 +2485,10 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 		}
 	}
 
-	// List again: a reconcile pass that loaded a table before the catalog
-	// drop can still have committed into its directory since the first
-	// listing, and that residue would keep the database listed.
+	// List again: on a shared bucket another node's reconcile pass, which
+	// this node's database lock does not hold (#1792), can have committed
+	// into the directory since the first listing, and that residue would
+	// keep the database listed.
 	if e.backend != nil && colocated != nil {
 		if again, err := e.colocatedMetadataByTable(ctx, database); err == nil {
 			for dir, keys := range again {
@@ -2503,8 +2535,9 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 	}
 	for _, sub := range subs {
 		for dir := range sub.dirs {
-			// Listed again now: a reconcile that loaded the table before the
-			// catalog drop may have committed into it since.
+			// Listed again now: another node's reconcile that loaded the
+			// table before the catalog drop may have committed into it since
+			// (#1792).
 			dkeys, err := e.backend.List(ctx, dir+"/")
 			if err != nil {
 				if firstErr == nil {
