@@ -516,7 +516,11 @@ func TestSharedDrop1792_TheEndOfAPassWhoseDatabaseWasDropped(t *testing.T) {
 	b.SetOnDatabaseDropped(func(db string) { told = append(told, db) })
 	drops := b.databaseDrops("mydb")
 	b.setSmallManifests("mydb\x00cpu", 2)
-	if !b.droppedUnderPass(ctx, "mydb", "cpu", func() bool { return true }) {
+	// With the pass's own context already ended: a pass that ran out of
+	// time after a commit still has to look.
+	ended, cancel := context.WithCancel(ctx)
+	cancel()
+	if !b.droppedUnderPass(ended, "mydb", "cpu", func() bool { return true }) {
 		t.Fatal("the exporter did not act on a drop recorded during its pass")
 	}
 	if left, _ := os.ReadDir(r.metaDir()); len(left) != 0 {
@@ -849,5 +853,50 @@ func TestSharedDrop1792_RemovalIsTheExportersAndWritesTheMarkerBack(t *testing.T
 	r.goneFromStorage("arc_mydb.db")
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("the removed table's drop marker was not written: %v", err)
+	}
+}
+
+// A node with no row of its own for the table (it never exported it, or
+// forgot it) judges the table the warehouse has, as its pass would load it:
+// what a former exporter left of a dropped table goes all the same.
+func TestSharedDrop1792_ANodeWithoutARowRemovesWhatAnotherLeft(t *testing.T) {
+	r, a, _ := sharedDropRig(t) // b exported the table
+	ctx := context.Background()
+	c := r.node(true)
+	c.SetForgetDroppedRows(true)
+	rec, _, err := a.beginDropRecord(ctx, "mydb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.finishDropRecord(ctx, "mydb", rec)
+	if err := c.settleDroppedTable(ctx, "mydb", "cpu", nil); err != nil {
+		t.Fatal(err)
+	}
+	r.goneFromStorage("arc_mydb.db")
+}
+
+// The scheduler's pass over a measurement whose files are all gone (the
+// directory survives the DELETE in some layouts) settles too, before it
+// looks at the table: it removes a table from before the drop instead of
+// committing it empty.
+func TestSharedDrop1792_ThePassOverAnEmptiedMeasurementSettles(t *testing.T) {
+	r, a, b := sharedDropRig(t)
+	ctx := context.Background()
+	rec, _, err := a.beginDropRecord(ctx, "mydb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.finishDropRecord(ctx, "mydb", rec)
+	if err := r.deleteData(); err != nil { // the data, not its directories
+		t.Fatal(err)
+	}
+	sched := NewScheduler(SchedulerConfig{Exporter: b, Source: NewStorageWalkSource(r.backend, "arc", zerolog.Nop()),
+		Interval: time.Hour, Logger: zerolog.Nop()})
+	if _, err := sched.reconcileOneRecovered(ctx, Measurement{Database: "mydb", Measurement: "cpu"}, "mydb\x00cpu"); err != nil {
+		t.Logf("the pass: %v", err)
+	}
+	r.goneFromStorage("arc_mydb.db")
+	if _, rowExists, err := b.catalogRow(ctx, "arc_mydb", "cpu"); err != nil || rowExists {
+		t.Fatalf("the exporting node kept the table of a dropped database (row exists=%v, err=%v)", rowExists, err)
 	}
 }
