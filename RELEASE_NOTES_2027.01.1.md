@@ -2,6 +2,40 @@
 
 > **Status:** Planned — January 2027 release.
 
+## New: ingest appends of several Iceberg tables run at once ([#1778](https://github.com/Basekick-Labs/arc/issues/1778))
+
+On object storage an ingest-triggered export is a few hundred milliseconds of waiting on storage requests, and Arc exported one table at a time: under three tables a second in a bucket's region. With many tables being written the tables queued behind each other, and the lag was the length of the queue, whatever `ingest_export_interval` said. The appends of different tables now overlap.
+
+- **New key `iceberg.ingest_export_concurrency`** (default `8`, 1 to 32): how many tables' ingest appends run at once. `1` exports one table at a time, as before.
+- **Reconcile passes still run one table at a time**: a table's first export, the pass every `iceberg.reconcile_interval`, the pass after 120 appends, and any fallback. Only the append (#1751) is run for several tables at once.
+- **Standalone nodes only**, like the ingest trigger itself ([#1756](https://github.com/Basekick-Labs/arc/issues/1756)). On a cluster node nothing reads the key.
+- A table is still exported by one thing at a time, and a file is still added to its table once: the scheduler starts a batch of appends, waits for all of them, and only then records what they did.
+
+Measured on AWS S3, standalone on EC2 in the bucket's region, 200 tables written at once, over 5 minutes after a 6-minute warm-up (one run each):
+
+| `ingest_export_interval` | Appends at once | Average export lag | Appends per second |
+|---|---|---|---|
+| 5 s | 1 | 48.0 s | 2.0 |
+| 5 s | 8 | 12.4 s | 9.8 |
+| 5 s | 16 | 7.1 s | 13.7 |
+| 15 s | 8 | 10.4 s | 10.4 |
+| 60 s (default) | 1 | 48.5 s | 1.9 |
+| 60 s (default) | 8 | 30.2 s | 2.9 |
+
+- **At the default interval the interval is now met with 200 tables**: 30 s is what a 60 s interval gives on average. Before, the lag was 48 s and files were still waiting 75 s at the end of the run.
+- **A short interval is not met at 200 tables**, though the lag is a quarter of what it was. What is left is the reconcile passes, which every table still gets one at a time: about 0.6 s each on S3, so 200 tables spend two minutes of every `reconcile_interval` in them, and the first export of 200 tables takes about two and a half minutes.
+- No append fell back in any run, there were no Iceberg warnings or errors, row counts matched storage on the tables checked and no file was in a table twice. Write round trips were the same at every setting.
+- **Cost:** Arc's CPU time over the 11-minute run went from 1:43 at one at a time to 3:07 at 8 and 3:52 at 16 with the 5 s interval: it did five to seven times as many exports. At the default interval it was 1:44 against 1:52.
+- The same load through a local S3 server with 30 ms added to every request: 97 s, 15.8 s and 9.0 s at 1, 8 and 16.
+
+Notes:
+
+- **Each append that runs beside others has 60 s**; one that runs out falls back to a reconcile pass (the fallback counter counts it, and the log names "context deadline exceeded"). With `ingest_export_concurrency = 1` an append and its fallback share the pass's two minutes, as before.
+- **Between two tables of a timed reconcile pass**, one batch of appends is served (before: one request), and still at most one request that needs a reconcile pass.
+- **Memory and connections grow with the key**: each append in flight holds the footers of its new files (a few MiB for a large append, 64 MiB at most) and reads at least four of them at once.
+- The catalog's SQLite database takes one statement at a time (it is usually the one the auth store uses); the appends' statements queue there for a few milliseconds each.
+- **Not run on the binary:** `ingest_export_concurrency = 32`, Glue sync, a warehouse outside the storage root, Azure and GCS.
+
 ## Fix: Arc no longer keeps one DuckDB connection busy from startup ([#1782](https://github.com/Basekick-Labs/arc/issues/1782))
 
 The DuckDB check Arc runs at startup (`SELECT 'Hello from Arc in Go!' …`) left its result set open until the process exited, so one connection of the pool (`database.max_connections`) was never available to queries. With `database.max_connections = 1` no query was answered at all: HTTP and Flight SQL requests waited for a connection that never came free. With any other positive value, queries had one connection fewer than configured, which is 3 instead of 4 on small machines (the default is at least 4). Releases since at least v26.01.1 are affected.
