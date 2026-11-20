@@ -82,12 +82,13 @@ type reconcileResult struct {
 	// floor owed has landed and no heal commit failed (#1098). Only then may the scheduler cache
 	// the fingerprint.
 	settled bool
-	// versionsHeld: the pass's prune left published versions on disk only
-	// because the version after each was published too recently
-	// (iceberg.min_version_age). The scheduler runs the table's next pass
-	// whatever its listing, so they are pruned once old enough even if the
-	// table has gone quiet by then.
-	versionsHeld bool
+	// pruneAgainAt: the pass's prune left published versions on disk that
+	// only time or a retry removes: the version after each was published too
+	// recently (iceberg.min_version_age), or the prune could not finish. It
+	// is when a pass of the table next has something to prune even if the
+	// table has gone quiet (Exporter.pruneAgainAt); zero when the prune left
+	// nothing it could remove later.
+	pruneAgainAt time.Time
 	// partial: new files remain unregistered because the pass ran out of time or lost the
 	// writer role. Not an error: what was committed stays, and the next pass continues.
 	partial bool
@@ -289,9 +290,10 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 	sort.Strings(toRemove)
 
 	if len(toAdd) == 0 && len(toRemove) == 0 {
-		// Already converged — no new snapshot. Still republish the discovery
-		// files: a previous pass may have committed the snapshot but failed to
-		// write them, and this is the path that pass's retry lands on.
+		// Already converged — no new snapshot. Still publish the discovery
+		// files unless they are in place (alreadyPublished): a previous pass
+		// may have committed the snapshot but failed to write them, and this
+		// is the path that pass's retry lands on.
 		//
 		// Sweep here too. A measurement whose file set has stopped changing is
 		// skipped by the scheduler's fingerprint gate before it ever reaches this
@@ -311,7 +313,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 		if err != nil {
 			return reconcileResult{}, err
 		}
-		return reconcileResult{settled: ok && hintOK && !e.healFailed(), schema: arcSchemaOf(tbl), versionsHeld: e.versionsHeldByAge()}, nil
+		return reconcileResult{settled: ok && hintOK && !e.healFailed(), schema: arcSchemaOf(tbl), pruneAgainAt: e.pruneAgainAt()}, nil
 	}
 
 	// Metadata-only: files are dropped and added as DataFiles. (Transaction.Delete is a
@@ -624,7 +626,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 		commits:      commits,
 		droppedCold:  droppedCold,
 		writerLost:   writerGone && !partial && !moved,
-		versionsHeld: e.versionsHeldByAge(),
+		pruneAgainAt: e.pruneAgainAt(),
 	}
 	if loopErr != nil {
 		return res, loopErr
@@ -691,7 +693,17 @@ func (e *Exporter) finishPass(ctx context.Context, tbl *icetable.Table, tkey, da
 			e.setExpiryOwed(tkey, false)
 		}
 	}
-	wrote := e.writeVersionHint(ctx, tbl)
+	// Not when the discovery files already name this metadata (#1787): a pass
+	// that committed nothing would refuse its own v<N> copy, read it back to
+	// compare and write the hint it just read. What a publish does besides
+	// the two files and still applies is done here.
+	wrote := e.alreadyPublished(tbl)
+	if wrote {
+		e.hardenLocalMetadataPerms(tbl.MetadataLocation())
+		e.drainExportLag(tbl.Identifier())
+	} else {
+		wrote = e.writeVersionHint(ctx, tbl)
+	}
 	published := wrote && !e.hintFailed()
 	if err := e.fencedErr(); err != nil {
 		return tbl, false, err

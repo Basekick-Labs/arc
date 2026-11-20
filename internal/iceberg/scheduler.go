@@ -26,6 +26,18 @@ type measurementState struct {
 	fingerprint string              // hash of the sorted file set + local-file set at last successful reconcile
 	schema      ArcSchema           // schema derived at that reconcile (reused/extended while files persist)
 	schemaFiles map[string]struct{} // schemaKey of every file at that reconcile — to diff for newly-added files
+	// pruneAt, when set, is when the table's pass runs though its listing has
+	// not changed: that reconcile left published versions on disk that only
+	// time or a retry removes (reconcileResult.pruneAgainAt). Until then an
+	// unchanged table is skipped like any other; without it a table that
+	// goes quiet would keep them for good (#1751, #1787).
+	pruneAt time.Time
+}
+
+// unchanged reports that a pass that listed fp has nothing to do: the
+// listing is the one this state was cached for, and no prune is due.
+func (st measurementState) unchanged(fp string, now time.Time) bool {
+	return st.fingerprint == fp && (st.pruneAt.IsZero() || now.Before(st.pruneAt))
 }
 
 // schemaKey identifies a file for schema derivation: its storage key and size. A different file

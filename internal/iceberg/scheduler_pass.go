@@ -59,7 +59,6 @@ type passJob struct {
 	op          stateOp
 	newState    measurementState
 	recent      []string // listed files an append could still be offered (noteRecent)
-	appended    bool     // the next pass must run whatever the listing is (markAppended)
 	droppedCold bool     // a cold file vanished: the cold listing is stale
 	commits     int
 	outcome     reconcileOutcome
@@ -182,9 +181,6 @@ func (s *Scheduler) applyPassState(job *passJob) {
 	case stateDrop:
 		delete(s.state, job.key)
 	}
-	if job.appended {
-		s.markAppended(job.key)
-	}
 }
 
 // finishPass records a pass that ran on another goroutine: everything
@@ -209,7 +205,6 @@ func (r *passRunner) run(ctx context.Context, job *passJob, exp *Exporter) {
 			// A guard: reconcile sets these last, with nothing after that can
 			// panic. A pass that panicked leaves its table's cached state alone.
 			job.op = stateKeep
-			job.appended = false
 			job.outcome, job.err = outcomeUnchanged, fmt.Errorf("reconcile panicked: %v", rec)
 		}
 		job.took = time.Since(job.startedAt)
@@ -292,7 +287,7 @@ func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter)
 		// directory Arc never prunes) is emptied ONCE and skipped every pass after — otherwise
 		// every tick re-runs the catalog load + commit and re-logs forever.
 		fp := fingerprint(files, localFiles)
-		if job.cached && job.prev.fingerprint == fp {
+		if job.cached && job.prev.unchanged(fp, time.Now()) {
 			return outcomeUnchanged, nil
 		}
 		// Only for a table that already exists: an empty directory that never held data must not
@@ -325,17 +320,14 @@ func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter)
 			job.dropState()
 			return outcomeReconciled, nil
 		}
-		job.setState(measurementState{fingerprint: fp})
-		if res.versionsHeld {
-			job.appended = true // come back to prune them (see reconcileResult.versionsHeld)
-		}
+		job.setState(measurementState{fingerprint: fp, pruneAt: res.pruneAgainAt})
 		return outcomeReconciled, nil
 	}
 	// Fingerprint the file set. Unchanged fingerprint + a cached schema => guaranteed no-op
 	// (same files in the table already), so skip the footer reads and the diff.
 	fp := fingerprint(files, localFiles)
 	prev, cached := job.prev, job.cached
-	if cached && prev.fingerprint == fp {
+	if cached && prev.unchanged(fp, time.Now()) {
 		return outcomeUnchanged, nil
 	}
 
@@ -452,13 +444,9 @@ func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter)
 	}
 	// The table's schema, not a union of footers: every listed file is now in the table, so it
 	// covers all of them, and it is exactly what the next pass's EnsureTable compares against.
-	job.setState(measurementState{fingerprint: fp, schema: res.schema, schemaFiles: schemaSet})
-	if res.versionsHeld {
-		// Published versions are waiting out iceberg.min_version_age: the
-		// next pass runs whatever the listing is, and prunes the ones old
-		// enough by then. Without this a table that goes quiet would keep
-		// them, since an unchanged table's pass is skipped.
-		job.appended = true
-	}
+	// pruneAt: published versions are waiting out iceberg.min_version_age, or
+	// the prune could not finish. The table's pass runs again then, whatever
+	// the listing is, and not before (measurementState.pruneAt).
+	job.setState(measurementState{fingerprint: fp, schema: res.schema, schemaFiles: schemaSet, pruneAt: res.pruneAgainAt})
 	return outcomeReconciled, nil
 }

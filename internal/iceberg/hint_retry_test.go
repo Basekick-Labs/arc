@@ -82,8 +82,13 @@ func TestReconcile_HintFailureIsReported(t *testing.T) {
 		t.Fatalf("first pass should have published the hint: %v", err)
 	}
 
-	// Make the metadata directory unwritable, then run a converged reconcile so
+	// Lose the hint, so that the converged pass has something to publish (a
+	// pass that finds its own publish in place writes nothing, #1787). Then
+	// make the metadata directory unwritable and run a converged reconcile, so
 	// only the discovery-file writes are attempted (no catalog commit).
+	if err := os.Remove(filepath.Join(metaDir, "version-hint.text")); err != nil {
+		t.Fatal(err)
+	}
 	info, err := os.Stat(metaDir)
 	if err != nil {
 		t.Fatal(err)
