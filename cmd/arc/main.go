@@ -4749,7 +4749,8 @@ func main() {
 		if icebergTopo.warnNoElection && compactionGate.CanCompact() {
 			log.Warn().Msg(icebergNoElectionWarning)
 		}
-		if n := cfg.Iceberg.ReconcileConcurrency; n > 1 && icebergReconcileConcurrency(n, clusterCoordinator != nil, icebergTopo.warnNoElection) == 1 {
+		icebergPassesAtOnce := icebergReconcileConcurrency(cfg.Iceberg.ReconcileConcurrency, clusterCoordinator != nil, icebergTopo.warnNoElection, storageBackend.Type() != "local")
+		if n := cfg.Iceberg.ReconcileConcurrency; n > 1 && icebergPassesAtOnce == 1 {
 			log.Info().Int("iceberg.reconcile_concurrency", n).
 				Msg("Iceberg export reconciles one table at a time on this node: reconcile passes of several tables at once are for standalone nodes")
 		}
@@ -4770,7 +4771,7 @@ func main() {
 			IngestConcurrency: cfg.Iceberg.IngestExportConcurrency,
 			// How many tables' reconcile passes run at once (#1786): one on a
 			// cluster node.
-			ReconcileConcurrency: icebergReconcileConcurrency(cfg.Iceberg.ReconcileConcurrency, clusterCoordinator != nil, icebergTopo.warnNoElection),
+			ReconcileConcurrency: icebergPassesAtOnce,
 		})
 		// #1731: with node-local warehouses (not icebergTopo.barrier, which is a shared bucket or
 		// shared_storage_mode), a database DELETE on the writer drops only the writer's tables.

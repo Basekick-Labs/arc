@@ -138,10 +138,10 @@ func TestLoad_IcebergIngestExport(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if cfg.Iceberg.ReconcileConcurrency != 4 {
-			t.Errorf("iceberg.reconcile_concurrency defaults to %d, want 4", cfg.Iceberg.ReconcileConcurrency)
+		if cfg.Iceberg.ReconcileConcurrency != 0 {
+			t.Errorf("iceberg.reconcile_concurrency defaults to %d, want 0 (by the storage)", cfg.Iceberg.ReconcileConcurrency)
 		}
-		for _, ok := range []string{"1", "8", "16"} {
+		for _, ok := range []string{"0", "1", "8", "16"} {
 			t.Setenv("ARC_ICEBERG_RECONCILE_CONCURRENCY", ok)
 			if cfg, err = Load(); err != nil {
 				t.Fatalf("iceberg.reconcile_concurrency = %s refused: %v", ok, err)
@@ -150,7 +150,7 @@ func TestLoad_IcebergIngestExport(t *testing.T) {
 				t.Errorf("iceberg.reconcile_concurrency = %s read as %s", ok, got)
 			}
 		}
-		for _, bad := range []string{"0", "-1", "17"} {
+		for _, bad := range []string{"-1", "17"} {
 			t.Setenv("ARC_ICEBERG_RECONCILE_CONCURRENCY", bad)
 			if _, err = Load(); err == nil || !strings.Contains(err.Error(), "iceberg.reconcile_concurrency") {
 				t.Errorf("iceberg.reconcile_concurrency = %s: err %v, want it refused by name", bad, err)

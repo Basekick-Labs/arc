@@ -73,7 +73,8 @@ func TestIngestRegistrationIsReportedToTheIcebergAppendPath(t *testing.T) {
 	for _, want := range []string{
 		"IngestAppend: cfg.Iceberg.IngestAppendEnabled,",
 		"IngestConcurrency: cfg.Iceberg.IngestExportConcurrency,",
-		"ReconcileConcurrency: icebergReconcileConcurrency(cfg.Iceberg.ReconcileConcurrency, clusterCoordinator != nil, icebergTopo.warnNoElection),",
+		"icebergPassesAtOnce := icebergReconcileConcurrency(cfg.Iceberg.ReconcileConcurrency, clusterCoordinator != nil, icebergTopo.warnNoElection, storageBackend.Type() != \"local\")",
+		"ReconcileConcurrency: icebergPassesAtOnce,",
 		"icebergScheduler.RequestIngestAppend(database, measurement, storagePath, sizeBytes)",
 		"arrowBuffer.SetOnFileRemoved(icebergScheduler.RequestReconcile)",
 		"exporter.SetVersionRetention(time.Duration(cfg.Iceberg.MinVersionAge)*time.Second,",
@@ -102,21 +103,31 @@ func TestIngestRegistrationIsReportedToTheIcebergAppendPath(t *testing.T) {
 // a node of a cluster, or one that may not be the only exporter, runs one.
 func TestIcebergReconcileConcurrencyIsOneOnAClusterNode(t *testing.T) {
 	for _, tc := range []struct {
-		configured                 int
-		hasCoordinator, noElection bool
-		want                       int
+		configured                              int
+		hasCoordinator, noElection, objectStore bool
+		want                                    int
 	}{
-		{4, false, false, 4},
-		{16, false, false, 16},
-		{1, false, false, 1},
-		{4, true, false, 1},
-		{4, false, true, 1},
-		{4, true, true, 1},
-		{0, false, false, 1},
+		// Not set: by the storage.
+		{0, false, false, true, icebergReconcileOnObjectStore},
+		{0, false, false, false, 1},
+		// Set: as set, on either storage.
+		{4, false, false, false, 4},
+		{16, false, false, true, 16},
+		{1, false, false, true, 1},
+		// A cluster node, or one with no election on a shared bucket: one.
+		{4, true, false, true, 1},
+		{0, true, false, true, 1},
+		{4, false, true, true, 1},
+		{0, false, true, true, 1},
+		{4, true, true, false, 1},
+		{-3, false, false, true, 1},
 	} {
-		if got := icebergReconcileConcurrency(tc.configured, tc.hasCoordinator, tc.noElection); got != tc.want {
-			t.Errorf("icebergReconcileConcurrency(%d, coordinator=%v, noElection=%v) = %d, want %d",
-				tc.configured, tc.hasCoordinator, tc.noElection, got, tc.want)
+		if got := icebergReconcileConcurrency(tc.configured, tc.hasCoordinator, tc.noElection, tc.objectStore); got != tc.want {
+			t.Errorf("icebergReconcileConcurrency(%d, coordinator=%v, noElection=%v, objectStore=%v) = %d, want %d",
+				tc.configured, tc.hasCoordinator, tc.noElection, tc.objectStore, got, tc.want)
 		}
+	}
+	if icebergReconcileOnObjectStore != 4 {
+		t.Errorf("a standalone node on an object store runs %d passes at once by default, want 4", icebergReconcileOnObjectStore)
 	}
 }
