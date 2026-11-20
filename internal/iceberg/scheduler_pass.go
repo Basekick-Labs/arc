@@ -268,17 +268,19 @@ func (s *Scheduler) runPasses(ctx context.Context, batch []*passJob) {
 func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter) (outcome reconcileOutcome, err error) {
 	m := job.m
 	// From before the listing to the end: the database's tables are not
-	// dropped while this pass works on one, and a pass that had to wait for
-	// a drop lists what the DELETE left (database_lock.go, #1789).
-	release, err := exp.holdDatabase(ctx, m.Database)
+	// dropped while this pass works on one (database_lock.go, #1789). While
+	// they are being dropped this pass gives way at once, like one whose
+	// files are changing under it: nothing was read or committed, what is
+	// cached is kept, and the table is tried again soon.
+	release, err := exp.holdDatabase(m.Database)
 	if err != nil {
-		return outcomeUnchanged, err
+		return outcomeBusy, err
 	}
 	defer release()
 	// What the scheduler remembered of the table was copied before this pass
-	// had the database. If the database was dropped since it was cached
-	// (while this pass waited for that very drop, or at any time before the
-	// loop got to forget it), it describes a table that is gone: its schema
+	// had the database. If the database was dropped since it was cached (at
+	// any time before the loop got to forget it, a drop that ended a moment
+	// ago included), it describes a table that is gone: its schema
 	// and its files' footers are not those of a table recreated under the
 	// name, and a pass that trusted them built the new table with the old
 	// columns. Start from the table, as on first sight.

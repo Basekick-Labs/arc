@@ -17,11 +17,11 @@ func TestDatabaseLock_ExportsShareItAndADropHoldsItAlone(t *testing.T) {
 	e := newPassRig(t, 1, 1, 1).exp
 	ctx := context.Background()
 	// Exports of one database, and of others, do not wait for each other.
-	r1, err := e.holdDatabase(ctx, "db")
+	r1, err := e.holdDatabase("db")
 	if err != nil {
 		t.Fatal(err)
 	}
-	r2, err := e.holdDatabase(ctx, "db")
+	r2, err := e.holdDatabase("db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,26 +58,39 @@ func TestDatabaseLock_ExportsShareItAndADropHoldsItAlone(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("a drop did not get the database once its exports had ended")
 	}
-	// While it is dropped, an export of it waits, for as long as it is given.
-	short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
-	defer cancel()
-	if _, err := e.holdDatabase(short, "db"); err == nil {
-		t.Fatal("an export started on a database that was being dropped")
+	// While it is dropped an export of it gives way at once: it does not
+	// wait, because nothing else would be exported while it did.
+	began := time.Now()
+	if _, err := e.holdDatabase("db"); !errors.Is(err, errDatabaseBeingDropped) {
+		t.Fatalf("an export of a database being dropped: %v, want errDatabaseBeingDropped", err)
 	}
-	held := make(chan func(), 1)
+	if took := time.Since(began); took > time.Second {
+		t.Fatalf("an export waited %v for a drop", took)
+	}
+	// So does one that arrives while a drop is still waiting its turn.
+	release()
+	busy, err := e.holdDatabase("db")
+	if err != nil {
+		t.Fatalf("an export once the drop had ended: %v", err)
+	}
+	waiting := make(chan func(), 1)
 	go func() {
-		rel, err := e.holdDatabase(ctx, "db")
+		rel, err := e.lockDatabaseForDrop(ctx, "db")
 		if err != nil {
 			t.Error(err)
 		}
-		held <- rel
+		waiting <- rel
 	}()
-	release()
+	time.Sleep(50 * time.Millisecond)
+	if _, err := e.holdDatabase("db"); !errors.Is(err, errDatabaseBeingDropped) {
+		t.Fatalf("an export that arrived behind a waiting drop: %v, want errDatabaseBeingDropped", err)
+	}
+	busy()
 	select {
-	case rel := <-held:
+	case rel := <-waiting:
 		rel()
 	case <-time.After(5 * time.Second):
-		t.Fatal("an export did not start once the drop had ended")
+		t.Fatal("the waiting drop did not get the database")
 	}
 }
 
@@ -91,7 +104,7 @@ func TestDatabaseLock_ASpokesDatabasesShareTheSpokesLock(t *testing.T) {
 			t.Errorf("databaseLockKey(%q) = %q, want %q", database, got, want)
 		}
 	}
-	rel, err := e.holdDatabase(ctx, "spoke/db")
+	rel, err := e.holdDatabase("spoke/db")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +129,7 @@ func TestDrop1789_ADropThatCannotStartDropsNothing(t *testing.T) {
 	t.Cleanup(func() { dropLockWait = old })
 	r := newPassRig(t, 2, 1, 1)
 	r.sched.runPass(context.Background())
-	rel, err := r.exp.holdDatabase(context.Background(), "mydb") // an export that does not end
+	rel, err := r.exp.holdDatabase("mydb") // an export that does not end
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,30 +377,27 @@ func TestDrop1789_APassThatWaitedForADropForgetsTheDroppedTable(t *testing.T) {
 			if got := len(r.entries(m)); got != 1 {
 				t.Fatalf("%d files in the table before the drop, want 1", got)
 			}
-			// An export holds the database; the drop waits behind it, and a
-			// pass of the table behind the drop, with what the scheduler
-			// remembers of the table already copied.
-			busy, err := r.exp.holdDatabase(ctx, "mydb")
-			if err != nil {
+			// What the scheduler remembers of the table is copied for a pass;
+			// before the pass gets the database, the database is dropped (the
+			// DELETE's files first) and written again.
+			key := "mydb\x00" + m
+			job := r.sched.preparePass(Measurement{Database: "mydb", Measurement: m}, key)
+			if !job.cached {
+				t.Fatal("no cached state for the table: the test's premise")
+			}
+			if err := os.RemoveAll(filepath.Join(r.root, "mydb")); err != nil {
 				t.Fatal(err)
 			}
-			dropped := make(chan error, 1)
-			go func() { dropped <- r.exp.DropDatabase(ctx, "mydb") }()
-			time.Sleep(50 * time.Millisecond) // the drop is waiting
-			passDone := make(chan struct{})
-			go func() { defer close(passDone); r.sched.runPass(ctx) }()
-			time.Sleep(50 * time.Millisecond) // the pass is waiting behind it
-			// The DELETE's files go, and the database is written again.
-			if err := os.RemoveAll(filepath.Join(r.root, "mydb")); err != nil {
+			if err := r.exp.DropDatabase(ctx, "mydb"); err != nil {
 				t.Fatal(err)
 			}
 			newName := ingestName(m, time.Now().Add(time.Second))
 			tc.new(t, r.path(m, newName), 1_700_000_000_000_000, 5)
-			busy()
-			if err := <-dropped; err != nil {
-				t.Fatal(err)
+			r.sched.passRunner(unionSchemaConcurrency).run(ctx, job, r.exp.forExport())
+			if job.err != nil {
+				t.Fatalf("the pass over the recreated table: %v", job.err)
 			}
-			<-passDone
+			r.sched.finishPass(job)
 			r.sched.runPass(ctx)
 			got := r.entries(m)
 			if len(got) != 1 || got[newName] != 1 {
@@ -459,8 +469,52 @@ func TestDrop1789_AFailedDropStillForgets(t *testing.T) {
 	if _, ok := r.exp.smallManifests("hub/spokedb\x00cpu"); ok {
 		t.Error("the exporter kept what it knew of a dropped spoke's database")
 	}
-	// And a context that has ended is not blamed on a drop when the database is free.
-	if _, err := r.exp.holdDatabase(ctx, "mydb"); err != nil {
-		t.Errorf("an export of a free database was refused on an ended context: %v", err)
+}
+
+// While one database is being dropped the exports of the others go on: a
+// pass of a table of the database being dropped gives way at once and is
+// tried again, and the timed pass does not stall on it.
+func TestDrop1789_ADropDoesNotHoldUpOtherDatabases(t *testing.T) {
+	r := newPassRig(t, 3, 2, 1)
+	ctx := context.Background()
+	r.sched.runPass(ctx)
+	for _, m := range r.tables {
+		r.newFile(m)
 	}
+	other := filepath.Join(r.root, "otherdb", "cpu", "2026", "07", "14", "15", ingestName("cpu", time.Now()))
+	writeArcStyleParquet(t, other, 1_700_000_000_000_000, 5)
+	// "mydb" is being dropped for as long as the test says.
+	dropping, err := r.exp.lockDatabaseForDrop(ctx, "mydb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	began := time.Now()
+	r.sched.runPass(ctx)
+	if took := time.Since(began); took > 5*time.Second {
+		t.Fatalf("the timed pass took %v while one database was being dropped", took)
+	}
+	if exists, err := r.exp.tableExists(ctx, "otherdb", "cpu"); err != nil || !exists {
+		t.Fatalf("the other database's table was not exported meanwhile: exists=%v err=%v", exists, err)
+	}
+	for _, m := range r.tables {
+		if got := len(r.entries(m)); got != 1 {
+			t.Errorf("table %s of the database being dropped has %d files: its pass ran", m, got)
+		}
+		if _, busy := r.sched.busySince["mydb\x00"+m]; !busy {
+			t.Errorf("table %s is not marked to be tried again", m)
+		}
+	}
+	// An append to one of its tables gives way too, and its request stays.
+	r.report(r.tables[0], r.files[r.tables[0]][1])
+	time.Sleep(5 * time.Millisecond)
+	r.sched.serviceIngest(ctx, ingestBatch)
+	r.sched.reqMu.Lock()
+	_, waits := r.sched.ingestDue["mydb\x00"+r.tables[0]]
+	r.sched.reqMu.Unlock()
+	if !waits {
+		t.Error("the ingest request of a table whose database was being dropped was not kept")
+	}
+	dropping()
+	r.sched.runPass(ctx)
+	r.wantEachOnce()
 }

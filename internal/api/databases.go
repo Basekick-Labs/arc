@@ -885,13 +885,21 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		// repeating the DELETE clears the residue; the 404 contract stands.
 		// That residue includes the empty directories an earlier version's
 		// delete left on local storage, which keep the database listed (#1425).
-		h.dropIcebergCatalog(ctx, name)
+		icebergErr := h.dropIcebergCatalog(ctx, name)
 		h.noticeIcebergDatabaseDropped(ctx, name)
 		removeEmptyDirectories(ctx, h.storage, name, h.logger)
 		removeDatabaseStateDirectories(ctx, h.storage, name, h.logger)
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+		notFound := fiber.Map{
 			"error": "Database '" + name + "' not found",
-		})
+		}
+		if icebergErr != nil {
+			// A repeat after a drop that could not run (#1789), refused
+			// again: still a 404, since there is no such database, with what
+			// is left of it.
+			notFound["iceberg_cleanup"] = "pending: the database's Iceberg tables were not dropped (" + icebergErr.Error() +
+				"); repeat the DELETE to drop them"
+		}
+		return c.Status(fiber.StatusNotFound).JSON(notFound)
 	}
 
 	// Rows acknowledged before the deletion and not in a file yet are flushed

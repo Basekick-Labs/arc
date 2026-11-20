@@ -438,9 +438,9 @@ func (s *Scheduler) runAppend(ctx context.Context, job *ingestJob, exp *Exporter
 	ctx = withExportReads(ctx)
 	// The database's tables are not dropped while this appends to one
 	// (database_lock.go, #1789).
-	release, err := exp.holdDatabase(ctx, m.Database)
+	release, err := exp.holdDatabase(m.Database)
 	if err != nil {
-		job.reason = err.Error()
+		job.reason = err.Error() // the pass that follows gives way too, and the request comes back
 		return
 	}
 	defer release()

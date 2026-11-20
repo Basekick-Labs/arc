@@ -2,6 +2,7 @@ package iceberg
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -27,6 +28,14 @@ import (
 // appends). DropDatabase holds it alone. So a drop waits for the exports of
 // that database in flight and no new one starts until it is done; an export
 // that starts after it lists the storage the DELETE left.
+//
+// An export does not wait for a drop. It runs on the scheduler's loop, or in
+// a batch the loop is waiting for, and while it waited no table of any other
+// database would be exported; a drop deletes every metadata object of every
+// table of its database, which on object storage is not quick. An export
+// that finds its database being dropped (or a drop waiting for it) gives way
+// at once (errDatabaseBeingDropped) and its table is tried again later, as
+// one whose files are changing under the export is.
 //
 // The lock is this process's. On a shared bucket the node that handles the
 // DELETE is usually not the node that exports, and that node's passes are
@@ -95,16 +104,18 @@ func (l *databaseLocks) of(database string) *semaphore.Weighted {
 	return sem
 }
 
+// errDatabaseBeingDropped is holdDatabase's refusal: the database's tables
+// are being dropped, or a drop is waiting for their exports to end.
+var errDatabaseBeingDropped = errors.New("iceberg: the database is being dropped")
+
 // holdDatabase holds the database's lock for one export of one of its
-// tables and returns the release. It waits while the database is being
-// dropped, for as long as ctx allows.
-func (e *Exporter) holdDatabase(ctx context.Context, database string) (release func(), err error) {
+// tables and returns the release. It never waits: only a drop, running or
+// waiting its turn, keeps an export out, and then it returns
+// errDatabaseBeingDropped.
+func (e *Exporter) holdDatabase(database string) (release func(), err error) {
 	sem := e.dbLocks.of(database)
 	if !sem.TryAcquire(1) {
-		// Only a drop, running or waiting its turn, keeps an export out.
-		if err := sem.Acquire(ctx, 1); err != nil {
-			return nil, fmt.Errorf("iceberg: database %q is being dropped: %w", database, err)
-		}
+		return nil, fmt.Errorf("database %q: %w", database, errDatabaseBeingDropped)
 	}
 	return func() { sem.Release(1) }, nil
 }
