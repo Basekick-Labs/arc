@@ -490,15 +490,15 @@ func TestPassBatch_FinishAppliesTheStateThePassDecided(t *testing.T) {
 			t.Fatalf("job %d started from %+v, cached=%v", i, jobs[i].prev, jobs[i].cached)
 		}
 	}
-	jobs[0].setState(measurementState{fingerprint: "new"})
-	jobs[0].appended = true
+	due := time.Now().Add(time.Minute)
+	jobs[0].setState(measurementState{fingerprint: "new", pruneAt: due})
 	jobs[1].dropState()
 	// jobs[2] decides nothing (a listing error keeps what was cached).
 	for _, job := range jobs {
 		r.sched.finishPass(job)
 	}
-	if got := r.sched.state[keyOf(0)].fingerprint; got != appendedFingerprint {
-		t.Errorf("a pass that set its state and asked for the next pass to run left fingerprint %q", got)
+	if got := r.sched.state[keyOf(0)]; got.fingerprint != "new" || !got.pruneAt.Equal(due) {
+		t.Errorf("a pass that set its state, with a prune due, left %q due %v", got.fingerprint, got.pruneAt)
 	}
 	if _, cached := r.sched.state[keyOf(1)]; cached {
 		t.Error("a pass that dropped its state left it cached")

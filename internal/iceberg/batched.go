@@ -88,9 +88,6 @@ type reconcileResult struct {
 	// is when a pass of the table next has something to prune even if the
 	// table has gone quiet (Exporter.pruneAgainAt); zero when nothing waits.
 	pruneAgainAt time.Time
-	// versionsHeld is !pruneAgainAt.IsZero(): the scheduler runs the table's
-	// next pass whatever its listing.
-	versionsHeld bool
 	// partial: new files remain unregistered because the pass ran out of time or lost the
 	// writer role. Not an error: what was committed stays, and the next pass continues.
 	partial bool
@@ -314,8 +311,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 		if err != nil {
 			return reconcileResult{}, err
 		}
-		again := e.pruneAgainAt()
-		return reconcileResult{settled: ok && hintOK && !e.healFailed(), schema: arcSchemaOf(tbl), pruneAgainAt: again, versionsHeld: !again.IsZero()}, nil
+		return reconcileResult{settled: ok && hintOK && !e.healFailed(), schema: arcSchemaOf(tbl), pruneAgainAt: e.pruneAgainAt()}, nil
 	}
 
 	// Metadata-only: files are dropped and added as DataFiles. (Transaction.Delete is a
@@ -630,7 +626,6 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 		writerLost:   writerGone && !partial && !moved,
 		pruneAgainAt: e.pruneAgainAt(),
 	}
-	res.versionsHeld = !res.pruneAgainAt.IsZero()
 	if loopErr != nil {
 		return res, loopErr
 	}

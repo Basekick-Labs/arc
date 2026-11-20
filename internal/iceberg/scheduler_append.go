@@ -401,8 +401,9 @@ func (s *Scheduler) exportIngest(ctx context.Context, m Measurement, key string)
 }
 
 // markAppended replaces the table's cached fingerprint with one no listing
-// produces, so its next pass runs whatever the listing is: after an append,
-// and while published versions wait out their minimum age.
+// produces, so its next pass runs whatever the listing is: after an append.
+// (A table whose published versions wait out their minimum age gets its pass
+// when they are due: measurementState.pruneAt.)
 func (s *Scheduler) markAppended(key string) {
 	if st, ok := s.state[key]; ok {
 		st.fingerprint = appendedFingerprint

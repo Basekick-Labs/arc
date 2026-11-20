@@ -221,9 +221,6 @@ func TestPrune1787_ReportsWhenTheHeldVersionsComeOfAge(t *testing.T) {
 	if d := res.pruneAgainAt.Sub(want); d < -2*time.Second || d > 2*time.Second {
 		t.Fatalf("prune again at %v, want %v: the latest successor's write time plus the minimum age", res.pruneAgainAt, want)
 	}
-	if !res.versionsHeld {
-		t.Fatal("versions are held, and the pass does not say so")
-	}
 
 	// Past that time one pass removes them all, and nothing waits.
 	old := now.Add(-2 * time.Hour)
@@ -236,7 +233,7 @@ func TestPrune1787_ReportsWhenTheHeldVersionsComeOfAge(t *testing.T) {
 	if got := r.vCopies(); len(got) != 2 {
 		t.Fatalf("copies %v once every successor is old enough, want retain_snapshots+1 = 2", got)
 	}
-	if !res.pruneAgainAt.IsZero() || res.versionsHeld {
+	if !res.pruneAgainAt.IsZero() {
 		t.Fatalf("prune again at %v with nothing left to prune", res.pruneAgainAt)
 	}
 }
