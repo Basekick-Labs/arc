@@ -411,7 +411,7 @@ func TestS3Append_AddsTheReportedFileWithoutListing(t *testing.T) {
 
 	// The first export is a pass: it creates the table from a listing.
 	first := newFile(0)
-	sched.RequestIngestAppend("mydb", "cpu", first)
+	sched.RequestIngestAppend("mydb", "cpu", first, 0)
 	created := serve()
 	if got := len(liveFiles(t, exp)); got != seed+1 {
 		t.Fatalf("%d files after the first export, want %d", got, seed+1)
@@ -429,14 +429,14 @@ func TestS3Append_AddsTheReportedFileWithoutListing(t *testing.T) {
 	// And an append, three times.
 	var appends []time.Duration
 	for i := 2; i < 5; i++ {
-		sched.RequestIngestAppend("mydb", "cpu", newFile(i))
+		sched.RequestIngestAppend("mydb", "cpu", newFile(i), 0)
 		appends = append(appends, serve())
 	}
 	if got := listings(); got != before {
 		t.Errorf("%d listings after three appends, want still %d", got, before)
 	}
 	// A file reported again is not added again.
-	sched.RequestIngestAppend("mydb", "cpu", first)
+	sched.RequestIngestAppend("mydb", "cpu", first, 0)
 	serve()
 	ictx := exp.withAWS(ctx)
 	lt, err := exp.catalog.LoadTable(ictx, exp.tableIdent("mydb", "cpu"))

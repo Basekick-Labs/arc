@@ -24,7 +24,7 @@ func TestParseVersionAndMetaDir(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(sibling, "metadata"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	e := &Exporter{warehouse: "file://" + wh}
+	e := &Exporter{exporterShared: &exporterShared{warehouse: "file://" + wh}, passState: newPassState()}
 	in := func(name string) string { return "file://" + filepath.Join(metaDir, name) }
 
 	for _, tc := range []struct {

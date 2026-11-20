@@ -113,6 +113,10 @@ func (e *Exporter) adoptPublished(ctx context.Context, ident icetable.Identifier
 	if err != nil {
 		return false, err
 	}
+	// notePassStart wants the same file a moment later (#1778). Adopting a
+	// version moves the catalog row and leaves the hint as it was read; a
+	// publish, which does change it, drops this (writeVersionHint).
+	exportReadsFrom(ctx).putHint(dirKey, hintN)
 	rowN := -1
 	if rowExists {
 		if v, _, ok := e.parseVersionAndMetaDir(rowLoc); ok {

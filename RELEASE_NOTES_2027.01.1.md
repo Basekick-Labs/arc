@@ -2,6 +2,93 @@
 
 > **Status:** Planned — January 2027 release.
 
+## New: ingest appends of several Iceberg tables run at once ([#1778](https://github.com/Basekick-Labs/arc/issues/1778))
+
+On object storage an ingest-triggered export is a few hundred milliseconds of waiting on storage requests, and Arc exported one table at a time: under three tables a second in a bucket's region. With many tables being written the tables queued behind each other, and the lag was the length of the queue, whatever `ingest_export_interval` said. The appends of different tables now overlap.
+
+- **New key `iceberg.ingest_export_concurrency`** (default `8`, 1 to 32): how many tables' ingest appends run at once. `1` exports one table at a time, as before.
+- **Reconcile passes still run one table at a time**: a table's first export, the pass every `iceberg.reconcile_interval`, the pass after 120 appends, and any fallback. Only the append (#1751) is run for several tables at once.
+- **Standalone nodes only**, like the ingest trigger itself ([#1756](https://github.com/Basekick-Labs/arc/issues/1756)). On a cluster node nothing reads the key.
+- A table is still exported by one thing at a time, and a file is still added to its table once: the scheduler starts a batch of appends, waits for all of them, and only then records what they did.
+
+Measured on AWS S3, standalone on EC2 in the bucket's region, over 4 to 5 minutes after a warm-up of 4 to 6 (one run each, except where two figures are given):
+
+| Tables written at once | `ingest_export_interval` | Appends at once | Average export lag | Appends per second |
+|---|---|---|---|---|
+| 50 | 5 s | 1 | 10.6 s | 2.4 |
+| 50 | 5 s | 8 | 0.98 s | 5.4 |
+| 200 | 5 s | 1 | 48.0 s | 2.0 |
+| 200 | 5 s | 8 | 12.4 s, 11.8 s | 9.8, 10.3 |
+| 200 | 5 s | 16 | 7.1 s | 13.7 |
+| 200 | 15 s | 8 | 10.4 s | 10.4 |
+| 200 | 60 s (default) | 1 | 48.5 s | 1.9 |
+| 200 | 60 s (default) | 8 | 30.2 s | 2.9 |
+
+- **With 50 tables a 5 s interval is met**: about a second from a file being written to its table, where it was over ten.
+
+- **At the default interval the interval is met with 200 tables**: 30 s is what a 60 s interval gives on average. Before, the lag was 48 s and files were still waiting 75 s at the end of the run.
+- **A short interval is not met at 200 tables**, though the lag is a quarter of what it was (a sixth with 16 at once). What is left is the reconcile passes, which every table still gets one at a time, at its first export and every `reconcile_interval`. Each measured window above began a minute after a timed pass started, so most of it was spent with that pass walking the 200 tables (in the local run with 30 ms added per request the walk took about 4.7 minutes): the figures are for the slow part of the cycle, and between two timed passes the lag is lower.
+- No append fell back in any run, there were no Iceberg warnings or errors, row counts matched storage on the tables checked and no file was in a table twice. On S3, write round trips were the same at every setting.
+- **Cost:** Arc's CPU time over the 11-minute run went from 1:43 at one at a time to 3:07 at 8 and 3:52 at 16 with the 5 s interval: it did five to seven times as many exports. At the default interval it was 1:44 against 1:52.
+- The same 200-table load at 5 s through a local S3 server with 30 ms added to every request: 97 s, 15.8 s and 9.0 s at 1, 8 and 16.
+- **On local storage**, where an export is tens of milliseconds, there is little to gain and a small cost: three runs each at 1 and at 8, 200 tables at 5 s, on a laptop that also ran the load: average lag 1.76, 0.58 and 1.65 s at one at a time and 0.79, 0.62 and 0.77 s at 8; an append took about 27 ms alone and about 39 ms beside others; the p95 of write round trips was 4.4, 3.9 and 4.9 ms at 1 and 8.4, 5.8 and 9.8 ms at 8, with the median and the p99 unchanged; CPU time was the same. So on a local-disk node the default buys a steadier lag and costs a few milliseconds at the p95 of writes under this load; `ingest_export_concurrency = 1` gives the previous behaviour. One run at 32 behaved as 8 did.
+
+Notes:
+
+- **Each append that runs beside others has 60 s**; one that runs out falls back to a reconcile pass (the fallback counter counts it, and the log names "context deadline exceeded"). With `ingest_export_concurrency = 1` an append and its fallback share the pass's two minutes, as before.
+- **Between two tables of a timed reconcile pass**, one batch of appends is served (before: one request), and still at most one request that needs a reconcile pass.
+- **Memory and connections grow with the key**: each append in flight holds the footers of its new files (a few MiB for a large append, 64 MiB at most) and reads at least four of them at once.
+- The catalog's SQLite database takes one statement at a time (it is usually the one the auth store uses); the appends' statements queue there for a few milliseconds each.
+- **Not run on the binary:** `ingest_export_concurrency = 32` on object storage (it was run on local storage), Glue sync, a warehouse outside the storage root, Azure and GCS.
+
+## Fix: Arc no longer keeps one DuckDB connection busy from startup ([#1782](https://github.com/Basekick-Labs/arc/issues/1782))
+
+The DuckDB check Arc runs at startup (`SELECT 'Hello from Arc in Go!' …`) left its result set open until the process exited, so one connection of the pool (`database.max_connections`) was never available to queries. With `database.max_connections = 1` no query was answered at all: HTTP and Flight SQL requests waited for a connection that never came free. With any other positive value, queries had one connection fewer than configured, which is 3 instead of 4 on small machines (the default is at least 4). Releases since at least v26.01.1 are affected.
+
+The check now gives its connection back as soon as it has read its row.
+
+- With `database.max_connections = 1`, queries over HTTP (JSON, Arrow, MessagePack, profiled) and Flight SQL are answered.
+- With 2 connections and 2 concurrent queries (5 rounds of a ~1 s query), the pool waited 5 times for 5.5 s before this fix and not at all after it; the 5 rounds took 11.4 s before and 6.4 s after.
+- **Visible change in the pool gauges.** At idle, `arc_db_connections_in_use` (`db_connections_in_use` in the JSON metrics, `connections_in_use` in the `pool` block of `GET /api/v1/metrics/query-pool`) is now 0 instead of 1, and the idle count is 1 higher. `arc_db_connections_open` (`connections_open`) can now drop to 0 after 10 minutes without queries, when idle connections are closed; before, the held connection kept it at 1 or more. The startup line `Database connection pool stats` shows `in_use: 0`. Dashboards that subtracted the idle 1, or alerts on no open connections, need adjusting.
+- The log messages of the startup check are unchanged.
+
+No configuration change.
+
+## Improvement: an Iceberg export on object storage makes fewer requests ([#1778](https://github.com/Basekick-Labs/arc/issues/1778))
+
+On S3 an export is a chain of requests made one after another, and the runs for #1751 showed that this, not CPU, is what an export costs there: about half a second per table in the bucket's region. A trace of those requests showed several that were not needed.
+
+- **A new data file is read once.** Its footer was fetched for the schema, and then iceberg-go fetched the file again to register it: a GET of the whole object, whose body it dropped, and two more reads of the footer. The export now hands iceberg-go the bytes it already has. No request asks for a whole data file any more.
+- **No HEAD per file reported by ingest**, on object storage. The size the flush wrote is used, and the footer read checks it against the stored object: a file that is gone is left out of the append as before, and one whose stored length differs makes that export a full pass. Local files are still stat'ed.
+- **`version-hint.text` is read once per export**, not twice, and **the count of small manifests is carried from one append to the next** in place of a read of the manifest list at every append. The carried count is an estimate: a table can hold a few more small manifests than before between two full passes.
+
+Requests for one export, counted through a proxy in front of an S3 server (`TestMeasure_S3RequestsPerExport`; a table of 49 files, the exporter set up as a production node). The counts are exact and tests pin them. The times are one run each with the proxy holding every request for 30 ms, to show what the counts are worth with a network in between; they are not AWS figures:
+
+| Export | Requests before | After | Time before | After |
+|---|---|---|---|---|
+| Append, 1 new file | 17 | 11 | 657 ms | 442 ms |
+| Append, 19 new files | 112 | 34 | 1,800 ms | 717 ms |
+| Full pass, 1 new file | 24 | 20 | 929 ms | 798 ms |
+| Full pass, 19 new files | 98 | 40 | 1,259 ms | 884 ms |
+
+Of the 11 requests left in an append, five are writes that must follow one another, and three are reads of the table's `metadata.json` (the load, iceberg-go's check before the commit, and the copy published as `v<N>.metadata.json`).
+
+On AWS S3, the build before this change and the build with it, on the same instance and bucket (standalone, append on, 3 to 5 minutes of writes):
+
+| Where Arc ran | Tables, interval | One export before | After | Average lag before | After |
+|---|---|---|---|---|---|
+| EC2 in the bucket's region | 10, 5 s (two runs each) | 494, 491 ms | 357, 354 ms | 0.94, 0.97 s | 0.60, 0.56 s |
+| EC2 in the bucket's region | 50, 15 s | 598 ms | 417 ms | 18.8 s | 13.3 s |
+| EC2 in the bucket's region | 200, 60 s (default) | 901 ms | 572 ms | 122 s | 82 s |
+| 77 ms from the bucket | 10, 5 s (two runs each) | 2.44, 2.48 s | 1.50, 1.52 s | 15.6, 15.5 s | 10.8, 10.4 s |
+
+An export takes 28 to 39% less time. No append fell back, row counts matched storage on the tables checked and no file was in a table twice. With 200 tables the build before still had files waiting 216 s when the run ended; this one had none. The 50- and 200-table rows are one run each.
+
+- Azure and GCS take the same code path and were not run.
+- **Tables are still exported one at a time.** This makes each export cheaper; it does not let several tables export at once, which is what many tables at a short `ingest_export_interval` need on object storage: with 200 tables at the default interval the lag is still over a minute. That remains open in #1778.
+- No change on local storage, and no new configuration. On the running binary (S3 API, 10 tables at a 5 s interval): 120 appends, none fell back, row counts matched storage and no file was in a table twice; an export averaged 41 ms against 57 ms on the previous build, in one run of each with no network in between and no repeat to show the spread.
+- The footers held for one export are bounded at 64 MiB (about a thousand new files); past that, the remaining files of that export are read by iceberg-go as before.
+
 ## Fix: late data no longer rewrites an old day's daily file ([#1775](https://github.com/Basekick-Labs/arc/issues/1775))
 
 When `compaction.daily_min_files` or more hour-level files (default 12) landed in a day that already had a daily file, daily compaction rewrote the whole day to fold them in: the job read the existing daily file and wrote it out again with the new rows. The cost followed the size of the day, not the size of the late data, and it repeated each time enough late files built up. One deployment rewrote 339 GB across 373 days to fold in 18 GB.

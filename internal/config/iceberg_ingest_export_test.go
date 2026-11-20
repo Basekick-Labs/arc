@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -97,6 +98,37 @@ func TestLoad_IcebergIngestExport(t *testing.T) {
 		}
 		if cfg.Iceberg.IngestAppendEnabled {
 			t.Error("iceberg.ingest_append_enabled = false was not read")
+		}
+	})
+	t.Run("export concurrency", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		t.Setenv("ARC_ICEBERG_ENABLED", "true")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Iceberg.IngestExportConcurrency != 8 {
+			t.Errorf("iceberg.ingest_export_concurrency defaults to %d, want 8", cfg.Iceberg.IngestExportConcurrency)
+		}
+		for _, ok := range []string{"1", "16", "32"} {
+			t.Setenv("ARC_ICEBERG_INGEST_EXPORT_CONCURRENCY", ok)
+			if cfg, err = Load(); err != nil {
+				t.Fatalf("iceberg.ingest_export_concurrency = %s refused: %v", ok, err)
+			}
+			if got := strconv.Itoa(cfg.Iceberg.IngestExportConcurrency); got != ok {
+				t.Errorf("iceberg.ingest_export_concurrency = %s read as %s", ok, got)
+			}
+		}
+		for _, bad := range []string{"0", "-1", "33"} {
+			t.Setenv("ARC_ICEBERG_INGEST_EXPORT_CONCURRENCY", bad)
+			if _, err = Load(); err == nil || !strings.Contains(err.Error(), "iceberg.ingest_export_concurrency") {
+				t.Errorf("iceberg.ingest_export_concurrency = %s: err %v, want it refused by name", bad, err)
+			}
+		}
+		// Off, it is not checked.
+		t.Setenv("ARC_ICEBERG_ENABLED", "false")
+		if _, err = Load(); err != nil {
+			t.Errorf("an out-of-range concurrency failed the load with the export off: %v", err)
 		}
 	})
 	// With the export off the keys are not checked: nothing reads them.

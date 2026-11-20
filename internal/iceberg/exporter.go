@@ -61,9 +61,77 @@ type FileRef struct {
 	Cold bool
 }
 
-// Exporter maintains Iceberg tables that mirror Arc's Parquet file set. One Exporter per
-// process; ReconcileMeasurement is the unit of work (one measurement's table).
+// Exporter maintains Iceberg tables that mirror Arc's Parquet file set. One per process
+// (NewExporter), plus the short-lived ones forAppend makes over the same shared state;
+// ReconcileMeasurement is the unit of work (one measurement's table).
+//
+// It is two parts. exporterShared is the process's one copy of everything
+// that is not about the export in progress. passState is the flags and
+// versions of one reconcile pass or one append: the scheduler's Exporter
+// carries the pass's, and an append that runs beside others gets its own
+// through forAppend, over the same exporterShared (#1778).
 type Exporter struct {
+	*exporterShared
+	passState
+}
+
+// passState is what one reconcile pass or append records about itself. One
+// export of one table at a time uses it.
+type passState struct {
+	// passLag is the largest export lag this pass or append observed, for
+	// its log line (export_lag.go, #1750).
+	passLag time.Duration
+
+	// hintFailure records that a discovery-file write failed anywhere during the
+	// current reconcile or append, including inside EnsureTable (which publishes
+	// on table creation and schema evolution). A passState belongs to one export
+	// of one table, so a plain flag reset at the start of each call is
+	// sufficient; the mutex only guards against a concurrent caller within it.
+	hintFailMu  sync.Mutex
+	hintFailure bool
+	// fenced is set when a publish found another writer's v<N> (adopt.go); cleared with
+	// hintFailure. The pass that sees it stops before pruning or sweeping.
+	fenced error
+	// healFailure records that a heal commit (name mapping, retention properties) failed during
+	// the current reconcile. Like hintFailure it keeps the pass unsettled, so the scheduler does
+	// not cache the measurement and the next pass retries the heal (#1098). Separate from
+	// hintFailure so the pass log's hint_published stays about the discovery files.
+	healFailure bool
+	// passLoaded is the table's metadata version when this reconcile first loaded it, and
+	// passHint the version version-hint.text named then — both before any heal or evolution
+	// committed (-1: not known). A reader may be resolving either, so the end-of-pass prune never
+	// deletes them (#1097). They differ when an earlier pass committed but failed its hint write.
+	passLoaded, passHint int
+	// passHintUnknown: version-hint.text could not be read at pass start, so the version a
+	// reader may be resolving is unknown and this pass prunes nothing (#1097).
+	passHintUnknown bool
+	// passHints are the versions this pass wrote to version-hint.text (heals, evolutions, the
+	// end-of-pass publish). A reader may have resolved any of them, so none is pruned this pass.
+	passHints []int
+	// passVersionsHeld: this pass's prune kept a published version on disk only because of
+	// iceberg.min_version_age (versionsHeldByAge).
+	passVersionsHeld bool
+	// passGate, while a reconcile runs, is its canCommit: EnsureTable's heals check it before
+	// committing, so a node that lost the writer role mid-pass does not publish a heal (#1097).
+	// nil outside a reconcile (always allowed).
+	passGate func() bool
+}
+
+// newPassState is the state of an export that has not loaded its table yet.
+func newPassState() passState {
+	return passState{passLoaded: -1, passHint: -1}
+}
+
+// forAppend returns an Exporter for one append: the same shared state, its
+// own pass state, so several appends of different tables can run at once.
+func (e *Exporter) forAppend() *Exporter {
+	return &Exporter{exporterShared: e.exporterShared, passState: newPassState()}
+}
+
+// exporterShared is the part of an Exporter every export of the process
+// uses. What a reconcile pass touches from the scheduler's loop goroutine
+// alone is marked so; everything an append reaches is guarded.
+type exporterShared struct {
 	db          *sql.DB
 	catalog     *sqlcat.Catalog
 	catalogName string
@@ -105,50 +173,13 @@ type Exporter struct {
 	resolvedWarehouse string
 	resolvedRoot      string
 
-	// hintFailure records that a discovery-file write failed anywhere during the
-	// current ReconcileMeasurementWithHint call, including inside EnsureTable
-	// (which publishes on table creation and schema evolution). The reconciler
-	// is single-writer and reconciles one measurement at a time, so a plain flag
-	// reset at the start of each call is sufficient; the mutex only guards
-	// against a future concurrent caller.
 	// lag holds the write times of ingest files committed and not yet
-	// published; passLag is the largest lag the current pass observed, for
-	// its log line (loop goroutine only). export_lag.go, #1750.
-	lag     exportLag
-	passLag time.Duration
-
-	hintFailMu  sync.Mutex
-	hintFailure bool
-	// fenced is set when a publish found another writer's v<N> (adopt.go); cleared with
-	// hintFailure. The pass that sees it stops before pruning or sweeping.
-	fenced error
-	// healFailure records that a heal commit (name mapping, retention properties) failed during
-	// the current reconcile. Like hintFailure it keeps the pass unsettled, so the scheduler does
-	// not cache the measurement and the next pass retries the heal (#1098). Separate from
-	// hintFailure so the pass log's hint_published stays about the discovery files.
-	healFailure bool
+	// published (export_lag.go, #1750).
+	lag exportLag
 	// propsCommit, when set, replaces the commit of a table-property transaction (name mapping,
 	// retention properties). Tests only: it is how a failing heal commit is reproduced without
 	// a failing catalog. nil in production.
 	propsCommit func(context.Context, *icetable.Transaction) (*icetable.Table, error)
-	// passLoaded is the table's metadata version when this reconcile first loaded it, and
-	// passHint the version version-hint.text named then — both before any heal or evolution
-	// committed (-1: not known). A reader may be resolving either, so the end-of-pass prune never
-	// deletes them (#1097). They differ when an earlier pass committed but failed its hint write.
-	passLoaded, passHint int
-	// passHintUnknown: version-hint.text could not be read at pass start, so the version a
-	// reader may be resolving is unknown and this pass prunes nothing (#1097).
-	passHintUnknown bool
-	// passHints are the versions this pass wrote to version-hint.text (heals, evolutions, the
-	// end-of-pass publish). A reader may have resolved any of them, so none is pruned this pass.
-	passHints []int
-	// passVersionsHeld: this pass's prune kept a published version on disk only because of
-	// iceberg.min_version_age (versionsHeldByAge).
-	passVersionsHeld bool
-	// passGate, while a reconcile runs, is its canCommit: EnsureTable's heals check it before
-	// committing, so a node that lost the writer role mid-pass does not publish a heal (#1097).
-	// nil outside a reconcile (always allowed).
-	passGate func() bool
 
 	// warehouseAuthoritative, published: see adopt.go.
 	warehouseAuthoritative bool
@@ -192,6 +223,11 @@ type Exporter struct {
 	// expireOwed: the tables appends have added snapshots to since a pass
 	// last expired any (batched.go expiryOwed); under chunkMu.
 	expireOwed map[string]bool
+	// appendSmall: per table, the small data manifests its current snapshot
+	// holds, as the last append left them; absent when not known (a pass
+	// ran, an append failed, the process started). Under chunkMu.
+	// See appendMergeDue.
+	appendSmall map[string]int
 	// expirySeen: the tables that have had a pass in this process.
 	expirySeen map[string]struct{}
 	chunkSize  map[string]int
@@ -273,7 +309,8 @@ func (e *Exporter) healFailed() bool {
 }
 
 // notePassStart records, the first time this reconcile loads the table, its version and the
-// version version-hint.text names (one GET; -1 when there is none or it cannot be read).
+// version version-hint.text names (-1 when there is none or it cannot be read): the adopt
+// check's read of it when this export just made one (export_reads.go), else one GET.
 func (e *Exporter) notePassStart(ctx context.Context, tbl *icetable.Table) {
 	e.hintFailMu.Lock()
 	seen := e.passLoaded >= 0
@@ -284,8 +321,13 @@ func (e *Exporter) notePassStart(ctx context.Context, tbl *icetable.Table) {
 	loaded, hint, unknown := e.metadataVersion(tbl), -1, false
 	if e.backend != nil {
 		if _, dirKey, ok := e.parseVersionAndMetaDir(tbl.MetadataLocation()); ok && dirKey != "" && dirKey != "." {
-			n, err := e.readHint(ctx, dirKey) // -1, nil when there is no hint
-			hint, unknown = n, err != nil
+			// The adopt check read it a moment ago in this export (#1778).
+			if n, ok := exportReadsFrom(ctx).takeHint(dirKey); ok {
+				hint = n
+			} else {
+				n, err := e.readHint(ctx, dirKey) // -1, nil when there is no hint
+				hint, unknown = n, err != nil
+			}
 		}
 	}
 	e.hintFailMu.Lock()
@@ -336,9 +378,7 @@ func NewExporter(db *sql.DB, backend storage.Backend, warehouse, nsPrefix string
 	if err != nil {
 		return nil, fmt.Errorf("create iceberg sql catalog: %w", err)
 	}
-	return &Exporter{
-		passLoaded:  -1,
-		passHint:    -1,
+	return &Exporter{passState: newPassState(), exporterShared: &exporterShared{
 		db:          db,
 		catalog:     cat,
 		catalogName: "arc",
@@ -364,7 +404,7 @@ func NewExporter(db *sql.DB, backend storage.Backend, warehouse, nsPrefix string
 		floorDue:                 make(map[string]struct{}),
 		namespaceMigrationDryRun: true,
 		layout:                   layoutWarehouse,
-	}, nil
+	}}, nil
 }
 
 // minOrphanGrace is the floor for how old an unreachable manifest must be before
@@ -969,6 +1009,10 @@ func (e *Exporter) addFilesMerging(ctx context.Context, txn *icetable.Transactio
 // AddFiles used to compute, with the same table schema, spec and properties. want gives each path's size
 // from the listing; a footer that disagrees (the file was replaced since it was listed) fails
 // the pass rather than register stats for bytes that are no longer there.
+// A file whose tail this export already read (export_reads.go) is built from that tail, whose
+// read checked the stored length against the same size; for such a file the check here compares
+// the size with itself, and a replacement between that read and this build is seen by the next
+// pass's listing.
 //
 // A file whose day() partition cannot be inferred (its rows straddle a UTC day) is returned in
 // skipped instead of failing the pass, so one such file does not wedge the measurement. Any
@@ -983,6 +1027,11 @@ func (e *Exporter) buildDataFiles(ctx context.Context, tbl *icetable.Table, path
 	for i, p := range paths {
 		if ios[i], err = e.fileIOFor(ctx, tbl, p); err != nil {
 			return nil, nil, err
+		}
+		// The footer this export already read for the file's schema: iceberg-go
+		// reads the file from it, not from the store again (#1778).
+		if tail, ok := exportReadsFrom(ctx).takeTail(p); ok {
+			ios[i] = &tailIO{path: p, tail: tail, under: ios[i]}
 		}
 	}
 	g, gctx := errgroup.WithContext(ctx)
@@ -1757,6 +1806,10 @@ func (e *Exporter) reachableManifestNames(ctx context.Context, tbl *icetable.Tab
 //
 // Returns true when there was nothing to do (no backend) or everything was written.
 func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bool {
+	// The hint is about to change. Nothing reads a recorded hint after a
+	// publish today (notePassStart takes it right after the adopt check that
+	// recorded it); this keeps that true for a caller added later.
+	exportReadsFrom(ctx).dropHints()
 	if e.backend == nil {
 		// No discovery files to write: the catalog commit is the publish.
 		e.drainExportLag(tbl.Identifier())

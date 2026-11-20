@@ -57,29 +57,46 @@ func appendMergeOn() iceberg.Properties {
 	}
 }
 
-// shouldMergeAppend reports whether the table has enough small data
-// manifests for this append to merge them (the new one included). One read
-// of the current snapshot's manifest list; any failure means no merge.
-func (e *Exporter) shouldMergeAppend(ctx context.Context, tbl *icetable.Table) bool {
+// appendMergeDue reports whether the table has enough small data manifests
+// for this append to merge them (the new one included), and how many it will
+// have with the new one.
+//
+// The count is read from the current snapshot's manifest list the first time
+// (any failure means no merge), and carried from one append to the next after
+// that: a reconcile pass forgets it (reconcile) and so does an append that
+// did not finish (appendFiles). On object storage that read was one request
+// of every append, and iceberg-go reads the same list again to commit
+// (#1778).
+//
+// Carried, it is an estimate. It counts the manifest each append adds as
+// small and a merge's result as one small manifest, and iceberg-go, which
+// packs by size and applies the minimum itself, can decline a staged merge.
+// The estimate only moves when a merge is tried: a few more small manifests
+// can stand than with a count read every time, until the table's next pass,
+// which comes after appendMaxBetweenPasses appends at the latest.
+func (e *Exporter) appendMergeDue(ctx context.Context, tkey string, tbl *icetable.Table) (merge bool, small int) {
+	if n, ok := e.smallManifests(tkey); ok {
+		return n+1 >= appendMergeMinCount, n + 1
+	}
 	snap := tbl.CurrentSnapshot()
 	if snap == nil {
-		return false
+		return false, -1
 	}
 	fio, err := tbl.FS(ctx)
 	if err != nil {
-		return false
+		return false, -1
 	}
 	manifests, err := snap.Manifests(fio)
 	if err != nil {
-		return false
+		return false, -1
 	}
-	small := 1 // the manifest this append adds
+	small = 1 // the manifest this append adds
 	for _, m := range manifests {
 		if m.ManifestContent() == iceberg.ManifestContentData && m.Length() < appendMergeTargetBytes {
 			small++
 		}
 	}
-	return small >= appendMergeMinCount
+	return small >= appendMergeMinCount, small
 }
 
 // appendResult is what appendFiles did with the files it was given.
@@ -107,6 +124,14 @@ func (e *Exporter) appendFiles(ctx context.Context, database, measurement string
 	// the exporter's, not the table's, and would otherwise carry over from
 	// the last table it worked on.
 	e.passLag = 0
+	tkey := database + "\x00" + measurement
+	// An append that does not finish leaves the table's manifests unknown to
+	// the next one (appendMergeDue).
+	defer func() {
+		if err != nil {
+			e.forgetSmallManifests(tkey)
+		}
+	}()
 	e.setPassGate(canCommit)
 	defer e.setPassGate(nil)
 	defer e.forgetExportLagIfNotPublisher(database, measurement)
@@ -161,7 +186,10 @@ func (e *Exporter) appendFiles(ctx context.Context, database, measurement string
 	}
 	start := time.Now()
 	txn := tbl.NewTransaction()
-	merge := e.shouldMergeAppend(ctx, tbl)
+	merge, small := e.appendMergeDue(ctx, tkey, tbl)
+	// Not known again until this append has finished (a panic past this point
+	// skips the deferred delete's err check).
+	e.forgetSmallManifests(tkey)
 	if merge {
 		if err := txn.SetProperties(appendMergeOn()); err != nil {
 			return res, fmt.Errorf("iceberg append: enable manifest merge: %w", err)
@@ -197,10 +225,45 @@ func (e *Exporter) appendFiles(ctx context.Context, database, measurement string
 	for _, df := range built {
 		res.added = append(res.added, df.FilePath())
 	}
+	// What the next append of this table starts from. A merge packs the small
+	// manifests into one, which is counted as small: if it is not, the next
+	// merge is staged one append early and iceberg-go, which applies the
+	// minimum itself, leaves the manifests alone.
+	if small > 0 {
+		if merge {
+			small = 1
+		}
+		e.setSmallManifests(tkey, small)
+	}
 	e.logger.Debug().
 		Str("database", database).Str("measurement", measurement).
 		Int("added", len(built)).Int("skipped", len(skipped)).Bool("merged_manifests", merge).
 		Dur("took", time.Since(start)).Dur("oldest_ingest_file_lag", e.passLag).
 		Msg("Appended ingest files to the Iceberg table")
 	return res, nil
+}
+
+// smallManifests, setSmallManifests and forgetSmallManifests are the count
+// appendMergeDue carries per table. Under chunkMu: appends of different
+// tables run at once (#1778), and a reconcile pass forgets a table's count.
+func (e *Exporter) smallManifests(tkey string) (int, bool) {
+	e.chunkMu.Lock()
+	defer e.chunkMu.Unlock()
+	n, ok := e.appendSmall[tkey]
+	return n, ok
+}
+
+func (e *Exporter) setSmallManifests(tkey string, n int) {
+	e.chunkMu.Lock()
+	defer e.chunkMu.Unlock()
+	if e.appendSmall == nil {
+		e.appendSmall = make(map[string]int)
+	}
+	e.appendSmall[tkey] = n
+}
+
+func (e *Exporter) forgetSmallManifests(tkey string) {
+	e.chunkMu.Lock()
+	defer e.chunkMu.Unlock()
+	delete(e.appendSmall, tkey)
 }

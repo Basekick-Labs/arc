@@ -72,7 +72,8 @@ func TestIngestRegistrationIsReportedToTheIcebergAppendPath(t *testing.T) {
 	src := string(raw)
 	for _, want := range []string{
 		"IngestAppend: cfg.Iceberg.IngestAppendEnabled,",
-		"icebergScheduler.RequestIngestAppend(database, measurement, storagePath)",
+		"IngestConcurrency: cfg.Iceberg.IngestExportConcurrency,",
+		"icebergScheduler.RequestIngestAppend(database, measurement, storagePath, sizeBytes)",
 		"arrowBuffer.SetOnFileRemoved(icebergScheduler.RequestReconcile)",
 		"exporter.SetVersionRetention(time.Duration(cfg.Iceberg.MinVersionAge)*time.Second,",
 	} {

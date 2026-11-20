@@ -869,17 +869,15 @@ func main() {
 
 	// Test query
 	log.Info().Msg("Testing DuckDB connection...")
-	rows, err := db.Query("SELECT 'Hello from Arc in Go!' as message, version() as duckdb_version")
-	if err != nil {
+	message, version, found, err := checkDuckDB(db)
+	var scanErr duckDBCheckScanError
+	switch {
+	case errors.As(err, &scanErr):
+		log.Fatal().Err(err).Msg("Failed to scan result")
+	case err != nil:
 		log.Fatal().Err(err).Msg("Failed to execute test query")
 	}
-	defer rows.Close()
-
-	var message, version string
-	if rows.Next() {
-		if err := rows.Scan(&message, &version); err != nil {
-			log.Fatal().Err(err).Msg("Failed to scan result")
-		}
+	if found {
 		log.Info().
 			Str("message", message).
 			Str("duckdb_version", version).
@@ -4763,6 +4761,9 @@ func main() {
 			// An ingest request adds only the files ingest reported, without
 			// listing the measurement (#1751).
 			IngestAppend: cfg.Iceberg.IngestAppendEnabled,
+			// How many tables' ingest appends run at once (#1778). Without the
+			// ingest trigger (a cluster node, interval 0) nothing reads it.
+			IngestConcurrency: cfg.Iceberg.IngestExportConcurrency,
 		})
 		// #1731: with node-local warehouses (not icebergTopo.barrier, which is a shared bucket or
 		// shared_storage_mode), a database DELETE on the writer drops only the writer's tables.
@@ -4817,8 +4818,8 @@ func main() {
 					// at registration and not at the write: a request served
 					// between the two would find no file and list the whole
 					// measurement.
-					arrowBuffer.SetOnFileRegistered(func(database, measurement, storagePath string, _ int64) {
-						icebergScheduler.RequestIngestAppend(database, measurement, storagePath)
+					arrowBuffer.SetOnFileRegistered(func(database, measurement, storagePath string, sizeBytes int64) {
+						icebergScheduler.RequestIngestAppend(database, measurement, storagePath, sizeBytes)
 					})
 				} else {
 					arrowBuffer.AddOnFilePublished(func(database, measurement string, _ time.Time) {

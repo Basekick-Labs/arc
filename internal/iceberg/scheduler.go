@@ -131,12 +131,15 @@ type Scheduler struct {
 	// goroutine's: appendOK the tables whose last reconcile pass settled,
 	// recentAdds the recent files in each table or seen by a pass,
 	// appendFallback the last reason a table's append ran a pass instead.
-	appendEnabled  bool
-	started        time.Time
-	appendPending  map[string]pendingFiles
-	appendOK       map[string]bool
-	recentAdds     map[string]map[string]time.Time
-	appendFallback map[string]string
+	appendEnabled bool
+	// ingestConcurrency is how many tables' appends run at once (1: one
+	// request at a time, start to end, on the loop goroutine).
+	ingestConcurrency int
+	started           time.Time
+	appendPending     map[string]pendingFiles
+	appendOK          map[string]bool
+	recentAdds        map[string]map[string]time.Time
+	appendFallback    map[string]string
 	// passCommits is how many data commits the reconcile pass in progress (or
 	// the last one) made: reconcileOne sets it, reconcileOneRecovered reads it.
 	passCommits int
@@ -249,6 +252,10 @@ type SchedulerConfig struct {
 	// (iceberg.ingest_append_enabled). Off: every ingest request is a
 	// reconcile pass of the measurement.
 	IngestAppend bool
+	// IngestConcurrency is how many tables' ingest appends run at once
+	// (iceberg.ingest_export_concurrency). One or less: one ingest request
+	// at a time, as before #1778.
+	IngestConcurrency int
 }
 
 // NewScheduler builds a reconcile scheduler.
@@ -257,32 +264,33 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		cfg.Interval = 5 * time.Minute
 	}
 	return &Scheduler{
-		exporter:       cfg.Exporter,
-		source:         cfg.Source,
-		interval:       cfg.Interval,
-		gate:           cfg.Gate,
-		logger:         cfg.Logger.With().Str("component", "iceberg-scheduler").Logger(),
-		state:          make(map[string]measurementState),
-		busySince:      make(map[string]time.Time),
-		requested:      make(map[string]Measurement),
-		requestedPaths: make(map[string]struct{}),
-		requestedHot:   make(map[string]struct{}),
-		retrying:       make(map[string]bool),
-		wake:           make(chan struct{}, 1),
-		ingestInterval: cfg.IngestInterval,
-		ingestDue:      make(map[string]ingestRequest),
-		ingestNext:     make(map[string]time.Time),
-		ingestPending:  make(map[string]ingestReports),
-		appendEnabled:  cfg.IngestAppend,
-		started:        time.Now(),
-		appendPending:  make(map[string]pendingFiles),
-		appendOK:       make(map[string]bool),
-		recentAdds:     make(map[string]map[string]time.Time),
-		appendFallback: make(map[string]string),
-		appendsSince:   make(map[string]int),
-		lastReconciled: make(map[string]time.Time),
-		drops:          make(map[string]struct{}),
-		dropRetry:      make(map[string]dropRetry),
+		exporter:          cfg.Exporter,
+		source:            cfg.Source,
+		interval:          cfg.Interval,
+		gate:              cfg.Gate,
+		logger:            cfg.Logger.With().Str("component", "iceberg-scheduler").Logger(),
+		state:             make(map[string]measurementState),
+		busySince:         make(map[string]time.Time),
+		requested:         make(map[string]Measurement),
+		requestedPaths:    make(map[string]struct{}),
+		requestedHot:      make(map[string]struct{}),
+		retrying:          make(map[string]bool),
+		wake:              make(chan struct{}, 1),
+		ingestInterval:    cfg.IngestInterval,
+		ingestDue:         make(map[string]ingestRequest),
+		ingestNext:        make(map[string]time.Time),
+		ingestPending:     make(map[string]ingestReports),
+		appendEnabled:     cfg.IngestAppend,
+		ingestConcurrency: max(1, cfg.IngestConcurrency),
+		started:           time.Now(),
+		appendPending:     make(map[string]pendingFiles),
+		appendOK:          make(map[string]bool),
+		recentAdds:        make(map[string]map[string]time.Time),
+		appendFallback:    make(map[string]string),
+		appendsSince:      make(map[string]int),
+		lastReconciled:    make(map[string]time.Time),
+		drops:             make(map[string]struct{}),
+		dropRetry:         make(map[string]dropRetry),
 	}
 }
 
@@ -981,6 +989,8 @@ func (s *Scheduler) reconcileOneRecovered(ctx context.Context, m Measurement, ke
 // the (data-file set + local-file set) lets us skip the expensive per-file footer reads and the
 // no-op diff entirely when nothing changed — the common steady-state case.
 func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string) (outcome reconcileOutcome, err error) {
+	// What this pass reads of the store is not read twice (export_reads.go, #1778).
+	ctx = withExportReads(ctx)
 	// One backend listing yields both the data-file URIs and the local paths (Files + LocalFiles
 	// would list the same prefix twice).
 	files, localFiles, err := s.source.FilesAndLocal(ctx, m)

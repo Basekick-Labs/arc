@@ -52,7 +52,7 @@ func (r *appendRig) newFile() string {
 
 func (r *appendRig) report(names ...string) {
 	for _, n := range names {
-		r.sched.RequestIngestAppend("mydb", "cpu", appendDir+n)
+		r.sched.RequestIngestAppend("mydb", "cpu", appendDir+n, 0)
 	}
 }
 
@@ -291,7 +291,7 @@ func TestAppend_FallsBackToAPass(t *testing.T) {
 		writeArcStyleParquet4Col(t, filepath.Join(r.root, filepath.FromSlash(appendDir+wide)), 1_700_000_000_000_000, 1)
 		// The append itself says why, before anything is read from the file
 		// to build its entry.
-		refs, _, err := r.src.AppendRefs(context.Background(), Measurement{Database: "mydb", Measurement: "cpu"}, []string{appendDir + wide})
+		refs, _, err := r.src.AppendRefs(context.Background(), Measurement{Database: "mydb", Measurement: "cpu"}, []string{appendDir + wide}, nil)
 		if err != nil || len(refs) != 1 {
 			t.Fatalf("AppendRefs: %v, %d refs", err, len(refs))
 		}
@@ -550,7 +550,7 @@ func TestPreviousVersionsMaxCoversTheMinimumAge(t *testing.T) {
 		{10, 300 * time.Second, 0, 10},              // ingest triggers nothing
 		{10, 0, 5 * time.Second, 10},
 	} {
-		e := &Exporter{retain: c.retain}
+		e := &Exporter{exporterShared: &exporterShared{retain: c.retain}, passState: newPassState()}
 		e.SetVersionRetention(c.age, c.interval)
 		if got := e.previousVersionsMax(); got != c.want {
 			t.Errorf("retain %d, age %v, interval %v: %d, want %d", c.retain, c.age, c.interval, got, c.want)
@@ -775,7 +775,7 @@ func TestHardenLocalMetadataPerms_LooksAtEachEntryOnce(t *testing.T) {
 		}
 		return info.Mode().Perm()
 	}
-	e := &Exporter{logger: zerolog.Nop(), warehouse: localFileURI(filepath.Join(base, "wh"))}
+	e := &Exporter{exporterShared: &exporterShared{logger: zerolog.Nop(), warehouse: localFileURI(filepath.Join(base, "wh"))}, passState: newPassState()}
 	first := write("00001-a.metadata.json")
 	loc := "file://" + filepath.ToSlash(first)
 	e.hardenLocalMetadataPerms(loc)
