@@ -109,9 +109,11 @@ type passState struct {
 	// passHints are the versions this pass wrote to version-hint.text (heals, evolutions, the
 	// end-of-pass publish). A reader may have resolved any of them, so none is pruned this pass.
 	passHints []int
-	// passVersionsHeld: this pass's prune kept a published version on disk only because of
-	// iceberg.min_version_age (versionsHeldByAge).
-	passVersionsHeld bool
+	// passPruneDue: when the table's version files need pruning again though
+	// nothing else about it changes: this pass's prune kept a published
+	// version only because of iceberg.min_version_age, or could not finish
+	// (pruneAgainAt). Zero: nothing is waiting.
+	passPruneDue time.Time
 	// passGate, while a reconcile runs, is its canCommit: EnsureTable's heals check it before
 	// committing, so a node that lost the writer role mid-pass does not publish a heal (#1097).
 	// nil outside a reconcile (always allowed).
@@ -190,6 +192,10 @@ type exporterShared struct {
 	markerCleared     map[string]struct{}
 	publishedMu       sync.Mutex
 	published         map[string]string
+	// hinted: per table, the metadata location this process last wrote to
+	// version-hint.text (writeVersionHint); under publishedMu. See
+	// alreadyPublished.
+	hinted map[string]string
 
 	// collapseThreshold is the manifest count at which a pass also collapses the manifest set
 	// (see manifestCollapseThreshold). A field rather than a bare constant so a test can raise it
@@ -245,16 +251,32 @@ func (e *Exporter) resetHintFailure() {
 	e.passLoaded, e.passHint = -1, -1
 	e.passHintUnknown = false
 	e.passHints = e.passHints[:0]
-	e.passVersionsHeld = false
+	e.passPruneDue = time.Time{}
 	e.hintFailMu.Unlock()
 }
 
-// versionsHeldByAge reports that this pass's prune kept a published version
-// only because of iceberg.min_version_age (pruneOldVersionFilesFrom).
-func (e *Exporter) versionsHeldByAge() bool {
+// pruneAgainAt is when this pass's prune left work that only time or a retry
+// finishes (pruneOldVersionFilesFrom), or zero. It is the latest of:
+//
+//   - for each published version kept only because of iceberg.min_version_age,
+//     the moment the version after it has been published that long. The
+//     latest, so that one later prune removes them all; the ones that come of
+//     age earlier wait for it, less than min_version_age more.
+//   - now, when the metadata directory could not be listed or a delete
+//     failed: the next pass retries.
+func (e *Exporter) pruneAgainAt() time.Time {
 	e.hintFailMu.Lock()
 	defer e.hintFailMu.Unlock()
-	return e.passVersionsHeld
+	return e.passPruneDue
+}
+
+// notePruneDue records a time the table's prune has to run again by.
+func (e *Exporter) notePruneDue(at time.Time) {
+	e.hintFailMu.Lock()
+	if at.After(e.passPruneDue) {
+		e.passPruneDue = at
+	}
+	e.hintFailMu.Unlock()
 }
 
 // notePublishedHint records a version this pass wrote to version-hint.text.
@@ -1425,6 +1447,7 @@ func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.T
 		}
 		objs, err := lister.ListObjects(ctx, dirKey+"/")
 		if err != nil {
+			e.notePruneDue(time.Now()) // not pruned: the next pass retries (pruneAgainAt)
 			return
 		}
 		written = make(map[string]time.Time, len(objs))
@@ -1435,6 +1458,7 @@ func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.T
 	} else {
 		var err error
 		if keys, err = e.backend.List(ctx, dirKey+"/"); err != nil {
+			e.notePruneDue(time.Now())
 			return
 		}
 	}
@@ -1485,15 +1509,20 @@ func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.T
 		if e.minVersionAge > 0 {
 			next := vs[keep+i-1] // the next version up that exists: vs is descending
 			at, ok := written[path.Base(next.key)]
-			if !ok || time.Since(at) < e.minVersionAge {
-				e.hintFailMu.Lock()
-				e.passVersionsHeld = true
-				e.hintFailMu.Unlock()
+			if !ok {
+				// No write time for the successor: kept, and looked at
+				// again once a successor written now would be old enough.
+				e.notePruneDue(time.Now().Add(e.minVersionAge))
+				continue
+			}
+			if time.Since(at) < e.minVersionAge {
+				e.notePruneDue(at.Add(e.minVersionAge))
 				continue
 			}
 		}
-		if err := e.backend.Delete(ctx, v.key); err != nil {
-			e.logger.Debug().Err(err).Str("key", v.key).Msg("prune old v<N> (non-fatal)")
+		if err := e.backend.Delete(ctx, v.key); err != nil && !storage.IsNotFound(err) {
+			e.logger.Debug().Err(err).Str("key", v.key).Msg("prune old v<N> (non-fatal; the next pass retries)")
+			e.notePruneDue(time.Now())
 		}
 	}
 }
@@ -1890,6 +1919,7 @@ func (e *Exporter) writeVersionHint(ctx context.Context, tbl *icetable.Table) bo
 		// that no earlier publish did (#1750).
 		e.drainExportLag(tbl.Identifier())
 		e.markPublished(tbl.Identifier(), metaLoc)
+		e.markHinted(tbl.Identifier(), metaLoc)
 		e.clearDropMarker(ctx, tbl.Identifier())
 		// Glue sync (#1690): report the publish. The callee must not block.
 		if e.onPublished != nil {
@@ -2237,6 +2267,7 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 	ns := icetable.Identifier{e.nsPrefix + "_" + database}
 	nsKey := catalogNamespaceKey(ns)
 	e.forgetExportLagNamespace(ns) // its tables' unpublished files will never be published (export_lag.go)
+	e.forgetHintedNamespace(ns)    // a table recreated under the same name publishes again (alreadyPublished)
 
 	// This node's tables. A node that never exported the database has no
 	// namespace in its own catalog, but on a shared bucket another node's
@@ -2299,6 +2330,11 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 	subs, err := e.spokeSubNamespaces(ctx, database)
 	if err != nil {
 		return err
+	}
+	for _, sub := range subs {
+		for _, ident := range sub.catalogTables {
+			e.forgetHinted(ident) // as for the database's own tables, above
+		}
 	}
 
 	// Drop markers first (dropped.go): a drop that fails after this point,

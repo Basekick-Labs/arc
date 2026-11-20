@@ -397,6 +397,79 @@ func (e *Exporter) isPublishedHere(ident icetable.Identifier, loc string) bool {
 	return e.published[strings.Join(ident, "\x00")] == loc
 }
 
+// markHinted records that this process wrote loc's v<N> copy and named it in
+// version-hint.text. Only writeVersionHint calls it: unlike markPublished,
+// which the adopt check also sets when it confirms a row, it says that the
+// publish and everything that goes with one (the drop marker, the Glue
+// notice) happened in this process for exactly this metadata file.
+func (e *Exporter) markHinted(ident icetable.Identifier, loc string) {
+	e.publishedMu.Lock()
+	defer e.publishedMu.Unlock()
+	if e.hinted == nil {
+		e.hinted = make(map[string]string)
+	}
+	e.hinted[strings.Join(ident, "\x00")] = loc
+}
+
+// forgetHinted drops markHinted's record of a table whose lineage ended or
+// changed under this node (a drop, a dead row): a recreated table can reach
+// the same metadata location again.
+func (e *Exporter) forgetHinted(ident icetable.Identifier) {
+	e.publishedMu.Lock()
+	delete(e.hinted, strings.Join(ident, "\x00"))
+	e.publishedMu.Unlock()
+}
+
+// forgetHintedNamespace is forgetHinted for every table of a namespace.
+func (e *Exporter) forgetHintedNamespace(ns icetable.Identifier) {
+	prefix := strings.Join(ns, "\x00") + "\x00"
+	e.publishedMu.Lock()
+	for key := range e.hinted {
+		if strings.HasPrefix(key, prefix) {
+			delete(e.hinted, key)
+		}
+	}
+	e.publishedMu.Unlock()
+}
+
+// alreadyPublished reports that the discovery files already name tbl's
+// metadata, so publishing it again would change nothing (#1787): this process
+// wrote this exact metadata file to version-hint.text (markHinted), and the
+// last hint this pass knows of still names its version: the one it published
+// itself, else the one read from storage when the pass started. A pass that
+// could not read the hint, the first pass of a process and a pass after an
+// adoption all publish.
+//
+// What it does not see is a v<N>.metadata.json deleted from outside Arc while
+// the hint still names it; a pass that publishes (any commit, any restart)
+// writes it again.
+func (e *Exporter) alreadyPublished(tbl *icetable.Table) bool {
+	if e.backend == nil {
+		return false
+	}
+	loc := tbl.MetadataLocation()
+	version, _, ok := e.parseVersionAndMetaDir(loc)
+	if !ok {
+		return false
+	}
+	n, err := strconv.Atoi(version)
+	if err != nil {
+		return false
+	}
+	e.publishedMu.Lock()
+	hinted := e.hinted[strings.Join(tbl.Identifier(), "\x00")] == loc
+	e.publishedMu.Unlock()
+	if !hinted {
+		return false
+	}
+	e.hintFailMu.Lock()
+	defer e.hintFailMu.Unlock()
+	if k := len(e.passHints); k > 0 {
+		return e.passHints[k-1] == n
+	}
+	return !e.passHintUnknown && e.passHint == n
+}
+
 func (e *Exporter) markPublished(ident icetable.Identifier, loc string) {
 	e.publishedMu.Lock()
 	defer e.publishedMu.Unlock()

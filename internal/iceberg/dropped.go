@@ -123,6 +123,7 @@ func (e *Exporter) recoverDeadRow(ctx context.Context, ident icetable.Identifier
 	// the drop marker again, even if it cleared (none) before the drop.
 	e.publishedMu.Lock()
 	delete(e.markerCleared, strings.Join(ident, "\x00"))
+	delete(e.hinted, strings.Join(ident, "\x00")) // and it publishes, whatever location it reaches (alreadyPublished)
 	e.publishedMu.Unlock()
 	slash := strings.LastIndex(rowLoc, "/")
 	if slash < 0 {

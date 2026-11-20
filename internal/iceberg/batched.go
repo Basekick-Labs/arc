@@ -82,11 +82,14 @@ type reconcileResult struct {
 	// floor owed has landed and no heal commit failed (#1098). Only then may the scheduler cache
 	// the fingerprint.
 	settled bool
-	// versionsHeld: the pass's prune left published versions on disk only
-	// because the version after each was published too recently
-	// (iceberg.min_version_age). The scheduler runs the table's next pass
-	// whatever its listing, so they are pruned once old enough even if the
-	// table has gone quiet by then.
+	// pruneAgainAt: the pass's prune left published versions on disk that
+	// only time or a retry removes: the version after each was published too
+	// recently (iceberg.min_version_age), or the prune could not finish. It
+	// is when a pass of the table next has something to prune even if the
+	// table has gone quiet (Exporter.pruneAgainAt); zero when nothing waits.
+	pruneAgainAt time.Time
+	// versionsHeld is !pruneAgainAt.IsZero(): the scheduler runs the table's
+	// next pass whatever its listing.
 	versionsHeld bool
 	// partial: new files remain unregistered because the pass ran out of time or lost the
 	// writer role. Not an error: what was committed stays, and the next pass continues.
@@ -311,7 +314,8 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 		if err != nil {
 			return reconcileResult{}, err
 		}
-		return reconcileResult{settled: ok && hintOK && !e.healFailed(), schema: arcSchemaOf(tbl), versionsHeld: e.versionsHeldByAge()}, nil
+		again := e.pruneAgainAt()
+		return reconcileResult{settled: ok && hintOK && !e.healFailed(), schema: arcSchemaOf(tbl), pruneAgainAt: again, versionsHeld: !again.IsZero()}, nil
 	}
 
 	// Metadata-only: files are dropped and added as DataFiles. (Transaction.Delete is a
@@ -624,8 +628,9 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 		commits:      commits,
 		droppedCold:  droppedCold,
 		writerLost:   writerGone && !partial && !moved,
-		versionsHeld: e.versionsHeldByAge(),
+		pruneAgainAt: e.pruneAgainAt(),
 	}
+	res.versionsHeld = !res.pruneAgainAt.IsZero()
 	if loopErr != nil {
 		return res, loopErr
 	}
@@ -691,7 +696,17 @@ func (e *Exporter) finishPass(ctx context.Context, tbl *icetable.Table, tkey, da
 			e.setExpiryOwed(tkey, false)
 		}
 	}
-	wrote := e.writeVersionHint(ctx, tbl)
+	// Not when the discovery files already name this metadata (#1787): a pass
+	// that committed nothing would refuse its own v<N> copy, read it back to
+	// compare and write the hint it just read. What a publish does besides
+	// the two files and still applies is done here.
+	wrote := e.alreadyPublished(tbl)
+	if wrote {
+		e.hardenLocalMetadataPerms(tbl.MetadataLocation())
+		e.drainExportLag(tbl.Identifier())
+	} else {
+		wrote = e.writeVersionHint(ctx, tbl)
+	}
 	published := wrote && !e.hintFailed()
 	if err := e.fencedErr(); err != nil {
 		return tbl, false, err
