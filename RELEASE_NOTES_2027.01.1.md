@@ -2,6 +2,16 @@
 
 > **Status:** Planned — January 2027 release.
 
+## New: Flight SQL can list databases as schemas, so Tableau can browse Arc ([#1645](https://github.com/Basekick-Labs/arc/issues/1645))
+
+Flight SQL metadata names a database as a catalog with one empty-named schema. Tableau's JDBC connection cannot select an empty schema, so it listed Arc's databases but never reached a table. A client can now send the call header `x-arc-metadata: schemas`: there are then no catalogs, each database is a schema, and measurements are its tables.
+
+- **Without the header nothing changes:** every client that does not send it (DBeaver, DataGrip, ADBC, the Power BI connector) gets the same metadata as before. `catalogs` asks for the default explicitly; any other value is `INVALID_ARGUMENT`.
+- **Tableau:** add `x-arc-metadata=schemas` to the JDBC URL (the driver passes unknown URL properties as call headers), for example `jdbc:arrow-flight-sql://host:port?useEncryption=false&x-arc-metadata=schemas`. With ADBC, set `adbc.flight.sql.rpc.call_header.x-arc-metadata`.
+- **In the schemas shape** the catalog filter is ignored (Tableau sends one it remembers), the database named exactly as the schema pattern is listed first, and the key listings (primary, imported, exported, cross-reference) answer empty instead of unimplemented: Tableau ends the connection on an unimplemented call when a table is added. Permissions, governance limits and `GetSqlInfo` are the same in both shapes.
+- **Tested** with Tableau Desktop 2026.3 and `flight-sql-jdbc-driver` 19.0.0. `docs/operations/flight-sql.md` has a Tableau section, including the cast that makes `time` a date in Tableau.
+- Flight SQL is off by default (`flight_sql.enabled = false`); nothing here runs unless it is on and the header is sent.
+
 ## Fix: an Iceberg snapshot expiry that failed is retried: every pass tries to expire down to `retain_snapshots` ([#1791](https://github.com/Basekick-Labs/arc/issues/1791))
 
 A reconcile pass expired snapshots over `iceberg.retain_snapshots` only when it had committed something, when an ingest append had come in since the last expiry, or on a table's first pass after a restart. So a table could stay over the bound once it went quiet:
