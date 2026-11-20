@@ -1,11 +1,13 @@
 package iceberg
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/apache/iceberg-go"
@@ -285,4 +287,27 @@ func refOfKey(r *appendRig, key string) (FileRef, error) {
 		}
 	}
 	return FileRef{}, errors.New("not listed: " + key)
+}
+
+// On a node with no election the cause is named at Warn, once per table,
+// however often the append falls back.
+func TestDoubleRegistration1795_TheOtherExporterIsNamedOnce(t *testing.T) {
+	r := newAppendRig(t)
+	var logs bytes.Buffer
+	r.sched.logger = zerolog.New(&logs)
+	first := r.settled()
+	names := []string{first}
+	for i := 0; i < 3; i++ {
+		r.exp.chunkMu.Lock()
+		r.exp.leftAt["mydb\x00cpu"] = "file:///somewhere/else/00099-x.metadata.json"
+		r.exp.chunkMu.Unlock()
+		f := r.newFile()
+		r.report(f)
+		r.serve()
+		names = append(names, f)
+	}
+	r.wantOnce(names...)
+	if got := strings.Count(logs.String(), "another process exports this bucket"); got != 1 {
+		t.Fatalf("warned %d times over three fallbacks, want once", got)
+	}
 }

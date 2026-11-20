@@ -181,6 +181,7 @@ func (s *Scheduler) forgetAppend(key string) {
 	delete(s.recentAdds, key)
 	delete(s.appendFallback, key)
 	delete(s.appendsSince, key)
+	delete(s.otherExporter, key)
 }
 
 // noteRecent records storage keys as in the table (or seen by a pass), and
@@ -376,20 +377,25 @@ func (s *Scheduler) noteAppendFallback(job *ingestJob) {
 	delete(s.appendOK, job.key)
 	s.markAppended(job.key)
 	metrics.Get().IncIcebergIngestAppendFallback()
+	if job.reason == reasonTableMoved && s.gate == nil {
+		// No election runs on this node, so nothing hands the export over to
+		// it: another process committed to the table (#1795). Once per table:
+		// the settled pass that follows clears appendFallback, and with two
+		// exporters this recurs at most ingest exports.
+		if _, warned := s.otherExporter[job.key]; !warned {
+			s.otherExporter[job.key] = struct{}{}
+			s.logger.Warn().Str("database", job.m.Database).Str("measurement", job.m.Measurement).
+				Msg("Iceberg: another process committed to this table, so another process exports this bucket. " +
+					"Run one exporter per bucket (one node, or a cluster with failover): with two, every ingest export of the table runs as a full pass")
+		}
+		return
+	}
 	if s.appendFallback[job.key] != job.reason {
 		// Once per reason per table: a table that keeps falling back would
 		// otherwise say so at every interval.
 		s.appendFallback[job.key] = job.reason
-		if job.reason == reasonTableMoved && s.gate == nil {
-			// No election runs on this node, so nothing hands the export over
-			// to it: another process committed to the table (#1795).
-			s.logger.Warn().Str("database", job.m.Database).Str("measurement", job.m.Measurement).
-				Msg("Iceberg: another process committed to this table, so another process exports this bucket. " +
-					"Run one exporter per bucket (one node, or a cluster with failover): with two, every ingest export of the table runs as a full pass")
-		} else {
-			s.logger.Info().Str("database", job.m.Database).Str("measurement", job.m.Measurement).Str("reason", job.reason).
-				Msg("Iceberg: ingest files not appended; running a reconcile pass of the measurement instead")
-		}
+		s.logger.Info().Str("database", job.m.Database).Str("measurement", job.m.Measurement).Str("reason", job.reason).
+			Msg("Iceberg: ingest files not appended; running a reconcile pass of the measurement instead")
 	}
 }
 
