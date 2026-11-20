@@ -11,7 +11,8 @@ func (e duckDBCheckScanError) Error() string { return e.err.Error() }
 func (e duckDBCheckScanError) Unwrap() error { return e.err }
 
 // checkDuckDB runs the startup test query and returns its row; found is false
-// when the query returned none.
+// when the query returned none. A query error is returned as is, a scan error
+// as a duckDBCheckScanError.
 //
 // The result set is closed before it returns (#1782). main used to defer the
 // close, and main does not return while Arc serves, so the pooled connection
@@ -26,10 +27,8 @@ func checkDuckDB(db *database.DuckDB) (message, version string, found bool, err 
 	}
 	defer rows.Close()
 
+	// No row is not an error, as before: main logs nothing and carries on.
 	if !rows.Next() {
-		if err := rows.Err(); err != nil {
-			return "", "", false, duckDBCheckScanError{err}
-		}
 		return "", "", false, nil
 	}
 	if err := rows.Scan(&message, &version); err != nil {
