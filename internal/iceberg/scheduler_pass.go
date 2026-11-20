@@ -54,8 +54,9 @@ type passJob struct {
 	prev      measurementState
 	cached    bool
 	startedAt time.Time
-	// drops is the exporter's count of drops of the table's database, read
-	// by the pass once it holds the database.
+	// drops is the table's stamp (Exporter.tableDropStamp), read by the pass
+	// once it holds the database and again after it settled the table
+	// against its database's drop record.
 	drops uint64
 
 	// What the pass did.

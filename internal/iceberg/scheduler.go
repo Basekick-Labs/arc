@@ -32,9 +32,10 @@ type measurementState struct {
 	// unchanged table is skipped like any other; without it a table that
 	// goes quiet would keep them for good (#1751, #1787).
 	pruneAt time.Time
-	// drops is how many drops of the table's database the exporter had
-	// counted when this was cached (Exporter.databaseDrops). A pass that
-	// finds another number starts from the table, not from this (#1789).
+	// drops is the table's stamp when this was cached
+	// (Exporter.tableDropStamp: drops of its database in this process, and
+	// changes of the table's lineage under it). A pass that finds another
+	// number starts from the table, not from this (#1789, #1801).
 	drops uint64
 }
 

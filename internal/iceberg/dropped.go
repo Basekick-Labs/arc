@@ -115,11 +115,13 @@ func (e *Exporter) loadTableRecovering(ctx context.Context, ident icetable.Ident
 // recoverDeadRow moves or forgets ident's catalog row, whose metadata file is
 // gone. It reports whether it changed the row.
 //
-// A changed row is another lineage under the name: what the scheduler cached
-// of the table (its schema, its files' footers) and what the export learnt of
-// working on it are of the old one, and are let go of (tableDropStamp). A
-// table recreated with a column of another type was otherwise built with the
-// old one's (#1796).
+// A changed row is usually another lineage under the name (the table was
+// dropped and recreated); what the scheduler cached of the table (its
+// schema, its files' footers) and what the export learnt of working on it
+// are then of the old one, and are let go of (tableDropStamp). A table
+// recreated with a column of another type was otherwise built with the old
+// one's (#1801). When it is the same lineage (a restore's hint ahead of its
+// files, #1613) that costs one look at the table on the next pass.
 func (e *Exporter) recoverDeadRow(ctx context.Context, ident icetable.Identifier) (recovered bool, err error) {
 	if e.backend == nil {
 		return false, nil

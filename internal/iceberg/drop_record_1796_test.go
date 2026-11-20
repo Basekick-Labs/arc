@@ -421,3 +421,123 @@ func TestDropRecord1796_ARowlessNodeDoesNotReviveAColocatedResidue(t *testing.T)
 		t.Fatal("a node with no row adopted what a finished drop left of a colocated table")
 	}
 }
+
+// A finished record written by a build without Finished: the drop's markers
+// are not taken for a drop still running (the #1796 review's M1).
+func TestDropRecord1799_AnOldRecordWithoutFinished(t *testing.T) {
+	r, a, b := sharedDropRig(t)
+	ctx := context.Background()
+	started := time.Now().UTC().Add(-time.Minute)
+	if err := a.writeDropRecord(ctx, "mydb", dropRecord{ID: "old", Started: started, Done: true}); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(r.root, filepath.FromSlash(droppedMarkerKey("arc_mydb", "cpu")))
+	_ = os.MkdirAll(filepath.Dir(marker), 0o700)
+	if err := os.WriteFile(marker, []byte(started.Add(30*time.Second).Format(time.RFC3339)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if b.dropInProgress(ctx, "mydb", "arc_mydb", "cpu") {
+		t.Fatal("a marker of a drop whose record has no Finished reads as a drop running")
+	}
+}
+
+// The lease moves to another node, the database is dropped and written again
+// with a column of another type, the other node exports the new table past
+// this node's old row; the lease comes back. This node adopts the new
+// lineage, and does not export it with what it cached of the old one
+// (the #1796 review's H2, #1801).
+func TestDropRecord1801_AdoptingAnotherLineageAfterALeaseMove(t *testing.T) {
+	r, a, b := sharedDropRig(t)
+	ctx := context.Background()
+	src := NewStorageWalkSource(r.backend, "arc", zerolog.Nop())
+	schedB := NewScheduler(SchedulerConfig{Exporter: b, Source: src, Interval: time.Hour, Logger: zerolog.Nop()})
+	m, key := Measurement{Database: "mydb", Measurement: "cpu"}, "mydb\x00cpu"
+	if _, err := schedB.reconcileOneRecovered(ctx, m, key); err != nil {
+		t.Fatal(err)
+	}
+	r.deleteDatabase(a)
+	c := r.node(true)
+	c.SetForgetDroppedRows(true)
+	schedC := NewScheduler(SchedulerConfig{Exporter: c, Source: src, Interval: time.Hour, Logger: zerolog.Nop()})
+	for i := 0; i < 6; i++ {
+		r.n++
+		writeStringValueParquet(t, filepath.Join(r.root, fmt.Sprintf("mydb/cpu/2023/11/14/22/f%03d.parquet", r.n)), r.base+int64(r.n)*1_000_000, 5)
+		if _, err := schedC.reconcileOneRecovered(ctx, m, key); err != nil {
+			t.Fatalf("c's pass %d: %v", i, err)
+		}
+	}
+	rowLoc, _, _ := b.catalogRow(ctx, "arc_mydb", "cpu")
+	v, _, _ := b.parseVersionAndMetaDir(rowLoc)
+	if rowN, _ := strconv.Atoi(v); rowN >= r.hint() {
+		t.Fatalf("the test's premise: the new lineage published past b's row (row v%d, hint v%d)", rowN, r.hint())
+	}
+	stamp := b.tableDropStamp("mydb", "cpu")
+	// The adoption alone, as b's next pass starts it.
+	if adopted, err := b.adoptPublished(ctx, b.tableIdent("mydb", "cpu"), "arc_mydb", "mydb", "cpu"); err != nil || !adopted {
+		t.Fatalf("b's adoption of the new lineage: adopted=%v err=%v", adopted, err)
+	}
+	if b.tableDropStamp("mydb", "cpu") == stamp {
+		t.Fatal("adopting another lineage did not move the table's stamp: the scheduler keeps what it cached of the old one")
+	}
+	r.n++
+	writeStringValueParquet(t, filepath.Join(r.root, fmt.Sprintf("mydb/cpu/2023/11/14/22/f%03d.parquet", r.n)), r.base+int64(r.n)*1_000_000, 5)
+	var last error
+	for i := 0; i < 3; i++ {
+		_, last = schedB.reconcileOneRecovered(ctx, m, key)
+	}
+	if last != nil {
+		t.Fatalf("b's passes once the lease is back: %v", last)
+	}
+	if n := r.live(b); n != 7 {
+		t.Fatalf("b's table holds %d files, want 7", n)
+	}
+}
+
+// A row the drop left dead, which recovery moves onto a version published
+// before the drop (a restore brought it back), is judged in the same settle:
+// a table from before the drop goes before the pass commits into it.
+func TestDropRecord1796_SettleJudgesARecoveredRow(t *testing.T) {
+	r, a, b := sharedDropRig(t)
+	ctx := context.Background()
+	saved := r.snapshotDirs("arc_mydb.db")
+	r.deleteDatabase(a)
+	// The restore brings back only the published versions and the hint:
+	// b's own row names a metadata file that is not among them.
+	for p := range saved {
+		if base := filepath.Base(p); !strings.HasPrefix(base, "v") && base != "version-hint.text" && strings.HasSuffix(base, ".metadata.json") {
+			delete(saved, p)
+		}
+	}
+	r.restore(saved, false)
+	if err := b.settleDroppedTable(ctx, "mydb", "cpu", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, rowExists, err := b.catalogRow(ctx, "arc_mydb", "cpu"); err != nil || rowExists {
+		t.Fatalf("after one settle b still has a row for a table from before the drop (exists=%v, err=%v)", rowExists, err)
+	}
+}
+
+// Adopting a newer version of the same table (another node advanced it) is
+// not another lineage: what the scheduler cached of it stays.
+func TestDropRecord1801_AdoptingTheSameLineageKeepsTheCache(t *testing.T) {
+	r, _, b := sharedDropRig(t)
+	ctx := context.Background()
+	c := r.node(true)
+	c.SetForgetDroppedRows(true)
+	if adopted, err := c.adoptPublished(ctx, c.tableIdent("mydb", "cpu"), "arc_mydb", "mydb", "cpu"); err != nil || !adopted {
+		t.Fatalf("c's first adoption: adopted=%v err=%v", adopted, err)
+	}
+	for i := 0; i < 2; i++ {
+		r.addFile()
+		if err := r.reconcile(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stamp := c.tableDropStamp("mydb", "cpu")
+	if adopted, err := c.adoptPublished(ctx, c.tableIdent("mydb", "cpu"), "arc_mydb", "mydb", "cpu"); err != nil || !adopted {
+		t.Fatalf("c's adoption of b's newer version: adopted=%v err=%v", adopted, err)
+	}
+	if c.tableDropStamp("mydb", "cpu") != stamp {
+		t.Fatal("adopting a newer version of the same table moved its stamp: the scheduler throws away its cache for nothing")
+	}
+}
