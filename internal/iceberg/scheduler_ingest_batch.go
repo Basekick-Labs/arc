@@ -28,10 +28,10 @@ import (
 //
 // Reconcile passes are never part of a batch of appends. A request that
 // needs one (a table's first export, a fallback, the pass after
-// appendMaxBetweenPasses appends) has it run after the batch: the passes one
-// batch of appends leaves run at once among themselves (scheduler_pass.go,
-// #1786), which in practice is that batch's fallbacks, since the collection
-// above stops at the first request that needs a pass.
+// appendMaxBetweenPasses appends) has it run after the batch: the requests
+// collected that need a pass and the batch's fallbacks run at once among
+// themselves (scheduler_pass.go, #1786), within the service's budget of
+// passes.
 
 // appendTimeout bounds one append of a batch. The loop waits for the whole
 // batch, so a wedged append holds the others' bookkeeping and every other
@@ -70,11 +70,15 @@ func (s *Scheduler) serviceIngestBatches(ctx context.Context, maxRequests, maxPa
 			s.dropIngest() // another node exports
 			return
 		}
-		// Take requests until the batch is full or one needs a pass.
+		// Take requests until the batch of appends is full, or as many need
+		// a pass as may run at once within this service's budget of passes
+		// (a node's tables get their first export this way when their data
+		// arrives after it started: many of them at once, #1786).
 		var batch []*ingestJob
-		var pass *ingestJob
+		var needPass []*ingestJob
+		passRoom := min(s.passConcurrency, maxPasses-passes)
 		took := 0
-		for len(batch) < s.ingestConcurrency && served < maxRequests && pass == nil {
+		for len(batch) < s.ingestConcurrency && served < maxRequests && len(needPass) < passRoom {
 			m, key, ok := s.takeDueIngest(time.Now())
 			if !ok {
 				break // none due yet: the loop's timer comes back for it
@@ -101,9 +105,7 @@ func (s *Scheduler) serviceIngestBatches(ctx context.Context, maxRequests, maxPa
 				if job.kind == ingestFallback {
 					s.noteAppendFallback(job)
 				}
-				// Within its budget: the service returns as soon as it has
-				// run maxPasses passes (below), so one is left here.
-				pass = job
+				needPass = append(needPass, job)
 			}
 		}
 		if took == 0 {
@@ -123,9 +125,7 @@ func (s *Scheduler) serviceIngestBatches(ctx context.Context, maxRequests, maxPa
 			}
 			s.afterIngest(job.m, job.key, outcome, nil, job.took)
 		}
-		if pass != nil {
-			passesDue = append(passesDue, pass)
-		}
+		passesDue = append(passesDue, needPass...)
 		for len(passesDue) > 0 {
 			if ctx.Err() != nil || !s.gateOpen() {
 				// Shutting down, or another node exports now (an append that

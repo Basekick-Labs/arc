@@ -665,3 +665,48 @@ func TestPassBatch_ADatabaseDroppedWhileItsTablesReconcile(t *testing.T) {
 	r.sched.runPass(context.Background())
 	r.wantEachOnce()
 }
+
+// Tables whose data arrives after the node started get their first export
+// from ingest requests: several of those passes at once, not one per service.
+func TestPassBatch_FirstExportsRequestedByIngestRunAtOnce(t *testing.T) {
+	r := newPassRig(t, 8, 4, 4)
+	for _, m := range r.tables {
+		r.report(m, r.files[m][0])
+	}
+	time.Sleep(5 * time.Millisecond)
+	done := r.gate(8, 4)
+	r.sched.serviceIngest(context.Background(), ingestBatch)
+	<-done
+	if most := r.ungate(); most != 4 {
+		t.Errorf("%d first exports at once, want 4", most)
+	}
+	r.wantEachOnce()
+	for _, m := range r.tables {
+		if got := r.src.passes(m); got != 1 {
+			t.Errorf("table %s was listed %d times, want 1", m, got)
+		}
+		if !r.sched.appendOK["mydb\x00"+m] {
+			t.Errorf("table %s does not take appends after its first export", m)
+		}
+	}
+	// Between two measurements of a timed pass: still one.
+	r2 := newPassRig(t, 4, 4, 4)
+	for _, m := range r2.tables {
+		r2.report(m, r2.files[m][0])
+	}
+	time.Sleep(5 * time.Millisecond)
+	r2.sched.serviceIngest(context.Background(), 1)
+	total := 0
+	for _, m := range r2.tables {
+		total += r2.src.passes(m)
+	}
+	if total != 1 {
+		t.Fatalf("%d first exports between two measurements, want 1", total)
+	}
+	r2.sched.reqMu.Lock()
+	due := len(r2.sched.ingestDue)
+	r2.sched.reqMu.Unlock()
+	if due != 3 {
+		t.Fatalf("%d requests still waiting, want the other 3", due)
+	}
+}

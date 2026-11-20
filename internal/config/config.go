@@ -739,9 +739,9 @@ type IcebergConfig struct {
 	// key, ReconcileConcurrency). 1 is one append at a time, as before.
 	IngestExportConcurrency int
 	// ReconcileConcurrency is how many tables' reconcile passes run at once
-	// (#1786): in the timed pass every reconcile_interval (which is also
-	// where every table gets its first export after a start), and for the
-	// passes one batch of ingest appends falls back to. A pass is mostly
+	// (#1786): in the timed pass every reconcile_interval, and for the
+	// passes ingest requests need (a table's first export, a fallback) when
+	// ingest_export_concurrency is above 1. A pass is mostly
 	// waiting on storage requests, so on object storage the tables' passes
 	// overlap. 1 is one table at a time, as before. Standalone nodes only: a
 	// cluster node runs one at a time whatever this says.
