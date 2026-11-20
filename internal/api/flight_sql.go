@@ -239,7 +239,7 @@ func NewFlightSQLServer(queryHandler *QueryHandler, config FlightSQLServerConfig
 		middleware = append(middleware, flightSQLAuthMiddleware(&flightSQLAuth{manager: queryHandler.authManager}))
 	}
 	flightServer := flight.NewServerWithMiddleware(middleware, options...)
-	flightServer.RegisterFlightService(flightsql.NewFlightServer(service))
+	flightServer.RegisterFlightService(flightsql.NewFlightServer(newFlightSQLMetadataModeService(service, logger)))
 
 	return &FlightSQLServer{
 		bridge:     bridge,
