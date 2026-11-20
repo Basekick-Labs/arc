@@ -26,6 +26,8 @@ type exportReads struct {
 	// for their schema; buildDataFiles hands each to iceberg-go and drops it.
 	tails     map[string]fileTail
 	tailBytes int64
+	// maxTailBytes bounds tailBytes; 0 means exportReadsMaxTailBytes.
+	maxTailBytes int64
 	// hints is version-hint.text as the adopt check read it, by metadata
 	// directory, for notePassStart, which would read it again a moment later.
 	hints map[string]int
@@ -57,6 +59,13 @@ func withExportReads(ctx context.Context) context.Context {
 	return context.WithValue(ctx, exportReadsKey{}, &exportReads{})
 }
 
+// withExportReadsBudget is withExportReads for an export that runs beside
+// others: it may hold maxTailBytes of tails, its share of what one export
+// alone holds (#1786).
+func withExportReadsBudget(ctx context.Context, maxTailBytes int64) context.Context {
+	return context.WithValue(ctx, exportReadsKey{}, &exportReads{maxTailBytes: maxTailBytes})
+}
+
 // exportReadsFrom returns the export's reads, or nil outside an export.
 func exportReadsFrom(ctx context.Context) *exportReads {
 	r, _ := ctx.Value(exportReadsKey{}).(*exportReads)
@@ -74,7 +83,11 @@ func (r *exportReads) putTail(physicalPath string, t fileTail) {
 		r.tailBytes -= int64(len(old.data))
 		delete(r.tails, physicalPath)
 	}
-	if r.tailBytes+int64(len(t.data)) > exportReadsMaxTailBytes {
+	limit := r.maxTailBytes
+	if limit <= 0 {
+		limit = exportReadsMaxTailBytes
+	}
+	if r.tailBytes+int64(len(t.data)) > limit {
 		return
 	}
 	if r.tails == nil {

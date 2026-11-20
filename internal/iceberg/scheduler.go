@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/basekick-labs/arc/internal/colname"
 )
@@ -989,208 +988,15 @@ func (s *Scheduler) reconcileOneRecovered(ctx context.Context, m Measurement, ke
 // the (data-file set + local-file set) lets us skip the expensive per-file footer reads and the
 // no-op diff entirely when nothing changed — the common steady-state case.
 func (s *Scheduler) reconcileOne(ctx context.Context, m Measurement, key string) (outcome reconcileOutcome, err error) {
-	// What this pass reads of the store is not read twice (export_reads.go, #1778).
-	ctx = withExportReads(ctx)
-	// One backend listing yields both the data-file URIs and the local paths (Files + LocalFiles
-	// would list the same prefix twice).
-	files, localFiles, err := s.source.FilesAndLocal(ctx, m)
-	if err != nil {
-		if errors.Is(err, errSourcesMoving) {
-			// The listing never held still: nothing was read or committed, and the cached state
-			// (if any) still describes the table, so it is kept.
-			return outcomeBusy, err
-		}
-		return outcomeUnchanged, err
-	}
-	// What this pass has seen is not offered to an append again (#1751).
-	s.noteListed(key, files)
-	if len(files) == 0 {
-		// Every data file is gone (retention/compaction/manual delete). We still reach this code
-		// because Arc's Delete only os.Remove()s the file — the {db}/{measurement}/… directory
-		// tree survives, so Measurements() keeps yielding this measurement. Returning early here
-		// would leave the Iceberg table pointing at deleted files forever, and external engines
-		// fail on the missing paths. Reconcile the table to EMPTY instead.
-		//
-		// Fingerprint-gate it like any other state so a permanently-empty measurement (an emptied
-		// directory Arc never prunes) is emptied ONCE and skipped every pass after — otherwise
-		// every tick re-runs the catalog load + commit and re-logs forever.
-		fp := fingerprint(files, localFiles)
-		if prev, cached := s.state[key]; cached && prev.fingerprint == fp {
-			return outcomeUnchanged, nil
-		}
-		// Only for a table that already exists: an empty directory that never held data must not
-		// mint a zero-column table (EnsureTable would create one with no fields and no partition
-		// spec). Schema is irrelevant when emptying — the existing table's schema is preserved.
-		exists, err := s.exporter.tableExists(ctx, m.Database, m.Measurement)
-		if err != nil {
-			return outcomeUnchanged, err
-		}
-		if !exists {
-			// Cache the negative result too: an empty directory with no table has no
-			// catalog state to reconcile, so unchanged passes need no catalog lookup.
-			s.state[key] = measurementState{fingerprint: fp}
-			return outcomeUnchanged, nil
-		}
-		res, err := s.exporter.reconcile(ctx, reconcileRequest{database: m.Database, measurement: m.Measurement, canCommit: s.canRun})
-		s.passCommits = res.commits
-		if err != nil {
-			return outcomeUnchanged, err
-		}
-		settled := res.settled
-		if !res.writerLost && !res.partial {
-			s.logger.Info().Str("database", m.Database).Str("measurement", m.Measurement).
-				Msg("Iceberg reconcile: all data files gone — table reconciled to empty")
-		}
-		// Cache the empty state (nil schema/localFiles) so a permanently-empty
-		// measurement is emptied once, but only once the discovery files are
-		// published — see the equivalent guard on the main path below.
-		if !settled {
-			delete(s.state, key)
-			return outcomeReconciled, nil
-		}
-		s.state[key] = measurementState{fingerprint: fp}
-		if res.versionsHeld {
-			s.markAppended(key) // come back to prune them (see reconcileResult.versionsHeld)
-		}
-		return outcomeReconciled, nil
-	}
-	// Fingerprint the file set. Unchanged fingerprint + a cached schema => guaranteed no-op
-	// (same files in the table already), so skip the footer reads and the diff.
-	fp := fingerprint(files, localFiles)
-	prev, cached := s.state[key]
-	if cached && prev.fingerprint == fp {
-		return outcomeUnchanged, nil
-	}
-
-	// The set changed (or first sight): work out which files' footers are not already accounted
-	// for — avoiding an O(N) re-read of every footer every time the set grows, local or remote.
-	// The exporter reads those, a chunk at a time, as it registers them. (Removed files can't
-	// remove columns: the table schema is a superset and all fields are optional, so dropping a
-	// file never narrows the schema.)
-	//
-	// What is accounted for: with a cache, the files of the last reconcile. Without one (first
-	// sight, a restart), the table's own schema and the files its current snapshot holds at
-	// their size: a restart then reads no footer for an unchanged table, and on an object store
-	// it does not GET the tail of every file the measurement has ever exported.
-	base, known := prev.schema, prev.schemaFiles
-	if !cached || known == nil {
-		tableSc, tableFiles, ok, err := s.exporter.tableSeed(ctx, m.Database, m.Measurement)
-		if err != nil {
-			return outcomeUnchanged, err
-		}
-		base, known = ArcSchema{}, nil
-		if ok {
-			base = tableSc
-			known = make(map[string]struct{}, len(tableFiles))
-			keyer, _ := s.source.(keyOfURIer)
-			for uri, size := range tableFiles {
-				key := uri
-				if keyer != nil {
-					if k, ok := keyer.KeyOf(uri); ok {
-						key = k
-					}
-				}
-				known[schemaKey(key, size)] = struct{}{}
-			}
-		}
-	}
-	var unread []FileRef
-	for _, f := range files {
-		if _, ok := known[refSchemaKey(f)]; !ok {
-			unread = append(unread, f)
-		}
-	}
-
-	// The unread footers are NOT all read here. The exporter reads them a chunk at a time, only
-	// for the files each commit registers, so a measurement with more new files than fit in one
-	// deadline still commits what it gets through (#1686). A file that is unread but already in
-	// the table at its size (a KeyOf miss) is never read: the table's schema already covers it.
-	res, err := s.exporter.reconcile(ctx, reconcileRequest{
-		database:    m.Database,
-		measurement: m.Measurement,
-		schema:      base,
-		current:     files,
-		unread:      unread,
-		readSchemas: s.unionFileSchemas,
-		canCommit:   s.canRun,
-		exists:      s.fileExists(),
-	})
-	s.passCommits = res.commits // before the error check: a pass can commit chunks and then fail
-	if res.droppedCold {
-		// A cold file vanished: its cached cold listing is stale until invalidated. Before the
-		// error check: a pass can drop a cold file and then fail a later chunk.
-		if ci, ok := s.source.(coldInvalidator); ok {
-			ci.InvalidateCold(m.Database)
-		}
-	}
-	if err != nil {
-		// Drop the entry: this pass may have committed chunks before failing, and a stale entry's
-		// schemaFiles would make the next pass re-read their footers. A cold entry seeds from the
-		// table instead (tableSeed), which has them.
-		delete(s.state, key)
-		return outcomeUnchanged, err
-	}
-	if res.moved {
-		// Files vanished and were left for the next pass. Not cached: the table is not the listing.
-		delete(s.state, key)
-		if res.commits > 0 {
-			return outcomeInProgress, nil
-		}
-		return outcomeBusy, nil
-	}
-	if res.partial {
-		// Not cached, for the same reason: the next pass seeds from the table and continues.
-		delete(s.state, key)
-		return outcomeInProgress, nil
-	}
-
-	// Cache only when the pass fully settled. The snapshot is committed either way, but
-	// caching an unsettled pass would gate this measurement out of every later one — and if
-	// its file set then goes quiet (the steady state) it would stay unsettled indefinitely.
-	// Leaving the entry uncached costs one repeated reconcile per tick until it succeeds.
-	//
-	// Three things can leave a pass unsettled, and the exporter has already logged which:
-	// unpublished reader discovery files, a snapshot expiry that failed on a pass whose
-	// removals made the older snapshots unreadable (#1092), or a heal commit (name mapping,
-	// retention properties) that failed (#1098). All need the same retry, so this does not name
-	// one — a message claiming the hint when the expiry failed would send an operator to the
-	// wrong place.
-	if res.writerLost {
-		// Not a failed step: the exporter logged that the writer role moved; nothing to retry here.
-		delete(s.state, key)
-		return outcomeReconciled, nil
-	}
-	if !res.settled {
-		delete(s.state, key)
-		s.logger.Warn().
-			Str("database", m.Database).Str("measurement", m.Measurement).
-			Msg("Iceberg reconcile: pass did not fully settle (see the preceding error for which step); will retry next pass")
-		return outcomeReconciled, nil
-	}
-
-	schemaSet := make(map[string]struct{}, len(files))
-	for _, f := range files {
-		schemaSet[refSchemaKey(f)] = struct{}{}
-	}
-	// The table's schema, not a union of footers: every listed file is now in the table, so it
-	// covers all of them, and it is exactly what the next pass's EnsureTable compares against.
-	s.state[key] = measurementState{fingerprint: fp, schema: res.schema, schemaFiles: schemaSet}
-	if res.versionsHeld {
-		// Published versions are waiting out iceberg.min_version_age: the
-		// next pass runs whatever the listing is, and prunes the ones old
-		// enough by then. Without this a table that goes quiet would keep
-		// them, since an unchanged table's pass is skipped.
-		s.markAppended(key)
-	}
-	return outcomeReconciled, nil
-}
-
-// fileExists is the source's existence check for the reconcile, or nil when it has none.
-func (s *Scheduler) fileExists() func(context.Context, FileRef) (bool, error) {
-	if fe, ok := s.source.(fileExister); ok {
-		return fe.FileExists
-	}
-	return nil
+	// One table, start to end, on the loop goroutine: the three steps a
+	// batch runs for several tables at once (scheduler_pass.go, #1786).
+	job := s.preparePass(m, key)
+	// Deferred: a pass can commit and then panic, and the commits it made
+	// and the cold listing it found stale are true either way.
+	defer s.applyPassEffects(job)
+	job.outcome, job.err = s.passRunner(unionSchemaConcurrency).reconcile(ctx, job, s.exporter)
+	s.applyPassState(job)
+	return job.outcome, job.err
 }
 
 // canRun reports whether this node may still write Iceberg metadata (nil gate = always).
@@ -1215,43 +1021,9 @@ func fingerprint(files []FileRef, localFiles []string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// unionFileSchemas derives the union schema of files through the source's FileSchema, reading
-// footers in parallel (bounded, as UnionSchema does) and folding them in the files' order so
-// column order and conflict detection do not depend on scheduling.
+// unionFileSchemas reads and merges the files' schemas (passRunner.unionFileSchemas).
 func (s *Scheduler) unionFileSchemas(ctx context.Context, files []FileRef) (ArcSchema, error) {
-	schemas := make([]ArcSchema, len(files))
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(unionSchemaConcurrency)
-	for i, f := range files {
-		g.Go(func() error {
-			if err := gctx.Err(); err != nil {
-				return err
-			}
-			sc, err := s.source.FileSchema(gctx, f)
-			if err != nil {
-				return fmt.Errorf("file %q: %w", f.PhysicalPath, err)
-			}
-			schemas[i] = sc
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
-		return ArcSchema{}, err
-	}
-	var out ArcSchema
-	for i, sc := range schemas {
-		// Each column remembers the file it came from, so a conflict, here or when the caller
-		// merges this schema with the table's, names the files (#1744).
-		sc.sources = make(map[string]string, len(sc.Fields))
-		for _, f := range sc.Fields {
-			sc.sources[f.Name] = fileRefKey(files[i])
-		}
-		var err error
-		if out, err = MergeSchemas(out, sc); err != nil {
-			return ArcSchema{}, markConflict(err, conflictWithFiles)
-		}
-	}
-	return out, nil
+	return s.passRunner(unionSchemaConcurrency).unionFileSchemas(ctx, files)
 }
 
 // fileRefKey is the storage key of a file, or its physical path when the source has none.
