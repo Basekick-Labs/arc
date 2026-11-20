@@ -59,15 +59,67 @@ type databaseLocks struct {
 	// process: what was learnt of a table under one count is not true under
 	// the next (databaseDrops).
 	drops map[string]uint64
+	// removals counts, by "<database>\x00<measurement>", the tables this
+	// process removed because another node had dropped their database
+	// (shared_drop.go): the same, for one table (tableDropStamp).
+	removals map[string]uint64
+}
+
+// countTableRemoval records that the table was removed (shared_drop.go).
+func (e *Exporter) countTableRemoval(database, measurement string) {
+	e.dbLocks.mu.Lock()
+	defer e.dbLocks.mu.Unlock()
+	if e.dbLocks.removals == nil {
+		e.dbLocks.removals = make(map[string]uint64)
+	}
+	e.dbLocks.removals[database+"\x00"+measurement]++
+}
+
+// tableDropStamp changes whenever what the scheduler learnt of the table
+// stops being true: the database's tables were dropped in this process, or
+// this table was removed because another node dropped its database. Two
+// counts that only grow, so their sum does too.
+func (e *Exporter) tableDropStamp(database, measurement string) uint64 {
+	e.dbLocks.mu.Lock()
+	defer e.dbLocks.mu.Unlock()
+	return e.dbLocks.drops[databaseLockKey(database)] + e.dbLocks.removals[database+"\x00"+measurement]
+}
+
+// forgetTableMemory is forgetDatabaseMemory for one table: what this
+// exporter remembers of a table removed because its database was dropped on
+// another node (shared_drop.go).
+func (e *Exporter) forgetTableMemory(database, measurement string) {
+	ident := e.tableIdent(database, measurement)
+	key := strings.Join(ident, "\x00")
+	e.publishedMu.Lock()
+	delete(e.published, key)
+	delete(e.markerCleared, key)
+	delete(e.hinted, key)
+	e.publishedMu.Unlock()
+	e.forgetExportLag(ident)
+	e.forgetTableWork(database, measurement)
+}
+
+// forgetTableWork forgets what the export learnt of working on the table
+// (its chunk size, its manifests, the drop id it was found to carry): not
+// true of another lineage under the name.
+func (e *Exporter) forgetTableWork(database, measurement string) {
+	tkey := database + "\x00" + measurement
+	e.dropSeenMu.Lock()
+	delete(e.dropSeen, tkey)
+	e.dropSeenMu.Unlock()
+	e.chunkMu.Lock()
+	delete(e.appendSmall, tkey)
+	delete(e.chunkSize, tkey)
+	delete(e.floorDue, tkey)
+	e.chunkMu.Unlock()
 }
 
 // databaseDrops is how many times the database's tables have been dropped in
-// this process, a table removed because another node dropped its database
-// included (shared_drop.go). A pass reads it while it holds the database, so
-// no drop in this process changes it under the pass (the pass itself can,
-// by removing such a table, and then it ends with an error and caches
-// nothing); what the scheduler cached for a table under another number
-// describes a table that is gone, whatever now has its name.
+// this process. A pass reads it (in tableDropStamp) while it holds the
+// database, so no drop in this process changes it under the pass; what the
+// scheduler cached for a table under another number describes a table that
+// is gone, whatever now has its name.
 func (e *Exporter) databaseDrops(database string) uint64 {
 	e.dbLocks.mu.Lock()
 	defer e.dbLocks.mu.Unlock()

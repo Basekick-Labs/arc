@@ -281,12 +281,22 @@ func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter)
 	// table that drop meant to remove is removed: before anything of the
 	// table is read, and only in a pass that will read it, not in one that
 	// finds its files unchanged (shared_drop.go, #1792).
+	// A table it removes is gone from what was cached of it too: the stamp
+	// moved, and the pass starts from the table as on first sight, not from
+	// the removed table's schema and footers.
 	settle := func() (reconcileOutcome, error) {
 		err := exp.settleDroppedTable(ctx, m.Database, m.Measurement, r.canRun)
 		if errors.Is(err, errDatabaseBeingDropped) {
 			return outcomeBusy, err
 		}
-		return outcomeUnchanged, err
+		if err != nil {
+			return outcomeUnchanged, err
+		}
+		if stamp := exp.tableDropStamp(m.Database, m.Measurement); stamp != job.drops {
+			job.drops = stamp
+			job.prev, job.cached = measurementState{}, false
+		}
+		return outcomeUnchanged, nil
 	}
 	// What the scheduler remembered of the table was copied before this pass
 	// had the database. If the database was dropped since it was cached (at
@@ -295,7 +305,7 @@ func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter)
 	// and its files' footers are not those of a table recreated under the
 	// name, and a pass that trusted them built the new table with the old
 	// columns. Start from the table, as on first sight.
-	job.drops = exp.databaseDrops(m.Database)
+	job.drops = exp.tableDropStamp(m.Database, m.Measurement)
 	if job.cached && job.prev.drops != job.drops {
 		job.prev, job.cached = measurementState{}, false
 	}
@@ -374,6 +384,7 @@ func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter)
 	if out, err := settle(); err != nil {
 		return out, err
 	}
+	prev, cached = job.prev, job.cached
 
 	// The set changed (or first sight): work out which files' footers are not already accounted
 	// for — avoiding an O(N) re-read of every footer every time the set grows, local or remote.

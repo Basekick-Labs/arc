@@ -591,7 +591,7 @@ func (e *Exporter) tableExists(ctx context.Context, database, measurement string
 			return false, err
 		}
 		if coloc, cerr := e.colocatedTableLocation(database, measurement); cerr == nil && sameLocation(dir, coloc+"/metadata") &&
-			(!e.forgetDroppedRows || e.dropInProgress(ctx, nsKey, measurement)) {
+			(!e.forgetDroppedRows || e.markerSet(ctx, nsKey, measurement)) {
 			return false, nil
 		}
 	}
@@ -2414,8 +2414,16 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 		dctx, cancel := context.WithDeadline(ctx, dropDeadline(rec.Started))
 		defer cancel()
 		if err := e.dropDatabase(dctx, database); err != nil {
-			// The record stays "not done": the database's export waits for
-			// the DELETE to be repeated, or for the record to go stale.
+			// A drop that failed has stopped deleting, unless it failed on
+			// its context: a backend need not end a delete when its context
+			// does, and the record's half-life margin is what covers those
+			// (dropDeadline). So the record is finished now (the exporting
+			// node then removes what predates it, whenever the database is
+			// written again) except after a deadline or a cancel, where it
+			// stays "running" until it is stale.
+			if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+				e.finishDropRecord(ctx, database, rec)
+			}
 			return err
 		}
 		// Kept also when the drop found nothing: a first export of one of

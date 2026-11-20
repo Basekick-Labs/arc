@@ -185,7 +185,7 @@ func (e *Exporter) adoptPublished(ctx context.Context, ident icetable.Identifier
 
 	vKey := path.Join(dirKey, "v"+strconv.Itoa(target)+".metadata.json")
 	body, err := e.backend.Read(ctx, vKey)
-	if err != nil && storage.IsNotFound(err) && rowExists && target == hintN && !e.dropInProgress(ctx, nsKey, measurement) {
+	if err != nil && storage.IsNotFound(err) && rowExists && target == hintN && !e.dropInProgress(ctx, database, nsKey, measurement) {
 		// The hint names a version that is not there: a backup copies the
 		// hint as it is at copy time, which can be newer than the v<N> files
 		// it listed (#1613). Decide again, once, from the newest v<N>

@@ -49,6 +49,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	icetable "github.com/apache/iceberg-go/table"
 
@@ -113,11 +114,24 @@ func (e *Exporter) loadTableRecovering(ctx context.Context, ident icetable.Ident
 
 // recoverDeadRow moves or forgets ident's catalog row, whose metadata file is
 // gone. It reports whether it changed the row.
-func (e *Exporter) recoverDeadRow(ctx context.Context, ident icetable.Identifier) (bool, error) {
+//
+// A changed row is another lineage under the name: what the scheduler cached
+// of the table (its schema, its files' footers) and what the export learnt of
+// working on it are of the old one, and are let go of (tableDropStamp). A
+// table recreated with a column of another type was otherwise built with the
+// old one's (#1796).
+func (e *Exporter) recoverDeadRow(ctx context.Context, ident icetable.Identifier) (recovered bool, err error) {
 	if e.backend == nil {
 		return false, nil
 	}
 	nsKey, measurement := catalogNamespaceKey(ident[:len(ident)-1]), ident[len(ident)-1]
+	defer func() {
+		if recovered {
+			database := databaseOfIdent(e.nsPrefix, ident)
+			e.countTableRemoval(database, measurement)
+			e.forgetTableWork(database, measurement)
+		}
+	}()
 	rowLoc, rowExists, err := e.catalogRow(ctx, nsKey, measurement)
 	if err != nil || !rowExists {
 		return false, err
@@ -155,7 +169,7 @@ func (e *Exporter) recoverDeadRow(ctx context.Context, ident icetable.Identifier
 	if target >= 0 {
 		vKey = path.Join(dirKey, "v"+strconv.Itoa(target)+".metadata.json")
 		body, err = e.backend.Read(ctx, vKey)
-		if err != nil && storage.IsNotFound(err) && target > newest && !e.dropInProgress(ctx, nsKey, measurement) {
+		if err != nil && storage.IsNotFound(err) && target > newest && !e.dropInProgress(ctx, databaseOfIdent(e.nsPrefix, ident), nsKey, measurement) {
 			// The hint names a version that is not there: a backup copies
 			// the hint as it is at copy time, which can be newer than the
 			// v<N> files it listed (#1613). The newest present one, even
@@ -208,13 +222,46 @@ func (e *Exporter) recoverDeadRow(ctx context.Context, ident icetable.Identifier
 	return true, nil
 }
 
-// dropInProgress reports whether ident carries a drop marker, where markers
-// are written (forgetDroppedRows). A database DROP deletes the v<N> files in
-// lexical order and the hint last, so while it runs a hint can name a missing
-// version and the newest v<N> left is arbitrary: the missing-hint fallbacks
-// must not follow it. A marker that cannot be read counts as set: the pass
+// dropInProgress reports whether a drop of the table may be running, where
+// markers are written (forgetDroppedRows). A database DROP deletes the v<N>
+// files in lexical order and the hint last, so while it runs a hint can name
+// a missing version and the newest v<N> left is arbitrary: the missing-hint
+// fallbacks must not follow it.
+//
+// The table's marker says a drop happened; the database's drop record
+// (shared_drop.go) says whether it is over. A marker no newer than when the
+// record's drop stopped is that drop's, or an earlier one's, and none of them
+// is running: the fallbacks apply again. That is what a database restored
+// after such a drop needs, whose hint can name a version its backup did not
+// list (#1613): the marker outlives the restore (#1799). A marker with no
+// record (a drop by a node without drop records), one newer than the record's
+// drop, and anything that cannot be read count as a drop running: the pass
 // fails as it did before the fallback existed and retries.
-func (e *Exporter) dropInProgress(ctx context.Context, nsKey, measurement string) bool {
+func (e *Exporter) dropInProgress(ctx context.Context, database, nsKey, measurement string) bool {
+	if !e.forgetDroppedRows || e.backend == nil {
+		return false
+	}
+	body, err := e.backend.Read(ctx, droppedMarkerKey(nsKey, measurement))
+	if err != nil {
+		return !storage.IsNotFound(err)
+	}
+	marked, err := time.Parse(time.RFC3339, strings.TrimSpace(string(body)))
+	if err != nil {
+		return true
+	}
+	rec, exists, err := e.readDropRecord(ctx, database)
+	if err != nil || !exists {
+		return true
+	}
+	stopped, ok := rec.stopped()
+	return !ok || marked.After(stopped)
+}
+
+// markerSet reports whether the table carries a drop marker, where markers
+// are written, whatever became of the drop: a rowless node does not adopt a
+// colocated table whose database was dropped (tableExists, #1676). A marker
+// that cannot be read counts as set.
+func (e *Exporter) markerSet(ctx context.Context, nsKey, measurement string) bool {
 	if !e.forgetDroppedRows || e.backend == nil {
 		return false
 	}
