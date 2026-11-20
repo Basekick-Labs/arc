@@ -146,9 +146,17 @@ func TestSharedDrop1792_APassCommitsBetweenTheDropsListingAndItsDeletes(t *testi
 		t.Fatalf("DropDatabase: %v", err)
 	}
 	a.dropAfterListing = nil
-	t.Logf("b's pass inside a's drop: err=%v", passErr)
-	left, _ := os.ReadDir(r.metaDir())
-	t.Logf("objects left in the table's metadata directory after the drop: %d", len(left))
+	// The pass saw at its end that the database had been dropped under it,
+	// and removed what it had written: nothing waits for a later pass.
+	if !errors.Is(passErr, errDroppedUnderPass) {
+		t.Fatalf("b's pass inside a's drop ended with %v, want errDroppedUnderPass", passErr)
+	}
+	if left, _ := os.ReadDir(r.metaDir()); len(left) != 0 {
+		t.Fatalf("%d objects of the dropped table are left once the drop and the pass have ended", len(left))
+	}
+	if _, rowExists, err := b.catalogRow(ctx, "arc_mydb", "cpu"); err != nil || rowExists {
+		t.Fatalf("the exporting node kept its row for the dropped table (exists=%v, err=%v)", rowExists, err)
+	}
 	// The database is written again, and b exports it.
 	r.addFile()
 	r.addFile()
@@ -452,5 +460,83 @@ func TestSharedDrop1792_TheSchedulersPassRemovesTheBrokenTable(t *testing.T) {
 	}
 	if _, settled := sched.state[key]; !settled {
 		t.Error("the recreated table did not settle")
+	}
+}
+
+// The look at the end of a pass: a node that is no longer the exporter
+// removes nothing (the node that is decides); the exporter removes the table,
+// forgets what it knew of the database and tells its scheduler.
+func TestSharedDrop1792_TheEndOfAPassWhoseDatabaseWasDropped(t *testing.T) {
+	r, a, b := sharedDropRig(t)
+	ctx := context.Background()
+	// b's pass started with no record; a drop has been recorded since.
+	if err := b.settleDroppedTable(ctx, "mydb", "cpu"); err != nil || b.dropID != "" {
+		t.Fatalf("settle with no record: err=%v dropID=%q", err, b.dropID)
+	}
+	rec, _, err := a.beginDropRecord(ctx, "mydb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.Done = true
+	if err := a.writeDropRecord(ctx, "mydb", rec); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadDir(r.metaDir())
+	if b.droppedUnderPass(ctx, "mydb", "cpu", func() bool { return false }) {
+		t.Fatal("a node that lost the writer role acted on another node's drop")
+	}
+	if after, _ := os.ReadDir(r.metaDir()); len(after) != len(before) || len(before) == 0 {
+		t.Fatalf("a node that lost the writer role removed the table (%d objects, was %d)", len(after), len(before))
+	}
+	var told []string
+	b.SetOnDatabaseDropped(func(db string) { told = append(told, db) })
+	drops := b.databaseDrops("mydb")
+	b.setSmallManifests("mydb\x00cpu", 2)
+	if !b.droppedUnderPass(ctx, "mydb", "cpu", func() bool { return true }) {
+		t.Fatal("the exporter did not act on a drop recorded during its pass")
+	}
+	if left, _ := os.ReadDir(r.metaDir()); len(left) != 0 {
+		t.Fatalf("%d objects of the dropped table are left", len(left))
+	}
+	if b.databaseDrops("mydb") != drops+1 {
+		t.Error("the exporter did not count the drop: a pass would trust what was cached for the dropped table")
+	}
+	if _, ok := b.smallManifests("mydb\x00cpu"); ok {
+		t.Error("the exporter kept what it knew of the dropped table")
+	}
+	if len(told) != 1 || told[0] != "mydb" {
+		t.Errorf("the scheduler was told %v, want mydb once", told)
+	}
+	// The same record again is not another drop.
+	b.dropID = rec.ID
+	if b.droppedUnderPass(ctx, "mydb", "cpu", func() bool { return true }) {
+		t.Error("a pass that started under the record took it for a drop during the pass")
+	}
+}
+
+// A drop that found nothing removes the record it wrote, and only that one:
+// a record another drop has written since stays.
+func TestSharedDrop1792_ADropThatFoundNothingLeavesAnotherDropsRecord(t *testing.T) {
+	r, a, _ := sharedDropRig(t)
+	ctx := context.Background()
+	mine, _, err := a.beginDropRecord(ctx, "mydb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, _, err := a.beginDropRecord(ctx, "mydb") // another drop, since
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.removeDropRecord(ctx, "mydb", mine); err != nil {
+		t.Fatal(err)
+	}
+	if rec, exists := r.dropRecord(a); !exists || rec.ID != other.ID {
+		t.Fatalf("the record after removing an older drop's: exists=%v id=%q, want the newer drop's %q", exists, rec.ID, other.ID)
+	}
+	if err := a.removeDropRecord(ctx, "mydb", other); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := r.dropRecord(a); exists {
+		t.Fatal("a drop that found nothing left its own record")
 	}
 }
