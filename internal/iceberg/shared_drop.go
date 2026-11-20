@@ -153,7 +153,6 @@ func (e *Exporter) removeDropRecord(ctx context.Context, database string, mine d
 // pass (a table the pass creates carries it, and the pass's end compares
 // with it). A no-op where there are no records.
 func (e *Exporter) settleDroppedTable(ctx context.Context, database, measurement string) error {
-	e.dropSettled = true
 	e.dropID = ""
 	if !e.forgetDroppedRows || e.backend == nil {
 		return nil
@@ -216,6 +215,7 @@ func (e *Exporter) removeTableOfAnEarlierDrop(ctx context.Context, database, mea
 	if err := e.forgetCatalogRow(ctx, nsKey, measurement, loc); err != nil {
 		return err
 	}
+	e.removeEmptiedTableDirs(ctx, database, tbl.MetadataLocation())
 	// What this node remembered of the table, and of its database's tables
 	// for the scheduler: as after a drop in this process.
 	e.countDatabaseDrop(database)
@@ -224,6 +224,33 @@ func (e *Exporter) removeTableOfAnEarlierDrop(ctx context.Context, database, mea
 		e.onDatabaseDropped(database)
 	}
 	return nil
+}
+
+// removeEmptiedTableDirs removes the directories a removed table leaves
+// empty on a filesystem (object stores have none): its metadata directory,
+// its own, and the namespace's or, colocated, the database's (and the
+// spoke's). An empty measurement directory would keep a dropped database
+// listed (#1676). Each removal fails, and is meant to, when the directory
+// still holds something: another table, or the data written since.
+func (e *Exporter) removeEmptiedTableDirs(ctx context.Context, database, metaLoc string) {
+	remover, ok := e.backend.(storage.DirectoryRemover)
+	if !ok {
+		return
+	}
+	_, dir, ok := e.parseVersionAndMetaDir(metaLoc)
+	if !ok {
+		return
+	}
+	levels := 3 // metadata, the table, the namespace or database
+	if e.colocatedLayout() && strings.Contains(database, "/") {
+		levels = 4 // and the spoke
+	}
+	for i := 0; i < levels && dir != "" && dir != "." && dir != "/"; i++ {
+		if err := remover.RemoveDirectory(ctx, dir); err != nil {
+			return
+		}
+		dir = path.Dir(dir)
+	}
 }
 
 // errDroppedUnderPass is a pass's error when its database was dropped on

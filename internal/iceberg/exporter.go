@@ -115,10 +115,9 @@ type passState struct {
 	// (pruneAgainAt). Zero: nothing is waiting.
 	passPruneDue time.Time
 	// dropID is the id of the database's drop record as this pass found it
-	// ("" when there is none), and dropSettled that settleDroppedTable has
-	// run for the pass (shared_drop.go).
-	dropID      string
-	dropSettled bool
+	// ("" when there is none): what a table the pass creates carries, and
+	// what the end of the pass compares the record with (shared_drop.go).
+	dropID string
 	// passGate, while a reconcile runs, is its canCommit: EnsureTable's heals check it before
 	// committing, so a node that lost the writer role mid-pass does not publish a heal (#1097).
 	// nil outside a reconcile (always allowed).
@@ -2338,6 +2337,14 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 			e.onDatabaseDropped(database)
 		}
 	}()
+	if recorded {
+		// The other nodes believe the record for dropRecordStale and then
+		// export the database again: this drop must have stopped deleting
+		// well before that, or it would delete what they then write.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, rec.Started.Add(dropRecordStale*2/3))
+		defer cancel()
+	}
 	var found bool
 	if err := e.dropDatabase(ctx, database, &found); err != nil {
 		return err // the record stays "not done": the export waits for the DELETE to be repeated
@@ -2472,6 +2479,11 @@ func (e *Exporter) dropDatabase(ctx context.Context, database string, found *boo
 	if e.dropAfterListing != nil {
 		e.dropAfterListing()
 	}
+	// A drop past its deadline deletes nothing more (DropDatabase): not
+	// every backend ends a delete when its context does.
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("drop iceberg tables of database %q: %w", database, err)
+	}
 	// The SQL catalog's DropNamespace refuses non-empty namespaces, so drop
 	// every table first. Collect the first error but keep going: partial
 	// cleanup converges on the next delete attempt.
@@ -2558,6 +2570,9 @@ func (e *Exporter) dropDatabase(ctx context.Context, database string, found *boo
 			return strings.HasSuffix(tkeys[i], "/version-hint.text") && !strings.HasSuffix(tkeys[j], "/version-hint.text")
 		})
 		for _, key := range tkeys {
+			if err := ctx.Err(); err != nil {
+				return fmt.Errorf("delete colocated Iceberg metadata of database %q: %w", database, err)
+			}
 			if err := e.backend.Delete(ctx, key); err != nil && !storage.IsNotFound(err) && firstErr == nil {
 				firstErr = fmt.Errorf("delete colocated Iceberg metadata %s: %w", key, err)
 			}
@@ -2605,6 +2620,9 @@ func (e *Exporter) deleteWarehouseDir(ctx context.Context, relDir string, keys [
 	var firstErr error
 	dirs := map[string]bool{relDir: true}
 	for _, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("delete warehouse objects under %s: %w", relDir, err)
+		}
 		if err := e.backend.Delete(ctx, key); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("delete warehouse object %s: %w", key, err)
 		}

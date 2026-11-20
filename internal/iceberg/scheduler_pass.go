@@ -339,7 +339,7 @@ func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter)
 			job.setState(measurementState{fingerprint: fp})
 			return outcomeUnchanged, nil
 		}
-		res, err := exp.reconcile(ctx, reconcileRequest{database: m.Database, measurement: m.Measurement, canCommit: r.canRun})
+		res, err := exp.reconcile(ctx, reconcileRequest{database: m.Database, measurement: m.Measurement, canCommit: r.canRun, dropChecked: true})
 		job.commits = res.commits
 		if err != nil {
 			return outcomeUnchanged, err
@@ -413,6 +413,7 @@ func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter)
 	res, err := exp.reconcile(ctx, reconcileRequest{
 		database:    m.Database,
 		measurement: m.Measurement,
+		dropChecked: true,
 		schema:      base,
 		current:     files,
 		unread:      unread,

@@ -153,6 +153,22 @@ func (e *Exporter) appendFiles(ctx context.Context, database, measurement string
 		return res, err
 	}
 	e.notePassStart(ctx, tbl)
+	// On a shared bucket, an append that reaches its commit looks at the
+	// database's drop record when it ends, however it ends: a table that is
+	// not of the latest drop was dropped on another node, under this append
+	// or before it, and goes with what the append wrote (shared_drop.go,
+	// #1792). After the commit and not before it: the look is one read per
+	// append, and a drop can begin at any point before the publish.
+	e.dropID = dropIDOf(tbl)
+	reachedCommit := false
+	defer func() {
+		if reachedCommit && e.droppedUnderPass(ctx, database, measurement, canCommit) {
+			res = appendResult{}
+			if err == nil {
+				err = fmt.Errorf("%s.%s: %w", database, measurement, errDroppedUnderPass)
+			}
+		}
+	}()
 
 	add, err := readSchemas(ctx, files)
 	if err != nil {
@@ -206,6 +222,7 @@ func (e *Exporter) appendFiles(ctx context.Context, database, measurement string
 			return res, fmt.Errorf("iceberg append: disable manifest merge: %w", err)
 		}
 	}
+	reachedCommit = true
 	committed, err := txn.Commit(ctx)
 	if err != nil {
 		return res, fmt.Errorf("iceberg append commit (%d files): %w", len(built), err)

@@ -59,6 +59,9 @@ const stopWriterLost = "writer role lost"
 // reconcileRequest is one measurement's reconcile input.
 type reconcileRequest struct {
 	database, measurement string
+	// dropChecked: the caller ran settleDroppedTable on this Exporter for
+	// this pass (shared_drop.go); otherwise reconcile does.
+	dropChecked bool
 	// schema covers every file in current except those in unread.
 	schema ArcSchema
 	// current is the measurement's full listing. It is always the whole listing, never the
@@ -135,18 +138,15 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 	// another node, and remove a table that drop meant to remove
 	// (shared_drop.go, #1792). The scheduler does this before it reads the
 	// table; a caller that has not is covered here.
-	if !e.dropSettled {
+	if !req.dropChecked {
 		if err := e.settleDroppedTable(ctx, database, measurement); err != nil {
 			return reconcileResult{}, err
 		}
 	}
-	e.dropSettled = false
-	// And at the end of a pass that wrote something: if the database was
-	// dropped on another node meanwhile, what was written goes.
+	// And at the end of the pass, however it ends (a pass can commit and
+	// then fail): if the database was dropped on another node meanwhile,
+	// what the pass wrote goes.
 	defer func() {
-		if res.commits == 0 && len(e.passHints) == 0 {
-			return
-		}
 		if e.droppedUnderPass(ctx, database, measurement, req.canCommit) {
 			res.settled = false
 			if err == nil {

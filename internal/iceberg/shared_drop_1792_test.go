@@ -23,10 +23,19 @@ import (
 // sharedDropRig is two nodes on one bucket, b having exported the table.
 func sharedDropRig(t *testing.T) (r *warehouseRig, a, b *Exporter) {
 	t.Helper()
+	return sharedDropRigLayout(t, layoutWarehouse)
+}
+
+func sharedDropRigLayout(t *testing.T, layout string) (r *warehouseRig, a, b *Exporter) {
+	t.Helper()
 	r = newWarehouseRig(t)
 	a, b = r.node(true), r.node(true)
-	a.SetForgetDroppedRows(true)
-	b.SetForgetDroppedRows(true)
+	for _, n := range []*Exporter{a, b} {
+		if err := n.SetLayout(layout); err != nil {
+			t.Fatal(err)
+		}
+		n.SetForgetDroppedRows(true)
+	}
 	for i := 0; i < 3; i++ {
 		r.addFile()
 		if err := r.reconcile(b); err != nil {
@@ -52,11 +61,23 @@ func (r *warehouseRig) schemaNow() ArcSchema {
 	return ArcSchema{}
 }
 
+// deleteData removes the database's data files, as the DELETE does before
+// the Iceberg drop: not the colocated metadata beside them, which is the
+// drop's.
+func (r *warehouseRig) deleteData() error {
+	return filepath.WalkDir(filepath.Join(r.root, "mydb"), func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(p, ".parquet") {
+			return err
+		}
+		return os.Remove(p)
+	})
+}
+
 // deleteDatabase is the DELETE as node a runs it: the data files, then the
 // Iceberg drop.
 func (r *warehouseRig) deleteDatabase(a *Exporter) {
 	r.t.Helper()
-	if err := os.RemoveAll(filepath.Join(r.root, "mydb")); err != nil {
+	if err := r.deleteData(); err != nil {
 		r.t.Fatal(err)
 	}
 	if err := a.DropDatabase(context.Background(), "mydb"); err != nil {
@@ -154,6 +175,7 @@ func TestSharedDrop1792_APassCommitsBetweenTheDropsListingAndItsDeletes(t *testi
 	if left, _ := os.ReadDir(r.metaDir()); len(left) != 0 {
 		t.Fatalf("%d objects of the dropped table are left once the drop and the pass have ended", len(left))
 	}
+	r.goneFromStorage("arc_mydb.db", "mydb/cpu/metadata")
 	if _, rowExists, err := b.catalogRow(ctx, "arc_mydb", "cpu"); err != nil || rowExists {
 		t.Fatalf("the exporting node kept its row for the dropped table (exists=%v, err=%v)", rowExists, err)
 	}
@@ -538,5 +560,177 @@ func TestSharedDrop1792_ADropThatFoundNothingLeavesAnotherDropsRecord(t *testing
 	}
 	if _, exists := r.dropRecord(a); exists {
 		t.Fatal("a drop that found nothing left its own record")
+	}
+}
+
+// overlap runs export on node b up to its commit, then the DELETE on node a,
+// whose drop lists and writes its markers before the export commits and
+// publishes, and deletes after: the order that left a broken table. It
+// returns the export's error.
+func (r *warehouseRig) overlap(a *Exporter, export func(canCommit func() bool) error) error {
+	r.t.Helper()
+	readyToCommit, listed, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	var exportErr error
+	go func() {
+		defer close(done)
+		exportErr = export(func() bool {
+			once.Do(func() { close(readyToCommit); <-listed })
+			return true
+		})
+	}()
+	select {
+	case <-readyToCommit:
+	case <-done:
+		r.t.Fatalf("the export ended before its commit: %v", exportErr)
+	}
+	a.dropAfterListing = func() { close(listed); <-done }
+	r.deleteDatabase(a)
+	a.dropAfterListing = nil
+	return exportErr
+}
+
+// goneFromStorage fails when anything of the dropped database is left: on a
+// shared filesystem an empty directory keeps a database or a namespace
+// listed.
+func (r *warehouseRig) goneFromStorage(dirs ...string) {
+	r.t.Helper()
+	for _, d := range dirs {
+		if _, err := os.Stat(filepath.Join(r.root, d)); !os.IsNotExist(err) {
+			r.t.Errorf("%s is still there once the drop and the overlapped export have ended (stat: %v)", d, err)
+		}
+	}
+}
+
+// The commoner route: an ingest append, not a pass, is at its commit when
+// the database is dropped on another node.
+func TestSharedDrop1792_AnAppendCommitsBetweenTheDropsListingAndItsDeletes(t *testing.T) {
+	for _, layout := range []string{layoutWarehouse, layoutColocated} {
+		t.Run(layout, func(t *testing.T) {
+			r, a, b := sharedDropRigLayout(t, layout)
+			ctx := context.Background()
+			all := r.addFile()
+			sc := r.schemaNow()
+			err := r.overlap(a, func(canCommit func() bool) error {
+				_, err := b.appendFiles(ctx, "mydb", "cpu", all[len(all)-1:],
+					func(context.Context, []FileRef) (ArcSchema, error) { return sc, nil }, canCommit)
+				return err
+			})
+			if !errors.Is(err, errDroppedUnderPass) {
+				t.Fatalf("the append inside another node's drop ended with %v, want errDroppedUnderPass", err)
+			}
+			r.goneFromStorage("arc_mydb.db", "mydb/cpu/metadata")
+			if _, rowExists, err := b.catalogRow(ctx, "arc_mydb", "cpu"); err != nil || rowExists {
+				t.Fatalf("the exporting node kept its row for the dropped table (exists=%v, err=%v)", rowExists, err)
+			}
+			// Written again: a pass creates the table, appends follow.
+			r.addFile()
+			if err := r.passOf(b); err != nil {
+				t.Fatal(err)
+			}
+			all = r.addFile()
+			if _, err := b.appendFiles(ctx, "mydb", "cpu", all[len(all)-1:],
+				func(context.Context, []FileRef) (ArcSchema, error) { return r.schemaNow(), nil }, nil); err != nil {
+				t.Fatalf("an append to the recreated table: %v", err)
+			}
+			if n := r.live(b); n != len(r.files()) {
+				t.Fatalf("the recreated table holds %d files, want %d", n, len(r.files()))
+			}
+		})
+	}
+}
+
+// The overlapped pass in the colocated layout, where the table's metadata
+// sits in the measurement's own directory: an empty one left behind would
+// keep the dropped database listed.
+func TestSharedDrop1792_APassOverlapsTheDropColocated(t *testing.T) {
+	r, a, b := sharedDropRigLayout(t, layoutColocated)
+	ctx := context.Background()
+	r.addFile()
+	current, sc := r.files(), r.schemaNow()
+	err := r.overlap(a, func(canCommit func() bool) error {
+		_, err := b.reconcile(ctx, reconcileRequest{database: "mydb", measurement: "cpu", schema: sc, current: current, canCommit: canCommit})
+		return err
+	})
+	if !errors.Is(err, errDroppedUnderPass) {
+		t.Fatalf("the pass inside another node's drop ended with %v, want errDroppedUnderPass", err)
+	}
+	r.goneFromStorage("arc_mydb.db", "mydb/cpu/metadata")
+}
+
+// A drop stops deleting well before the other nodes stop believing its
+// record: past that, they export the database again and the drop would
+// delete what they write. The DELETE reports it and is repeated.
+func TestSharedDrop1792_ADropStopsBeforeItsRecordIsStale(t *testing.T) {
+	r, a, _ := sharedDropRig(t)
+	ctx := context.Background()
+	old := dropRecordStale
+	dropRecordStale = 300 * time.Millisecond
+	t.Cleanup(func() { dropRecordStale = old })
+	if err := r.deleteData(); err != nil {
+		t.Fatal(err)
+	}
+	a.dropAfterListing = func() { time.Sleep(350 * time.Millisecond) } // a drop that takes too long
+	err := a.DropDatabase(ctx, "mydb")
+	a.dropAfterListing = nil
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a drop that outlasted its record: %v, want its deadline", err)
+	}
+	if rec, exists := r.dropRecord(a); !exists || rec.Done {
+		t.Fatalf("the record of a drop that did not finish: exists=%v done=%v", exists, rec.Done)
+	}
+	if left, _ := os.ReadDir(r.metaDir()); len(left) == 0 {
+		t.Fatal("the drop went on deleting past its deadline")
+	}
+	dropRecordStale = old
+	if err := a.DropDatabase(ctx, "mydb"); err != nil { // the DELETE, repeated
+		t.Fatal(err)
+	}
+	if rec, exists := r.dropRecord(a); !exists || !rec.Done {
+		t.Fatalf("after the repeated DELETE the record is exists=%v done=%v", exists, rec.Done)
+	}
+	r.goneFromStorage("arc_mydb.db")
+}
+
+// The directories a removed table leaves empty go, up to the database's:
+// the DELETE's own sweep of empty directories may already have run. One
+// that holds something (data written since, another table) stays.
+func TestSharedDrop1792_EmptiedDirectoriesAreRemoved(t *testing.T) {
+	r, _, b := sharedDropRigLayout(t, layoutColocated)
+	ctx := context.Background()
+	mk := func(dirs ...string) {
+		for _, d := range dirs {
+			if err := os.MkdirAll(filepath.Join(r.root, d), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	loc := func(db, table string) string {
+		return "file://" + filepath.Join(r.root, db, table, "metadata", "00001-x.metadata.json")
+	}
+	mk("gone/cpu/metadata")
+	b.removeEmptiedTableDirs(ctx, "gone", loc("gone", "cpu"))
+	r.goneFromStorage("gone")
+	// Another measurement of the database is still there.
+	mk("kept/cpu/metadata", "kept/mem/metadata")
+	b.removeEmptiedTableDirs(ctx, "kept", loc("kept", "cpu"))
+	r.goneFromStorage("kept/cpu")
+	if _, err := os.Stat(filepath.Join(r.root, "kept/mem/metadata")); err != nil {
+		t.Errorf("another table's directory was removed: %v", err)
+	}
+	// Data written since.
+	mk("live/cpu/metadata", "live/cpu/2023")
+	b.removeEmptiedTableDirs(ctx, "live", loc("live", "cpu"))
+	r.goneFromStorage("live/cpu/metadata")
+	if _, err := os.Stat(filepath.Join(r.root, "live/cpu/2023")); err != nil {
+		t.Errorf("a directory with data written since was removed: %v", err)
+	}
+	// A spoke's database: up to the spoke.
+	mk("spoke/db/cpu/metadata")
+	b.removeEmptiedTableDirs(ctx, "spoke/db", loc("spoke/db", "cpu"))
+	r.goneFromStorage("spoke")
+	// Never above the database: the storage root's other directories stay.
+	if _, err := os.Stat(r.root); err != nil {
+		t.Fatal(err)
 	}
 }
