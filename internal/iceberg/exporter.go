@@ -235,6 +235,11 @@ type exporterShared struct {
 	// once, and onDatabaseDropped is told after a drop (database_lock.go).
 	dbLocks           databaseLocks
 	onDatabaseDropped func(database string)
+	// dropAfterListing, when set, runs inside a drop once it has listed what
+	// it will delete and written its markers, before it deletes anything.
+	// Tests only: it is how another node's pass is placed inside a drop
+	// (#1792). nil in production.
+	dropAfterListing func()
 	// appendSmall: per table, the small data manifests its current snapshot
 	// holds, as the last append left them; absent when not known (a pass
 	// ran, an append failed, the process started). Under chunkMu.
@@ -2429,6 +2434,9 @@ func (e *Exporter) dropDatabase(ctx context.Context, database string) error {
 		}
 	}
 
+	if e.dropAfterListing != nil {
+		e.dropAfterListing()
+	}
 	// The SQL catalog's DropNamespace refuses non-empty namespaces, so drop
 	// every table first. Collect the first error but keep going: partial
 	// cleanup converges on the next delete attempt.
