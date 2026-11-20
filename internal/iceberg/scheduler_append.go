@@ -267,60 +267,146 @@ func (s *Scheduler) appendable(key string, p pendingFiles, now time.Time) (keys 
 	return keys, ""
 }
 
-// exportIngest serves a due ingest request for the table: an append of the
-// files reported for it when that is possible, a reconcile pass otherwise.
-func (s *Scheduler) exportIngest(ctx context.Context, m Measurement, key string) (reconcileOutcome, error) {
+// An ingest request is served in three steps, so that the middle one can run
+// for several tables at once (#1778, scheduler_ingest_batch.go):
+//
+//   - prepareIngest, on the loop goroutine: what the request is. Every read of
+//     the scheduler's maps that decides it happens here.
+//   - runAppend, on any goroutine: the storage and catalog work of an append.
+//     It uses the scheduler's source, exporter, gate and logger, which do not
+//     change after construction, and nothing else of the scheduler.
+//   - finishAppend, on the loop goroutine: every write to the scheduler's maps.
+//
+// One table is in at most one of these at a time, and the loop runs no
+// reconcile pass while any append is running, so the file comment's argument
+// holds as it did with one export at a time.
+
+// ingestKind is what serving an ingest request takes.
+type ingestKind int
+
+const (
+	ingestPass     ingestKind = iota // a reconcile pass of the measurement
+	ingestFallback                   // a pass, because the reported files cannot be appended (reason)
+	ingestCovered                    // nothing: every reported file is in the table
+	ingestAppend                     // an append of keys
+)
+
+// ingestJob is one ingest request taken from the queue.
+type ingestJob struct {
+	m     Measurement
+	key   string
+	kind  ingestKind
+	began time.Time
+	// An append: the files, and when they were taken from the pending list.
+	resolver appendResolver
+	keys     []string
+	sizes    map[string]int64
+	takenAt  time.Time
+	// reason is why a pass is needed: set by prepareIngest (ingestFallback)
+	// or by runAppend.
+	reason string
+	// What runAppend did.
+	done  []string // storage keys now in the table, or left out for good
+	added int
+	took  time.Duration
+}
+
+// prepareIngest decides how the table's due ingest request is served. Loop
+// goroutine only.
+func (s *Scheduler) prepareIngest(m Measurement, key string) *ingestJob {
+	job := &ingestJob{m: m, key: key, began: time.Now()}
 	// With the append path off no table is ever marked as taking appends
 	// (notePassEnded), so every request is the pass.
 	resolver, canResolve := s.source.(appendResolver)
 	_, settled := s.state[key]
 	if !canResolve || !settled || !s.appendOK[key] || s.appendsSince[key] >= appendMaxBetweenPasses {
 		// The pending files stay: the pass drops the ones it covers.
-		return s.reconcileOneRecovered(ctx, m, key)
+		return job
 	}
 	pending, takenAt := s.takeAppendPending(key)
 	if len(pending.files) == 0 && !pending.overflow {
 		// A request with no file behind it (the trigger without a report).
-		return s.reconcileOneRecovered(ctx, m, key)
+		return job
 	}
+	job.takenAt = takenAt
 	keys, reason := s.appendable(key, pending, takenAt)
-	if reason == "" {
-		if len(keys) == 0 {
-			// Everything reported is in the table already.
-			s.noteIngestCovered(key, takenAt, outcomeUnchanged, false, nil)
-			return outcomeUnchanged, nil
-		}
-		sizes := make(map[string]int64, len(pending.files))
-		for _, f := range pending.files {
-			sizes[f.key] = f.size
-		}
-		var added int
-		added, reason = s.appendRecovered(ctx, resolver, m, key, keys, sizes)
-		if reason == "" {
-			outcome := outcomeUnchanged
-			if added > 0 {
-				outcome = outcomeReconciled
-			}
-			s.noteIngestCovered(key, takenAt, outcome, added > 0, nil)
+	if reason != "" {
+		job.kind, job.reason = ingestFallback, reason
+		return job
+	}
+	if len(keys) == 0 {
+		// Everything reported is in the table already.
+		job.kind = ingestCovered
+		return job
+	}
+	job.kind, job.resolver, job.keys = ingestAppend, resolver, keys
+	job.sizes = make(map[string]int64, len(pending.files))
+	for _, f := range pending.files {
+		job.sizes[f.key] = f.size
+	}
+	return job
+}
+
+// finishAppend records what an append did, and returns the outcome and
+// whether a reconcile pass must follow (job.reason says why). Loop goroutine
+// only.
+func (s *Scheduler) finishAppend(job *ingestJob) (outcome reconcileOutcome, needsPass bool) {
+	if job.reason != "" {
+		return outcomeUnchanged, true
+	}
+	s.noteRecent(job.key, job.done)
+	outcome = outcomeUnchanged
+	if job.added > 0 {
+		// The cached listing no longer describes the table: make the next
+		// pass of the measurement run (see the file comment).
+		s.markAppended(job.key)
+		s.appendsSince[job.key]++
+		metrics.Get().AddIcebergIngestAppend(job.added)
+		outcome = outcomeReconciled
+	}
+	s.noteIngestCovered(job.key, job.takenAt, outcome, job.added > 0, nil)
+	return outcome, false
+}
+
+// noteAppendFallback is the bookkeeping for reported files that were not
+// appended, before the reconcile pass that follows. The pass decides what the
+// table holds. Until one settles, the table takes no append. And the cached
+// listing may no longer be the table: an append that failed can still have
+// committed (a publish that failed, a commit whose answer was lost). If the
+// pass then fails at its listing the cache is kept, and it must not match a
+// later listing. Loop goroutine only.
+func (s *Scheduler) noteAppendFallback(job *ingestJob) {
+	delete(s.appendOK, job.key)
+	s.markAppended(job.key)
+	metrics.Get().IncIcebergIngestAppendFallback()
+	if s.appendFallback[job.key] != job.reason {
+		// Once per reason per table: a table that keeps falling back would
+		// otherwise say so at every interval.
+		s.appendFallback[job.key] = job.reason
+		s.logger.Info().Str("database", job.m.Database).Str("measurement", job.m.Measurement).Str("reason", job.reason).
+			Msg("Iceberg: ingest files not appended; running a reconcile pass of the measurement instead")
+	}
+}
+
+// exportIngest serves a due ingest request for the table on the loop
+// goroutine, start to end: an append of the files reported for it when that
+// is possible, a reconcile pass otherwise.
+func (s *Scheduler) exportIngest(ctx context.Context, m Measurement, key string) (reconcileOutcome, error) {
+	job := s.prepareIngest(m, key)
+	switch job.kind {
+	case ingestPass:
+		return s.reconcileOneRecovered(ctx, m, key)
+	case ingestCovered:
+		s.noteIngestCovered(key, job.takenAt, outcomeUnchanged, false, nil)
+		return outcomeUnchanged, nil
+	case ingestAppend:
+		s.runAppend(ctx, job, s.exporter, unionSchemaConcurrency)
+		outcome, needsPass := s.finishAppend(job)
+		if !needsPass {
 			return outcome, nil
 		}
 	}
-	// Not an append: the pass decides what the table holds. Until one
-	// settles, the table takes no append. And the cached listing may no
-	// longer be the table: an append that failed can still have committed (a
-	// publish that failed, a commit whose answer was lost). If the pass below
-	// then fails at its listing the cache is kept, and it must not match a
-	// later listing.
-	delete(s.appendOK, key)
-	s.markAppended(key)
-	metrics.Get().IncIcebergIngestAppendFallback()
-	if s.appendFallback[key] != reason {
-		// Once per reason per table: a table that keeps falling back would
-		// otherwise say so at every interval.
-		s.appendFallback[key] = reason
-		s.logger.Info().Str("database", m.Database).Str("measurement", m.Measurement).Str("reason", reason).
-			Msg("Iceberg: ingest files not appended; running a reconcile pass of the measurement instead")
-	}
+	s.noteAppendFallback(job)
 	return s.reconcileOneRecovered(ctx, m, key)
 }
 
@@ -339,45 +425,56 @@ type appendResolver interface {
 	AppendRefs(ctx context.Context, m Measurement, keys []string, sizes map[string]int64) ([]FileRef, bool, error)
 }
 
-// appendRecovered appends the files and returns how many it added, or the
-// reason a reconcile pass is needed. A panic is a reason too, as in
-// reconcileOneRecovered.
-func (s *Scheduler) appendRecovered(ctx context.Context, resolver appendResolver, m Measurement, key string, keys []string, sizes map[string]int64) (added int, reason string) {
+// runAppend appends the job's files with exp and records in the job what it
+// did, or the reason a reconcile pass is needed. A panic is a reason too, as
+// in reconcileOneRecovered, and is recovered here: this may be its own
+// goroutine. fileReads bounds the footers read at once.
+//
+// It touches nothing of the scheduler but its source, gate and logger (see
+// prepareIngest).
+func (s *Scheduler) runAppend(ctx context.Context, job *ingestJob, exp *Exporter, fileReads int) {
+	m := job.m
 	defer func() {
 		if r := recover(); r != nil {
 			s.logger.Error().Str("database", m.Database).Str("measurement", m.Measurement).
 				Str("panic", fmt.Sprint(r)).Str("stack", string(debug.Stack())).
 				Msg("Iceberg append: recovered a panic")
-			added, reason = 0, fmt.Sprintf("the append panicked: %v", r)
+			job.done, job.added, job.reason = nil, 0, fmt.Sprintf("the append panicked: %v", r)
 		}
+		job.took = time.Since(job.began)
 	}()
 	// What this export reads of the new files is read once (export_reads.go).
 	ctx = withExportReads(ctx)
-	refs, ok, err := resolver.AppendRefs(ctx, m, keys, sizes)
+	refs, ok, err := job.resolver.AppendRefs(ctx, m, job.keys, job.sizes)
 	if err != nil {
-		return 0, err.Error()
+		job.reason = err.Error()
+		return
 	}
 	if !ok {
-		return 0, "this storage layout has no per-file check"
+		job.reason = "this storage layout has no per-file check"
+		return
 	}
 	// The footers, read here and not in appendFiles so that a file that has
 	// left storage since it was reported is left out, as the stat in
 	// AppendRefs leaves one out on local storage (#1778). When the append
 	// then cannot run, the pass that follows reads them again.
-	refs, sc, err := s.presentFileSchemas(ctx, refs)
+	refs, sc, err := s.presentFileSchemas(ctx, refs, fileReads)
 	if err != nil {
-		return 0, err.Error()
+		job.reason = err.Error()
+		return
 	}
 	if len(refs) == 0 {
-		return 0, "" // gone or left out since they were reported: nothing to add
+		return // gone or left out since they were reported: nothing to add
 	}
 	readSchemas := func(context.Context, []FileRef) (ArcSchema, error) { return sc, nil }
-	res, err := s.exporter.appendFiles(ctx, m.Database, m.Measurement, refs, readSchemas, s.canRun)
+	res, err := exp.appendFiles(ctx, m.Database, m.Measurement, refs, readSchemas, s.canRun)
 	if err != nil {
 		if errors.Is(err, errNeedsFullPass) {
-			return 0, "the table does not exist or lacks a column of the new files"
+			job.reason = "the table does not exist or lacks a column of the new files"
+		} else {
+			job.reason = err.Error()
 		}
-		return 0, err.Error()
+		return
 	}
 	// Added, and left out for good (rows across a UTC day): neither is
 	// offered again.
@@ -385,37 +482,29 @@ func (s *Scheduler) appendRecovered(ctx context.Context, resolver appendResolver
 	for _, f := range refs {
 		keyOf[f.PhysicalPath] = f.Key
 	}
-	done := make([]string, 0, len(res.added)+len(res.skipped))
+	job.done = make([]string, 0, len(res.added)+len(res.skipped))
 	for _, p := range res.added {
-		done = append(done, keyOf[p])
+		job.done = append(job.done, keyOf[p])
 	}
 	for _, p := range res.skipped {
-		done = append(done, keyOf[p])
+		job.done = append(job.done, keyOf[p])
 	}
-	s.noteRecent(key, done)
+	job.added = len(res.added)
 	if len(res.skipped) > 0 {
 		s.logger.Warn().Str("database", m.Database).Str("measurement", m.Measurement).
 			Int("skipped", len(res.skipped)).Str("sample", strings.Join(res.skipped[:min(3, len(res.skipped))], ", ")).
 			Msg("Iceberg: ingest files left out of the table (their rows span more than one UTC day); the reconcile pass reports them")
 	}
-	if len(res.added) > 0 {
-		// The cached listing no longer describes the table: make the next
-		// pass of the measurement run (see the file comment).
-		s.markAppended(key)
-		s.appendsSince[key]++
-		metrics.Get().AddIcebergIngestAppend(len(res.added))
-	}
-	return len(res.added), ""
 }
 
 // presentFileSchemas reads the schemas of reported files, as
 // unionFileSchemas does, leaving out the files the store no longer has. It
 // returns the files left and their merged schema.
-func (s *Scheduler) presentFileSchemas(ctx context.Context, files []FileRef) ([]FileRef, ArcSchema, error) {
+func (s *Scheduler) presentFileSchemas(ctx context.Context, files []FileRef, limit int) ([]FileRef, ArcSchema, error) {
 	schemas := make([]ArcSchema, len(files))
 	gone := make([]bool, len(files))
 	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(unionSchemaConcurrency)
+	g.SetLimit(max(1, limit))
 	for i, f := range files {
 		g.Go(func() error {
 			if err := gctx.Err(); err != nil {

@@ -286,6 +286,19 @@ func (s *Scheduler) serviceIngest(ctx context.Context, max int) {
 	if s.ingestInterval <= 0 {
 		return
 	}
+	if s.ingestConcurrency > 1 {
+		// Appends of several tables at once (scheduler_ingest_batch.go). Idle
+		// (max > 1), any due request may run a pass; between the measurements
+		// of a timed pass (max == 1) one may, as before, and the appends of
+		// one batch ride along.
+		if max > 1 {
+			max = maxInt(max, s.ingestConcurrency)
+			s.serviceIngestBatches(ctx, max, max)
+		} else {
+			s.serviceIngestBatches(ctx, s.ingestConcurrency, 1)
+		}
+		return
+	}
 	for served := 0; ctx.Err() == nil && served < max; served++ {
 		if s.otherRequestsQueued() {
 			s.serviceDrops(ctx)
@@ -315,26 +328,33 @@ func (s *Scheduler) serviceIngest(ctx context.Context, max int) {
 		began := time.Now()
 		outcome, err := s.exportIngest(mctx, m, key)
 		cancel()
-		s.noteOutcome(key, outcome)
-		event := s.logger.Debug()
-		if err != nil && outcome != outcomeBusy {
-			event = logSchemaConflict(s.logger.Warn().Err(err), err)
+		s.afterIngest(m, key, outcome, err, time.Since(began))
+	}
+}
+
+// afterIngest is what follows every served ingest request, whatever it ran:
+// the outcome's bookkeeping, the log line, and the request's return when the
+// table did not settle. Loop goroutine only.
+func (s *Scheduler) afterIngest(m Measurement, key string, outcome reconcileOutcome, err error, took time.Duration) {
+	s.noteOutcome(key, outcome)
+	event := s.logger.Debug()
+	if err != nil && outcome != outcomeBusy {
+		event = logSchemaConflict(s.logger.Warn().Err(err), err)
+	}
+	event.Str("database", m.Database).Str("measurement", m.Measurement).Str("outcome", outcome.String()).
+		Dur("took", took). // an append or a pass, whichever it was (#1751)
+		Msg("Iceberg reconcile on request (an ingest flush)")
+	// Anything short of a settled reconcile comes back one interval
+	// later, whether or not another flush asks: a failure, a busy table,
+	// files left behind, a publish that did not land. Except a table the
+	// timed passes have escalated as busy for too long: they own it now,
+	// as for the other kinds of request (serviceRequests).
+	if outcome == outcomeBusy {
+		if since, started := s.busySince[key]; started && time.Since(since) >= busyEscalateAfter {
+			return
 		}
-		event.Str("database", m.Database).Str("measurement", m.Measurement).Str("outcome", outcome.String()).
-			Dur("took", time.Since(began)). // an append or a pass, whichever it was (#1751)
-			Msg("Iceberg reconcile on request (an ingest flush)")
-		// Anything short of a settled reconcile comes back one interval
-		// later, whether or not another flush asks: a failure, a busy table,
-		// files left behind, a publish that did not land. Except a table the
-		// timed passes have escalated as busy for too long: they own it now,
-		// as for the other kinds of request (serviceRequests).
-		if outcome == outcomeBusy {
-			if since, started := s.busySince[key]; started && time.Since(since) >= busyEscalateAfter {
-				continue
-			}
-		}
-		if _, settled := s.state[key]; err != nil || !settled || outcome == outcomeInProgress || outcome == outcomeBusy {
-			s.requeueIngest(m, key)
-		}
+	}
+	if _, settled := s.state[key]; err != nil || !settled || outcome == outcomeInProgress || outcome == outcomeBusy {
+		s.requeueIngest(m, key)
 	}
 }

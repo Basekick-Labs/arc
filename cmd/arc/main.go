@@ -4761,6 +4761,9 @@ func main() {
 			// An ingest request adds only the files ingest reported, without
 			// listing the measurement (#1751).
 			IngestAppend: cfg.Iceberg.IngestAppendEnabled,
+			// How many tables' ingest appends run at once (#1778). Without the
+			// ingest trigger (a cluster node, interval 0) nothing reads it.
+			IngestConcurrency: cfg.Iceberg.IngestExportConcurrency,
 		})
 		// #1731: with node-local warehouses (not icebergTopo.barrier, which is a shared bucket or
 		// shared_storage_mode), a database DELETE on the writer drops only the writer's tables.

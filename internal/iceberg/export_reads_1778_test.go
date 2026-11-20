@@ -240,7 +240,7 @@ func TestAppend_PresentFileSchemasLeavesOutAFileThatIsGone(t *testing.T) {
 			}
 		}
 	}
-	present, sc, err := r.sched.presentFileSchemas(context.Background(), refs)
+	present, sc, err := r.sched.presentFileSchemas(context.Background(), refs, unionSchemaConcurrency)
 	if err != nil {
 		t.Fatalf("a file that is gone failed the read: %v", err)
 	}
