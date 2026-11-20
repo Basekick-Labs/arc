@@ -121,11 +121,51 @@ func (s *Scheduler) backstopDrops(ctx context.Context) {
 	}
 }
 
+// noteDatabaseDropped is told by the exporter that a database's tables were
+// dropped, from whichever goroutine dropped them (the API's DELETE, or this
+// scheduler's own loop). The loop forgets what it remembers of the database
+// at its next service of drops: before its next batch of exports. Until then
+// what it remembers is stale and harmless: a pass of a table that is gone
+// finds it gone, and an append to one falls back to a pass. Never blocks.
+func (s *Scheduler) noteDatabaseDropped(database string) {
+	if s == nil || database == "" {
+		return
+	}
+	s.reqMu.Lock()
+	s.dropped[database] = struct{}{}
+	s.reqMu.Unlock()
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// forgetDropped forgets the databases dropped since the last call. Loop
+// goroutine only.
+func (s *Scheduler) forgetDropped() {
+	s.reqMu.Lock()
+	if len(s.dropped) == 0 {
+		s.reqMu.Unlock()
+		return
+	}
+	dbs := make([]string, 0, len(s.dropped))
+	for db := range s.dropped {
+		dbs = append(dbs, db)
+	}
+	clear(s.dropped)
+	s.reqMu.Unlock()
+	for _, db := range dbs {
+		s.forgetDatabase(db)
+	}
+}
+
 // serviceDrops runs the requested drops that are due. Loop goroutine only.
 func (s *Scheduler) serviceDrops(ctx context.Context) {
 	if s.exporter == nil {
 		return
 	}
+	// What a DELETE dropped since the last service (#1789), first.
+	s.forgetDropped()
 	s.backstopDrops(ctx)
 	s.reqMu.Lock()
 	if len(s.drops) == 0 {

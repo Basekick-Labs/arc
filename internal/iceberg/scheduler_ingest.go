@@ -222,7 +222,7 @@ func (s *Scheduler) forgetIngest(key string) {
 func (s *Scheduler) otherRequestsQueued() bool {
 	s.reqMu.Lock()
 	defer s.reqMu.Unlock()
-	return len(s.requested)+len(s.requestedPaths)+len(s.requestedHot)+len(s.drops) > 0
+	return len(s.requested)+len(s.requestedPaths)+len(s.requestedHot)+len(s.drops)+len(s.dropped) > 0
 }
 
 // noteIngestCovered records what a reconcile of key which started at

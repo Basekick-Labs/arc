@@ -261,6 +261,14 @@ func (s *Scheduler) runPasses(ctx context.Context, batch []*passJob) {
 // difference. It records in the job what the scheduler should remember.
 func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter) (outcome reconcileOutcome, err error) {
 	m := job.m
+	// From before the listing to the end: the database's tables are not
+	// dropped while this pass works on one, and a pass that had to wait for
+	// a drop lists what the DELETE left (database_lock.go, #1789).
+	release, err := exp.holdDatabase(ctx, m.Database)
+	if err != nil {
+		return outcomeUnchanged, err
+	}
+	defer release()
 	// What this pass reads of the store is not read twice (export_reads.go, #1778).
 	ctx = withExportReads(ctx)
 	// One backend listing yields both the data-file URIs and the local paths (Files + LocalFiles

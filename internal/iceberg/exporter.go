@@ -231,6 +231,10 @@ type exporterShared struct {
 	// expireOwed: the tables appends have added snapshots to since a pass
 	// last expired any (batched.go expiryOwed); under chunkMu.
 	expireOwed map[string]bool
+	// dbLocks keeps a database's tables from being exported and dropped at
+	// once, and onDatabaseDropped is told after a drop (database_lock.go).
+	dbLocks           databaseLocks
+	onDatabaseDropped func(database string)
 	// appendSmall: per table, the small data manifests its current snapshot
 	// holds, as the last append left them; absent when not known (a pass
 	// ran, an append failed, the process started). Under chunkMu.
@@ -2281,11 +2285,32 @@ func isAlreadyExists(err error) bool {
 // with it, catalog rows, markers and warehouse directories alike (#1730; see
 // spokeSubNamespaces). A single spoke database ("{spoke}/{db}") is refused: the
 // API never sends one, and its namespace naming does not follow this mapping.
+//
+// It waits for the exports of the database's tables that are running, and
+// none starts until it is done (database_lock.go, #1789); if they do not end
+// in time it drops nothing and says so.
 func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 	ctx = e.withAWS(ctx)
 	if strings.ContainsAny(database, "/\\") {
 		return fmt.Errorf("refusing to drop namespaced database %q from the Iceberg catalog", database)
 	}
+	release, err := e.lockDatabaseForDrop(ctx, database)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if err := e.dropDatabase(ctx, database); err != nil {
+		return err
+	}
+	e.forgetDatabaseMemory(database)
+	if e.onDatabaseDropped != nil {
+		e.onDatabaseDropped(database)
+	}
+	return nil
+}
+
+// dropDatabase is DropDatabase's work, with the database's lock held.
+func (e *Exporter) dropDatabase(ctx context.Context, database string) error {
 	ns := icetable.Identifier{e.nsPrefix + "_" + database}
 	nsKey := catalogNamespaceKey(ns)
 	e.forgetExportLagNamespace(ns) // its tables' unpublished files will never be published (export_lag.go)
