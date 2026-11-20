@@ -900,3 +900,46 @@ func TestSharedDrop1792_ThePassOverAnEmptiedMeasurementSettles(t *testing.T) {
 		t.Fatalf("the exporting node kept the table of a dropped database (row exists=%v, err=%v)", rowExists, err)
 	}
 }
+
+// After a real overlapped drop (per-table markers written, the exporter's own
+// checks off as before the fix), ANOTHER node that never exported the table
+// takes over the export: what does it make of the residue, and of the
+// database written again?
+func TestSharedDrop1792_AnotherNodeTakesOverAfterAnOverlappedDrop(t *testing.T) {
+	r, a, b := sharedDropRig(t)
+	ctx := context.Background()
+	c := r.node(true)
+	c.SetForgetDroppedRows(true)
+	r.addFile()
+	current, sc := r.files(), r.schemaNow()
+	b.SetForgetDroppedRows(false)
+	_ = r.overlap(a, func(canCommit func() bool) error {
+		_, err := b.reconcile(ctx, reconcileRequest{database: "mydb", measurement: "cpu", schema: sc, current: current, canCommit: canCommit})
+		return err
+	})
+	if left, _ := os.ReadDir(r.metaDir()); len(left) == 0 {
+		t.Fatal("the overlapped pass left nothing behind: the test's premise")
+	}
+	// The database is written again, and c exports it.
+	r.addFile()
+	r.addFile()
+	var last error
+	for i := 0; i < 3; i++ {
+		last = r.passOf(c)
+		t.Logf("c's pass %d: %v", i, last)
+	}
+	if last != nil {
+		t.Fatalf("the node that took over still fails: %v", last)
+	}
+	if n := r.live(c); n != len(r.files()) {
+		t.Fatalf("c's table holds %d files, want %d", n, len(r.files()))
+	}
+	rec, _ := r.dropRecord(c)
+	tbl, err := c.catalog.LoadTable(ctx, c.tableIdent("mydb", "cpu"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dropIDOf(tbl); got != rec.ID {
+		t.Fatalf("c exports a table with drop id %q under record %q: it took the dropped table's residue for the table", got, rec.ID)
+	}
+}
