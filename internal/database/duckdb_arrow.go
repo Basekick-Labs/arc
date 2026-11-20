@@ -123,11 +123,28 @@ func (d *DuckDB) DescribeArrowSchema(ctx context.Context, query string) (*arrow.
 	return schema, nil
 }
 
-func describeArrowSchemaOnConn(ctx context.Context, driverConn any, query string) (*arrow.Schema, error) {
+func describeArrowSchemaOnConn(ctx context.Context, driverConn any, query string) (schema *arrow.Schema, err error) {
 	preparer, ok := driverConn.(driver.ConnPrepareContext)
 	if !ok {
 		return nil, fmt.Errorf("connection does not implement driver.ConnPrepareContext")
 	}
+	execer, ok := driverConn.(driver.ExecerContext)
+	if !ok {
+		return nil, fmt.Errorf("connection does not implement driver.ExecerContext")
+	}
+	// No optimizer during the bind: it would fold constant expressions, which
+	// is work no query is counted for. The binder still folds constant
+	// arguments of functions; the bind slots bound that. The setting is per
+	// connection, so it is restored before the connection goes back to the
+	// pool, and a connection it cannot be restored on is discarded.
+	if _, err := execer.ExecContext(ctx, "PRAGMA disable_optimizer", nil); err != nil {
+		return nil, describeFailure(ctx, err)
+	}
+	defer func() {
+		if _, restoreErr := execer.ExecContext(context.WithoutCancel(ctx), "PRAGMA enable_optimizer", nil); restoreErr != nil {
+			schema, err = nil, fmt.Errorf("restore optimizer: %w: %w", restoreErr, driver.ErrBadConn)
+		}
+	}()
 	stmt, err := preparer.PrepareContext(ctx, query)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
