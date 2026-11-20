@@ -86,7 +86,8 @@ type reconcileResult struct {
 	// only time or a retry removes: the version after each was published too
 	// recently (iceberg.min_version_age), or the prune could not finish. It
 	// is when a pass of the table next has something to prune even if the
-	// table has gone quiet (Exporter.pruneAgainAt); zero when nothing waits.
+	// table has gone quiet (Exporter.pruneAgainAt); zero when the prune left
+	// nothing it could remove later.
 	pruneAgainAt time.Time
 	// partial: new files remain unregistered because the pass ran out of time or lost the
 	// writer role. Not an error: what was committed stays, and the next pass continues.
@@ -289,9 +290,10 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 	sort.Strings(toRemove)
 
 	if len(toAdd) == 0 && len(toRemove) == 0 {
-		// Already converged — no new snapshot. Still republish the discovery
-		// files: a previous pass may have committed the snapshot but failed to
-		// write them, and this is the path that pass's retry lands on.
+		// Already converged — no new snapshot. Still publish the discovery
+		// files unless they are in place (alreadyPublished): a previous pass
+		// may have committed the snapshot but failed to write them, and this
+		// is the path that pass's retry lands on.
 		//
 		// Sweep here too. A measurement whose file set has stopped changing is
 		// skipped by the scheduler's fingerprint gate before it ever reaches this

@@ -411,16 +411,10 @@ func (e *Exporter) markHinted(ident icetable.Identifier, loc string) {
 	e.hinted[strings.Join(ident, "\x00")] = loc
 }
 
-// forgetHinted drops markHinted's record of a table whose lineage ended or
-// changed under this node (a drop, a dead row): a recreated table can reach
-// the same metadata location again.
-func (e *Exporter) forgetHinted(ident icetable.Identifier) {
-	e.publishedMu.Lock()
-	delete(e.hinted, strings.Join(ident, "\x00"))
-	e.publishedMu.Unlock()
-}
-
-// forgetHintedNamespace is forgetHinted for every table of a namespace.
+// forgetHintedNamespace drops markHinted's record of every table of a
+// namespace and of the namespaces under it: their lineage ended (a drop). A pass of one of them that is publishing at
+// that moment can record its location again; that location is the dropped
+// table's own (alreadyPublished), which no later table has.
 func (e *Exporter) forgetHintedNamespace(ns icetable.Identifier) {
 	prefix := strings.Join(ns, "\x00") + "\x00"
 	e.publishedMu.Lock()
@@ -460,6 +454,13 @@ func (e *Exporter) alreadyPublished(tbl *icetable.Table) bool {
 	hinted := e.hinted[strings.Join(tbl.Identifier(), "\x00")] == loc
 	e.publishedMu.Unlock()
 	if !hinted {
+		return false
+	}
+	// An adopted row points at the published copy itself, v<N>.metadata.json
+	// (adoptPublished), a name a dropped and recreated table reaches again.
+	// Only iceberg-go's own names, 000NN-<uuid>, are one metadata file's for
+	// good; a table still on an adopted row publishes at every pass it has.
+	if strings.HasPrefix(path.Base(loc), "v") {
 		return false
 	}
 	e.hintFailMu.Lock()

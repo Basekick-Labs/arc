@@ -182,13 +182,19 @@ func TestPublish1787_ADroppedTableIsPublishedAgain(t *testing.T) {
 	r := newHealRig(t, 3)
 	r.history(2)
 	key := strings.Join(r.exp.tableIdent("mydb", "cpu"), "\x00")
-	if r.exp.hinted[key] == "" {
+	hintedLoc := func() (string, bool) {
+		r.exp.publishedMu.Lock()
+		defer r.exp.publishedMu.Unlock()
+		loc, ok := r.exp.hinted[key]
+		return loc, ok
+	}
+	if loc, _ := hintedLoc(); loc == "" {
 		t.Fatal("no record of the publish after two passes")
 	}
 	if err := r.exp.DropDatabase(context.Background(), "mydb"); err != nil {
 		t.Fatal(err)
 	}
-	if loc, ok := r.exp.hinted[key]; ok {
+	if loc, ok := hintedLoc(); ok {
 		t.Fatalf("the dropped table's publish is still remembered (%s)", loc)
 	}
 }
@@ -271,5 +277,87 @@ func TestPrune1787_AFailedPruneIsRetried(t *testing.T) {
 		if got := r.vCopies(); len(got) > 3 || !res.pruneAgainAt.IsZero() {
 			t.Fatalf("min age %v: copies %v, prune again at %v after the retry; want them pruned and nothing waiting", minAge, got, res.pruneAgainAt)
 		}
+	}
+}
+
+// A table on an adopted row points at the published copy, v<N>.metadata.json:
+// a name a dropped and recreated table reaches again, so it is not taken as
+// proof of this process's publish. Such a table publishes at every pass.
+func TestPublish1787_ATableOnAnAdoptedRowPublishesEveryPass(t *testing.T) {
+	r := newHealRig(t, 3)
+	files, sc := r.history(3)
+	local := r.exp.backend.(*storage.LocalBackend)
+
+	// A node with an empty catalog over the same warehouse adopts the
+	// published version.
+	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "other.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	other, err := NewExporter(db, local, "file://"+r.root, "arc", 3, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	other.SetWarehouseAuthoritative(true)
+	other.resolveBases()
+	r.exp = other
+	rec := r.record()
+	for pass := 1; pass <= 2; pass++ {
+		res := r.passResult(files, sc)
+		if w := rec.take(); len(w) == 0 || !res.settled {
+			t.Fatalf("pass %d on the adopted row: wrote %v, settled %v; want the discovery files published", pass, w, res.settled)
+		}
+	}
+}
+
+// A copy's write time ahead of this node's clock does not put the prune off
+// past one minimum age from now.
+func TestPrune1787_AWriteTimeInTheFutureIsBounded(t *testing.T) {
+	r := newHealRig(t, 1)
+	r.exp.SetVersionRetention(time.Hour, 0)
+	files, sc := r.history(5)
+	ahead := time.Now().Add(24 * time.Hour)
+	for _, v := range r.vCopies() {
+		if err := os.Chtimes(r.metaPath("v"+strconv.Itoa(v)+".metadata.json"), ahead, ahead); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res := r.passResult(files, sc)
+	if until := time.Until(res.pruneAgainAt); until <= 0 || until > time.Hour {
+		t.Fatalf("prune due in %v with copies written a day ahead, want within the minimum age of an hour", until)
+	}
+}
+
+// The copies a pass of several commits keeps for itself are over the bound
+// when it ends. The pass asks for another, which removes them; a table that
+// went quiet used to keep them.
+func TestPrune1787_CopiesKeptForOnePassAreRemovedByTheNext(t *testing.T) {
+	r := newHealRig(t, 1)
+	r.exp.chunkMax = 1
+	var files []FileRef
+	for i := 0; i < 5; i++ {
+		files = append(files, r.write(0, "k"+strconv.Itoa(i)))
+	}
+	sc := r.schema(files[0])
+	unread := append([]FileRef(nil), files...)
+	before := time.Now()
+	res, err := r.exp.reconcile(context.Background(), reconcileRequest{database: "mydb", measurement: "cpu", schema: sc, current: files,
+		unread: unread, readSchemas: func(context.Context, []FileRef) (ArcSchema, error) { return sc, nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.commits < 3 {
+		t.Fatalf("%d commits, want a pass of several", res.commits)
+	}
+	if got := r.vCopies(); len(got) <= 2 {
+		t.Fatalf("copies %v after a pass of %d commits at retain 1: nothing was kept over the bound, the test shows nothing", got, res.commits)
+	}
+	if res.pruneAgainAt.Before(before) {
+		t.Fatalf("prune again at %v after a pass that kept its own copies over the bound, want now", res.pruneAgainAt)
+	}
+	res = r.passResult(files, sc)
+	if got := r.vCopies(); len(got) != 2 || !res.pruneAgainAt.IsZero() {
+		t.Fatalf("copies %v, prune again at %v after the next pass; want retain_snapshots+1 = 2 and nothing waiting", got, res.pruneAgainAt)
 	}
 }

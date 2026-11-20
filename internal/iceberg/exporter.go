@@ -262,8 +262,12 @@ func (e *Exporter) resetHintFailure() {
 //     the moment the version after it has been published that long. The
 //     latest, so that one later prune removes them all; the ones that come of
 //     age earlier wait for it, less than min_version_age more.
+//   - now plus min_version_age, for a version kept only for this pass (one
+//     it claimed, or one a reader may have resolved when it started).
 //   - now, when the metadata directory could not be listed or a delete
 //     failed: the next pass retries.
+//
+// Never later than now plus min_version_age.
 func (e *Exporter) pruneAgainAt() time.Time {
 	e.hintFailMu.Lock()
 	defer e.hintFailMu.Unlock()
@@ -1447,6 +1451,7 @@ func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.T
 		}
 		objs, err := lister.ListObjects(ctx, dirKey+"/")
 		if err != nil {
+			e.logger.Warn().Err(err).Str("dir", dirKey).Msg("Iceberg: could not list the metadata directory to prune old published versions; the table's next pass retries")
 			e.notePruneDue(time.Now()) // not pruned: the next pass retries (pruneAgainAt)
 			return
 		}
@@ -1458,6 +1463,7 @@ func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.T
 	} else {
 		var err error
 		if keys, err = e.backend.List(ctx, dirKey+"/"); err != nil {
+			e.logger.Warn().Err(err).Str("dir", dirKey).Msg("Iceberg: could not list the metadata directory to prune old published versions; the table's next pass retries")
 			e.notePruneDue(time.Now())
 			return
 		}
@@ -1503,7 +1509,15 @@ func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.T
 	// (written, above), so it survives a restart and covers copies written
 	// by claimVersion.
 	for i, v := range vs[keep:] {
-		if v.n == curN || (keepFrom >= 0 && v.n >= keepFrom) || slices.Contains(protect, v.n) {
+		if v.n == curN {
+			continue
+		}
+		if (keepFrom >= 0 && v.n >= keepFrom) || slices.Contains(protect, v.n) {
+			// Kept for this pass only (a version it claimed, or one a reader
+			// may have resolved when it started): a later pass removes it,
+			// and a table that goes quiet has no later pass unless one is
+			// asked for.
+			e.notePruneDue(time.Now().Add(e.minVersionAge))
 			continue
 		}
 		if e.minVersionAge > 0 {
@@ -1516,12 +1530,19 @@ func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.T
 				continue
 			}
 			if time.Since(at) < e.minVersionAge {
-				e.notePruneDue(at.Add(e.minVersionAge))
+				// Never later than a successor written now would give: a
+				// write time ahead of this node's clock (skew, a restore
+				// that keeps them) must not put the prune off for good.
+				due := at.Add(e.minVersionAge)
+				if latest := time.Now().Add(e.minVersionAge); due.After(latest) {
+					due = latest
+				}
+				e.notePruneDue(due)
 				continue
 			}
 		}
 		if err := e.backend.Delete(ctx, v.key); err != nil && !storage.IsNotFound(err) {
-			e.logger.Debug().Err(err).Str("key", v.key).Msg("prune old v<N> (non-fatal; the next pass retries)")
+			e.logger.Warn().Err(err).Str("key", v.key).Msg("Iceberg: could not delete an old published version; the table's next pass retries")
 			e.notePruneDue(time.Now())
 		}
 	}
@@ -2267,7 +2288,7 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 	ns := icetable.Identifier{e.nsPrefix + "_" + database}
 	nsKey := catalogNamespaceKey(ns)
 	e.forgetExportLagNamespace(ns) // its tables' unpublished files will never be published (export_lag.go)
-	e.forgetHintedNamespace(ns)    // a table recreated under the same name publishes again (alreadyPublished)
+	e.forgetHintedNamespace(ns)    // its tables', and a spoke's databases' (alreadyPublished)
 
 	// This node's tables. A node that never exported the database has no
 	// namespace in its own catalog, but on a shared bucket another node's
@@ -2330,11 +2351,6 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 	subs, err := e.spokeSubNamespaces(ctx, database)
 	if err != nil {
 		return err
-	}
-	for _, sub := range subs {
-		for _, ident := range sub.catalogTables {
-			e.forgetHinted(ident) // as for the database's own tables, above
-		}
 	}
 
 	// Drop markers first (dropped.go): a drop that fails after this point,
