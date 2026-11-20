@@ -2,6 +2,18 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: an Iceberg snapshot expiry that failed is retried: every pass tries to expire down to `retain_snapshots` ([#1791](https://github.com/Basekick-Labs/arc/issues/1791))
+
+A reconcile pass expired snapshots over `iceberg.retain_snapshots` only when it had committed something, when an ingest append had come in since the last expiry, or on a table's first pass after a restart. So a table could stay over the bound once it went quiet:
+
+- **An expiry that failed was not tried again.** The pass that failed was left unsettled and the next one ran, but it committed nothing and so did not expire; it settled, and the extra snapshots stayed until the table's next commit.
+- **The same for an expiry that never ran**: a node that lost the writer role between its last commit and the end of its pass, or another node that appended or committed and stopped before expiring, when the node that took over had already reconciled the table in its process.
+
+Every pass that reaches its end as the writer now tries to expire down to `retain_snapshots`, whether or not it committed. A table within the bound costs nothing more: the count is read from the metadata the pass already loaded, and no commit is made. The exporter no longer keeps a record of which tables are owed an expiry.
+
+- **While an expiry keeps failing** the table's pass stays unsettled and runs in full at every `iceberg.reconcile_interval`, logging the failure at Error each time, and its ingest exports run as passes. That was already so for a table that keeps receiving data; for a quiet one it used to stop after one pass, with the snapshots left in place.
+- A node without the writer role still makes no expiry commit.
+- No configuration changes. Found by reading during #1787; the failing sequence is reproduced by the new tests, not seen in a deployment.
 ## Fix: a database deleted while its Iceberg tables were being exported could leave them broken ([#1789](https://github.com/Basekick-Labs/arc/issues/1789))
 
 A `DELETE` of a database drops its Iceberg tables from the request itself, and nothing kept that from landing in the middle of a reconcile pass or an append of one of those tables. The pass had loaded its table before the drop and committed or published after it, and the catalog ended with a table whose metadata named files the drop had deleted. Such a table still loads, so nothing treated it as gone: every later pass of it failed (`could not open manifest file`), and a database written again under the same name was exported into it. It did not heal.

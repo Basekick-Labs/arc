@@ -80,17 +80,30 @@ func (r *rig1686) history(n int) ([]FileRef, ArcSchema) {
 }
 
 // The issue's rig: a table built at retain_snapshots=10, then reconciled at 1. The retention
-// heal publishes a copy on a pass that commits no data; that pass now prunes down to retain+1.
+// heal publishes a copy on a pass that commits no data, and the pass expires the snapshots
+// over the new bound, which publishes another (#1791: every pass expires). It prunes to
+// retain+1 and the version it loaded, which a reader may have resolved when it started; the
+// pass it asks for (#1787) removes that one.
 func TestHeal1097_ConvergedPassPrunesTheHealCopy(t *testing.T) {
 	r := newHealRig(t, 10)
 	files, sc := r.history(4)
 	r.exp.retain = 1
-	settled, err := r.exp.ReconcileMeasurementWithHint(context.Background(), "mydb", "cpu", sc, files)
-	if err != nil || !settled {
-		t.Fatalf("converged pass: settled %v err %v", settled, err)
+	res, err := r.exp.reconcile(context.Background(), reconcileRequest{database: "mydb", measurement: "cpu", schema: sc, current: files})
+	if err != nil || !res.settled {
+		t.Fatalf("converged pass: settled %v err %v", res.settled, err)
 	}
-	if got := r.vCopies(); len(got) != 2 {
-		t.Fatalf("v<N> copies %v after a converged heal pass at retain=1, want retain+1 = 2", got)
+	if got := r.snapshots(); got != 1 {
+		t.Fatalf("%d snapshots after a pass at retain=1, want 1", got)
+	}
+	if got := r.vCopies(); len(got) != 3 || res.pruneAgainAt.IsZero() {
+		t.Fatalf("v<N> copies %v, prune again at %v after a converged heal pass at retain=1; want retain+1 and the version the pass loaded, and a pass asked for", got, res.pruneAgainAt)
+	}
+	res, err = r.exp.reconcile(context.Background(), reconcileRequest{database: "mydb", measurement: "cpu", schema: sc, current: files})
+	if err != nil || !res.settled {
+		t.Fatalf("the pass after: settled %v err %v", res.settled, err)
+	}
+	if got := r.vCopies(); len(got) != 2 || !res.pruneAgainAt.IsZero() {
+		t.Fatalf("v<N> copies %v, prune again at %v after the next pass; want retain+1 = 2 and nothing waiting", got, res.pruneAgainAt)
 	}
 }
 
