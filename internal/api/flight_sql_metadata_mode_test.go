@@ -239,7 +239,6 @@ func TestFlightSQLMetadataSchemasShape(t *testing.T) {
 func TestFlightSQLMetadataDefaultShapeUnchanged(t *testing.T) {
 	client, ctx := newMetadataModeFlightServer(t, nil, true)
 	ref := flightsql.TableRef{Catalog: ptr("w0_sales"), Table: "orders"}
-	_, baseErr := (&flightsql.BaseServer{}).GetFlightInfoPrimaryKeys(context.Background(), ref, nil)
 	for _, c := range []struct {
 		name            string
 		infoCtx, getCtx context.Context
@@ -267,9 +266,27 @@ func TestFlightSQLMetadataDefaultShapeUnchanged(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, []metadataRow{{catalog: "w0_sales", table: "orders"}}, fetchMetadata(t, client, info, c.getCtx))
 
-			_, err = client.GetPrimaryKeys(c.infoCtx, ref)
-			require.Equal(t, status.Code(baseErr), status.Code(err), "%v", err)
-			require.Equal(t, status.Convert(baseErr).Message(), status.Convert(err).Message())
+			base := &flightsql.BaseServer{}
+			for name, pair := range map[string]struct {
+				arc  func() error
+				base func() error
+			}{
+				"primary": {func() error { _, err := client.GetPrimaryKeys(c.infoCtx, ref); return err },
+					func() error { _, err := base.GetFlightInfoPrimaryKeys(context.Background(), ref, nil); return err }},
+				"imported": {func() error { _, err := client.GetImportedKeys(c.infoCtx, ref); return err },
+					func() error { _, err := base.GetFlightInfoImportedKeys(context.Background(), ref, nil); return err }},
+				"exported": {func() error { _, err := client.GetExportedKeys(c.infoCtx, ref); return err },
+					func() error { _, err := base.GetFlightInfoExportedKeys(context.Background(), ref, nil); return err }},
+				"cross": {func() error { _, err := client.GetCrossReference(c.infoCtx, ref, ref); return err },
+					func() error {
+						_, err := base.GetFlightInfoCrossReference(context.Background(), flightsql.CrossTableRef{PKRef: ref, FKRef: ref}, nil)
+						return err
+					}},
+			} {
+				err, want := pair.arc(), pair.base()
+				require.Equal(t, status.Code(want), status.Code(err), "%s: %v", name, err)
+				require.Equal(t, status.Convert(want).Message(), status.Convert(err).Message(), name)
+			}
 		})
 	}
 }
@@ -283,10 +300,18 @@ func TestFlightSQLMetadataModeFollowsEachCall(t *testing.T) {
 	require.Len(t, fetchMetadata(t, client, info, ctx), 3)
 
 	ref := flightsql.TableRef{Table: "orders"}
-	info, err = client.GetPrimaryKeys(withMetadataMode(ctx, "schemas"), ref)
-	require.NoError(t, err)
-	err = doGetErr(client, ctx, info)
-	require.Equal(t, codes.Unimplemented, status.Code(err), "%v", err)
+	schemas := withMetadataMode(ctx, "schemas")
+	for name, plan := range map[string]func() (*flight.FlightInfo, error){
+		"primary":  func() (*flight.FlightInfo, error) { return client.GetPrimaryKeys(schemas, ref) },
+		"imported": func() (*flight.FlightInfo, error) { return client.GetImportedKeys(schemas, ref) },
+		"exported": func() (*flight.FlightInfo, error) { return client.GetExportedKeys(schemas, ref) },
+		"cross":    func() (*flight.FlightInfo, error) { return client.GetCrossReference(schemas, ref, ref) },
+	} {
+		info, err := plan()
+		require.NoError(t, err, name)
+		err = doGetErr(client, ctx, info)
+		require.Equal(t, codes.Unimplemented, status.Code(err), "%s: %v", name, err)
+	}
 }
 
 func TestFlightSQLMetadataHeaderValidation(t *testing.T) {
@@ -332,7 +357,8 @@ func TestFlightSQLMetadataSchemasAuth(t *testing.T) {
 	})
 }
 
-// The metadata calls ignore x-arc-database in both shapes (#1720).
+// The metadata calls ignore x-arc-database in the schemas shape too; the
+// default shape's case is TestFlightSQLDatabaseHeader (#1720).
 func TestFlightSQLMetadataSchemasIgnoresDatabaseHeader(t *testing.T) {
 	client, ctx := newMetadataModeFlightServer(t, nil, true)
 	both := withDatabase(withMetadataMode(ctx, "schemas"), "zz")

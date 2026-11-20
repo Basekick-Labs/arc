@@ -244,6 +244,9 @@ it never reaches a table. A client can send the call header
   the header, and `GetSqlInfo` answers the same in both shapes (catalog term
   `database`).
 - Any other value, or the header sent twice, is `INVALID_ARGUMENT`.
+- **Send it on every call**, the `DoGet` included: each call answers in the
+  shape its own header asks for. The JDBC and ADBC drivers send it on every
+  call.
 - **Sending it:** the JDBC driver passes any URL property it does not know as
   a call header, so add `x-arc-metadata=schemas` to the URL. With ADBC, set the
   connection option `adbc.flight.sql.rpc.call_header.x-arc-metadata`.

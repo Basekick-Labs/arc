@@ -206,6 +206,8 @@ func (s *flightSQLMetadataModeService) schemaDatabases(ctx context.Context, patt
 			databases = append(databases, database)
 		}
 	}
+	// Compared with the raw pattern: an escaped one (w0\_sales) already
+	// matches only the exact name, so it needs no reordering.
 	if pattern != nil {
 		exact := *pattern
 		sort.SliceStable(databases, func(i, j int) bool {
@@ -220,80 +222,88 @@ func (s *flightSQLMetadataModeService) schemaDatabases(ctx context.Context, patt
 // unimplemented, as they always were.
 
 func (s *flightSQLMetadataModeService) GetFlightInfoPrimaryKeys(ctx context.Context, ref flightsql.TableRef, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
-	if ok, err := flightSchemasMode(ctx); err != nil || !ok {
-		if err != nil {
-			return nil, err
-		}
+	ok, err := flightSchemasMode(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
 		return s.flightSQLService.GetFlightInfoPrimaryKeys(ctx, ref, desc)
 	}
 	return s.flightInfo(desc, schema_ref.PrimaryKeys), nil
 }
 
 func (s *flightSQLMetadataModeService) DoGetPrimaryKeys(ctx context.Context, ref flightsql.TableRef) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	if ok, err := flightSchemasMode(ctx); err != nil || !ok {
-		if err != nil {
-			return nil, nil, err
-		}
+	ok, err := flightSchemasMode(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !ok {
 		return s.flightSQLService.DoGetPrimaryKeys(ctx, ref)
 	}
 	return flightEmptyStream(ctx, schema_ref.PrimaryKeys)
 }
 
 func (s *flightSQLMetadataModeService) GetFlightInfoImportedKeys(ctx context.Context, ref flightsql.TableRef, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
-	if ok, err := flightSchemasMode(ctx); err != nil || !ok {
-		if err != nil {
-			return nil, err
-		}
+	ok, err := flightSchemasMode(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
 		return s.flightSQLService.GetFlightInfoImportedKeys(ctx, ref, desc)
 	}
 	return s.flightInfo(desc, schema_ref.ImportedKeys), nil
 }
 
 func (s *flightSQLMetadataModeService) DoGetImportedKeys(ctx context.Context, ref flightsql.TableRef) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	if ok, err := flightSchemasMode(ctx); err != nil || !ok {
-		if err != nil {
-			return nil, nil, err
-		}
+	ok, err := flightSchemasMode(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !ok {
 		return s.flightSQLService.DoGetImportedKeys(ctx, ref)
 	}
 	return flightEmptyStream(ctx, schema_ref.ImportedKeys)
 }
 
 func (s *flightSQLMetadataModeService) GetFlightInfoExportedKeys(ctx context.Context, ref flightsql.TableRef, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
-	if ok, err := flightSchemasMode(ctx); err != nil || !ok {
-		if err != nil {
-			return nil, err
-		}
+	ok, err := flightSchemasMode(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
 		return s.flightSQLService.GetFlightInfoExportedKeys(ctx, ref, desc)
 	}
 	return s.flightInfo(desc, schema_ref.ExportedKeys), nil
 }
 
 func (s *flightSQLMetadataModeService) DoGetExportedKeys(ctx context.Context, ref flightsql.TableRef) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	if ok, err := flightSchemasMode(ctx); err != nil || !ok {
-		if err != nil {
-			return nil, nil, err
-		}
+	ok, err := flightSchemasMode(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !ok {
 		return s.flightSQLService.DoGetExportedKeys(ctx, ref)
 	}
 	return flightEmptyStream(ctx, schema_ref.ExportedKeys)
 }
 
 func (s *flightSQLMetadataModeService) GetFlightInfoCrossReference(ctx context.Context, ref flightsql.CrossTableRef, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
-	if ok, err := flightSchemasMode(ctx); err != nil || !ok {
-		if err != nil {
-			return nil, err
-		}
+	ok, err := flightSchemasMode(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
 		return s.flightSQLService.GetFlightInfoCrossReference(ctx, ref, desc)
 	}
 	return s.flightInfo(desc, schema_ref.CrossReference), nil
 }
 
 func (s *flightSQLMetadataModeService) DoGetCrossReference(ctx context.Context, ref flightsql.CrossTableRef) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	if ok, err := flightSchemasMode(ctx); err != nil || !ok {
-		if err != nil {
-			return nil, nil, err
-		}
+	ok, err := flightSchemasMode(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !ok {
 		return s.flightSQLService.DoGetCrossReference(ctx, ref)
 	}
 	return flightEmptyStream(ctx, schema_ref.CrossReference)
