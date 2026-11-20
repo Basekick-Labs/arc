@@ -2,11 +2,14 @@ package iceberg
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"path/filepath"
 	"strconv"
 	"testing"
 
 	icetable "github.com/apache/iceberg-go/table"
+	"github.com/rs/zerolog"
 )
 
 // refuseExpiry makes every snapshot-expiry commit fail without committing.
@@ -115,5 +118,54 @@ func TestExpiry1791_AnExpirySkippedWithoutTheWriterRoleIsMadeUpLater(t *testing.
 	res := r.passResult1791(files, sc, nil)
 	if got := r.snapshots(); got != 2 || !res.settled {
 		t.Fatalf("role back: %d snapshots, settled %v; want retain_snapshots = 2 and a settled pass", got, res.settled)
+	}
+}
+
+// Another node committed to the table and stopped before it expired. The
+// node that takes over has reconciled the table before in this process, so
+// nothing told it an expiry was due; its next pass, which commits nothing,
+// expires all the same.
+func TestExpiry1791_APassExpiresWhatAnotherNodeLeft(t *testing.T) {
+	r := newHealRig(t, 2)
+	r.exp.SetWarehouseAuthoritative(true)
+	files := []FileRef{r.write(0, "n0")}
+	sc := r.schema(files[0])
+	if res := r.passResult1791(files, sc, nil); !res.settled {
+		t.Fatal("the first node's pass is not settled")
+	}
+	first := r.exp
+
+	// The other node: its own catalog over the same warehouse. Its passes
+	// commit, and none of its expiries lands.
+	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "other.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	other, err := NewExporter(db, first.backend, "file://"+r.root, "arc", 2, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	other.SetWarehouseAuthoritative(true)
+	other.chunkMax = 16
+	other.expireCommit = refuseExpiry
+	r.exp = other
+	for i := 1; i <= 4; i++ {
+		files = append(files, r.write(0, "n"+strconv.Itoa(i)))
+		r.passResult1791(files, sc, nil)
+	}
+	if got := r.snapshots(); got <= 2 {
+		t.Fatalf("%d snapshots after the other node's passes: nothing is over retain_snapshots = 2, the test shows nothing", got)
+	}
+
+	// Back on the first node: it adopts what was published, finds every
+	// file in the table, and expires.
+	r.exp = first
+	res := r.passResult1791(files, sc, nil)
+	if res.commits != 0 {
+		t.Fatalf("%d data commits on the first node's pass, want none: the test is about a pass that commits nothing", res.commits)
+	}
+	if got := r.snapshots(); got != 2 || !res.settled {
+		t.Fatalf("%d snapshots, settled %v after the first node's pass; want retain_snapshots = 2 and a settled pass", got, res.settled)
 	}
 }
