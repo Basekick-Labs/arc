@@ -33,7 +33,10 @@ type passSource struct {
 	panicFor  map[string]bool
 	onList    func(m Measurement)
 	onListCtx func(ctx context.Context, m Measurement)
-	coldGone  []string // databases whose cold listing was invalidated
+	// Schema reads in flight, across every pass.
+	reading, mostReading int
+	slowRead             time.Duration
+	coldGone             []string // databases whose cold listing was invalidated
 }
 
 func (p *passSource) FilesAndLocal(ctx context.Context, m Measurement) ([]FileRef, []string, error) {
@@ -709,5 +712,112 @@ func TestPassBatch_FirstExportsRequestedByIngestRunAtOnce(t *testing.T) {
 	r2.sched.reqMu.Unlock()
 	if due != 3 {
 		t.Fatalf("%d requests still waiting, want the other 3", due)
+	}
+}
+
+func (p *passSource) FileSchema(ctx context.Context, f FileRef) (ArcSchema, error) {
+	p.mu.Lock()
+	p.reading++
+	p.mostReading = max(p.mostReading, p.reading)
+	slow := p.slowRead
+	p.mu.Unlock()
+	if slow > 0 {
+		time.Sleep(slow)
+	}
+	defer func() {
+		p.mu.Lock()
+		p.reading--
+		p.mu.Unlock()
+	}()
+	return p.StorageWalkSource.FileSchema(ctx, f)
+}
+
+// The footer reads of a batch's passes are bounded together: with three
+// passes that would each read 8 at once, never more than the batch's 16 are
+// in flight, and more than one pass's 8 are (the bound is shared, the passes
+// are not made to take turns).
+func TestPassBatch_TheBatchBoundsItsFooterReadsTogether(t *testing.T) {
+	r := newPassRig(t, 3, 3, 1)
+	for _, m := range r.tables {
+		for i := 0; i < 23; i++ {
+			r.newFile(m)
+		}
+	}
+	r.src.mu.Lock()
+	r.src.slowRead = 15 * time.Millisecond
+	r.src.mu.Unlock()
+	r.sched.runPass(context.Background())
+	r.src.mu.Lock()
+	most := r.src.mostReading
+	r.src.mu.Unlock()
+	if most > batchReadsAtOnce {
+		t.Errorf("%d footer reads in flight across the batch, want at most %d", most, batchReadsAtOnce)
+	}
+	if most <= unionSchemaConcurrency {
+		t.Errorf("%d footer reads in flight across three passes: no more than one pass alone makes", most)
+	}
+	r.wantEachOnce()
+}
+
+// With the append path off every ingest request is a reconcile pass: idle,
+// they run several at once; between two measurements of a timed pass, one.
+func TestPassBatch_WithTheAppendPathOffIngestPassesRunAtOnce(t *testing.T) {
+	r := newPassRig(t, 8, 4, 4)
+	r.sched.appendEnabled = false
+	for _, m := range r.tables {
+		r.report(m, r.files[m][0])
+	}
+	time.Sleep(5 * time.Millisecond)
+	done := r.gate(8, 4)
+	r.sched.serviceIngest(context.Background(), ingestBatch)
+	<-done
+	if most := r.ungate(); most != 4 {
+		t.Errorf("%d passes at once with the append path off, want 4", most)
+	}
+	r.wantEachOnce()
+	// A second round: still passes (no table takes appends), one between
+	// two measurements.
+	for _, m := range r.tables {
+		r.report(m, r.newFile(m))
+	}
+	time.Sleep(5 * time.Millisecond)
+	before := 0
+	for _, m := range r.tables {
+		before += r.src.passes(m)
+	}
+	r.sched.serviceIngest(context.Background(), 1)
+	after := 0
+	for _, m := range r.tables {
+		after += r.src.passes(m)
+	}
+	if after-before != 1 {
+		t.Fatalf("%d passes between two measurements with the append path off, want 1", after-before)
+	}
+}
+
+// A pass that ran beside others and committed restarts its table's export
+// spacing, as one on the loop goroutine does; one that committed nothing
+// does not.
+func TestPassBatch_ACommittingPassRestartsTheSpacing(t *testing.T) {
+	r := newPassRig(t, 2, 4, 1)
+	r.sched.runPass(context.Background())
+	r.sched.ingestInterval = time.Hour
+	for i, commits := range []int{2, 0} {
+		key := "mydb\x00" + r.tables[i]
+		r.sched.reqMu.Lock()
+		delete(r.sched.ingestNext, key)
+		r.sched.reqMu.Unlock()
+		job := r.sched.preparePass(Measurement{Database: "mydb", Measurement: r.tables[i]}, key)
+		job.outcome, job.commits = outcomeReconciled, commits
+		r.sched.finishPass(job)
+		r.sched.reqMu.Lock()
+		next, stamped := r.sched.ingestNext[key]
+		r.sched.reqMu.Unlock()
+		if commits > 0 && (!stamped || time.Until(next) < 50*time.Minute) {
+			t.Errorf("a pass that committed left the table's next export at %v (stamped=%v), want an interval from now", next, stamped)
+		}
+		if commits == 0 && stamped {
+			t.Errorf("a pass that committed nothing restarted the table's export spacing (next %v)", next)
+		}
 	}
 }

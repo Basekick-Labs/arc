@@ -4753,6 +4753,10 @@ func main() {
 		if n := cfg.Iceberg.ReconcileConcurrency; n > 1 && icebergPassesAtOnce == 1 {
 			log.Info().Int("iceberg.reconcile_concurrency", n).
 				Msg("Iceberg export reconciles one table at a time on this node: reconcile passes of several tables at once are for standalone nodes")
+		} else {
+			// The value in effect: unset, it depends on the storage.
+			log.Info().Int("reconcile_passes_at_once", icebergPassesAtOnce).Int("iceberg.reconcile_concurrency", n).
+				Msg("Iceberg export: reconcile passes of different tables that run at once")
 		}
 		icebergScheduler := iceberg.NewScheduler(iceberg.SchedulerConfig{
 			Exporter: exporter,
