@@ -59,6 +59,9 @@ const stopWriterLost = "writer role lost"
 // reconcileRequest is one measurement's reconcile input.
 type reconcileRequest struct {
 	database, measurement string
+	// dropChecked: the caller ran settleDroppedTable on this Exporter for
+	// this pass (shared_drop.go); otherwise reconcile does.
+	dropChecked bool
 	// schema covers every file in current except those in unread.
 	schema ArcSchema
 	// current is the measurement's full listing. It is always the whole listing, never the
@@ -126,11 +129,32 @@ func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, m
 	return res.settled, err
 }
 
-func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconcileResult, error) {
+func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res reconcileResult, err error) {
 	ctx = e.withAWS(ctx)
 	e.passLag = 0 // the largest export lag this pass publishes (export_lag.go)
 	database, measurement := req.database, req.measurement
 	tkey := database + "\x00" + measurement
+	// On a shared bucket: give way to a drop of the database running on
+	// another node, and remove a table that drop meant to remove
+	// (shared_drop.go, #1792). The scheduler does this before it reads the
+	// table; a caller that has not is covered here.
+	if !req.dropChecked {
+		if err := e.settleDroppedTable(ctx, database, measurement, req.canCommit); err != nil {
+			return reconcileResult{}, err
+		}
+	}
+	// And at the end of the pass, however it ends (a pass can commit and
+	// then fail, and one that creates the table need not commit): if the
+	// database was dropped on another node meanwhile, what the pass wrote
+	// goes.
+	defer func() {
+		if e.droppedUnderPass(ctx, database, measurement, req.canCommit) {
+			res.settled = false
+			if err == nil {
+				err = fmt.Errorf("%s.%s: %w", database, measurement, errDroppedUnderPass)
+			}
+		}
+	}()
 	// A pass can rewrite the table's manifests: the append path counts them again (append.go).
 	e.forgetSmallManifests(tkey)
 	canCommit := req.canCommit
@@ -617,7 +641,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 			Int("registered", registered).Int("left_for_next_pass", deferredNew).
 			Msg("Iceberg: source files disappeared during this pass (a compaction, delete or retention is rewriting this measurement); what they touched is left for the next pass")
 	}
-	res := reconcileResult{
+	res = reconcileResult{
 		partial:      partial,
 		registered:   registered,
 		remaining:    remaining,

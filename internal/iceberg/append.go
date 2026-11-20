@@ -153,7 +153,6 @@ func (e *Exporter) appendFiles(ctx context.Context, database, measurement string
 		return res, err
 	}
 	e.notePassStart(ctx, tbl)
-
 	add, err := readSchemas(ctx, files)
 	if err != nil {
 		return res, err

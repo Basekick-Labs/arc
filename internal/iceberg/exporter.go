@@ -114,6 +114,10 @@ type passState struct {
 	// version only because of iceberg.min_version_age, or could not finish
 	// (pruneAgainAt). Zero: nothing is waiting.
 	passPruneDue time.Time
+	// dropID is the id of the database's drop record as this pass found it
+	// ("" when there is none): what a table the pass creates carries, and
+	// what the end of the pass compares the record with (shared_drop.go).
+	dropID string
 	// passGate, while a reconcile runs, is its canCommit: EnsureTable's heals check it before
 	// committing, so a node that lost the writer role mid-pass does not publish a heal (#1097).
 	// nil outside a reconcile (always allowed).
@@ -190,6 +194,11 @@ type exporterShared struct {
 
 	// warehouseAuthoritative, published: see adopt.go.
 	warehouseAuthoritative bool
+	// dropSeen: the drop record id each table ("<db>\x00<measurement>") was
+	// last found to carry, so a pass does not load the table to compare again
+	// (shared_drop.go). Forgotten with the database's memory.
+	dropSeenMu sync.Mutex
+	dropSeen   map[string]string
 	// forgetDroppedRows, markerCleared (guarded by publishedMu): see dropped.go (#1611).
 	forgetDroppedRows bool
 	markerCleared     map[string]struct{}
@@ -235,6 +244,11 @@ type exporterShared struct {
 	// once, and onDatabaseDropped is told after a drop (database_lock.go).
 	dbLocks           databaseLocks
 	onDatabaseDropped func(database string)
+	// dropAfterListing, when set, runs inside a drop once it has listed what
+	// it will delete and written its markers, before it deletes anything.
+	// Tests only: it is how another node's pass is placed inside a drop
+	// (#1792). nil in production.
+	dropAfterListing func()
 	// appendSmall: per table, the small data manifests its current snapshot
 	// holds, as the last append left them; absent when not known (a pass
 	// ran, an append failed, the process started). Under chunkMu.
@@ -719,11 +733,18 @@ func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string
 	// Bound iceberg-go's own metadata-file history so NNNNN-*.metadata.json don't accumulate
 	// forever: enable delete-after-commit and cap previous versions at `retain`. (Our own
 	// v<N>.metadata.json copies are pruned separately in pruneOldVersionFiles.)
+	props := iceberg.Properties{}
 	if e.retain > 0 {
-		createOpts = append(createOpts, icecatalog.WithProperties(iceberg.Properties{
-			icetable.MetadataDeleteAfterCommitEnabledKey: "true",
-			icetable.MetadataPreviousVersionsMaxKey:      strconv.Itoa(e.previousVersionsMax()),
-		}))
+		props[icetable.MetadataDeleteAfterCommitEnabledKey] = "true"
+		props[icetable.MetadataPreviousVersionsMaxKey] = strconv.Itoa(e.previousVersionsMax())
+	}
+	// The database's drop record when the table is created (shared_drop.go,
+	// #1792): what tells this table from one a later drop meant to remove.
+	if e.dropID != "" {
+		props[tableDropIDProp] = e.dropID
+	}
+	if len(props) > 0 {
+		createOpts = append(createOpts, icecatalog.WithProperties(props))
 	}
 
 	if e.colocatedLayout() {
@@ -738,6 +759,9 @@ func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string
 	tbl, err = e.catalog.CreateTable(ctx, ident, schema, createOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("create iceberg table %v: %w", ident, err)
+	}
+	if e.dropID != "" {
+		e.noteDropSeen(database, measurement, e.dropID) // created under it: no later pass need load the table to compare
 	}
 	e.writeVersionHint(ctx, tbl)
 	e.logger.Info().Str("database", database).Str("measurement", measurement).Msg("Created Iceberg table")
@@ -2293,6 +2317,12 @@ func isAlreadyExists(err error) bool {
 // It waits for the exports of the database's tables that are running, and
 // none starts until it is done (database_lock.go, #1789); if they do not end
 // in time it drops nothing and says so.
+//
+// On a shared bucket the exports run on another node, which that lock does
+// not hold: the drop writes the database's drop record first, stops deleting
+// at dropDeadline, and marks the record done at its end (shared_drop.go,
+// #1792). A drop that fails or runs out of time leaves the record "running",
+// and re-run (the DELETE repeated) starts a new one.
 func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 	ctx = e.withAWS(ctx)
 	if strings.ContainsAny(database, "/\\") {
@@ -2303,6 +2333,13 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 		return err
 	}
 	defer release()
+	// On a shared bucket, tell the other nodes first (shared_drop.go, #1792):
+	// the exporting node gives way while this runs, and what it wrote into
+	// these tables before it saw the record is recognised as dropped.
+	rec, recorded, err := e.beginDropRecord(ctx, database)
+	if err != nil {
+		return err
+	}
 	// Whatever the drop gets through, and before the lock is released: a
 	// drop that fails part way has still removed tables, and forgetting what
 	// was known of a table that is there after all only costs its next pass
@@ -2314,6 +2351,22 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 			e.onDatabaseDropped(database)
 		}
 	}()
+	if recorded {
+		// The other nodes believe the record for dropRecordStale and then
+		// export the database again: this drop must have stopped deleting
+		// well before that, or it would delete what they then write.
+		dctx, cancel := context.WithDeadline(ctx, dropDeadline(rec.Started))
+		defer cancel()
+		if err := e.dropDatabase(dctx, database); err != nil {
+			// The record stays "not done": the database's export waits for
+			// the DELETE to be repeated, or for the record to go stale.
+			return err
+		}
+		// Kept also when the drop found nothing: a first export of one of
+		// the database's tables may be about to create it.
+		e.finishDropRecord(ctx, database, rec)
+		return nil
+	}
 	return e.dropDatabase(ctx, database)
 }
 
@@ -2429,6 +2482,14 @@ func (e *Exporter) dropDatabase(ctx context.Context, database string) error {
 		}
 	}
 
+	if e.dropAfterListing != nil {
+		e.dropAfterListing()
+	}
+	// A drop past its deadline deletes nothing more (DropDatabase): not
+	// every backend ends a delete when its context does.
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("drop iceberg tables of database %q: %w", database, err)
+	}
 	// The SQL catalog's DropNamespace refuses non-empty namespaces, so drop
 	// every table first. Collect the first error but keep going: partial
 	// cleanup converges on the next delete attempt.
@@ -2515,6 +2576,9 @@ func (e *Exporter) dropDatabase(ctx context.Context, database string) error {
 			return strings.HasSuffix(tkeys[i], "/version-hint.text") && !strings.HasSuffix(tkeys[j], "/version-hint.text")
 		})
 		for _, key := range tkeys {
+			if err := ctx.Err(); err != nil {
+				return fmt.Errorf("delete colocated Iceberg metadata of database %q: %w", database, err)
+			}
 			if err := e.backend.Delete(ctx, key); err != nil && !storage.IsNotFound(err) && firstErr == nil {
 				firstErr = fmt.Errorf("delete colocated Iceberg metadata %s: %w", key, err)
 			}
@@ -2557,11 +2621,16 @@ func (e *Exporter) dropDatabase(ctx context.Context, database string) error {
 
 // deleteWarehouseDir deletes a namespace directory's objects, then sweeps the
 // emptied directory tree deepest-first (RemoveDirectory is non-recursive;
-// object stores no-op). The first delete error is returned; the rest go on.
+// object stores no-op). The first delete error is returned; the rest go on,
+// except when ctx has ended: a drop past its deadline deletes nothing more
+// and leaves the sweep to its re-run.
 func (e *Exporter) deleteWarehouseDir(ctx context.Context, relDir string, keys []string) error {
 	var firstErr error
 	dirs := map[string]bool{relDir: true}
 	for _, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("delete warehouse objects under %s: %w", relDir, err)
+		}
 		if err := e.backend.Delete(ctx, key); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("delete warehouse object %s: %w", key, err)
 		}
