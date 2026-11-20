@@ -54,6 +54,9 @@ type passJob struct {
 	prev      measurementState
 	cached    bool
 	startedAt time.Time
+	// drops is the exporter's count of drops of the table's database, read
+	// by the pass once it holds the database.
+	drops uint64
 
 	// What the pass did.
 	op          stateOp
@@ -66,8 +69,11 @@ type passJob struct {
 	took        time.Duration
 }
 
-func (j *passJob) setState(st measurementState) { j.op, j.newState = stateSet, st }
-func (j *passJob) dropState()                   { j.op = stateDrop }
+func (j *passJob) setState(st measurementState) {
+	st.drops = j.drops
+	j.op, j.newState = stateSet, st
+}
+func (j *passJob) dropState() { j.op = stateDrop }
 
 // passRunner is what a reconcile pass uses besides its job and its exporter.
 // None of it changes after the scheduler is built.
@@ -269,6 +275,17 @@ func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter)
 		return outcomeUnchanged, err
 	}
 	defer release()
+	// What the scheduler remembered of the table was copied before this pass
+	// had the database. If the database was dropped since it was cached
+	// (while this pass waited for that very drop, or at any time before the
+	// loop got to forget it), it describes a table that is gone: its schema
+	// and its files' footers are not those of a table recreated under the
+	// name, and a pass that trusted them built the new table with the old
+	// columns. Start from the table, as on first sight.
+	job.drops = exp.databaseDrops(m.Database)
+	if job.cached && job.prev.drops != job.drops {
+		job.prev, job.cached = measurementState{}, false
+	}
 	// What this pass reads of the store is not read twice (export_reads.go, #1778).
 	ctx = withExportReads(ctx)
 	// One backend listing yields both the data-file URIs and the local paths (Files + LocalFiles

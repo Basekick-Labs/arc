@@ -2299,14 +2299,18 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 		return err
 	}
 	defer release()
-	if err := e.dropDatabase(ctx, database); err != nil {
-		return err
-	}
-	e.forgetDatabaseMemory(database)
-	if e.onDatabaseDropped != nil {
-		e.onDatabaseDropped(database)
-	}
-	return nil
+	// Whatever the drop gets through, and before the lock is released: a
+	// drop that fails part way has still removed tables, and forgetting what
+	// was known of a table that is there after all only costs its next pass
+	// a look at the table itself.
+	defer func() {
+		e.countDatabaseDrop(database)
+		e.forgetDatabaseMemory(database)
+		if e.onDatabaseDropped != nil {
+			e.onDatabaseDropped(database)
+		}
+	}()
+	return e.dropDatabase(ctx, database)
 }
 
 // dropDatabase is DropDatabase's work, with the database's lock held.

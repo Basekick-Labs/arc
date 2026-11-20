@@ -45,6 +45,29 @@ var dropLockWait = 150 * time.Second
 type databaseLocks struct {
 	mu sync.Mutex
 	m  map[string]*semaphore.Weighted
+	// drops counts the drops of each database (by lock key) in this
+	// process: what was learnt of a table under one count is not true under
+	// the next (databaseDrops).
+	drops map[string]uint64
+}
+
+// databaseDrops is how many times the database's tables have been dropped in
+// this process. A pass reads it while it holds the database, so the number
+// cannot change under it; what the scheduler cached for a table under
+// another number describes a table that is gone, whatever now has its name.
+func (e *Exporter) databaseDrops(database string) uint64 {
+	e.dbLocks.mu.Lock()
+	defer e.dbLocks.mu.Unlock()
+	return e.dbLocks.drops[databaseLockKey(database)]
+}
+
+func (e *Exporter) countDatabaseDrop(database string) {
+	e.dbLocks.mu.Lock()
+	defer e.dbLocks.mu.Unlock()
+	if e.dbLocks.drops == nil {
+		e.dbLocks.drops = make(map[string]uint64)
+	}
+	e.dbLocks.drops[databaseLockKey(database)]++
 }
 
 // databaseLockKey is what a database's lock is kept under: the database, or
@@ -77,8 +100,11 @@ func (l *databaseLocks) of(database string) *semaphore.Weighted {
 // dropped, for as long as ctx allows.
 func (e *Exporter) holdDatabase(ctx context.Context, database string) (release func(), err error) {
 	sem := e.dbLocks.of(database)
-	if err := sem.Acquire(ctx, 1); err != nil {
-		return nil, fmt.Errorf("iceberg: database %q is being dropped: %w", database, err)
+	if !sem.TryAcquire(1) {
+		// Only a drop, running or waiting its turn, keeps an export out.
+		if err := sem.Acquire(ctx, 1); err != nil {
+			return nil, fmt.Errorf("iceberg: database %q is being dropped: %w", database, err)
+		}
 	}
 	return func() { sem.Release(1) }, nil
 }
@@ -88,6 +114,9 @@ func (e *Exporter) holdDatabase(ctx context.Context, database string) (release f
 // dropLockWait or when ctx ends, whichever is first.
 func (e *Exporter) lockDatabaseForDrop(ctx context.Context, database string) (release func(), err error) {
 	sem := e.dbLocks.of(database)
+	if sem.TryAcquire(databaseLockShares) {
+		return func() { sem.Release(databaseLockShares) }, nil
+	}
 	wctx, cancel := context.WithTimeout(ctx, dropLockWait)
 	defer cancel()
 	if err := sem.Acquire(wctx, databaseLockShares); err != nil {

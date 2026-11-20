@@ -3,6 +3,8 @@ package iceberg
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -332,5 +334,133 @@ func TestDrop1789_ADropWaitsForTheAppendInProgress(t *testing.T) {
 		if exists, err := r.exp.tableExists(context.Background(), "mydb", m); err != nil || exists {
 			t.Errorf("table %s after the drop: exists=%v err=%v", m, exists, err)
 		}
+	}
+}
+
+// A pass that had to wait for a drop of its database starts from the table
+// it finds, not from what the scheduler remembered of the table that was
+// dropped: a database written again with other columns is exported with
+// those columns, and one whose column changed type is exported at all.
+func TestDrop1789_APassThatWaitedForADropForgetsTheDroppedTable(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		old, new func(t *testing.T, path string, baseTS int64, n int)
+		want     []string
+	}{
+		{"the new files lack a column of the old table", writeArcStyleParquet4Col, writeArcStyleParquet, []string{"time", "host", "value"}},
+		{"a column of the new files has another type", writeArcStyleParquet, writeStringValueParquet, []string{"time", "host", "value"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newPassRig(t, 1, 1, 1)
+			m := r.tables[0]
+			ctx := context.Background()
+			// The table as first written.
+			if err := os.RemoveAll(filepath.Join(r.root, "mydb")); err != nil {
+				t.Fatal(err)
+			}
+			oldName := ingestName(m, time.Now())
+			tc.old(t, r.path(m, oldName), 1_700_000_000_000_000, 5)
+			r.sched.runPass(ctx)
+			if got := len(r.entries(m)); got != 1 {
+				t.Fatalf("%d files in the table before the drop, want 1", got)
+			}
+			// An export holds the database; the drop waits behind it, and a
+			// pass of the table behind the drop, with what the scheduler
+			// remembers of the table already copied.
+			busy, err := r.exp.holdDatabase(ctx, "mydb")
+			if err != nil {
+				t.Fatal(err)
+			}
+			dropped := make(chan error, 1)
+			go func() { dropped <- r.exp.DropDatabase(ctx, "mydb") }()
+			time.Sleep(50 * time.Millisecond) // the drop is waiting
+			passDone := make(chan struct{})
+			go func() { defer close(passDone); r.sched.runPass(ctx) }()
+			time.Sleep(50 * time.Millisecond) // the pass is waiting behind it
+			// The DELETE's files go, and the database is written again.
+			if err := os.RemoveAll(filepath.Join(r.root, "mydb")); err != nil {
+				t.Fatal(err)
+			}
+			newName := ingestName(m, time.Now().Add(time.Second))
+			tc.new(t, r.path(m, newName), 1_700_000_000_000_000, 5)
+			busy()
+			if err := <-dropped; err != nil {
+				t.Fatal(err)
+			}
+			<-passDone
+			r.sched.runPass(ctx)
+			got := r.entries(m)
+			if len(got) != 1 || got[newName] != 1 {
+				t.Fatalf("the recreated table holds %v, want only %s", got, newName)
+			}
+			// What is cached now is cached for the database as it is: the
+			// next pass trusts it (and is skipped while nothing changes).
+			st, cached := r.sched.state["mydb\x00"+m]
+			if !cached || st.drops != r.exp.databaseDrops("mydb") || st.drops == 0 {
+				t.Fatalf("the recreated table's state is cached=%v under drop count %d; the exporter counts %d", cached, st.drops, r.exp.databaseDrops("mydb"))
+			}
+			tbl, err := r.exp.catalog.LoadTable(ctx, r.exp.tableIdent("mydb", m))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var cols []string
+			for _, f := range tbl.Schema().Fields() {
+				cols = append(cols, f.Name)
+			}
+			if strings.Join(cols, ",") != strings.Join(tc.want, ",") {
+				t.Fatalf("the recreated table has columns %v, want %v: it was built from the dropped table's schema", cols, tc.want)
+			}
+			if tc.name == "a column of the new files has another type" {
+				f, _ := tbl.Schema().FindFieldByName("value")
+				if f.Type.String() != "string" {
+					t.Fatalf("column value is %s in the recreated table, want string", f.Type)
+				}
+			}
+		})
+	}
+}
+
+// A drop that failed part way still counts as a drop: what was known of the
+// database's tables is forgotten, and the scheduler is told.
+func TestDrop1789_AFailedDropStillForgets(t *testing.T) {
+	r := newPassRig(t, 1, 1, 1)
+	r.sched.runPass(context.Background())
+	before := r.exp.databaseDrops("mydb")
+	r.exp.setSmallManifests("mydb\x00"+r.tables[0], 3)
+	r.exp.setSmallManifests("hub/spokedb\x00cpu", 3) // a spoke's database, dropped with the spoke
+	r.exp.publishedMu.Lock()
+	if r.exp.markerCleared == nil {
+		r.exp.markerCleared = map[string]struct{}{}
+	}
+	r.exp.markerCleared["arc_mydb\x00"+r.tables[0]] = struct{}{}
+	r.exp.publishedMu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the drop's own work fails at once; the lock is free, so it is entered
+	if err := r.exp.DropDatabase(ctx, "mydb"); err == nil {
+		t.Skip("the drop did not fail on a cancelled context here; nothing to check")
+	}
+	if got := r.exp.databaseDrops("mydb"); got != before+1 {
+		t.Errorf("a drop that failed part way counted %d drops, want %d", got-before, 1)
+	}
+	if _, ok := r.exp.smallManifests("mydb\x00" + r.tables[0]); ok {
+		t.Error("the exporter kept what it knew of a table after a drop that failed part way")
+	}
+	r.exp.publishedMu.Lock()
+	_, kept := r.exp.markerCleared["arc_mydb\x00"+r.tables[0]]
+	r.exp.publishedMu.Unlock()
+	if kept {
+		t.Error("the exporter still counts the table's drop marker as cleared after a drop")
+	}
+	if !r.sched.otherRequestsQueued() {
+		t.Error("the scheduler was not told of a drop that failed part way")
+	}
+	// A spoke's databases go with the spoke.
+	r.exp.forgetDatabaseMemory("hub")
+	if _, ok := r.exp.smallManifests("hub/spokedb\x00cpu"); ok {
+		t.Error("the exporter kept what it knew of a dropped spoke's database")
+	}
+	// And a context that has ended is not blamed on a drop when the database is free.
+	if _, err := r.exp.holdDatabase(ctx, "mydb"); err != nil {
+		t.Errorf("an export of a free database was refused on an ended context: %v", err)
 	}
 }
