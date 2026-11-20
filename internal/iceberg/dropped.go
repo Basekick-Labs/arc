@@ -35,6 +35,9 @@ package iceberg
 // is set. A table's marker is removed by its next successful publish: from
 // then on a lagging node follows the published version and needs no marker,
 // and a later loss of that table (a wiped prefix) is the #637 error again.
+// That publish can be one of a pass the drop overlapped, on another node;
+// the pass then finds its table dropped and writes the marker back before
+// it removes what it wrote (shared_drop.go, #1792).
 
 import (
 	"context"

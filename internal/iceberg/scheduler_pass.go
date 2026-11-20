@@ -278,9 +278,11 @@ func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter)
 	}
 	defer release()
 	// The same on a shared bucket, for a drop running on another node, and a
-	// table that drop meant to remove is removed here, before anything of it
-	// is read (shared_drop.go, #1792).
-	if err := exp.settleDroppedTable(ctx, m.Database, m.Measurement); err != nil {
+	// table that drop meant to remove is removed: before anything of the
+	// table is read, and only in a pass that will read it, not in one that
+	// finds its files unchanged (shared_drop.go, #1792).
+	settle := func() (reconcileOutcome, error) {
+		err := exp.settleDroppedTable(ctx, m.Database, m.Measurement, r.canRun)
 		if errors.Is(err, errDatabaseBeingDropped) {
 			return outcomeBusy, err
 		}
@@ -329,6 +331,9 @@ func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter)
 		// Only for a table that already exists: an empty directory that never held data must not
 		// mint a zero-column table (EnsureTable would create one with no fields and no partition
 		// spec). Schema is irrelevant when emptying — the existing table's schema is preserved.
+		if out, err := settle(); err != nil {
+			return out, err
+		}
 		exists, err := exp.tableExists(ctx, m.Database, m.Measurement)
 		if err != nil {
 			return outcomeUnchanged, err
@@ -365,6 +370,9 @@ func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter)
 	prev, cached := job.prev, job.cached
 	if cached && prev.unchanged(fp, time.Now()) {
 		return outcomeUnchanged, nil
+	}
+	if out, err := settle(); err != nil {
+		return out, err
 	}
 
 	// The set changed (or first sight): work out which files' footers are not already accounted

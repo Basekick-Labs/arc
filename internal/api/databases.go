@@ -1862,8 +1862,9 @@ func extractSubdirectories(files []string, prefix string) []string {
 // dropIcebergCatalog is the nil-safe, logged wrapper around the wired
 // catalog dropper. It returns the dropper's error for the caller to report:
 // the files are deleted either way, and the database's Iceberg tables are
-// not (the drop waits for an export of them in progress and gives up when
-// that does not end in time, #1789, or it failed part way).
+// not, or not all of them (the drop waits for an export of them in progress
+// and gives up when that does not end in time, #1789; or it failed part way;
+// or, on a shared bucket, it ran past its deadline, #1792).
 func (h *DatabasesHandler) dropIcebergCatalog(ctx context.Context, name string) error {
 	if h.icebergDropper == nil {
 		return nil

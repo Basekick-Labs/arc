@@ -194,6 +194,11 @@ type exporterShared struct {
 
 	// warehouseAuthoritative, published: see adopt.go.
 	warehouseAuthoritative bool
+	// dropSeen: the drop record id each table ("<db>\x00<measurement>") was
+	// last found to carry, so a pass does not load the table to compare again
+	// (shared_drop.go). Forgotten with the database's memory.
+	dropSeenMu sync.Mutex
+	dropSeen   map[string]string
 	// forgetDroppedRows, markerCleared (guarded by publishedMu): see dropped.go (#1611).
 	forgetDroppedRows bool
 	markerCleared     map[string]struct{}
@@ -754,6 +759,9 @@ func (e *Exporter) EnsureTable(ctx context.Context, database, measurement string
 	tbl, err = e.catalog.CreateTable(ctx, ident, schema, createOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("create iceberg table %v: %w", ident, err)
+	}
+	if e.dropID != "" {
+		e.noteDropSeen(database, measurement, e.dropID) // created under it: no later pass need load the table to compare
 	}
 	e.writeVersionHint(ctx, tbl)
 	e.logger.Info().Str("database", database).Str("measurement", measurement).Msg("Created Iceberg table")
@@ -2309,6 +2317,12 @@ func isAlreadyExists(err error) bool {
 // It waits for the exports of the database's tables that are running, and
 // none starts until it is done (database_lock.go, #1789); if they do not end
 // in time it drops nothing and says so.
+//
+// On a shared bucket the exports run on another node, which that lock does
+// not hold: the drop writes the database's drop record first, stops deleting
+// at dropDeadline, and marks the record done at its end (shared_drop.go,
+// #1792). A drop that fails or runs out of time leaves the record "running",
+// and re-run (the DELETE repeated) starts a new one.
 func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 	ctx = e.withAWS(ctx)
 	if strings.ContainsAny(database, "/\\") {
@@ -2341,30 +2355,23 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 		// The other nodes believe the record for dropRecordStale and then
 		// export the database again: this drop must have stopped deleting
 		// well before that, or it would delete what they then write.
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithDeadline(ctx, rec.Started.Add(dropRecordStale*2/3))
+		dctx, cancel := context.WithDeadline(ctx, dropDeadline(rec.Started))
 		defer cancel()
-	}
-	var found bool
-	if err := e.dropDatabase(ctx, database, &found); err != nil {
-		return err // the record stays "not done": the export waits for the DELETE to be repeated
-	}
-	if !recorded {
+		if err := e.dropDatabase(dctx, database); err != nil {
+			// The record stays "not done": the database's export waits for
+			// the DELETE to be repeated, or for the record to go stale.
+			return err
+		}
+		// Kept also when the drop found nothing: a first export of one of
+		// the database's tables may be about to create it.
+		e.finishDropRecord(ctx, database, rec)
 		return nil
 	}
-	if !found {
-		// Nothing of this database was ever exported: no table can be from
-		// before this drop, so no record is kept for it.
-		return e.removeDropRecord(ctx, database, rec)
-	}
-	rec.Done = true
-	return e.writeDropRecord(ctx, database, rec)
+	return e.dropDatabase(ctx, database)
 }
 
-// dropDatabase is DropDatabase's work, with the database's lock held. found
-// is set to whether there was anything of the database to drop: a table in
-// this node's catalog, or an object in the warehouse.
-func (e *Exporter) dropDatabase(ctx context.Context, database string, found *bool) error {
+// dropDatabase is DropDatabase's work, with the database's lock held.
+func (e *Exporter) dropDatabase(ctx context.Context, database string) error {
 	ns := icetable.Identifier{e.nsPrefix + "_" + database}
 	nsKey := catalogNamespaceKey(ns)
 	e.forgetExportLagNamespace(ns) // its tables' unpublished files will never be published (export_lag.go)
@@ -2475,7 +2482,6 @@ func (e *Exporter) dropDatabase(ctx context.Context, database string, found *boo
 		}
 	}
 
-	*found = len(localTables) > 0 || len(keys) > 0 || len(colocated) > 0 || len(subs) > 0
 	if e.dropAfterListing != nil {
 		e.dropAfterListing()
 	}
@@ -2615,7 +2621,9 @@ func (e *Exporter) dropDatabase(ctx context.Context, database string, found *boo
 
 // deleteWarehouseDir deletes a namespace directory's objects, then sweeps the
 // emptied directory tree deepest-first (RemoveDirectory is non-recursive;
-// object stores no-op). The first delete error is returned; the rest go on.
+// object stores no-op). The first delete error is returned; the rest go on,
+// except when ctx has ended: a drop past its deadline deletes nothing more
+// and leaves the sweep to its re-run.
 func (e *Exporter) deleteWarehouseDir(ctx context.Context, relDir string, keys []string) error {
 	var firstErr error
 	dirs := map[string]bool{relDir: true}

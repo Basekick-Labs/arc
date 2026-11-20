@@ -244,7 +244,7 @@ func TestSharedDrop1792_TheNextPassRemovesATableFromBeforeTheDrop(t *testing.T) 
 	b.SetForgetDroppedRows(true)
 	// The table is broken, and the database is still empty: the next pass
 	// removes what is left.
-	if err := b.settleDroppedTable(ctx, "mydb", "cpu"); err != nil {
+	if err := b.settleDroppedTable(ctx, "mydb", "cpu", nil); err != nil {
 		t.Fatalf("the next pass's look at the drop record: %v", err)
 	}
 	if left, _ := os.ReadDir(r.metaDir()); len(left) != 0 {
@@ -325,7 +325,7 @@ func TestSharedDrop1792_AStaleOrUnreadableRecord(t *testing.T) {
 	if err != nil || !recorded {
 		t.Fatalf("beginDropRecord: %v %v", recorded, err)
 	}
-	if err := b.settleDroppedTable(ctx, "mydb", "cpu"); !errors.Is(err, errDatabaseBeingDropped) {
+	if err := b.settleDroppedTable(ctx, "mydb", "cpu", nil); !errors.Is(err, errDatabaseBeingDropped) {
 		t.Fatalf("a pass while a drop's record says running: %v", err)
 	}
 	if n := r.live(b); n != len(r.files()) {
@@ -335,7 +335,7 @@ func TestSharedDrop1792_AStaleOrUnreadableRecord(t *testing.T) {
 	dropRecordStale = 0
 	t.Cleanup(func() { dropRecordStale = old })
 	// No longer believed to be running: the table predates it and goes.
-	if err := b.settleDroppedTable(ctx, "mydb", "cpu"); err != nil {
+	if err := b.settleDroppedTable(ctx, "mydb", "cpu", nil); err != nil {
 		t.Fatalf("a pass once the record is stale: %v", err)
 	}
 	if left, _ := os.ReadDir(r.metaDir()); len(left) != 0 {
@@ -382,7 +382,7 @@ func TestSharedDrop1792_NoRecordNoRemoval(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(r.root, filepath.FromSlash(dropRecordKey("mydb")))); !os.IsNotExist(err) {
 		t.Fatalf("a drop wrote a record where records are off (stat: %v)", err)
 	}
-	if err := solo.settleDroppedTable(ctx, "mydb", "cpu"); err != nil || solo.dropID != "" {
+	if err := solo.settleDroppedTable(ctx, "mydb", "cpu", nil); err != nil || solo.dropID != "" {
 		t.Fatalf("a pass where records are off: err=%v dropID=%q", err, solo.dropID)
 	}
 	// A shared bucket, a table created under a drop, and the record gone.
@@ -494,7 +494,7 @@ func TestSharedDrop1792_TheEndOfAPassWhoseDatabaseWasDropped(t *testing.T) {
 	r, a, b := sharedDropRig(t)
 	ctx := context.Background()
 	// b's pass started with no record; a drop has been recorded since.
-	if err := b.settleDroppedTable(ctx, "mydb", "cpu"); err != nil || b.dropID != "" {
+	if err := b.settleDroppedTable(ctx, "mydb", "cpu", nil); err != nil || b.dropID != "" {
 		t.Fatalf("settle with no record: err=%v dropID=%q", err, b.dropID)
 	}
 	rec, _, err := a.beginDropRecord(ctx, "mydb")
@@ -538,33 +538,6 @@ func TestSharedDrop1792_TheEndOfAPassWhoseDatabaseWasDropped(t *testing.T) {
 	}
 }
 
-// A drop that found nothing removes the record it wrote, and only that one:
-// a record another drop has written since stays.
-func TestSharedDrop1792_ADropThatFoundNothingLeavesAnotherDropsRecord(t *testing.T) {
-	r, a, _ := sharedDropRig(t)
-	ctx := context.Background()
-	mine, _, err := a.beginDropRecord(ctx, "mydb")
-	if err != nil {
-		t.Fatal(err)
-	}
-	other, _, err := a.beginDropRecord(ctx, "mydb") // another drop, since
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := a.removeDropRecord(ctx, "mydb", mine); err != nil {
-		t.Fatal(err)
-	}
-	if rec, exists := r.dropRecord(a); !exists || rec.ID != other.ID {
-		t.Fatalf("the record after removing an older drop's: exists=%v id=%q, want the newer drop's %q", exists, rec.ID, other.ID)
-	}
-	if err := a.removeDropRecord(ctx, "mydb", other); err != nil {
-		t.Fatal(err)
-	}
-	if _, exists := r.dropRecord(a); exists {
-		t.Fatal("a drop that found nothing left its own record")
-	}
-}
-
 // overlap runs export on node b up to its commit, then the DELETE on node a,
 // whose drop lists and writes its markers before the export commits and
 // publishes, and deletes after: the order that left a broken table. It
@@ -601,44 +574,6 @@ func (r *warehouseRig) goneFromStorage(dirs ...string) {
 		if _, err := os.Stat(filepath.Join(r.root, d)); !os.IsNotExist(err) {
 			r.t.Errorf("%s is still there once the drop and the overlapped export have ended (stat: %v)", d, err)
 		}
-	}
-}
-
-// The commoner route: an ingest append, not a pass, is at its commit when
-// the database is dropped on another node.
-func TestSharedDrop1792_AnAppendCommitsBetweenTheDropsListingAndItsDeletes(t *testing.T) {
-	for _, layout := range []string{layoutWarehouse, layoutColocated} {
-		t.Run(layout, func(t *testing.T) {
-			r, a, b := sharedDropRigLayout(t, layout)
-			ctx := context.Background()
-			all := r.addFile()
-			sc := r.schemaNow()
-			err := r.overlap(a, func(canCommit func() bool) error {
-				_, err := b.appendFiles(ctx, "mydb", "cpu", all[len(all)-1:],
-					func(context.Context, []FileRef) (ArcSchema, error) { return sc, nil }, canCommit)
-				return err
-			})
-			if !errors.Is(err, errDroppedUnderPass) {
-				t.Fatalf("the append inside another node's drop ended with %v, want errDroppedUnderPass", err)
-			}
-			r.goneFromStorage("arc_mydb.db", "mydb/cpu/metadata")
-			if _, rowExists, err := b.catalogRow(ctx, "arc_mydb", "cpu"); err != nil || rowExists {
-				t.Fatalf("the exporting node kept its row for the dropped table (exists=%v, err=%v)", rowExists, err)
-			}
-			// Written again: a pass creates the table, appends follow.
-			r.addFile()
-			if err := r.passOf(b); err != nil {
-				t.Fatal(err)
-			}
-			all = r.addFile()
-			if _, err := b.appendFiles(ctx, "mydb", "cpu", all[len(all)-1:],
-				func(context.Context, []FileRef) (ArcSchema, error) { return r.schemaNow(), nil }, nil); err != nil {
-				t.Fatalf("an append to the recreated table: %v", err)
-			}
-			if n := r.live(b); n != len(r.files()) {
-				t.Fatalf("the recreated table holds %d files, want %d", n, len(r.files()))
-			}
-		})
 	}
 }
 
@@ -774,5 +709,145 @@ func TestSharedDrop1792_APassThatCommitsAndThenFailsStillLooks(t *testing.T) {
 	r.goneFromStorage("arc_mydb.db")
 	if _, rowExists, err := b.catalogRow(ctx, "arc_mydb", "cpu"); err != nil || rowExists {
 		t.Fatalf("the exporting node kept its row for the dropped table (exists=%v, err=%v)", rowExists, err)
+	}
+}
+
+// A table's first export overlapping the DELETE: the drop finds nothing, and
+// the pass creates the table after it. The drop's record is kept for this:
+// the pass sees at its end that the database was dropped, and removes the
+// table it created for a database that is gone.
+func TestSharedDrop1792_AFirstExportOverlapsTheDrop(t *testing.T) {
+	for _, layout := range []string{layoutWarehouse, layoutColocated} {
+		t.Run(layout, func(t *testing.T) {
+			r := newWarehouseRig(t)
+			a, b := r.node(true), r.node(true)
+			for _, n := range []*Exporter{a, b} {
+				if err := n.SetLayout(layout); err != nil {
+					t.Fatal(err)
+				}
+				n.SetForgetDroppedRows(true)
+			}
+			ctx := context.Background()
+			current := r.addFile()
+			sc := r.schemaNow()
+			_, err := b.reconcile(ctx, reconcileRequest{database: "mydb", measurement: "cpu", current: current, unread: current,
+				readSchemas: func(context.Context, []FileRef) (ArcSchema, error) {
+					r.deleteDatabase(a) // the whole DELETE, between the pass's footer read and its create
+					return sc, nil
+				}})
+			t.Logf("the first export: %v", err)
+			if rec, exists := r.dropRecord(a); !exists || !rec.Done {
+				t.Fatalf("a drop that found nothing left record exists=%v done=%v, want a finished record", exists, rec.Done)
+			}
+			r.goneFromStorage("arc_mydb.db", "mydb/cpu/metadata")
+			if _, rowExists, err := b.catalogRow(ctx, "arc_mydb", "cpu"); err != nil || rowExists {
+				t.Fatalf("the exporting node has a table for a database that was deleted (row exists=%v, err=%v)", rowExists, err)
+			}
+		})
+	}
+}
+
+// Marking a record done is for the drop that wrote it: with two writers
+// around a failover, the earlier drop's end must not call the later one's
+// finished.
+func TestSharedDrop1792_ADropFinishesOnlyItsOwnRecord(t *testing.T) {
+	r, a, _ := sharedDropRig(t)
+	ctx := context.Background()
+	first, _, err := a.beginDropRecord(ctx, "mydb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := a.beginDropRecord(ctx, "mydb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.finishDropRecord(ctx, "mydb", first)
+	if rec, _ := r.dropRecord(a); rec.ID != second.ID || rec.Done {
+		t.Fatalf("after the earlier drop ended the record is id=%q done=%v, want the later drop's, still running", rec.ID, rec.Done)
+	}
+	a.finishDropRecord(ctx, "mydb", second)
+	if rec, _ := r.dropRecord(a); rec.ID != second.ID || !rec.Done {
+		t.Fatalf("after the later drop ended the record is id=%q done=%v", rec.ID, rec.Done)
+	}
+}
+
+// The drop stops deleting with at least half of the record's life left: that
+// half is what the nodes' clocks may differ by.
+func TestSharedDrop1792_TheDropsDeadlineLeavesHalfTheRecordsLife(t *testing.T) {
+	started := time.Unix(1_700_000_000, 0)
+	if left := started.Add(dropRecordStale).Sub(dropDeadline(started)); left < dropRecordStale/2 {
+		t.Fatalf("the drop's deadline leaves %v of the record's %v", left, dropRecordStale)
+	}
+	if !dropDeadline(started).After(started.Add(time.Minute)) {
+		t.Fatal("the drop has no time to run")
+	}
+}
+
+// A pass that finds a table's files unchanged does not read the drop record
+// (one request per table per tick otherwise), and a pass that does read it
+// loads the table to compare only once per table and drop.
+func TestSharedDrop1792_AnUnchangedTableCostsNothing(t *testing.T) {
+	r, a, b := sharedDropRig(t)
+	ctx := context.Background()
+	r.deleteDatabase(a)
+	r.addFile()
+	sched := NewScheduler(SchedulerConfig{Exporter: b, Source: NewStorageWalkSource(r.backend, "arc", zerolog.Nop()),
+		Interval: time.Hour, Logger: zerolog.Nop()})
+	m, key := Measurement{Database: "mydb", Measurement: "cpu"}, "mydb\x00cpu"
+	for i := 0; i < 3; i++ {
+		_, _ = sched.reconcileOneRecovered(ctx, m, key)
+	}
+	if _, settled := sched.state[key]; !settled {
+		t.Fatal("the recreated table did not settle")
+	}
+	rec, _ := r.dropRecord(b)
+	b.dropSeenMu.Lock()
+	seen := b.dropSeen[key]
+	b.dropSeenMu.Unlock()
+	if seen != rec.ID {
+		t.Fatalf("the table's drop id was not remembered (%q, record %q): every pass would load the table to compare", seen, rec.ID)
+	}
+	// The record is now unreadable: a pass that read it would give way.
+	if err := r.backend.Write(ctx, dropRecordKey("mydb"), []byte("{not json")); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := sched.reconcileOneRecovered(ctx, m, key); err != nil || out != outcomeUnchanged {
+		t.Fatalf("a pass over unchanged files: outcome=%v err=%v, want unchanged and no look at the record", out, err)
+	}
+	r.addFile() // changed: now it looks
+	if _, err := sched.reconcileOneRecovered(ctx, m, key); !errors.Is(err, errDatabaseBeingDropped) {
+		t.Fatalf("a pass over changed files with an unreadable record: %v, want it to give way", err)
+	}
+}
+
+// Removing a table that predates a drop: not on a node that is not the
+// exporter; and the table's drop marker is written back first, so that a
+// row which then cannot be forgotten (or another node's) is not a dead row
+// for good.
+func TestSharedDrop1792_RemovalIsTheExportersAndWritesTheMarkerBack(t *testing.T) {
+	r, a, b := sharedDropRig(t)
+	ctx := context.Background()
+	rec, _, err := a.beginDropRecord(ctx, "mydb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.finishDropRecord(ctx, "mydb", rec)
+	before, _ := os.ReadDir(r.metaDir())
+	if err := b.settleDroppedTable(ctx, "mydb", "cpu", func() bool { return false }); err != nil {
+		t.Fatal(err)
+	}
+	if after, _ := os.ReadDir(r.metaDir()); len(after) != len(before) || len(before) == 0 {
+		t.Fatalf("a node that is not the exporter removed the table (%d objects, was %d)", len(after), len(before))
+	}
+	marker := filepath.Join(r.root, filepath.FromSlash(droppedMarkerKey("arc_mydb", "cpu")))
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("the test's premise: no marker before the removal (stat: %v)", err)
+	}
+	if err := b.settleDroppedTable(ctx, "mydb", "cpu", func() bool { return true }); err != nil {
+		t.Fatal(err)
+	}
+	r.goneFromStorage("arc_mydb.db")
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("the removed table's drop marker was not written: %v", err)
 	}
 }

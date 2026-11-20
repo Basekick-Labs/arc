@@ -139,13 +139,14 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 	// (shared_drop.go, #1792). The scheduler does this before it reads the
 	// table; a caller that has not is covered here.
 	if !req.dropChecked {
-		if err := e.settleDroppedTable(ctx, database, measurement); err != nil {
+		if err := e.settleDroppedTable(ctx, database, measurement, req.canCommit); err != nil {
 			return reconcileResult{}, err
 		}
 	}
 	// And at the end of the pass, however it ends (a pass can commit and
-	// then fail): if the database was dropped on another node meanwhile,
-	// what the pass wrote goes.
+	// then fail, and one that creates the table need not commit): if the
+	// database was dropped on another node meanwhile, what the pass wrote
+	// goes.
 	defer func() {
 		if e.droppedUnderPass(ctx, database, measurement, req.canCommit) {
 			res.settled = false
