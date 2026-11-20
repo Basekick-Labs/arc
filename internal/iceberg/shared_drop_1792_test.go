@@ -517,6 +517,7 @@ func TestSharedDrop1792_TheEndOfAPassWhoseDatabaseWasDropped(t *testing.T) {
 	stamp, other := b.tableDropStamp("mydb", "cpu"), b.tableDropStamp("mydb", "mem")
 	b.setSmallManifests("mydb\x00cpu", 2)
 	b.setSmallManifests("mydb\x00mem", 3)
+	b.noteLeftAt("mydb\x00cpu", "somewhere")
 	// With the pass's own context already ended: a pass that ran out of
 	// time after a commit still has to look.
 	ended, cancel := context.WithCancel(ctx)
@@ -535,6 +536,9 @@ func TestSharedDrop1792_TheEndOfAPassWhoseDatabaseWasDropped(t *testing.T) {
 	}
 	if _, ok := b.smallManifests("mydb\x00cpu"); ok {
 		t.Error("the exporter kept what it knew of the removed table")
+	}
+	if _, ok := b.leftAtLoc("mydb\x00cpu"); ok {
+		t.Error("the exporter kept where an append left the removed table")
 	}
 	if n, ok := b.smallManifests("mydb\x00mem"); !ok || n != 3 {
 		t.Error("the exporter forgot what it knew of another table of the database")

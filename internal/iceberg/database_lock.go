@@ -112,6 +112,7 @@ func (e *Exporter) forgetTableWork(database, measurement string) {
 	delete(e.appendSmall, tkey)
 	delete(e.chunkSize, tkey)
 	delete(e.floorDue, tkey)
+	delete(e.leftAt, tkey) // where an append left the table: another lineage now (#1795)
 	e.chunkMu.Unlock()
 }
 
