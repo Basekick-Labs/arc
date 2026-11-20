@@ -263,9 +263,10 @@ func (e *Exporter) resetHintFailure() {
 //     latest, so that one later prune removes them all; the ones that come of
 //     age earlier wait for it, less than min_version_age more.
 //   - now plus min_version_age, for a version kept only for this pass (one
-//     it claimed, or one a reader may have resolved when it started).
-//   - now, when the metadata directory could not be listed or a delete
-//     failed: the next pass retries.
+//     it claimed, or one a reader may have resolved when it started), and
+//     when the metadata directory could not be listed or a delete failed:
+//     a store that keeps refusing costs one pass of the table per
+//     min_version_age, not one per reconcile interval.
 //
 // Never later than now plus min_version_age.
 func (e *Exporter) pruneAgainAt() time.Time {
@@ -1451,8 +1452,8 @@ func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.T
 		}
 		objs, err := lister.ListObjects(ctx, dirKey+"/")
 		if err != nil {
-			e.logger.Warn().Err(err).Str("dir", dirKey).Msg("Iceberg: could not list the metadata directory to prune old published versions; the table's next pass retries")
-			e.notePruneDue(time.Now()) // not pruned: the next pass retries (pruneAgainAt)
+			e.logger.Warn().Err(err).Str("dir", dirKey).Msg("Iceberg: could not list the metadata directory to prune old published versions; retried after iceberg.min_version_age")
+			e.notePruneDue(time.Now().Add(e.minVersionAge)) // not pruned: retried then (pruneAgainAt)
 			return
 		}
 		written = make(map[string]time.Time, len(objs))
@@ -1463,8 +1464,8 @@ func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.T
 	} else {
 		var err error
 		if keys, err = e.backend.List(ctx, dirKey+"/"); err != nil {
-			e.logger.Warn().Err(err).Str("dir", dirKey).Msg("Iceberg: could not list the metadata directory to prune old published versions; the table's next pass retries")
-			e.notePruneDue(time.Now())
+			e.logger.Warn().Err(err).Str("dir", dirKey).Msg("Iceberg: could not list the metadata directory to prune old published versions; retried after iceberg.min_version_age")
+			e.notePruneDue(time.Now().Add(e.minVersionAge))
 			return
 		}
 	}
@@ -1542,8 +1543,8 @@ func (e *Exporter) pruneOldVersionFilesFrom(ctx context.Context, tbl *icetable.T
 			}
 		}
 		if err := e.backend.Delete(ctx, v.key); err != nil && !storage.IsNotFound(err) {
-			e.logger.Warn().Err(err).Str("key", v.key).Msg("Iceberg: could not delete an old published version; the table's next pass retries")
-			e.notePruneDue(time.Now())
+			e.logger.Warn().Err(err).Str("key", v.key).Msg("Iceberg: could not delete an old published version; retried after iceberg.min_version_age")
+			e.notePruneDue(time.Now().Add(e.minVersionAge))
 		}
 	}
 }

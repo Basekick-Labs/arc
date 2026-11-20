@@ -244,8 +244,9 @@ func TestPrune1787_ReportsWhenTheHeldVersionsComeOfAge(t *testing.T) {
 	}
 }
 
-// A prune that could not list the directory or delete a copy asks for the
-// next pass: a quiet table would otherwise keep those copies for good.
+// A prune that could not list the directory or delete a copy asks for a pass
+// one minimum age later: a quiet table would otherwise keep those copies for
+// good.
 func TestPrune1787_AFailedPruneIsRetried(t *testing.T) {
 	for _, minAge := range []time.Duration{time.Millisecond, 0} {
 		r := newHealRig(t, 10)
@@ -259,8 +260,8 @@ func TestPrune1787_AFailedPruneIsRetried(t *testing.T) {
 			rec.failList = true
 			before := time.Now()
 			res := r.passResult(files, sc)
-			if res.pruneAgainAt.Before(before) || res.pruneAgainAt.After(time.Now()) {
-				t.Fatalf("min age %v, listing failed: prune again at %v, want now", minAge, res.pruneAgainAt)
+			if res.pruneAgainAt.Before(before.Add(minAge)) || res.pruneAgainAt.After(time.Now().Add(minAge)) {
+				t.Fatalf("min age %v, listing failed: prune again at %v, want one minimum age from now", minAge, res.pruneAgainAt)
 			}
 			rec.failList = false
 		}
@@ -268,8 +269,8 @@ func TestPrune1787_AFailedPruneIsRetried(t *testing.T) {
 		rec.failDeletes = true
 		before := time.Now()
 		res := r.passResult(files, sc)
-		if res.pruneAgainAt.Before(before) || res.pruneAgainAt.After(time.Now()) {
-			t.Fatalf("min age %v, deletes failed: prune again at %v, want now", minAge, res.pruneAgainAt)
+		if res.pruneAgainAt.Before(before.Add(minAge)) || res.pruneAgainAt.After(time.Now().Add(minAge)) {
+			t.Fatalf("min age %v, deletes failed: prune again at %v, want one minimum age from now", minAge, res.pruneAgainAt)
 		}
 		rec.failDeletes = false
 
