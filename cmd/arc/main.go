@@ -869,17 +869,15 @@ func main() {
 
 	// Test query
 	log.Info().Msg("Testing DuckDB connection...")
-	rows, err := db.Query("SELECT 'Hello from Arc in Go!' as message, version() as duckdb_version")
-	if err != nil {
+	message, version, found, err := checkDuckDB(db)
+	var scanErr duckDBCheckScanError
+	switch {
+	case errors.As(err, &scanErr):
+		log.Fatal().Err(err).Msg("Failed to scan result")
+	case err != nil:
 		log.Fatal().Err(err).Msg("Failed to execute test query")
 	}
-	defer rows.Close()
-
-	var message, version string
-	if rows.Next() {
-		if err := rows.Scan(&message, &version); err != nil {
-			log.Fatal().Err(err).Msg("Failed to scan result")
-		}
+	if found {
 		log.Info().
 			Str("message", message).
 			Str("duckdb_version", version).
