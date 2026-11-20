@@ -51,7 +51,8 @@ Notes:
 - **The passes of a batch share** 16 storage reads in flight (footers and existence checks) and the 64 MiB of footers one pass alone may hold. Their listings, metadata reads and commits are not bounded together.
 - Each pass in a batch has the two minutes a pass always had; the batch ends when its slowest pass does.
 - **Not run on the binary:** `reconcile_concurrency = 16` on AWS (it ran on a local S3 server), a cold tier, Glue sync, a warehouse outside the storage root, Azure and GCS.
-- While a table's published versions are held by `iceberg.min_version_age`, each of its passes still repeats its requests and re-publishes without having committed anything; that is not changed here.
+- **A database deleted during a reconcile pass** ([#1789](https://github.com/Basekick-Labs/arc/issues/1789)): on a standalone node the delete does not wait for a pass in progress, and a table whose pass it lands in can be left missing or pointing at metadata the delete removed. That was so with one pass at a time (5 of 30 runs of a test that forces the overlap); with several at once more tables of the database can be in a pass at that moment (10 of 30 at six at once). Not fixed here.
+- While a table's published versions are held by `iceberg.min_version_age`, each of its passes still repeats its requests and re-publishes without having committed anything ([#1787](https://github.com/Basekick-Labs/arc/issues/1787)); that is not changed here.
 
 ## New: ingest appends of several Iceberg tables run at once ([#1778](https://github.com/Basekick-Labs/arc/issues/1778))
 
