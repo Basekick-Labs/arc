@@ -4749,6 +4749,10 @@ func main() {
 		if icebergTopo.warnNoElection && compactionGate.CanCompact() {
 			log.Warn().Msg(icebergNoElectionWarning)
 		}
+		if n := cfg.Iceberg.ReconcileConcurrency; n > 1 && icebergReconcileConcurrency(n, clusterCoordinator != nil, icebergTopo.warnNoElection) == 1 {
+			log.Info().Int("iceberg.reconcile_concurrency", n).
+				Msg("Iceberg export reconciles one table at a time on this node: reconcile passes of several tables at once are for standalone nodes")
+		}
 		icebergScheduler := iceberg.NewScheduler(iceberg.SchedulerConfig{
 			Exporter: exporter,
 			Source:   icebergSource,

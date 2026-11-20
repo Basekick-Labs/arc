@@ -204,6 +204,8 @@ func (r *passRunner) run(ctx context.Context, job *passJob, exp *Exporter) {
 			r.logger.Error().Str("database", job.m.Database).Str("measurement", job.m.Measurement).
 				Str("panic", fmt.Sprint(rec)).Str("stack", string(debug.Stack())).
 				Msg("Iceberg reconcile: recovered a panic")
+			// A guard: reconcile sets these last, with nothing after that can
+			// panic. A pass that panicked leaves its table's cached state alone.
 			job.op = stateKeep
 			job.appended = false
 			job.outcome, job.err = outcomeUnchanged, fmt.Errorf("reconcile panicked: %v", rec)

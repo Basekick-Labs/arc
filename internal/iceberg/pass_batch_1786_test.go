@@ -362,6 +362,42 @@ func TestPassBatch_ThePassesAfterAnIngestBatchRunAtOnce(t *testing.T) {
 			t.Errorf("table %s does not take appends after the pass that followed its failed append", m)
 		}
 	}
+	// The passes covered the files reported before them: nothing waits.
+	r.sched.reqMu.Lock()
+	waiting, due := len(r.sched.ingestPending), len(r.sched.ingestDue)
+	r.sched.reqMu.Unlock()
+	if waiting != 0 || due != 0 {
+		t.Errorf("%d tables with files counted as waiting and %d requests queued after passes that settled", waiting, due)
+	}
+}
+
+// Between two measurements of a timed pass one ingest request may run a
+// reconcile pass, however many passes may run at once.
+func TestPassBatch_BetweenMeasurementsStillOneIngestPass(t *testing.T) {
+	r := newPassRig(t, 4, 4, 4)
+	r.sched.runPass(context.Background())
+	r.sched.source = &failingAppends{passSource: r.src, fail: errors.New("injected append failure")}
+	passes := func() (n int) {
+		for _, m := range r.tables {
+			n += r.src.passes(m)
+		}
+		return n
+	}
+	before := passes()
+	for _, m := range r.tables {
+		r.report(m, r.newFile(m))
+	}
+	time.Sleep(5 * time.Millisecond)
+	r.sched.serviceIngest(context.Background(), 1)
+	if got := passes() - before; got != 1 {
+		t.Fatalf("%d passes between two measurements after four appends failed, want 1", got)
+	}
+	r.sched.reqMu.Lock()
+	due := len(r.sched.ingestDue)
+	r.sched.reqMu.Unlock()
+	if due != 3 {
+		t.Fatalf("%d requests waiting, want the 3 whose pass did not run", due)
+	}
 }
 
 type failingAppends struct {
