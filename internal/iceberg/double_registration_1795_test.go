@@ -221,9 +221,7 @@ func TestDoubleRegistration1795_AnAppendOntoATableThisNodeDidNotLeaveIsAPass(t *
 	r := newAppendRig(t)
 	first := r.settled()
 	key := "mydb\x00cpu"
-	r.exp.chunkMu.Lock()
-	r.exp.leftAt[key] = "file:///somewhere/else/00099-x.metadata.json"
-	r.exp.chunkMu.Unlock()
+	r.exp.noteLeftAt(key, "file:///somewhere/else/00099-x.metadata.json")
 	f := r.newFile()
 	r.report(f)
 	listed := r.listings()
@@ -247,9 +245,7 @@ func TestDoubleRegistration1795_AnAppendOntoATableThisNodeDidNotLeaveIsAPass(t *
 func TestDoubleRegistration1795_AppendFilesRefusesATableThatMoved(t *testing.T) {
 	r := newAppendRig(t)
 	first := r.settled()
-	r.exp.chunkMu.Lock()
-	r.exp.leftAt["mydb\x00cpu"] = "file:///somewhere/else/00099-x.metadata.json"
-	r.exp.chunkMu.Unlock()
+	r.exp.noteLeftAt("mydb\x00cpu", "file:///somewhere/else/00099-x.metadata.json")
 	f := r.newFile()
 	ref, err := refOfKey(r, appendDir+f)
 	if err != nil {
@@ -298,9 +294,7 @@ func TestDoubleRegistration1795_TheOtherExporterIsNamedOnce(t *testing.T) {
 	first := r.settled()
 	names := []string{first}
 	for i := 0; i < 3; i++ {
-		r.exp.chunkMu.Lock()
-		r.exp.leftAt["mydb\x00cpu"] = "file:///somewhere/else/00099-x.metadata.json"
-		r.exp.chunkMu.Unlock()
+		r.exp.noteLeftAt("mydb\x00cpu", "file:///somewhere/else/00099-x.metadata.json")
 		f := r.newFile()
 		r.report(f)
 		r.serve()
@@ -310,4 +304,147 @@ func TestDoubleRegistration1795_TheOtherExporterIsNamedOnce(t *testing.T) {
 	if got := strings.Count(logs.String(), "another process exports this bucket"); got != 1 {
 		t.Fatalf("warned %d times over three fallbacks, want once", got)
 	}
+}
+
+// The further splits of one large file are not entries held twice, in any
+// order; two entries that start at 0 are.
+func TestDoubleRegistration1795_SplitsAreNotDuplicates(t *testing.T) {
+	r := newAppendRig(t)
+	first := r.settled()
+	f := r.newFile()
+	r.report(f)
+	r.serve()
+	ctx := context.Background()
+	tbl, err := r.exp.catalog.LoadTable(ctx, r.exp.tableIdent("mydb", "cpu"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, err := r.exp.tableLiveFiles(ctx, tbl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var a, b iceberg.DataFile
+	for p, df := range live {
+		switch filepath.Base(p) {
+		case first:
+			a = df
+		case f:
+			b = df
+		}
+	}
+	split := []icetable.FileScanTask{{File: a, Start: 4096}, {File: a, Start: 0}, {File: a, Start: 8192}, {File: b, Start: 0}}
+	if got, held := liveAndHeldTwice(split); len(got) != 2 || len(held) != 0 {
+		t.Fatalf("one file in three splits and another file: %d live, %d held twice; want 2 and 0", len(got), len(held))
+	}
+	twice := []icetable.FileScanTask{{File: a, Start: 0}, {File: a, Start: 4096}, {File: a, Start: 0}, {File: b, Start: 0}}
+	if got, held := liveAndHeldTwice(twice); len(got) != 2 || len(held) != 1 || len(held[a.FilePath()]) != 2 {
+		t.Fatalf("one file held twice: %d live, held %d; want 2 live and that file twice", len(got), len(held))
+	}
+}
+
+// A node that lost the writer role makes no repair commit.
+func TestDoubleRegistration1795_NoRepairWithoutTheWriterRole(t *testing.T) {
+	r := newAppendRig(t)
+	r.exp.retain = 10
+	r.settled()
+	f := r.newFile()
+	r.report(f)
+	r.serve()
+	r.holdTwice(f)
+	ctx := context.Background()
+	files, _, err := r.src.FilesAndLocal(ctx, Measurement{Database: "mydb", Measurement: "cpu"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc, err := r.sched.unionFileSchemas(ctx, files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := r.exp.reconcile(ctx, reconcileRequest{database: "mydb", measurement: "cpu", schema: sc, current: files, canCommit: func() bool { return false }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.writerLost || res.commits != 0 {
+		t.Fatalf("writerLost %v, %d commits; want the pass to stop without committing", res.writerLost, res.commits)
+	}
+	if got := r.entries()[f]; got != 2 {
+		t.Fatalf("%s is in the table %d times: a node without the writer role repaired it", f, got)
+	}
+}
+
+// A repair whose commit outcome is unknown is returned as an error, so the
+// pass ends instead of going on from the old table.
+func TestDoubleRegistration1795_ARepairWhoseOutcomeIsUnknownEndsThePass(t *testing.T) {
+	r := newAppendRig(t)
+	r.exp.retain = 10
+	r.settled()
+	f := r.newFile()
+	r.report(f)
+	r.serve()
+	r.holdTwice(f)
+	ctx := context.Background()
+	tbl, err := r.exp.catalog.LoadTable(ctx, r.exp.tableIdent("mydb", "cpu"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, held, err := r.exp.tableLiveEntries(ctx, tbl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.exp.db.Close() // the catalog is gone when the commit is sent
+	if _, ok, err := r.exp.repairDuplicates(ctx, tbl, live, held, nil, "mydb", "cpu"); err == nil || ok {
+		t.Fatalf("repair with the catalog gone: ok %v err %v; want the error returned", ok, err)
+	}
+}
+
+// One exporter, its current metadata file deleted: the dead row is recovered,
+// the append becomes a pass, and the warning names that cause too.
+func TestDoubleRegistration1795_ARecoveredRowIsNamedInTheWarning(t *testing.T) {
+	r := newAppendRig(t)
+	var logs bytes.Buffer
+	r.sched.logger = zerolog.New(&logs)
+	first := r.settled()
+	tbl, err := r.exp.catalog.LoadTable(context.Background(), r.exp.tableIdent("mydb", "cpu"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(strings.TrimPrefix(tbl.MetadataLocation(), "file://")); err != nil {
+		t.Fatal(err)
+	}
+	f := r.newFile()
+	r.report(f)
+	r.serve()
+	r.wantOnce(first, f)
+	if !strings.Contains(logs.String(), "recovered the table's catalog row") {
+		t.Errorf("the warning does not name a recovered row as a cause: %s", logs.String())
+	}
+}
+
+// One exporter: a timed pass whose expiry commits, then an append: it stays
+// an append (the converged pass records where it left the table).
+func TestDoubleRegistration1795_AnAppendAfterAnExpiringPassStaysAnAppend(t *testing.T) {
+	r := newAppendRig(t)
+	r.exp.retain = 3
+	names := []string{r.settled()}
+	for i := 0; i < 5; i++ {
+		f := r.newFile()
+		r.report(f)
+		r.serve()
+		names = append(names, f)
+	}
+	before := r.snapshotCount()
+	if _, err := r.pass(); err != nil {
+		t.Fatal(err)
+	}
+	if after := r.snapshotCount(); after >= before {
+		t.Fatalf("the pass expired nothing (%d -> %d): the test shows nothing", before, after)
+	}
+	g := r.newFile()
+	r.report(g)
+	listed := r.listings()
+	r.serve()
+	if got := r.listings(); got != listed {
+		t.Fatalf("the append after an expiring pass fell back to a pass (%d -> %d listings)", listed, got)
+	}
+	r.wantOnce(append(names, g)...)
 }

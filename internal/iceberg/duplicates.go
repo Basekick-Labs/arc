@@ -50,10 +50,14 @@ func (e *Exporter) leftAtLoc(tkey string) (string, bool) {
 }
 
 // repairDuplicates rewrites the table's data entries so that each path in
-// dups is held once, and returns the committed table. It is best-effort: on any
-// failure it logs and returns the table unchanged with ok=false, and the pass
-// goes on with the table as it was (a duplicate whose file is still in storage
-// blocks nothing; one whose file left storage fails the removal, as before).
+// dups is held once, and returns the committed table. It is best-effort where
+// nothing was committed: when it cannot stage the repair, or the catalog
+// refuses the commit cleanly (ErrCommitFailed), it logs and returns the table
+// unchanged with ok=false, and the pass goes on with the table as it was (a
+// duplicate whose file is still in storage blocks nothing; one whose file left
+// storage fails the removal, as before). Any other commit error leaves it
+// unknown whether the catalog took the repair, so it is returned and the pass
+// ends: going on from the old table could publish it over the repaired one.
 //
 // The entry kept for a path is the one whose size matches the listing (want),
 // else the first; the diff that follows treats a size mismatch as a rewrite.
@@ -65,16 +69,16 @@ func (e *Exporter) leftAtLoc(tkey string) (string, bool) {
 // equality deletes written before would stop applying and deleted rows would
 // come back.
 func (e *Exporter) repairDuplicates(ctx context.Context, tbl *icetable.Table, live map[string]iceberg.DataFile,
-	dups map[string][]iceberg.DataFile, want map[string]int64, database, measurement string) (*icetable.Table, bool) {
+	dups map[string][]iceberg.DataFile, want map[string]int64, database, measurement string) (*icetable.Table, bool, error) {
 	log := e.logger.With().Str("database", database).Str("measurement", measurement).Int("paths_held_twice", len(dups)).Logger()
 	hasDeletes, err := snapshotHasDeleteFiles(ctx, tbl)
 	if err != nil {
 		log.Error().Err(err).Msg("Iceberg: the table holds data files more than once and could not be checked for delete files; not repaired this pass")
-		return tbl, false
+		return tbl, false, nil
 	}
 	if hasDeletes {
 		log.Error().Msg("Iceberg: the table holds data files more than once, and has delete files, which a repair would stop applying; not repaired. Readers count those files' rows more than once")
-		return tbl, false
+		return tbl, false, nil
 	}
 	keep := make([]iceberg.DataFile, 0, len(live))
 	for p, df := range live {
@@ -95,16 +99,19 @@ func (e *Exporter) repairDuplicates(ctx context.Context, tbl *icetable.Table, li
 	txn := tbl.NewTransaction()
 	if err := txn.Delete(ctx, iceberg.AlwaysTrue{}, nil); err != nil {
 		log.Error().Err(err).Msg("Iceberg: could not stage the repair of data files held more than once; the next pass tries again")
-		return tbl, false
+		return tbl, false, nil
 	}
 	if err := e.stageMergedAdd(ctx, txn, keep); err != nil {
 		log.Error().Err(err).Msg("Iceberg: could not stage the repair of data files held more than once; the next pass tries again")
-		return tbl, false
+		return tbl, false, nil
 	}
 	repaired, err := txn.Commit(ctx)
 	if err != nil {
+		if !errors.Is(err, icetable.ErrCommitFailed) {
+			return tbl, false, err
+		}
 		log.Error().Err(err).Msg("Iceberg: the repair of data files held more than once did not commit; the next pass tries again")
-		return tbl, false
+		return tbl, false, nil
 	}
 	examples := make([]string, 0, 3)
 	for p := range dups {
@@ -117,7 +124,7 @@ func (e *Exporter) repairDuplicates(ctx context.Context, tbl *icetable.Table, li
 	log.Warn().Strs("examples", examples).Int("files", len(keep)).
 		Msg("Iceberg: the table held data files more than once, so readers counted their rows more than once; each is held once now. " +
 			"This comes from two processes exporting the same bucket (#1795); run one exporter per bucket")
-	return repaired, true
+	return repaired, true, nil
 }
 
 // snapshotHasDeleteFiles reports whether the current snapshot lists a delete

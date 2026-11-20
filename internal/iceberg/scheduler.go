@@ -161,8 +161,8 @@ type Scheduler struct {
 	// otherExporter: the tables another process was found committing to, on
 	// a node with no election; warned about once each (#1795). Loop goroutine.
 	otherExporter map[string]struct{}
-	// passCommits is how many data commits the reconcile pass in progress (or
-	// the last one) made: reconcileOne sets it, reconcileOneRecovered reads it.
+	// passCommits is how many commits the reconcile pass in progress (or the
+	// last one) made, a repair of entries held twice included (#1795): reconcileOne sets it, reconcileOneRecovered reads it.
 	passCommits int
 	// appendsSince counts each table's appends since its last settled pass.
 	appendsSince map[string]int

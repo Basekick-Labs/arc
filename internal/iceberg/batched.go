@@ -286,9 +286,10 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 		return reconcileResult{}, fmt.Errorf("read current iceberg data files: %w", err)
 	}
 	// Paths the table holds more than once (#1795, duplicates.go) are repaired first, as this
-	// pass's first commit: the diff below could not remove such a path, and the fence claims
-	// the repair's version like any other commit of the pass (commit, below). Best-effort: a
-	// repair that fails leaves the table as it was and the pass goes on.
+	// pass's first commit: the diff below could not remove such a path. A later commit of the
+	// pass claims the version the repair and its floor leave, as after the removal commit and
+	// its floor (commit, below). A repair refused cleanly leaves the table as it was and the
+	// pass goes on; one whose outcome is unknown ends the pass, as any other commit does.
 	repairCommits, repairStart := 0, -1
 	if len(dups) > 0 {
 		if !canCommit() {
@@ -296,7 +297,11 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 				Msg("Iceberg reconcile: this node stopped being the writer during the pass; published and pruned nothing, the new writer settles the table")
 			return reconcileResult{schema: arcSchemaOf(tbl), writerLost: true}, nil
 		}
-		if repaired, ok := e.repairDuplicates(ctx, tbl, live, dups, want, database, measurement); ok {
+		repaired, ok, err := e.repairDuplicates(ctx, tbl, live, dups, want, database, measurement)
+		if err != nil {
+			return reconcileResult{}, fmt.Errorf("repair data files held more than once: %w", err)
+		}
+		if ok {
 			tbl = repaired
 			repairCommits, repairStart = 1, e.metadataVersion(tbl)
 			// Every older snapshot holds those paths more than once, and the repair leaves an

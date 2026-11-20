@@ -2291,42 +2291,49 @@ func (e *Exporter) tableLiveFiles(ctx context.Context, tbl *icetable.Table) (map
 // task is the only kind iceberg-go splits, and its first split starts at 0. So two tasks of one
 // path that both start at 0 are two entries; the further splits of one large file are not.
 func (e *Exporter) tableLiveEntries(ctx context.Context, tbl *icetable.Table) (map[string]iceberg.DataFile, map[string][]iceberg.DataFile, error) {
-	out := make(map[string]iceberg.DataFile)
 	if tbl.CurrentSnapshot() == nil {
-		return out, nil, nil // empty table
+		return map[string]iceberg.DataFile{}, nil, nil // empty table
 	}
 	tasks, err := tbl.Scan().PlanFiles(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-	var entries map[string][]iceberg.DataFile
-	first := make(map[string]iceberg.DataFile)
+	live, held := liveAndHeldTwice(tasks)
+	return live, held, nil
+}
+
+// liveAndHeldTwice is tableLiveEntries over planned tasks.
+//
+// One data file can yield SEVERAL tasks since iceberg-go v0.7.0: a Parquet file above
+// read.split.target-size (128 MiB) with at least two split offsets is planned as one task per
+// byte range. live stays correct only because it is a map keyed on the path, and every split
+// of a file carries the same DataFile — len(tasks), a slice, or task.Length would each
+// double-count. Arc's own files are far below that size; bulk-imported Parquet need not be.
+// For the same reason only tasks that start at 0 count as entries in held: a further split
+// of one file shares its path and starts later, in whatever order the tasks come.
+func liveAndHeldTwice(tasks []icetable.FileScanTask) (live map[string]iceberg.DataFile, held map[string][]iceberg.DataFile) {
+	live = make(map[string]iceberg.DataFile, len(tasks))
+	first := make(map[string]iceberg.DataFile, len(tasks))
 	for _, task := range tasks {
+		p := task.File.FilePath()
+		live[p] = task.File
 		if task.Start != 0 {
 			continue
 		}
-		p := task.File.FilePath()
-		if prev, seen := first[p]; seen {
-			if entries == nil {
-				entries = make(map[string][]iceberg.DataFile)
-			}
-			if len(entries[p]) == 0 {
-				entries[p] = append(entries[p], prev)
-			}
-			entries[p] = append(entries[p], task.File)
+		prev, seen := first[p]
+		if !seen {
+			first[p] = task.File
 			continue
 		}
-		first[p] = task.File
+		if held == nil {
+			held = make(map[string][]iceberg.DataFile)
+		}
+		if len(held[p]) == 0 {
+			held[p] = append(held[p], prev)
+		}
+		held[p] = append(held[p], task.File)
 	}
-	// One data file can yield SEVERAL tasks since iceberg-go v0.7.0: a Parquet file above
-	// read.split.target-size (128 MiB) with at least two split offsets is planned as one task per
-	// byte range. This stays correct only because it is a map keyed on the path, and every split
-	// of a file carries the same DataFile — len(tasks), a slice, or task.Length would each
-	// double-count. Arc's own files are far below that size; bulk-imported Parquet need not be.
-	for _, task := range tasks {
-		out[task.File.FilePath()] = task.File
-	}
-	return out, entries, nil
+	return live, held
 }
 
 // isAlreadyExists reports whether a catalog error means "the thing is already there", which the

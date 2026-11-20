@@ -379,13 +379,14 @@ func (s *Scheduler) noteAppendFallback(job *ingestJob) {
 	metrics.Get().IncIcebergIngestAppendFallback()
 	if job.reason == reasonTableMoved && s.gate == nil {
 		// No election runs on this node, so nothing hands the export over to
-		// it: another process committed to the table (#1795). Once per table:
-		// the settled pass that follows clears appendFallback, and with two
-		// exporters this recurs at most ingest exports.
+		// it: another process committed to the table, or this node recovered
+		// the table's catalog row (#1795). Once per table and process: with two
+		// exporters it recurs at almost every ingest export.
 		if _, warned := s.otherExporter[job.key]; !warned {
 			s.otherExporter[job.key] = struct{}{}
 			s.logger.Warn().Str("database", job.m.Database).Str("measurement", job.m.Measurement).
-				Msg("Iceberg: another process committed to this table, so another process exports this bucket. " +
+				Msg("Iceberg: this table is at a version this node did not commit: another process exports this bucket, " +
+					"or this node recovered the table's catalog row from the warehouse (its metadata file was gone). " +
 					"Run one exporter per bucket (one node, or a cluster with failover): with two, every ingest export of the table runs as a full pass")
 		}
 		return
