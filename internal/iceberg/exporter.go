@@ -184,6 +184,9 @@ type exporterShared struct {
 	// retention properties). Tests only: it is how a failing heal commit is reproduced without
 	// a failing catalog. nil in production.
 	propsCommit func(context.Context, *icetable.Transaction) (*icetable.Table, error)
+	// expireCommit, when set, replaces the commit of a snapshot-expiry
+	// transaction (expireSnapshots). Tests fail it; nothing else sets it.
+	expireCommit func(context.Context, *icetable.Transaction) (*icetable.Table, error)
 
 	// warehouseAuthoritative, published: see adopt.go.
 	warehouseAuthoritative bool
@@ -228,9 +231,6 @@ type exporterShared struct {
 	// chunkMu guards chunkSize (a measurement's shrunk chunk size after a chunk that did not fit)
 	// and floorDue (tables whose #1092 history floor failed and is retried by later passes).
 	chunkMu sync.Mutex
-	// expireOwed: the tables appends have added snapshots to since a pass
-	// last expired any (batched.go expiryOwed); under chunkMu.
-	expireOwed map[string]bool
 	// dbLocks keeps a database's tables from being exported and dropped at
 	// once, and onDatabaseDropped is told after a drop (database_lock.go).
 	dbLocks           databaseLocks
@@ -240,10 +240,8 @@ type exporterShared struct {
 	// ran, an append failed, the process started). Under chunkMu.
 	// See appendMergeDue.
 	appendSmall map[string]int
-	// expirySeen: the tables that have had a pass in this process.
-	expirySeen map[string]struct{}
-	chunkSize  map[string]int
-	floorDue   map[string]struct{}
+	chunkSize   map[string]int
+	floorDue    map[string]struct{}
 }
 
 // resetHintFailure clears the per-reconcile discovery-file failure flag.
@@ -1384,7 +1382,11 @@ func (e *Exporter) expireSnapshots(ctx context.Context, tbl *icetable.Table, dat
 			Msg("Iceberg ExpireSnapshots failed (non-fatal) — snapshot history grows until it recovers")
 		return tbl, false
 	}
-	expired, err := txn.Commit(ctx)
+	commit := txn.Commit
+	if e.expireCommit != nil {
+		commit = func(ctx context.Context) (*icetable.Table, error) { return e.expireCommit(ctx, txn) }
+	}
+	expired, err := commit(ctx)
 	if err != nil {
 		e.logger.Error().Err(err).Str("database", database).Str("measurement", measurement).
 			Bool("floor_history", mode == floorHistory).

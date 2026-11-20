@@ -631,9 +631,10 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 	if loopErr != nil {
 		return res, loopErr
 	}
-	// A failed floor must not be cached as settled. The scheduler keys its skip gate on this
-	// value; reporting not-settled keeps the fingerprint uncached so the next tick re-drives the
-	// measurement, and finishPass retries the owed floor there even if that pass removes nothing.
+	// A failed expiry, floor or retention, must not be cached as settled. The scheduler keys its
+	// skip gate on this value; reporting not-settled keeps the fingerprint uncached so the next
+	// tick re-drives the measurement, and finishPass retries there even if that pass removes and
+	// commits nothing.
 	res.settled = !partial && !moved && hintOK && finishedOK && !e.healFailed()
 	return res, nil
 }
@@ -655,19 +656,23 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (reconci
 // older snapshots' record_count and bounds describe content that no longer exists there — the
 // original #1092 symptom.
 //
-// Best-effort for the retention case: a failure doesn't undo the successful reconcile, and the
-// next pass retries. NOT best-effort for the floor: only a pass that removes something asks to
-// floor, so the next pass may well remove nothing. A failed floor is remembered (floorOwed) and
-// retried by every later pass until it lands, including a pass with nothing to commit; before
-// #1686 the retry pass took the converged branch, which never expired, and the floor was lost.
-// The memory is per process: a restart in between forgets it. The floor itself is taken
-// straight after the commit that removed the paths (reconcile), so here it is only the retry.
+// A failed expiry doesn't undo the successful reconcile, but it leaves the pass unsettled, so
+// the scheduler runs the table's next pass. For the retention case that pass retries by itself:
+// every pass expires down to retain_snapshots, committed or not (#1791; before, a pass that
+// committed nothing did not, and a failed expiry was lost once the table went quiet). The floor
+// needs a memory: only a pass that removes something asks to floor, so the next pass may well
+// remove nothing. A failed floor is remembered (floorOwed) and retried by every later pass until
+// it lands, including a pass with nothing to commit; before #1686 the retry pass took the
+// converged branch, which never expired, and the floor was lost. The memory is per process: a
+// restart in between forgets it. The floor itself is taken straight after the commit that
+// removed the paths (reconcile), so here it is only the retry.
 //
 // passStart is the first version this pass committed (-1: none). Pruning keeps it and every
 // later v<N> copy, so the versions a multi-commit pass claimed (claimVersion) stay on disk for
 // the fence until the next pass.
 //
-// ok reports that the discovery files were published and any owed floor landed. (A failed heal
+// ok reports that the discovery files were published and the expiry, floor or retention, did
+// not fail. (A failed heal
 // also leaves the pass unsettled; the callers read that from healFailed, #1098.)
 func (e *Exporter) finishPass(ctx context.Context, tbl *icetable.Table, tkey, database, measurement string, commits, passStart int) (*icetable.Table, bool, error) {
 	// The writer role can be lost after the pass's last commit check. Then the pass still
@@ -675,7 +680,6 @@ func (e *Exporter) finishPass(ctx context.Context, tbl *icetable.Table, tkey, da
 	// commit and does not prune or sweep: its view is stale, and the new writer's pass does those.
 	mayCommit := e.passMayCommit()
 	floor := e.floorOwed(tkey)
-	appended := e.expiryOwed(tkey) // read on every pass: it also notes the table's first one
 	expireOK := true
 	switch {
 	case !mayCommit:
@@ -683,15 +687,16 @@ func (e *Exporter) finishPass(ctx context.Context, tbl *icetable.Table, tkey, da
 	case floor:
 		tbl, expireOK = e.expireSnapshots(ctx, tbl, database, measurement, floorHistory)
 		e.setFloorOwed(tkey, !expireOK)
-	case commits > 0 || appended:
-		// Also on a pass that committed nothing, after appends (append.go):
-		// they add snapshots and expire none, and the pass that follows them
-		// finds every appended file in the table already. And on a table's
-		// first pass in this process, for the appends of the last one.
+	default:
+		// Every pass, whether or not it committed (#1791). What can leave a
+		// table over retain_snapshots is not only this pass's commits:
+		// appends add snapshots and expire none (append.go), an earlier
+		// pass's expiry can have failed, and another process or node can
+		// have committed and stopped before expiring. The table says how
+		// many snapshots it has, so nothing has to remember that an expiry
+		// is owed. Within retain_snapshots this reads the loaded metadata
+		// and commits nothing (expireSnapshots).
 		tbl, expireOK = e.expireSnapshots(ctx, tbl, database, measurement, retainConfigured)
-		if expireOK {
-			e.setExpiryOwed(tkey, false)
-		}
 	}
 	// Not when the discovery files already name this metadata (#1787): a pass
 	// that committed nothing would refuse its own v<N> copy, read it back to
@@ -1019,36 +1024,4 @@ func (e *Exporter) setFloorOwed(tkey string, owed bool) {
 	} else {
 		delete(e.floorDue, tkey)
 	}
-}
-
-// expiryOwed reports that appends may have added snapshots to the table
-// since a pass last expired any (append.go): one did in this process, or this
-// is the table's first pass in this process and what the last process left is
-// not known. The flag is per process, like floorOwed; the first-pass rule is
-// what covers a restart, after which a table that goes quiet would otherwise
-// keep the snapshots of its appends until its next commit.
-func (e *Exporter) expiryOwed(tkey string) bool {
-	e.chunkMu.Lock()
-	defer e.chunkMu.Unlock()
-	if _, seen := e.expirySeen[tkey]; !seen {
-		if e.expirySeen == nil {
-			e.expirySeen = make(map[string]struct{})
-		}
-		e.expirySeen[tkey] = struct{}{}
-		return true
-	}
-	return e.expireOwed[tkey]
-}
-
-func (e *Exporter) setExpiryOwed(tkey string, owed bool) {
-	e.chunkMu.Lock()
-	defer e.chunkMu.Unlock()
-	if !owed {
-		delete(e.expireOwed, tkey)
-		return
-	}
-	if e.expireOwed == nil {
-		e.expireOwed = make(map[string]bool)
-	}
-	e.expireOwed[tkey] = true
 }

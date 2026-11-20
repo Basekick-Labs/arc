@@ -727,11 +727,8 @@ func TestAppend_TheFirstPassOfAProcessExpiresWhatTheLastOneLeft(t *testing.T) {
 		r.report(r.newFile())
 		r.serve()
 	}
-	// "Restart": the exporter forgets what it owes and which tables it saw,
-	// and the scheduler its cache.
-	r.exp.chunkMu.Lock()
-	r.exp.expireOwed, r.exp.expirySeen = nil, nil
-	r.exp.chunkMu.Unlock()
+	// "Restart": the scheduler forgets its cache. The exporter keeps nothing
+	// about expiry: the table says how many snapshots it has (#1791).
 	delete(r.sched.state, "mydb\x00cpu")
 	if _, err := r.pass(); err != nil {
 		t.Fatal(err)
