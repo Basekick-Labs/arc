@@ -281,9 +281,38 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 		want[f.PhysicalPath] = f.SizeBytes
 		keyOf[f.PhysicalPath] = f.Key
 	}
-	live, err := e.tableLiveFiles(ctx, tbl)
+	live, dups, err := e.tableLiveEntries(ctx, tbl)
 	if err != nil {
 		return reconcileResult{}, fmt.Errorf("read current iceberg data files: %w", err)
+	}
+	// Paths the table holds more than once (#1795, duplicates.go) are repaired first, as this
+	// pass's first commit: the diff below could not remove such a path. A later commit of the
+	// pass claims the version the repair and its floor leave, as after the removal commit and
+	// its floor (commit, below). A repair refused cleanly leaves the table as it was and the
+	// pass goes on; one whose outcome is unknown ends the pass, as any other commit does.
+	repairCommits, repairStart := 0, -1
+	if len(dups) > 0 {
+		if !canCommit() {
+			e.logger.Info().Str("database", database).Str("measurement", measurement).
+				Msg("Iceberg reconcile: this node stopped being the writer during the pass; published and pruned nothing, the new writer settles the table")
+			return reconcileResult{schema: arcSchemaOf(tbl), writerLost: true}, nil
+		}
+		repaired, ok, err := e.repairDuplicates(ctx, tbl, live, dups, want, database, measurement)
+		if err != nil {
+			return reconcileResult{}, fmt.Errorf("repair data files held more than once: %w", err)
+		}
+		if ok {
+			tbl = repaired
+			repairCommits, repairStart = 1, e.metadataVersion(tbl)
+			// Every older snapshot holds those paths more than once, and the repair leaves an
+			// empty one behind it: floored, as after a removal. finishPass retries a failed floor.
+			var floorOK bool
+			tbl, floorOK = e.expireSnapshots(ctx, tbl, database, measurement, floorRepaired)
+			e.setFloorOwed(tkey, !floorOK)
+			if live, err = e.tableLiveFiles(ctx, tbl); err != nil {
+				return reconcileResult{commits: repairCommits}, fmt.Errorf("read current iceberg data files: %w", err)
+			}
+		}
 	}
 
 	// The diff key is (path, size). A path on both sides with a different size is a file
@@ -333,11 +362,15 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 				Msg("Iceberg reconcile: this node stopped being the writer during the pass; published and pruned nothing, the new writer settles the table")
 			return reconcileResult{schema: arcSchemaOf(tbl), writerLost: true}, nil
 		}
-		tbl, ok, err := e.finishPass(ctx, tbl, tkey, database, measurement, 0, -1)
+		tbl, ok, err := e.finishPass(ctx, tbl, tkey, database, measurement, repairCommits, repairStart)
 		if err != nil {
-			return reconcileResult{}, err
+			return reconcileResult{commits: repairCommits}, err
 		}
-		return reconcileResult{settled: ok && hintOK && !e.healFailed(), schema: arcSchemaOf(tbl), pruneAgainAt: e.pruneAgainAt()}, nil
+		settled := ok && hintOK && !e.healFailed()
+		if settled {
+			e.noteLeftAt(tkey, tbl.MetadataLocation()) // where an append may go on from (appendFiles)
+		}
+		return reconcileResult{settled: settled, schema: arcSchemaOf(tbl), pruneAgainAt: e.pruneAgainAt(), commits: repairCommits}, nil
 	}
 
 	// Metadata-only: files are dropped and added as DataFiles. (Transaction.Delete is a
@@ -380,7 +413,10 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 		stopReason string
 	)
 	liveNow := len(live)
-	passStart := -1 // the first version this pass committed; finishPass's prune keeps it and later ones
+	// The first version this pass committed; finishPass's prune keeps it and later ones. A repair
+	// above is the pass's first commit.
+	passStart := repairStart
+	commits = repairCommits
 	commit := func(rm, adds []iceberg.DataFile) error {
 		if commits > 0 {
 			// Claim the previous commit's version before making another (adopt.go): a pass of
@@ -660,6 +696,9 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 	// tick re-drives the measurement, and finishPass retries there even if that pass removes and
 	// commits nothing.
 	res.settled = !partial && !moved && hintOK && finishedOK && !e.healFailed()
+	if res.settled {
+		e.noteLeftAt(tkey, tbl.MetadataLocation()) // where an append may go on from (appendFiles)
+	}
 	return res, nil
 }
 

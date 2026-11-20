@@ -256,6 +256,10 @@ type exporterShared struct {
 	appendSmall map[string]int
 	chunkSize   map[string]int
 	floorDue    map[string]struct{}
+	// leftAt: per table (tkey), the metadata location this process last left
+	// the table at — its own last append, or the end of its last settled
+	// pass. Under chunkMu. See appendFiles (#1795).
+	leftAt map[string]string
 }
 
 // resetHintFailure clears the per-reconcile discovery-file failure flag.
@@ -1037,13 +1041,10 @@ func (e *Exporter) commitDiff(ctx context.Context, tbl *icetable.Table, toRemove
 	return committed, nil
 }
 
-// addFilesMerging adds DataFiles that iceberg-go refused as "already referenced" (stale DELETED
-// history) by enabling manifest merging for this transaction only and adding with the
-// duplicate check off. The reconcile diff is the authority on the live file set (it comes from
-// PlanFiles, which yields live entries only), so the check can only be tripped by DELETED
-// history — including the removal staged one call earlier in this same transaction, which is
-// the rewrite case. The toggle is staged metadata: a dropped transaction leaves the table as it was.
-func (e *Exporter) addFilesMerging(ctx context.Context, txn *icetable.Transaction, files []iceberg.DataFile, database, measurement string) error {
+// stageMergedAdd stages files as a merge-append with the duplicate check off: manifest merging
+// on for this transaction only, then off again. A merge keeps only its own snapshot's DELETED
+// entries, so a removal staged earlier in the transaction leaves no tombstones behind it.
+func (e *Exporter) stageMergedAdd(ctx context.Context, txn *icetable.Transaction, files []iceberg.DataFile) error {
 	if err := txn.SetProperties(manifestMergeOn()); err != nil {
 		return fmt.Errorf("enable manifest merge: %w", err)
 	}
@@ -1052,6 +1053,19 @@ func (e *Exporter) addFilesMerging(ctx context.Context, txn *icetable.Transactio
 	}
 	if err := txn.SetProperties(manifestMergeOff()); err != nil {
 		return fmt.Errorf("disable manifest merge: %w", err)
+	}
+	return nil
+}
+
+// addFilesMerging adds DataFiles that iceberg-go refused as "already referenced" (stale DELETED
+// history) by enabling manifest merging for this transaction only and adding with the
+// duplicate check off. The reconcile diff is the authority on the live file set (it comes from
+// PlanFiles, which yields live entries only), so the check can only be tripped by DELETED
+// history — including the removal staged one call earlier in this same transaction, which is
+// the rewrite case. The toggle is staged metadata: a dropped transaction leaves the table as it was.
+func (e *Exporter) addFilesMerging(ctx context.Context, txn *icetable.Transaction, files []iceberg.DataFile, database, measurement string) error {
+	if err := e.stageMergedAdd(ctx, txn, files); err != nil {
+		return err
 	}
 	e.logger.Info().
 		Str("database", database).Str("measurement", measurement).Int("files", len(files)).
@@ -1327,11 +1341,17 @@ func isPartitionInferenceError(err error) bool {
 // overriding iceberg.retain_snapshots. The caller passes it when the pass removed any
 // path, because such a path is gone from the primary backend and every older snapshot
 // still names it (#1092).
-type expireMode bool
+//
+// floorRepaired is the same floor after a repair of entries held twice (#1795): every older
+// snapshot holds those paths twice, and the repair leaves an empty snapshot behind it. It
+// differs only in what is logged: the floor's Warn says Arc deleted data files, which a
+// repair did not.
+type expireMode int
 
 const (
-	retainConfigured expireMode = false
-	floorHistory     expireMode = true
+	retainConfigured expireMode = iota
+	floorHistory
+	floorRepaired
 )
 
 // expireSnapshots trims snapshot history to the last retain_snapshots (0 = keep all, a
@@ -1351,7 +1371,7 @@ func (e *Exporter) expireSnapshots(ctx context.Context, tbl *icetable.Table, dat
 		return tbl, true
 	}
 	effective := e.retain
-	if mode == floorHistory {
+	if mode != retainConfigured {
 		effective = 1
 	}
 	before := len(tbl.Metadata().Snapshots())
@@ -1402,7 +1422,7 @@ func (e *Exporter) expireSnapshots(ctx context.Context, tbl *icetable.Table, dat
 		icetable.WithPostCommit(false),
 	); err != nil {
 		e.logger.Error().Err(err).Str("database", database).Str("measurement", measurement).
-			Bool("floor_history", mode == floorHistory).
+			Bool("floor_history", mode != retainConfigured).
 			Msg("Iceberg ExpireSnapshots failed (non-fatal) — snapshot history grows until it recovers")
 		return tbl, false
 	}
@@ -1413,7 +1433,7 @@ func (e *Exporter) expireSnapshots(ctx context.Context, tbl *icetable.Table, dat
 	expired, err := commit(ctx)
 	if err != nil {
 		e.logger.Error().Err(err).Str("database", database).Str("measurement", measurement).
-			Bool("floor_history", mode == floorHistory).
+			Bool("floor_history", mode != retainConfigured).
 			Msg("Iceberg ExpireSnapshots commit failed (non-fatal) — snapshot history grows until it recovers")
 		return tbl, false
 	}
@@ -2261,23 +2281,59 @@ func (e *Exporter) tableDataFiles(ctx context.Context, tbl *icetable.Table) (map
 // tableLiveFiles returns the current snapshot's data files by path, as the table's own
 // DataFile entries: what a removal hands back to ReplaceDataFilesWithDataFiles.
 func (e *Exporter) tableLiveFiles(ctx context.Context, tbl *icetable.Table) (map[string]iceberg.DataFile, error) {
-	out := make(map[string]iceberg.DataFile)
+	live, _, err := e.tableLiveEntries(ctx, tbl)
+	return live, err
+}
+
+// tableLiveEntries is tableLiveFiles plus the paths the table holds more than once, with each
+// of their entries (#1795). A path is in the table once per manifest entry, and every entry
+// yields exactly one task that starts at offset 0, whatever its split offsets: a whole-file
+// task is the only kind iceberg-go splits, and its first split starts at 0. So two tasks of one
+// path that both start at 0 are two entries; the further splits of one large file are not.
+func (e *Exporter) tableLiveEntries(ctx context.Context, tbl *icetable.Table) (map[string]iceberg.DataFile, map[string][]iceberg.DataFile, error) {
 	if tbl.CurrentSnapshot() == nil {
-		return out, nil // empty table
+		return map[string]iceberg.DataFile{}, nil, nil // empty table
 	}
 	tasks, err := tbl.Scan().PlanFiles(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	// One data file can yield SEVERAL tasks since iceberg-go v0.7.0: a Parquet file above
-	// read.split.target-size (128 MiB) with at least two split offsets is planned as one task per
-	// byte range. This stays correct only because it is a map keyed on the path, and every split
-	// of a file carries the same DataFile — len(tasks), a slice, or task.Length would each
-	// double-count. Arc's own files are far below that size; bulk-imported Parquet need not be.
+	live, held := liveAndHeldTwice(tasks)
+	return live, held, nil
+}
+
+// liveAndHeldTwice is tableLiveEntries over planned tasks.
+//
+// One data file can yield SEVERAL tasks since iceberg-go v0.7.0: a Parquet file above
+// read.split.target-size (128 MiB) with at least two split offsets is planned as one task per
+// byte range. live stays correct only because it is a map keyed on the path, and every split
+// of a file carries the same DataFile — len(tasks), a slice, or task.Length would each
+// double-count. Arc's own files are far below that size; bulk-imported Parquet need not be.
+// For the same reason only tasks that start at 0 count as entries in held: a further split
+// of one file shares its path and starts later, in whatever order the tasks come.
+func liveAndHeldTwice(tasks []icetable.FileScanTask) (live map[string]iceberg.DataFile, held map[string][]iceberg.DataFile) {
+	live = make(map[string]iceberg.DataFile, len(tasks))
+	first := make(map[string]iceberg.DataFile, len(tasks))
 	for _, task := range tasks {
-		out[task.File.FilePath()] = task.File
+		p := task.File.FilePath()
+		live[p] = task.File
+		if task.Start != 0 {
+			continue
+		}
+		prev, seen := first[p]
+		if !seen {
+			first[p] = task.File
+			continue
+		}
+		if held == nil {
+			held = make(map[string][]iceberg.DataFile)
+		}
+		if len(held[p]) == 0 {
+			held[p] = append(held[p], prev)
+		}
+		held[p] = append(held[p], task.File)
 	}
-	return out, nil
+	return live, held
 }
 
 // isAlreadyExists reports whether a catalog error means "the thing is already there", which the
