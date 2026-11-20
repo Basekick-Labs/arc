@@ -390,3 +390,34 @@ func TestDropRecord1796_ATakeoverResidueIsCollected(t *testing.T) {
 		t.Fatal("a node with no row follows the residue, not the new exporter's table")
 	}
 }
+
+// A node with no row does not adopt what a drop left of a colocated table
+// (#1676), also once that drop is over: the marker alone decides there, not
+// whether a drop is running (the #1796 review's H1).
+func TestDropRecord1796_ARowlessNodeDoesNotReviveAColocatedResidue(t *testing.T) {
+	r, a, _ := sharedDropRigLayout(t, layoutColocated)
+	ctx := context.Background()
+	// What the drop left: the table's metadata, as a pass that published
+	// after the drop's listings would leave it.
+	residue := r.snapshotDirs("mydb/cpu/metadata")
+	r.deleteDatabase(a)
+	r.restore(residue, false)
+	if left, _ := os.ReadDir(filepath.Join(r.root, "mydb", "cpu", "metadata")); len(left) == 0 {
+		t.Fatal("the test's premise: a colocated residue")
+	}
+	if rec, exists := r.dropRecord(a); !exists || !rec.Done {
+		t.Fatalf("the test's premise: a finished drop (exists=%v done=%v)", exists, rec.Done)
+	}
+	c := r.node(true)
+	if err := c.SetLayout(layoutColocated); err != nil {
+		t.Fatal(err)
+	}
+	c.SetForgetDroppedRows(true)
+	exists, err := c.tableExists(ctx, "mydb", "cpu")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Fatal("a node with no row adopted what a finished drop left of a colocated table")
+	}
+}
