@@ -6,12 +6,12 @@
 
 After #1778 the appends of different tables overlap, but a reconcile pass still ran for one table at a time, and every table gets one: at its first export, every `iceberg.reconcile_interval`, and after 120 appends. On object storage a pass is about half a second of waiting on storage requests (14 to 16 of them for a table that only took appends), so a timed pass over 200 tables took minutes, during which those tables' appends were served one batch per table visited. The passes of different tables now overlap too.
 
-- **New key `iceberg.reconcile_concurrency`** (1 to 16; default `0`, which picks by the storage: `4` on an object store, `1` on local storage). `1` reconciles one table at a time, as before.
-- **Where it applies:** the timed pass's walk of the tables, and the passes ingest requests need (a table's first export when its data arrives after the node started, a fallback) when `iceberg.ingest_export_concurrency` is above 1. Passes asked for by compaction, DELETE, retention or tiering still run one at a time.
+- **New key `iceberg.reconcile_concurrency`** (1 to 16; default `0`, which picks by the storage: `4` on an object store, `1` on local storage). `1` reconciles one table at a time, as before. The value in effect is logged at startup. Azure and GCS count as object stores and so default to 4; they were not run.
+- **Where it applies:** the timed pass's walk of the tables, and the passes ingest requests need (a table's first export when its data arrives after the node started, a fallback, every request with `ingest_append_enabled = false`) when `iceberg.ingest_export_concurrency` is above 1. Passes asked for by compaction, DELETE, retention or tiering still run one at a time.
 - **Standalone nodes only.** A node of a cluster, and a node on a shared bucket with no election of the exporter, runs one at a time whatever the key says, and logs it when the key was set higher.
 - As with the appends, the scheduler starts a batch, waits for all of it, and only then records what each pass did: a table is still exported by one thing at a time.
 
-Measured on AWS S3, standalone on EC2 in the bucket's region, 200 tables written at once with `ingest_export_interval = 5` and 16 appends at once, over 10 minutes (two timed passes) after a 6-minute warm-up; one run each:
+Measured on AWS S3, standalone on EC2 in the bucket's region, 200 tables written at once with `ingest_export_interval = 5` and 16 appends at once, over 10 minutes after a 6-minute warm-up (two timed passes by the timer; the instance's logs were not kept); one run each:
 
 | Passes at once | Average export lag | Appends per second | Longest wait at the end of the run |
 |---|---|---|---|
@@ -19,7 +19,7 @@ Measured on AWS S3, standalone on EC2 in the bucket's region, 200 tables written
 | 4 | 3.2 s | 19.5 | 2 s |
 | 8 | 2.1 s | 21.0 | 1 s |
 
-A second set on the final build, the same load with a 5-minute window that held one timed pass, and how long the first export of the 200 tables took after the node started (their data arrives after the start, so those are passes ingest requests ask for):
+A second set on the final build, the same load over minutes 5 to 10 of the run (a timed pass is due at minute 5), and how long the first export of the 200 tables took after the node started (their data arrives after the start, so those are passes ingest requests ask for):
 
 | `reconcile_concurrency` | Average export lag | First export of all 200 tables |
 |---|---|---|
@@ -27,13 +27,15 @@ A second set on the final build, the same load with a 5-minute window that held 
 | not set (4 on object storage) | 3.5 s | 48 s |
 | 8 | 2.0 s | 27 s |
 
-The same load through a local S3 server with 30 ms added to every request, over a window that held a timed pass:
+The same load through a local S3 server with 30 ms added to every request, where the logs give the lengths:
 
-| Passes at once | Average export lag | The timed pass's walk of 200 tables | First export of all 200 tables after start |
-|---|---|---|---|
-| 1 | 9.1 s | about 5 minutes | 5 min 10 s |
-| 4 | 2.6 s | 77 s | 83 s |
-| 8 | 1.8 s | 45 s | 46 s |
+| Passes at once | The timed pass's walk of 200 tables | First export of all 200 tables after start |
+|---|---|---|
+| 1 | about 5 minutes | 5 min 10 s |
+| 4 | 77 s | 83 s |
+| 8 | 45 s | 46 s |
+
+(The lag in those local runs is not comparable across rows: the 4-minute window lay inside the walk at 1, overlapped it by seconds at 4, and came after it at 8.)
 
 - **At the default `ingest_export_interval` of 60 s nothing changes**: 30.3 s at one pass at a time and 29.9 s at 4 on AWS, which is what a 60 s interval gives. The gain is at short intervals, in how long a timed pass takes, and at start-up.
 - In every run no append fell back, there were no Iceberg warnings or errors, row counts matched storage on the tables checked and no file was in a table twice.
