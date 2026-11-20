@@ -11,7 +11,7 @@ A pass that kept published versions on disk only because of `iceberg.min_version
 - **Given up:** a pass that commits nothing no longer puts back a `v<N>.metadata.json` deleted from outside Arc while the hint still names it. The next commit or restart writes it.
 - **A prune that could not finish is retried.** When the metadata directory cannot be listed, or a copy cannot be deleted, the table's next pass runs and tries again, and the failure is logged at Warn (it was at Debug, or not logged). Before, a table that then went quiet kept those copies until its files next changed. While the failure lasts that is one full pass of the table per `reconcile_interval`.
 - **Copies a pass of several commits keeps for itself are removed by the next pass.** They used to stay over `retain_snapshots + 1` on a table that went quiet.
-- **Measured** with the built binary on SeaweedFS, `reconcile_interval = 15`, `min_version_age = 120`, 30 writes and then nothing: before, `version-hint.text` was written again at each of the 7 passes that followed the last commit; after, not once, and one pass about 130 s after the last publish pruned the table to `retain_snapshots + 1` copies. One run each.
+- **Measured** with the built binary on SeaweedFS, `reconcile_interval = 15`, `min_version_age = 120`, 30 writes and then nothing: before, `version-hint.text` was written again at each of the 7 passes that followed the last commit; after, not once: the six passes that followed the last publish skipped the table, and the seventh, 105 s after it, pruned the table from 10 copies to `retain_snapshots + 1`. One run before, two after.
 - No configuration changes.
 
 ## New: reconcile passes of several Iceberg tables run at once ([#1786](https://github.com/Basekick-Labs/arc/issues/1786))
