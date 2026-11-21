@@ -315,9 +315,7 @@ func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []str
 			var files []string
 			err := errTierListingFailed
 			if !listing.skip() {
-				listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				files, err = backend.List(listCtx, prefix)
-				cancel()
+				files, err = listDirectParquet(ctx, backend, prefix)
 			}
 			if err != nil {
 				listing.failed = true
@@ -327,15 +325,8 @@ func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []str
 				verified = false
 				continue
 			}
-			var directFiles []string
-			for _, f := range files {
-				remaining := strings.TrimPrefix(f, prefix)
-				if remaining != "" && !strings.Contains(remaining, "/") && strings.HasSuffix(remaining, ".parquet") {
-					directFiles = append(directFiles, remaining)
-				}
-			}
-			p.globCache.setScoped(cacheKey, directFiles, scope)
-			hasFiles = len(directFiles) > 0
+			p.globCache.setScoped(cacheKey, files, scope)
+			hasFiles = len(files) > 0
 		}
 		if hasFiles {
 			existing = append(existing, path)

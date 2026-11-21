@@ -1023,6 +1023,11 @@ func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, pat
 
 	// Cache of parent -> set of existing child directories
 	parentChildren := make(map[string]map[string]bool)
+	// dayFiles holds, for a day directory this pass listed as the parent of
+	// requested hours, the .parquet files directly in it. The day-level
+	// check below reads it before the cache. Kept apart from the cache so
+	// that answer is not counted as a cache hit: it was listed just now.
+	dayFiles := make(map[string][]string)
 
 	// Fetch child listings for each unique parent (one API call per parent)
 	for parentDir := range uniqueParents {
@@ -1062,9 +1067,29 @@ func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, pat
 			verified = false
 			continue
 		}
+		// One listing of the level answers two questions when the backend
+		// can report a level's own files (storage.LevelLister): which child
+		// directories exist, and, when this parent is a day directory,
+		// whether the day holds daily files directly. The second is what the
+		// day-level check below asks, so it is kept and that check makes no
+		// request for a day listed here. (It still makes one when the day's
+		// directories came from the cache, when open-ended bounds resolved
+		// them first, or when only the day glob was asked about.)
+		var subdirs, levelFiles []string
+		var err error
 		listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		subdirs, err := lister.ListDirectories(listCtx, storagePrefix)
+		level, hasLevel := lister.(storage.LevelLister)
+		if hasLevel {
+			subdirs, levelFiles, err = level.ListLevel(listCtx, storagePrefix)
+		} else {
+			subdirs, err = lister.ListDirectories(listCtx, storagePrefix)
+		}
 		cancel()
+		if err == nil && hasLevel && isDayPrefix(storagePrefix) {
+			direct := parquetNames(levelFiles)
+			dayFiles[storagePrefix] = direct
+			p.globCache.setScoped("remote:dayfiles:"+storagePrefix, direct, scope)
+		}
 
 		if err != nil {
 			p.logger.Debug().Err(err).Str("prefix", storagePrefix).Msg("Failed to list remote directories")
@@ -1126,19 +1151,19 @@ func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, pat
 			verified = false
 			continue
 		}
-		if parts := strings.Split(strings.Trim(prefix, "/"), "/"); len(parts) == 5 {
+		if isDayPrefix(prefix) {
 			// Check cache first for day-level file existence
 			cacheKey := "remote:dayfiles:" + prefix
 			var hasFiles bool
-			if cached, ok := p.globCache.getFresh(cacheKey, maxAge); ok {
+			if listed, ok := dayFiles[prefix]; ok {
+				hasFiles = len(listed) > 0
+			} else if cached, ok := p.globCache.getFresh(cacheKey, maxAge); ok {
 				hits++
 				hasFiles = len(cached) > 0
 				p.logger.Debug().Str("prefix", prefix).Bool("has_files", hasFiles).Msg("Using cached day-level file check")
 			} else {
 				// Cache miss - make API call
-				listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				files, err := p.storage.List(listCtx, prefix)
-				cancel()
+				directFiles, err := listDirectParquet(ctx, p.storage, prefix)
 				if err != nil {
 					p.logger.Debug().Err(err).Str("prefix", prefix).Msg("Failed to list files at day-level path")
 					// Dropped, as before, but the absence is not verified:
@@ -1151,14 +1176,6 @@ func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, pat
 					// so OptimizeTablePath never caches one.
 					verified = false
 					continue
-				}
-				// Find direct parquet files (not in subdirs)
-				var directFiles []string
-				for _, f := range files {
-					remaining := strings.TrimPrefix(f, prefix)
-					if remaining != "" && !strings.Contains(remaining, "/") && strings.HasSuffix(remaining, ".parquet") {
-						directFiles = append(directFiles, remaining)
-					}
 				}
 				// Cache the result
 				p.globCache.setScoped(cacheKey, directFiles, scope)
@@ -1223,6 +1240,57 @@ func (p *PartitionPruner) extractStoragePrefix(url, basePath string) (string, bo
 	p.logger.Warn().Str("url", url).Str("base_path", basePath).
 		Msg("Partition path is not under the storage root it was generated from; skipping existence filtering")
 	return "", false
+}
+
+// isDayPrefix reports whether a storage prefix names a day directory:
+// database/measurement/year/month/day.
+func isDayPrefix(prefix string) bool {
+	return len(strings.Split(strings.Trim(prefix, "/"), "/")) == 5
+}
+
+// parquetNames keeps the .parquet names of a level's files.
+func parquetNames(names []string) []string {
+	var out []string
+	for _, n := range names {
+		if strings.HasSuffix(n, ".parquet") {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// listDirectParquet returns the names of the .parquet files directly in
+// prefix, not those in directories beneath it: what tells a day that holds
+// daily files from one that only holds hour directories.
+//
+// A backend that can list one level (storage.LevelLister; all of Arc's can)
+// is asked for exactly that, one delimiter listing whose size is the day's
+// hour directories plus its daily files. Otherwise every object under the
+// prefix is listed and the direct ones picked out, which on a day with many
+// uncompacted files is thousands of keys for a yes/no answer and is what
+// used to run out the timeout.
+func listDirectParquet(ctx context.Context, backend storage.Backend, prefix string) ([]string, error) {
+	listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if level, ok := backend.(storage.LevelLister); ok {
+		_, files, err := level.ListLevel(listCtx, prefix)
+		if err != nil {
+			return nil, err
+		}
+		return parquetNames(files), nil
+	}
+	files, err := backend.List(listCtx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	var direct []string
+	for _, f := range files {
+		remaining := strings.TrimPrefix(f, prefix)
+		if remaining != "" && !strings.Contains(remaining, "/") && strings.HasSuffix(remaining, ".parquet") {
+			direct = append(direct, remaining)
+		}
+	}
+	return direct, nil
 }
 
 // InvalidateGlobCache clears the glob cache
