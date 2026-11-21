@@ -442,3 +442,33 @@ func TestFirstDecimalOverflowNullsAndOffsets(t *testing.T) {
 	_, found = firstDecimalOverflow(edgeRec, 1)
 	require.False(t, found, "math.MinInt64 fits")
 }
+
+// Arrow and msgpack slice to the cap before they cast, so a value past the
+// cap never fails them either.
+func TestDecimalOverflowPastTheCapArrowAndMsgpack(t *testing.T) {
+	r := newOverflowRig(t)
+	const capRows, bad = 5, 9
+	reader, conn, err := r.duck.ArrowQueryContext(context.Background(), hugeAt(20, bad))
+	require.NoError(t, err)
+	defer conn.Close()
+	peeked, overflow := peekDecimalOverflow(reader, capRows)
+	require.Nil(t, overflow)
+	info := normalizeDecimalSchema(peeked.Schema())
+	var buf bytes.Buffer
+	w := bufio.NewWriter(&buf)
+	rows, err := streamArrowIPC(context.Background(), w, peeked, info.schema, info, false, "", capRows, zerolog.Nop())
+	require.NoError(t, err)
+	require.EqualValues(t, capRows, rows)
+	peeked.Release()
+
+	reader, conn2, err := r.duck.ArrowQueryContext(context.Background(), hugeAt(20, bad))
+	require.NoError(t, err)
+	defer conn2.Close()
+	batches, n, err := drainArrowBatches(context.Background(), reader, capRows, normalizeDecimalSchema(reader.Schema()))
+	require.NoError(t, err)
+	require.Equal(t, capRows, n)
+	for _, b := range batches {
+		b.Release()
+	}
+	reader.Release()
+}
