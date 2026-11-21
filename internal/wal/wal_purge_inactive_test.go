@@ -184,15 +184,10 @@ func TestDuplication_CompoundsOverMultipleCycles(t *testing.T) {
 	t.Logf("Total duplicated: %d — production would have %d records instead of 50", totalDuplicated, 50+totalDuplicated)
 }
 
-// ==========================================================================
-// No duplication proof: new periodic cycle (flush + purge)
-// ==========================================================================
-
-// TestNoDuplication_NewPeriodicCycle proves the new flush+purge cycle does NOT
-// cause duplication. PurgeInactive deletes old WAL files without replaying
-// any entries through a callback. Zero records replayed = zero duplicates.
-func TestNoDuplication_NewPeriodicCycle(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "wal-nodup-new-*")
+// TestPurgeAll_DeletesEveryWALFile: the clean-shutdown purge removes the
+// file the writer had open as well as older ones.
+func TestPurgeAll_DeletesEveryWALFile(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "wal-test-purge-all-*")
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
@@ -207,269 +202,27 @@ func TestNoDuplication_NewPeriodicCycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create writer: %v", err)
 	}
-
-	records := make([]map[string]interface{}, 100)
-	for i := 0; i < 100; i++ {
-		records[i] = map[string]interface{}{
-			"measurement": "sensor",
-			"device_id":   "device-01",
-			"temperature": float64(20 + i),
-		}
-	}
-	writer.Append(records)
-	time.Sleep(50 * time.Millisecond)
-
-	// Create 3 old WAL files (simulate previous rotations)
-	for i := 0; i < 3; i++ {
-		oldName := filepath.Join(tmpDir, "arc-2024010"+string(rune('1'+i))+"_000000.wal")
-		f, _ := os.Create(oldName)
-		header := make([]byte, WALFileHeaderSize)
-		copy(header[0:4], WALMagic)
-		binary.BigEndian.PutUint16(header[4:6], WALVersion)
-		header[6] = WALChecksumCRC32
-		f.Write(header)
-		f.Close()
-	}
-
-	before, _ := filepath.Glob(filepath.Join(tmpDir, "*.wal"))
-	if len(before) != 4 {
-		t.Fatalf("expected 4 WAL files, got %d", len(before))
-	}
-
-	// New periodic cycle: purge only, no replay
-	deleted, err := writer.PurgeInactive()
-	if err != nil {
-		t.Fatalf("PurgeInactive failed: %v", err)
-	}
-
-	if deleted != 3 {
-		t.Errorf("expected 3 old WAL files purged, got %d", deleted)
-	}
-
-	remaining, _ := filepath.Glob(filepath.Join(tmpDir, "*.wal"))
-	if len(remaining) != 1 {
-		t.Errorf("expected 1 remaining WAL file (active only), got %d", len(remaining))
-	}
-
-	writer.Close()
-	t.Logf("New periodic cycle: 0 records replayed, %d files purged — no duplication", deleted)
-}
-
-// TestNoDuplication_MultipleNewCycles proves multiple new-style cycles never
-// cause duplication. Each cycle purges old files without replaying anything.
-func TestNoDuplication_MultipleNewCycles(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "wal-nodup-multi-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	writer, err := NewWriter(&WriterConfig{
-		WALDir:       tmpDir,
-		SyncMode:     SyncModeAsync,
-		MaxSizeBytes: 100 * 1024 * 1024,
-		Logger:       zerolog.Nop(),
-	})
-	if err != nil {
-		t.Fatalf("failed to create writer: %v", err)
-	}
-
-	writer.Append([]map[string]interface{}{
-		{"measurement": "cpu", "value": 42.0},
-	})
-	time.Sleep(50 * time.Millisecond)
-
-	for cycle := 1; cycle <= 5; cycle++ {
-		oldName := filepath.Join(tmpDir, "arc-2024010"+string(rune('0'+cycle))+"_000000.wal")
-		os.WriteFile(oldName, []byte("old"), 0600)
-
-		deleted, err := writer.PurgeInactive()
-		if err != nil {
-			t.Fatalf("cycle %d: PurgeInactive failed: %v", cycle, err)
-		}
-		t.Logf("Cycle %d: purged %d files, replayed 0 records", cycle, deleted)
-	}
-
-	writer.Close()
-	t.Logf("5 periodic cycles, 0 records replayed, 0 duplicates")
-}
-
-// TestNoDuplication_FlushFailurePreservesWAL proves that when FlushAll fails,
-// PurgeInactive is skipped, preserving WAL files for retry next cycle.
-func TestNoDuplication_FlushFailurePreservesWAL(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "wal-nodup-flush-fail-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	writer, err := NewWriter(&WriterConfig{
-		WALDir:       tmpDir,
-		SyncMode:     SyncModeAsync,
-		MaxSizeBytes: 100 * 1024 * 1024,
-		Logger:       zerolog.Nop(),
-	})
-	if err != nil {
-		t.Fatalf("failed to create writer: %v", err)
-	}
-	defer writer.Close()
-
-	oldFiles := []string{
-		filepath.Join(tmpDir, "arc-20240101_000000.wal"),
-		filepath.Join(tmpDir, "arc-20240102_000000.wal"),
-	}
-	for _, f := range oldFiles {
-		os.WriteFile(f, []byte("important data"), 0600)
-	}
-
-	// Simulate FlushAll failure — skip PurgeInactive (matches main.go logic)
-	flushFailed := true
-	if !flushFailed {
-		writer.PurgeInactive()
-	}
-
-	// WAL files must be preserved for retry
-	for _, f := range oldFiles {
-		if _, err := os.Stat(f); os.IsNotExist(err) {
-			t.Errorf("WAL file %s should be preserved after flush failure", filepath.Base(f))
-		}
-	}
-
-	allFiles, _ := filepath.Glob(filepath.Join(tmpDir, "*.wal"))
-	if len(allFiles) != 3 { // 1 active + 2 old
-		t.Errorf("expected 3 WAL files preserved, got %d", len(allFiles))
-	}
-}
-
-// ==========================================================================
-// PurgeInactive() method tests
-// ==========================================================================
-
-// TestPurgeInactive_DeletesNonActiveFiles verifies PurgeInactive deletes all
-// WAL files except the currently active one.
-func TestPurgeInactive_DeletesNonActiveFiles(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "wal-test-purge-inactive-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	writer, err := NewWriter(&WriterConfig{
-		WALDir:       tmpDir,
-		SyncMode:     SyncModeAsync,
-		MaxSizeBytes: 100 * 1024 * 1024,
-		Logger:       zerolog.Nop(),
-	})
-	if err != nil {
-		t.Fatalf("failed to create writer: %v", err)
-	}
-	defer writer.Close()
-
-	activeFile := writer.CurrentFile()
-
-	oldFiles := []string{
-		filepath.Join(tmpDir, "arc-20240101_100000.wal"),
-		filepath.Join(tmpDir, "arc-20240101_110000.wal"),
-		filepath.Join(tmpDir, "arc-20240101_120000.wal"),
-	}
-	for _, f := range oldFiles {
-		header := make([]byte, WALFileHeaderSize)
-		copy(header[0:4], WALMagic)
-		binary.BigEndian.PutUint16(header[4:6], WALVersion)
-		header[6] = WALChecksumCRC32
-		os.WriteFile(f, header, 0600)
-	}
-
-	allFiles, _ := filepath.Glob(filepath.Join(tmpDir, "*.wal"))
-	if len(allFiles) != 4 {
-		t.Fatalf("expected 4 WAL files before purge, got %d", len(allFiles))
-	}
-
-	deleted, err := writer.PurgeInactive()
-	if err != nil {
-		t.Fatalf("PurgeInactive failed: %v", err)
-	}
-	if deleted != 3 {
-		t.Errorf("expected 3 deleted files, got %d", deleted)
-	}
-
-	remaining, _ := filepath.Glob(filepath.Join(tmpDir, "*.wal"))
-	if len(remaining) != 1 {
-		t.Errorf("expected 1 remaining WAL file, got %d", len(remaining))
-	}
-	if len(remaining) == 1 && remaining[0] != activeFile {
-		t.Errorf("remaining file should be active file %s, got %s", activeFile, remaining[0])
-	}
-}
-
-// TestPurgeInactive_NoFilesToPurge verifies PurgeInactive returns 0 when
-// only the active file exists.
-func TestPurgeInactive_NoFilesToPurge(t *testing.T) {
-	writer, tmpDir := newTestWriter(t, SyncModeAsync)
-	defer os.RemoveAll(tmpDir)
-	defer writer.Close()
-
-	deleted, err := writer.PurgeInactive()
-	if err != nil {
-		t.Fatalf("PurgeInactive failed: %v", err)
-	}
-	if deleted != 0 {
-		t.Errorf("expected 0 deleted, got %d", deleted)
-	}
-	if _, err := os.Stat(writer.CurrentFile()); os.IsNotExist(err) {
-		t.Error("active WAL file should not be deleted")
-	}
-}
-
-// TestPurgeInactive_PreservesActiveFileDuringWrites verifies PurgeInactive
-// does not interfere with the active file while writes are happening.
-func TestPurgeInactive_PreservesActiveFileDuringWrites(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "wal-test-purge-active-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	writer, err := NewWriter(&WriterConfig{
-		WALDir:       tmpDir,
-		SyncMode:     SyncModeAsync,
-		MaxSizeBytes: 100 * 1024 * 1024,
-		Logger:       zerolog.Nop(),
-	})
-	if err != nil {
-		t.Fatalf("failed to create writer: %v", err)
-	}
-	defer writer.Close()
-
-	writer.Append([]map[string]interface{}{{"measurement": "cpu", "value": 42.0}})
-	waitForEntries(t, writer, 1)
 
 	os.WriteFile(filepath.Join(tmpDir, "arc-20240101_000000.wal"), []byte("old"), 0600)
-
-	deleted, err := writer.PurgeInactive()
+	writer.Close()
+	deleted, err := writer.PurgeAll()
 	if err != nil {
-		t.Fatalf("PurgeInactive failed: %v", err)
+		t.Fatalf("PurgeAll failed: %v", err)
 	}
-	if deleted != 1 {
-		t.Errorf("expected 1 deleted, got %d", deleted)
-	}
-	if _, err := os.Stat(writer.CurrentFile()); os.IsNotExist(err) {
-		t.Fatal("active file should still exist after purge")
+	if deleted != 2 {
+		t.Errorf("PurgeAll: expected 2 deleted, got %d", deleted)
 	}
 
-	// Can still write after purge
-	err = writer.Append([]map[string]interface{}{{"measurement": "cpu", "value": 43.0}})
-	if err != nil {
-		t.Errorf("should be able to write after PurgeInactive: %v", err)
+	remaining, _ := filepath.Glob(filepath.Join(tmpDir, "*.wal"))
+	if len(remaining) != 0 {
+		t.Errorf("PurgeAll should delete all files, %d remain", len(remaining))
 	}
-	waitForEntries(t, writer, 2)
 }
 
-// TestPurgeInactive_DoesNotDeleteNonWALFiles verifies only .wal files are deleted.
-func TestPurgeInactive_DoesNotDeleteNonWALFiles(t *testing.T) {
+// TestPurgeAll_DoesNotDeleteNonWALFiles: only *.wal files are purged.
+func TestPurgeAll_DoesNotDeleteNonWALFiles(t *testing.T) {
 	writer, tmpDir := newTestWriter(t, SyncModeAsync)
 	defer os.RemoveAll(tmpDir)
-	defer writer.Close()
 
 	otherFiles := []string{
 		filepath.Join(tmpDir, "notes.txt"),
@@ -479,117 +232,20 @@ func TestPurgeInactive_DoesNotDeleteNonWALFiles(t *testing.T) {
 	for _, f := range otherFiles {
 		os.WriteFile(f, []byte("data"), 0600)
 	}
-
 	os.WriteFile(filepath.Join(tmpDir, "arc-20240101_000000.wal"), []byte("old"), 0600)
 
-	deleted, err := writer.PurgeInactive()
+	writer.Close()
+	deleted, err := writer.PurgeAll()
 	if err != nil {
-		t.Fatalf("PurgeInactive failed: %v", err)
+		t.Fatalf("PurgeAll failed: %v", err)
 	}
-	if deleted != 1 {
-		t.Errorf("expected 1 deleted (only .wal), got %d", deleted)
+	if deleted != 2 {
+		t.Errorf("expected 2 deleted (the writer's file and the old .wal), got %d", deleted)
 	}
-
 	for _, f := range otherFiles {
 		if _, err := os.Stat(f); os.IsNotExist(err) {
 			t.Errorf("non-WAL file should not be deleted: %s", filepath.Base(f))
 		}
-	}
-}
-
-// TestPurgeInactive_ConcurrentWithWrite verifies thread safety of PurgeInactive.
-func TestPurgeInactive_ConcurrentWithWrite(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "wal-test-concurrent-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	writer, err := NewWriter(&WriterConfig{
-		WALDir:       tmpDir,
-		SyncMode:     SyncModeAsync,
-		MaxSizeBytes: 100 * 1024 * 1024,
-		SyncInterval: 10 * time.Millisecond,
-		BufferSize:   10000,
-		Logger:       zerolog.Nop(),
-	})
-	if err != nil {
-		t.Fatalf("failed to create writer: %v", err)
-	}
-	defer writer.Close()
-
-	for i := 0; i < 5; i++ {
-		name := filepath.Join(tmpDir, "arc-2024010"+string(rune('1'+i))+"_000000.wal")
-		os.WriteFile(name, []byte("old data"), 0600)
-	}
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for i := 0; i < 100; i++ {
-			writer.Append([]map[string]interface{}{
-				{"measurement": "cpu", "value": float64(i)},
-			})
-		}
-	}()
-
-	deleted, err := writer.PurgeInactive()
-	if err != nil {
-		t.Fatalf("PurgeInactive failed: %v", err)
-	}
-	if deleted != 5 {
-		t.Errorf("expected 5 deleted, got %d", deleted)
-	}
-
-	// <-done only means the 100 Appends were enqueued; the background writer
-	// may not have written any of them yet. Wait for the writes themselves.
-	<-done
-	waitForEntries(t, writer, 1)
-}
-
-// TestPurgeAll_VsPurgeInactive verifies the behavioral difference between
-// PurgeAll (shutdown — deletes everything) and PurgeInactive (periodic — keeps active).
-func TestPurgeAll_VsPurgeInactive(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "wal-test-purge-compare-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	writer, err := NewWriter(&WriterConfig{
-		WALDir:       tmpDir,
-		SyncMode:     SyncModeAsync,
-		MaxSizeBytes: 100 * 1024 * 1024,
-		Logger:       zerolog.Nop(),
-	})
-	if err != nil {
-		t.Fatalf("failed to create writer: %v", err)
-	}
-
-	activeFile := writer.CurrentFile()
-	oldFile := filepath.Join(tmpDir, "arc-20240101_000000.wal")
-	os.WriteFile(oldFile, []byte("old"), 0600)
-
-	// PurgeInactive keeps active file
-	deleted, _ := writer.PurgeInactive()
-	if deleted != 1 {
-		t.Errorf("PurgeInactive: expected 1 deleted, got %d", deleted)
-	}
-	if _, err := os.Stat(activeFile); os.IsNotExist(err) {
-		t.Error("PurgeInactive should not delete active file")
-	}
-
-	// PurgeAll deletes everything (shutdown)
-	os.WriteFile(oldFile, []byte("old"), 0600)
-	writer.Close()
-	allDeleted, _ := writer.PurgeAll()
-	if allDeleted != 2 {
-		t.Errorf("PurgeAll: expected 2 deleted, got %d", allDeleted)
-	}
-
-	remaining, _ := filepath.Glob(filepath.Join(tmpDir, "*.wal"))
-	if len(remaining) != 0 {
-		t.Errorf("PurgeAll should delete all files, %d remain", len(remaining))
 	}
 }
 
@@ -1068,8 +724,7 @@ func TestNewWriterTrackedInstancesAreRandomized(t *testing.T) {
 	}
 }
 
-// TestPurgeAll_UsesSharedHelper verifies PurgeAll still works after refactoring
-// to use the shared purgeWALFiles helper.
+// TestPurgeAll_UsesSharedHelper verifies PurgeAll end to end on a writer's own files.
 func TestPurgeAll_UsesSharedHelper(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "wal-test-purge-all-shared-*")
 	if err != nil {

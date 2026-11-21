@@ -786,7 +786,13 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 	// valid only until that partition's first flush: never cached, here or
 	// by the SQL transform cache.
 	liveDropped := p.liveWindow().droppedLive(generated, existing)
-	if liveDropped {
+	// An unverified result rests on a listing that failed: a path was kept
+	// or dropped without knowing what it holds. Remembering it would repeat
+	// that guess for every query until the cache expires (here, and in the
+	// SQL transform cache), long after storage answers again, so it is
+	// never cached either. The cost is that while a listing keeps failing,
+	// every query asks storage again.
+	if liveDropped || !verified {
 		markVolatile(ctx)
 	}
 	if len(partitionPaths) == 0 {
@@ -810,7 +816,7 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 			}
 		}
 		p.logger.Info().Msg("No data exists for time range, using fallback")
-		if !liveDropped {
+		if !liveDropped && verified {
 			p.partitionCache.set(cacheKey, originalPath, false, scope)
 		}
 		return originalPath, false, false
@@ -840,7 +846,7 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 	// and a declined pass (every file in range, too many kept) can expand on
 	// the next query once older files fall out of the range. The per-query
 	// re-glob this costs is a few ms.
-	if !fileEligible && !liveDropped {
+	if !fileEligible && !liveDropped && verified {
 		p.partitionCache.set(cacheKey, result, true, scope)
 	}
 	return result, true, false
@@ -1135,7 +1141,14 @@ func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, pat
 				cancel()
 				if err != nil {
 					p.logger.Debug().Err(err).Str("prefix", prefix).Msg("Failed to list files at day-level path")
-					// Dropped, as before, but the absence is not verified.
+					// Dropped, as before, but the absence is not verified:
+					// if the day does hold daily files they are missing
+					// from this answer. Keeping the path instead is not
+					// free either: a day with only hour directories is the
+					// normal state of recent days, and there a kept path
+					// matches nothing and fails the query. What an
+					// unverified result must not do is outlive the failure,
+					// so OptimizeTablePath never caches one.
 					verified = false
 					continue
 				}

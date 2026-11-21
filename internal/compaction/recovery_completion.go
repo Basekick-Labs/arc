@@ -21,9 +21,9 @@ import (
 var errRecoveryPermanent = errors.New("compaction recovery cannot complete this manifest")
 
 // shortOutputError reports that the stored output is not the size the manifest
-// records, discovered while streaming it to hash it. This is a partial upload,
-// and recoverLoadedManifest routes it to the same handling as the ObjectLister
-// size check so the outcome does not depend on the backend.
+// records, discovered while streaming it to hash it. recoverLoadedManifest
+// routes it to the same handling as its own stored-size check
+// (discardPartialOutput).
 type shortOutputError struct {
 	path     string
 	expected int64

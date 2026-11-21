@@ -14,7 +14,7 @@ import (
 // Residue accumulates in a directory that is already under a capacity alert:
 // a crash between CreateTemp and its deferred remove leaks a write temporary,
 // and every purge path removes a *.wal while leaving its attempt sidecar behind
-// (PurgeFlushed, and purgeWALFiles via PurgeAll and PurgeInactive). Nothing
+// (PurgeFlushed and PurgeAll). Nothing
 // reclaimed either.
 func TestSweepRecoveryArtifacts(t *testing.T) {
 	dir := t.TempDir()

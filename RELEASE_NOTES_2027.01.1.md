@@ -2,6 +2,24 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: compaction recovery confirms an output before it deletes the inputs ([#1809](https://github.com/Basekick-Labs/arc/pull/1809))
+
+When a compaction job is interrupted after uploading its output, the next cycle finishes it: it checks the output and deletes the inputs the output replaces. The check compared the stored output's size with the size the job recorded, but only when a listing of the output succeeded. If that listing failed or came back empty, the comparison was skipped and the inputs were deleted anyway.
+
+- **The size is always read, and must match.** If it cannot be read, the inputs and the recovery record are kept and the next cycle tries again.
+- **A short output is discarded only when the inputs are all still there.** The job is then redone from them, as before. If an input is missing or cannot be checked, nothing is deleted: the output may be the only copy of those rows. Arc logs `Compaction output size differs from its manifest and its inputs are not all in storage` at error level on every compaction cycle, and keeps those files out of compaction, until the record under `_compaction_state/` is removed by hand.
+- **The recovery record is removed only after the short output is really gone.** Before, a failed delete left the output and its inputs together with nothing to stop the next cycle compacting them into duplicate rows.
+
+## Fix: a compaction job that could not delete its inputs no longer has them compacted again ([#1809](https://github.com/Basekick-Labs/arc/pull/1809))
+
+A job that uploads its output but cannot delete its inputs leaves a record so those inputs stay out of compaction until the deletion is finished. Jobs run in a subprocess, and the main process kept its own list of such records for 30 seconds, so it could miss one for that long. The daily tier later in the same cycle, or a cycle starting right after, could then compact the new output together with the inputs it already contained, which duplicates their rows. The list is now refreshed whenever a job returns.
+
+## Fix: after a storage listing fails, queries no longer keep leaving out a day's daily files ([#1809](https://github.com/Basekick-Labs/arc/pull/1809))
+
+On S3, Azure and GCS, Arc lists a day's directory to see whether it holds daily files. If that listing fails, the day's daily files are left out of the query. That result was then remembered for up to a minute, so queries over the day kept answering without them after storage was answering again. A result that depends on a failed listing is no longer remembered: the next query lists again.
+
+- **The query whose listing fails is not changed**: it still answers without that day's daily files.
+- **Cost:** while listings keep failing, every query over the day asks storage again.
 ## Fix: a write is no longer lost to a directory cleanup climbing the same partition ([#1804](https://github.com/Basekick-Labs/arc/issues/1804))
 
 **Who is affected:** Arc with local storage, mostly on macOS, while tiering, a database delete, retention or compaction removes empty directories. Linux is rarely affected; object storage is unchanged.
