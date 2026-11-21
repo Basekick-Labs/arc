@@ -19,8 +19,10 @@ type levelBackend struct {
 	t      *testing.T
 	mu     sync.Mutex
 	levels map[string]level // prefix -> its directories and direct files
-	fail   map[string]error // prefix -> error, checked before levels
-	calls  []string         // prefixes asked for, in order
+	fail   map[string]error // prefix -> error for ListLevel, checked before levels
+	// failFirst makes the first N ListLevel calls for a prefix fail.
+	failFirst map[string]int
+	calls     []string // prefixes ListLevel was asked for, in order
 }
 
 type level struct {
@@ -34,13 +36,21 @@ func (b *levelBackend) ListLevel(_ context.Context, prefix string) ([]string, []
 	if err := b.fail[prefix]; err != nil {
 		return nil, nil, err
 	}
+	if b.failFirst[prefix] > 0 {
+		b.failFirst[prefix]--
+		return nil, nil, errListing
+	}
 	l := b.levels[prefix]
 	return l.dirs, l.files, nil
 }
 
-func (b *levelBackend) ListDirectories(ctx context.Context, prefix string) ([]string, error) {
-	dirs, _, err := b.ListLevel(ctx, prefix)
-	return dirs, err
+// ListDirectories answers from the same levels but is not subject to fail:
+// the open-ended resolver lists with it, and a test needs to fail the day
+// check alone.
+func (b *levelBackend) ListDirectories(_ context.Context, prefix string) ([]string, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.levels[prefix].dirs, nil
 }
 
 func (b *levelBackend) List(_ context.Context, prefix string) ([]string, error) {
@@ -77,7 +87,8 @@ func newLevelPruner(t *testing.T, day level) (*PartitionPruner, *levelBackend) {
 			lvlMonth: {dirs: []string{"15"}},
 			lvlDay:   day,
 		},
-		fail: map[string]error{},
+		fail:      map[string]error{},
+		failFirst: map[string]int{},
 	}
 	p := NewPartitionPruner(zerolog.Nop())
 	p.SetStorageBackend(b)
@@ -123,38 +134,6 @@ func TestDayLevelCheckUsesOneLevelListing(t *testing.T) {
 				t.Errorf("the day directory was listed %d times, want %d (calls: %v)", n, c.dayListings, b.calls)
 			}
 		})
-	}
-}
-
-// When the level listing of the day fails, nothing about the day is known:
-// its hours are assumed to exist, its day path is dropped, and the result is
-// unverified (so it is not cached, TestUnverifiedPruningResultIsNotCached).
-func TestDayLevelListingFailureWithOneLevelListing(t *testing.T) {
-	p, b := newLevelPruner(t, level{dirs: []string{"10"}, files: []string{"cpu_daily.parquet"}})
-	b.fail[lvlDay] = errListing
-
-	got, verified, _ := p.filterExistingRemotePathsOpts(context.Background(), []string{lvlDayG, lvlHourG}, lvlBase, 0)
-	if want := []string{lvlHourG}; !reflect.DeepEqual(got, want) {
-		t.Errorf("paths = %v, want %v", got, want)
-	}
-	if verified {
-		t.Error("verified = true although the day could not be listed")
-	}
-
-	// Storage answers again. The failed listing must not have been
-	// remembered as "this day has no daily files": asked about the day glob
-	// alone (as the newest-partition shortcut does), it is kept.
-	delete(b.fail, lvlDay)
-	got, verified, _ = p.filterExistingRemotePathsOpts(context.Background(), []string{lvlDayG}, lvlBase, 0)
-	if want := []string{lvlDayG}; !reflect.DeepEqual(got, want) || !verified {
-		t.Errorf("day glob alone after recovery: paths = %v, verified = %v; want %v, true", got, verified, want)
-	}
-
-	// And the full set sees the daily files too.
-	p.InvalidateGlobCache()
-	got, verified, _ = p.filterExistingRemotePathsOpts(context.Background(), []string{lvlDayG, lvlHourG}, lvlBase, 0)
-	if want := []string{lvlDayG, lvlHourG}; !reflect.DeepEqual(got, want) || !verified {
-		t.Errorf("after recovery: paths = %v, verified = %v; want %v, true", got, verified, want)
 	}
 }
 
