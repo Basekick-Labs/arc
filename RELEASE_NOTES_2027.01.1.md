@@ -4,22 +4,31 @@
 
 ## Fix: a sum or a stored decimal beyond the int64 range is answered as a 400 with the reason ([#1784](https://github.com/Basekick-Labs/arc/issues/1784))
 
-Arc sends a scale-0 decimal result column as `int64` (#599). DuckDB returns `sum()` of any integer column as a 128-bit integer (HUGEINT, exported as `DECIMAL(38,0)`), and a column stored with `ingest.decimal_columns` (#276) can be that wide too, so a value beyond the int64 range failed the conversion after the response had started:
+**Who is affected:** only queries that already failed. A query whose result contains a scale-0 decimal value outside the int64 range (±9,223,372,036,854,775,807), such as `sum()` of a large integer column or a `DECIMAL(38,0)` column stored with `ingest.decimal_columns` (#276), now gets an error status with a clear reason instead of an empty or cut result. **Every query that returned a complete result before returns exactly the same now.**
 
-| Endpoint | Before | Now |
+**Nothing to enable or redefine:** this is the default behaviour; there is no setting and no header. Stored data, Parquet files and `ingest.decimal_columns` are not touched, so no table has to be redefined, re-ingested or migrated. The change is only in how the query response is built.
+
+Why it failed: Arc sends a scale-0 decimal result column as `int64` (#599), and DuckDB returns `sum()` of any integer column as a 128-bit integer (HUGEINT, exported as `DECIMAL(38,0)`). A value beyond int64 failed that conversion after the response had started:
+
+| Endpoint | Before | Now (value in the first 2,048 rows) |
 |---|---|---|
-| `POST /api/v1/query` (JSON) | 200, `success: true`, no rows, `truncated` | **400** with the reason |
+| `POST /api/v1/query` (JSON) | 200, `success: true`, `truncated` | **400** with the reason |
 | `POST /api/v1/query/arrow` | 200, a cut stream, the reason in the trailer | **400** with the reason |
-| `POST /api/v1/query/msgpack` | 500 | **400** with the reason |
+| `POST /api/v1/query/msgpack` | 500 | **400** with the reason (any row) |
 | Flight SQL | `INTERNAL: … unexpected EOF`, reason lost | `INVALID_ARGUMENT` with the reason |
 
-The reason names the column and the row, and the SQL cast that returns the value: `decimal value beyond the int64 range: column "s" (DECIMAL(38,0)/HUGEINT) at row 0; cast it in SQL: ::DOUBLE (approximate) or ::VARCHAR (exact digits)`.
+**The error text changes**, for clients that match on it:
 
-- **This changes a published status:** clients that read a 200 with `truncated` (JSON), a cut Arrow stream or a 500 (msgpack) for this case now get a 400.
-- **Limit:** JSON, Arrow and Flight SQL check the first chunk of the result (2,048 rows) before answering. A value that first appears later still cuts the response as before (`truncated` on JSON, the trailer on Arrow); the reason is now this message with the value's row, and Flight SQL now ends with `INVALID_ARGUMENT` and the reason instead of a generic error. In those later-chunk reasons the column name is masked (`column "..."`), as Arc masks quoted text in every error it logs or sends as a trailer. msgpack, which reads the whole result first, answers 400 for any row.
+- Before: `decimal cast failed at row N: invalid: integer value out of bounds` (JSON, msgpack) or `failed to cast decimal columns at row N: …` (Arrow trailer); N was the start of a batch, not the row of the value.
+- Now: `decimal value beyond the int64 range: column "s" (DECIMAL(38,0)/HUGEINT) at row N; cast it in SQL: ::DOUBLE (approximate) or ::VARCHAR (exact digits)`, with N the value's own row.
+
+**Details:**
+
+- **A value after the first 2,048 rows** (the first chunk of the result) still cuts the streaming responses as before: `truncated` on JSON, the trailer on Arrow, now with the new text; Flight SQL now ends with `INVALID_ARGUMENT` and the reason instead of a generic error. In those reasons the column name shows as `"..."`, because Arc masks quoted text in every error it sends as a truncation reason. msgpack reads the whole result first and answers 400 for any row.
 - **Governance row cap:** only rows within the cap are checked. On JSON, a value beyond the cap used to cut a capped result short; it now returns the capped rows, as Arrow and msgpack already did.
+- **Clients:** arcli prints the reason and exits 1, without writing a partial table; the Python SDK (`arc-tsdb-client` 0.2.1) raises `ArcQueryError` from `query()`, `query_arrow()` and `query_msgpack()` with the server's reason, where `query()` used to return an empty result marked `truncated`.
 - **Unchanged:** values that fit (still `int64`), decimals with a scale (still `float64`), the `types` field on msgpack, and the schema a Flight SQL prepare reports.
-- **Workaround on older versions:** cast in SQL, `sum(x)::DOUBLE` (approximate) or `sum(x)::VARCHAR` (exact digits).
+- **Getting the value:** cast it in SQL, `sum(x)::DOUBLE` (approximate) or `sum(x)::VARCHAR` (exact digits). This also works on older versions.
 
 ## Fix: on a shared bucket, an Iceberg table recreated with a column of another type, or restored after a delete, stopped exporting ([#1801](https://github.com/Basekick-Labs/arc/issues/1801), [#1799](https://github.com/Basekick-Labs/arc/issues/1799), [#1796](https://github.com/Basekick-Labs/arc/issues/1796))
 
