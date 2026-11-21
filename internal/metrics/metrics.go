@@ -159,10 +159,11 @@ type Metrics struct {
 	dbWaitCount        atomic.Int64 // Cumulative connections waited for
 	dbWaitMicros       atomic.Int64 // Cumulative time blocked waiting, microseconds
 	// There is deliberately no DuckDB-level query counter. db_queries_total
-	// and db_query_errors_total existed, were never incremented, and were
-	// removed: from /metrics in #802, from the JSON snapshot, the `api`
-	// timeseries and /api/v1/metrics/query-pool in #1747, where they had
-	// still been served as a permanent 0.
+	// and db_query_errors_total existed and were never incremented.
+	// arc_db_queries_total left /metrics in #802 (the error counter was never
+	// on it); both left the JSON snapshot, the `api` timeseries and
+	// /api/v1/metrics/query-pool in #1747, where they had still been served
+	// as a permanent 0.
 	//
 	// Counting at the DuckDB wrapper (DuckDB.Query/QueryContext/Exec) would
 	// miss the hot path: shipped builds answer queries through
