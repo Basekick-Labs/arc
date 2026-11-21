@@ -65,6 +65,9 @@ func (b *GCSBackend) ListUnusable(context.Context, string) ([]UnusableObject, er
 func (b *GCSBackend) ListDirectories(context.Context, string) ([]string, error) {
 	return nil, ErrGCSNotInFIPSBuild
 }
+func (b *GCSBackend) ListLevel(context.Context, string) ([]string, []string, error) {
+	return nil, nil, ErrGCSNotInFIPSBuild
+}
 func (b *GCSBackend) ObjectSHA(context.Context, string) (int64, string, error) {
 	return 0, "", ErrGCSNotInFIPSBuild
 }

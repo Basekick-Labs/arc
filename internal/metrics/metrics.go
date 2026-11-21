@@ -70,6 +70,10 @@ type Metrics struct {
 	// the cold tier could not list, because this node's tier metadata holds
 	// no cold rows for the range (#1550).
 	queryColdUnlistedSkipped atomic.Int64
+	// queryDaysReadUnlisted counts days a query read through one recursive
+	// glob because the day's listing failed (#1810): its partitions could
+	// not be told apart, so the whole day was read.
+	queryDaysReadUnlisted atomic.Int64
 	// queryColdMarkSkipped counts cluster reads that left out cold
 	// partitions the cold tier could not list because the cluster's cold
 	// mark says the range holds no cold data (#1552).
@@ -569,6 +573,10 @@ func (m *Metrics) IncSlowQueries()   { m.querySlowTotal.Add(1) }
 // cold tier could not list, on tier metadata's word that the range has no
 // cold rows (#1550).
 func (m *Metrics) IncQueryColdUnlistedSkipped() { m.queryColdUnlistedSkipped.Add(1) }
+
+// IncQueryDaysReadUnlisted counts one day a returned query plan reads whole
+// because the day's storage listing failed (#1810).
+func (m *Metrics) IncQueryDaysReadUnlisted() { m.queryDaysReadUnlisted.Add(1) }
 
 // IncQueryColdMarkSkipped counts one cluster read answered without the cold
 // partitions it could not list, on the cold mark's word (#1552).
@@ -1351,6 +1359,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"query_timeouts_total":              m.queryTimeoutsTotal.Load(),
 		"query_slow_total":                  m.querySlowTotal.Load(),
 		"query_cold_unlisted_skipped_total": m.queryColdUnlistedSkipped.Load(),
+		"query_days_read_unlisted_total":    m.queryDaysReadUnlisted.Load(),
 		"query_cold_mark_skipped_total":     m.queryColdMarkSkipped.Load(),
 		"query_rows_total":                  m.queryRowsTotal.Load(),
 		"query_latency_sum_us":              m.queryLatencySum.Load(),
@@ -1728,6 +1737,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_query_cold_unlisted_skipped_total Reads that left out cold partitions the cold tier could not list, because tier metadata holds no cold rows for the range\n"...)
 	b = append(b, "# TYPE arc_query_cold_unlisted_skipped_total counter\n"...)
 	b = appendMetric(b, "arc_query_cold_unlisted_skipped_total", float64(m.queryColdUnlistedSkipped.Load()))
+
+	b = append(b, "# HELP arc_query_days_read_unlisted_total Days a query read whole because the day's storage listing failed\n"...)
+	b = append(b, "# TYPE arc_query_days_read_unlisted_total counter\n"...)
+	b = appendMetric(b, "arc_query_days_read_unlisted_total", float64(m.queryDaysReadUnlisted.Load()))
 
 	b = append(b, "# HELP arc_query_cold_mark_skipped_total Cluster reads answered without cold partitions the cold tier could not list, because the cluster's cold mark says the read's range holds no cold data.\n"...)
 	b = append(b, "# TYPE arc_query_cold_mark_skipped_total counter\n"...)

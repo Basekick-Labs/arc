@@ -2,6 +2,21 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: on S3, a failed storage listing no longer leaves a day's daily files out of a query ([#1810](https://github.com/Basekick-Labs/arc/issues/1810))
+
+For a time-ranged query on object storage, Arc lists each day's directory to learn which hours exist and whether the day holds daily files. When that listing failed, Arc guessed: it assumed every requested hour existed (a missing one then failed the query with a 503) and left the day's daily files out, so the query could answer 200 without them.
+
+- **On S3, a day that cannot be listed is now read whole.** Arc hands DuckDB one pattern for the day (`<day>/**/*.parquet`) in place of that day's hour and daily patterns. DuckDB lists the day itself and the query's time filter still decides which rows count, so the answer is complete, and a missing hour no longer fails the query.
+- **Cost, only when the listing fails:** a query over one hour opens every file of that day. Measured with the built binary on SeaweedFS S3, on a day of 3,004 files, with the day's listing failing: the same row counts as without the failure, in 0.6 to 4.3 s where the same queries took 0.14 to 0.63 s. That time includes the storage client's own retries of the failed listing, which were not measured separately. Such a result is never remembered, so the next query lists again.
+- **New metric `arc_query_days_read_unlisted_total`** (`query_days_read_unlisted_total` in the JSON metrics): days a query read this way. It staying above zero means listings of your bucket are failing.
+- **If the day holds nothing at all,** the query answers the retryable 503, with a warning in the log saying the day's listing failed, not an empty result.
+- **Azure and GCS are not changed:** there a day whose listing fails still loses its daily files from that query. Reading the day whole depends on a DuckDB pattern behaviour measured on S3 only.
+
+Also in this change, on every object store:
+
+- **The day check asks storage for one level only.** It used to list every object under the day, hour directories included, to find the files at the top: thousands of keys on a day with many files not yet compacted, under a 5 second limit, which is the listing that failed most. The check for which hours exist already lists the day's directory, and that same listing now answers both, in the hot read, the cold tier read and for queries with only a start time. Measured as above, first query after start: the check's own listing, 4 requests of up to 1,000 keys each, is gone, with the same answer and the same query time (0.63 s).
+- **Hours of a day that does not exist are not read.** When the month's listing, made for that query, does not show a day and the day's own listing fails, its hours were assumed to exist and the query failed with a 503. It now answers.
+
 ## Fix: in a cluster with local storage, a compacted file's last copy is no longer removed when moving it into place fails ([#1807](https://github.com/Basekick-Labs/arc/issues/1807))
 
 **Who is affected:** clusters with local storage, replication on and staged compaction (#1207). Object storage and single nodes are unchanged.

@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 )
@@ -809,7 +810,11 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 		// rows it does not bound, and the newest partition would drop them);
 		// never cached (the window's live hour has no files yet).
 		if newestGlob != "" && hasCompleteSchemaAnchor(ctx) && IsStartOnlyTimeRange(sql) {
-			if have, _, _ := p.filterExistingPathsOpts(ctx, []string{newestGlob}, basePath, 0); len(have) == 1 {
+			// Only when the answer IS that glob: a day whose listing failed
+			// comes back as a day-wide glob, which is not the newest
+			// partition and may match nothing; the unpruned fallback below
+			// answers instead, as it did when the glob was dropped.
+			if have, _, _ := p.filterExistingPathsOpts(ctx, []string{newestGlob}, basePath, 0); len(have) == 1 && have[0] == newestGlob {
 				markVolatile(ctx)
 				p.logger.Debug().Str("path", newestGlob).Msg("Empty open-ended window; reading the newest partition only")
 				return newestGlob, true, false
@@ -848,6 +853,14 @@ func (p *PartitionPruner) optimize(ctx context.Context, originalPath, sql string
 	// re-glob this costs is a few ms.
 	if !fileEligible && !liveDropped && verified {
 		p.partitionCache.set(cacheKey, result, true, scope)
+	}
+	// Counted here, on the plan actually returned: the filter also runs for
+	// the empty-range proof and the newest-partition shortcut, whose
+	// results may be discarded.
+	for _, path := range partitionPaths {
+		if strings.HasSuffix(path, dayWideSuffix) {
+			metrics.Get().IncQueryDaysReadUnlisted()
+		}
 	}
 	return result, true, false
 }
@@ -1023,6 +1036,19 @@ func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, pat
 
 	// Cache of parent -> set of existing child directories
 	parentChildren := make(map[string]map[string]bool)
+	// dayFiles holds, for a day directory this pass listed as the parent of
+	// requested hours, the .parquet files directly in it. The day-level
+	// check below reads it before the cache. Kept apart from the cache so
+	// that answer is not counted as a cache hit: it was listed just now.
+	dayFiles := make(map[string][]string)
+	// unknownDays holds the day directories (storage prefixes) whose level
+	// listing failed: neither their hours nor their daily files are known.
+	unknownDays := make(map[string]bool)
+	// listedNow holds the parents whose children were listed in THIS pass,
+	// as opposed to remembered: only such a listing can say a child does
+	// not exist. A remembered one may predate the child (a day's first
+	// file, written since, on this node or another).
+	listedNow := make(map[string]bool)
 
 	// Fetch child listings for each unique parent (one API call per parent)
 	for parentDir := range uniqueParents {
@@ -1062,9 +1088,37 @@ func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, pat
 			verified = false
 			continue
 		}
+		// One listing of the level answers two questions when the backend
+		// can report a level's own files (storage.LevelLister): which child
+		// directories exist, and, when this parent is a day directory,
+		// whether the day holds daily files directly. The second is what the
+		// day-level check below asks, so it is kept and that check makes no
+		// request for a day listed here. (It still makes one when the day's
+		// directories came from the cache but its file answer has expired,
+		// or when only the day glob was asked about.)
+		var subdirs, levelFiles []string
+		var err error
 		listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		subdirs, err := lister.ListDirectories(listCtx, storagePrefix)
+		level, hasLevel := lister.(storage.LevelLister)
+		if hasLevel {
+			subdirs, levelFiles, err = level.ListLevel(listCtx, storagePrefix)
+		} else {
+			subdirs, err = lister.ListDirectories(listCtx, storagePrefix)
+		}
 		cancel()
+		if err != nil && hasLevel && isDayPrefix(storagePrefix) {
+			// The day's level listing answers for its hours and its daily
+			// files at once, so a failure leaves the whole day unknown.
+			// Not retried here: the storage client has already retried the
+			// request, and each further attempt against a failing store is
+			// seconds of the query's time.
+			unknownDays[storagePrefix] = true
+		}
+		if err == nil && hasLevel && isDayPrefix(storagePrefix) {
+			direct := parquetNames(levelFiles)
+			dayFiles[storagePrefix] = direct
+			p.globCache.setScoped("remote:dayfiles:"+storagePrefix, direct, scope)
+		}
 
 		if err != nil {
 			p.logger.Debug().Err(err).Str("prefix", storagePrefix).Msg("Failed to list remote directories")
@@ -1089,6 +1143,7 @@ func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, pat
 		// Cache by parent directory
 		p.globCache.setScoped(cacheKey, childNames, scope)
 		parentChildren[parentDir] = childSet
+		listedNow[parentDir] = true
 		p.logger.Debug().Str("parent", parentDir).Int("children", len(childNames)).Msg("Cached parent listing")
 	}
 
@@ -1097,7 +1152,21 @@ func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, pat
 	for dir, info := range dirDetails {
 		childSet := parentChildren[info.parent]
 		if childSet == nil {
-			// Parent listing failed - assume directory exists
+			// The parent could not be listed. If the parent is itself a
+			// directory this pass asked about and ITS parent, listed in
+			// this pass, does not show it, nothing under it exists either:
+			// that is an answer, not an assumption. (A day the month
+			// listing does not show, whose own listing then failed.) A
+			// remembered month listing does not count: the day may have
+			// been created since, and its hours would be left out.
+			parent := strings.TrimSuffix(info.parent, "/")
+			if up, ok := dirDetails[parent]; ok && listedNow[up.parent] {
+				if upSet := parentChildren[up.parent]; upSet != nil && !upSet[up.target] {
+					p.logger.Debug().Str("dir", dir).Msg("Remote directory does not exist (its parent does not)")
+					continue
+				}
+			}
+			// Otherwise assume the directory exists.
 			existingDirs[dir] = true
 			p.logger.Debug().Str("dir", dir).Msg("Remote directory exists (assumed)")
 		} else if childSet[info.target] {
@@ -1110,6 +1179,9 @@ func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, pat
 
 	// Filter paths to only include existing directories/files
 	existingPaths := []string{}
+	// widened holds the day directories (URLs) to read through one recursive
+	// glob in place of their hour and day globs; see widenUnknownDays.
+	widened := make(map[string]bool)
 	for _, path := range paths {
 		dir := pathToDir[path]
 		if !existingDirs[dir] {
@@ -1126,39 +1198,41 @@ func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, pat
 			verified = false
 			continue
 		}
-		if parts := strings.Split(strings.Trim(prefix, "/"), "/"); len(parts) == 5 {
+		if isDayPrefix(prefix) {
 			// Check cache first for day-level file existence
 			cacheKey := "remote:dayfiles:" + prefix
 			var hasFiles bool
-			if cached, ok := p.globCache.getFresh(cacheKey, maxAge); ok {
+			if unknownDays[prefix] && canWidenDay(path) {
+				// Its level listing already failed in this pass (verified
+				// is already false), and the day can be read without that
+				// answer: no second attempt.
+				widened[dir] = true
+				continue
+			} else if listed, ok := dayFiles[prefix]; ok {
+				hasFiles = len(listed) > 0
+			} else if cached, ok := p.globCache.getFresh(cacheKey, maxAge); ok {
 				hits++
 				hasFiles = len(cached) > 0
 				p.logger.Debug().Str("prefix", prefix).Bool("has_files", hasFiles).Msg("Using cached day-level file check")
 			} else {
 				// Cache miss - make API call
-				listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				files, err := p.storage.List(listCtx, prefix)
-				cancel()
+				directFiles, err := listDirectParquet(ctx, p.storage, prefix)
 				if err != nil {
 					p.logger.Debug().Err(err).Str("prefix", prefix).Msg("Failed to list files at day-level path")
-					// Dropped, as before, but the absence is not verified:
-					// if the day does hold daily files they are missing
-					// from this answer. Keeping the path instead is not
-					// free either: a day with only hour directories is the
-					// normal state of recent days, and there a kept path
-					// matches nothing and fails the query. What an
-					// unverified result must not do is outlive the failure,
-					// so OptimizeTablePath never caches one.
+					// Whether the day holds daily files is unknown. Where
+					// the day can be read through one recursive glob it is
+					// (widenUnknownDays). Elsewhere the day glob is dropped,
+					// as before: if the day does hold daily files they are
+					// missing from this answer, and keeping the glob is not
+					// free either, since on a day with only hour directories
+					// (the normal state of recent days) it matches nothing
+					// and fails the query. Either way the result is
+					// unverified, so OptimizeTablePath never caches it.
+					if canWidenDay(path) {
+						widened[dir] = true
+					}
 					verified = false
 					continue
-				}
-				// Find direct parquet files (not in subdirs)
-				var directFiles []string
-				for _, f := range files {
-					remaining := strings.TrimPrefix(f, prefix)
-					if remaining != "" && !strings.Contains(remaining, "/") && strings.HasSuffix(remaining, ".parquet") {
-						directFiles = append(directFiles, remaining)
-					}
 				}
 				// Cache the result
 				p.globCache.setScoped(cacheKey, directFiles, scope)
@@ -1172,6 +1246,10 @@ func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, pat
 		}
 
 		existingPaths = append(existingPaths, path)
+	}
+
+	if len(widened) > 0 {
+		existingPaths = p.widenUnknownDays(paths, existingPaths, pathToDir, widened)
 	}
 
 	p.logger.Info().
@@ -1223,6 +1301,157 @@ func (p *PartitionPruner) extractStoragePrefix(url, basePath string) (string, bo
 	p.logger.Warn().Str("url", url).Str("base_path", basePath).
 		Msg("Partition path is not under the storage root it was generated from; skipping existence filtering")
 	return "", false
+}
+
+// dayWideSuffix ends the glob a day is read through when its listing failed.
+const dayWideSuffix = "/**/*.parquet"
+
+// canWidenDay reports whether a day glob may be replaced by the day-wide
+// recursive glob. Only on s3://: the replacement relies on DuckDB's "**"
+// matching zero directories, so that files directly in the day are read.
+// Measured through the built binary on SeaweedFS S3 with the DuckDB Arc
+// ships (1.5.6, 2026-11-21): a measurement whose only file sits directly in
+// its directory is read through its "**/*.parquet" glob, and a day holding
+// a daily file and 3,003 hour files returned the same counts through the
+// day-wide glob as through its partition globs. Not measured on Azure or
+// GCS; there the day glob is dropped, as before.
+func canWidenDay(dayGlob string) bool {
+	return strings.HasPrefix(dayGlob, "s3://")
+}
+
+// widenUnknownDays rewrites the filtered paths for days whose level listing
+// failed. Such a day's hours were kept on an assumption and its day glob
+// could be neither kept (it fails the query when the day has no daily files)
+// nor dropped (it loses them when it does). Reading the day through ONE
+// recursive glob removes the guess: DuckDB lists the day itself, daily files
+// and hour files alike, and the query's time predicate still decides which
+// rows count. The price is paid only on this path: a query for one hour
+// opens every file of that day.
+//
+// The glob REPLACES every path of the day, in the position of the first: an
+// hour or day glob left beside it would read those files twice. Paths of
+// other days keep their order. kept is the filter's result so far; paths is
+// its input, which is what decides order and which days are present.
+func (p *PartitionPruner) widenUnknownDays(paths, kept []string, pathToDir map[string]string, widened map[string]bool) []string {
+	keptSet := make(map[string]bool, len(kept))
+	for _, k := range kept {
+		keptSet[k] = true
+	}
+	emitted := make(map[string]bool, len(widened))
+	out := make([]string, 0, len(kept)+len(widened))
+	for _, path := range paths {
+		dir := pathToDir[path]
+		day := dir
+		if !widened[day] {
+			// An hour glob belongs to the day above it.
+			if i := strings.LastIndex(dir, "/"); i >= 0 {
+				day = dir[:i]
+			}
+		}
+		if !widened[day] {
+			if keptSet[path] {
+				out = append(out, path)
+			}
+			continue
+		}
+		if !emitted[day] {
+			emitted[day] = true
+			out = append(out, day+dayWideSuffix)
+			p.logger.Debug().Str("day", day).Msg("Day could not be listed; reading it through one recursive glob")
+		}
+	}
+	return out
+}
+
+// IsDayWideGlob reports whether a pattern DuckDB named is a day-wide
+// recursive glob (widenUnknownDays) rather than a measurement's unpruned
+// glob. Both end in "/**/*.parquet", and they mean opposite things when they
+// match nothing: an empty measurement is an empty result, an empty day read
+// in place of its partitions is not.
+//
+// root is the storage root the pattern was built under ("s3://bucket/prefix/",
+// "" when unknown). Under a known root the answer is exact: a day-wide glob
+// has database/measurement/year/month/day before the suffix, an unpruned one
+// has database/measurement (three segments with a spoke namespace). Without
+// one it goes by the date shape alone, which can only err towards "day-wide".
+func IsDayWideGlob(pattern, root string) bool {
+	stem, ok := strings.CutSuffix(pattern, dayWideSuffix)
+	if !ok {
+		return false
+	}
+	segs := strings.Split(stem, "/")
+	n := len(segs)
+	if n < 3 || !isDigits(segs[n-3], 4) || !isDigits(segs[n-2], 2) || !isDigits(segs[n-1], 2) {
+		return false
+	}
+	if root == "" || !strings.HasPrefix(stem, root) {
+		return true
+	}
+	rel := strings.Trim(strings.TrimPrefix(stem, root), "/")
+	return len(strings.Split(rel, "/")) >= 5
+}
+
+func isDigits(s string, n int) bool {
+	if len(s) != n {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// isDayPrefix reports whether a storage prefix names a day directory:
+// database/measurement/year/month/day.
+func isDayPrefix(prefix string) bool {
+	return len(strings.Split(strings.Trim(prefix, "/"), "/")) == 5
+}
+
+// parquetNames keeps the .parquet names of a level's files.
+func parquetNames(names []string) []string {
+	var out []string
+	for _, n := range names {
+		if strings.HasSuffix(n, ".parquet") {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// listDirectParquet returns the names of the .parquet files directly in
+// prefix, not those in directories beneath it: what tells a day that holds
+// daily files from one that only holds hour directories.
+//
+// A backend that can list one level (storage.LevelLister; all of Arc's can)
+// is asked for exactly that, one delimiter listing whose size is the day's
+// hour directories plus its daily files. Otherwise every object under the
+// prefix is listed and the direct ones picked out, which on a day with many
+// uncompacted files is thousands of keys for a yes/no answer and is what
+// used to run out the timeout.
+func listDirectParquet(ctx context.Context, backend storage.Backend, prefix string) ([]string, error) {
+	listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if level, ok := backend.(storage.LevelLister); ok {
+		_, files, err := level.ListLevel(listCtx, prefix)
+		if err != nil {
+			return nil, err
+		}
+		return parquetNames(files), nil
+	}
+	files, err := backend.List(listCtx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	var direct []string
+	for _, f := range files {
+		remaining := strings.TrimPrefix(f, prefix)
+		if remaining != "" && !strings.Contains(remaining, "/") && strings.HasSuffix(remaining, ".parquet") {
+			direct = append(direct, remaining)
+		}
+	}
+	return direct, nil
 }
 
 // InvalidateGlobCache clears the glob cache

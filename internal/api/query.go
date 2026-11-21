@@ -3004,6 +3004,18 @@ const vanishedPartitionMessage = "data read by this query was removed while it r
 // compaction deleting a batch's inputs while a query reads the hour (#1355).
 // That is the same condition and gets the same answer.
 //
+// One more pattern ends in "**/*.parquet" and is NOT the measurement's: the
+// day-wide glob a day is read through when its listing FAILED
+// (pruning.IsDayWideGlob). It was never listed, so its matching nothing is
+// not a removal; but it stood in for that day's partitions, and an empty
+// answer for it would be the whole query's. It gets the retryable answer,
+// with its own log line, since the client message's "removed while it ran"
+// is not what happened.
+// Measured through the built binary on SeaweedFS S3 (DuckDB 1.5.6,
+// 2026-11-21): DuckDB names that glob as Arc wrote it,
+// "s3://bucket/prefix/db/m/2026/11/17/**/*.parquet", and the query answers
+// 503 where it would have answered an empty result.
+//
 // A "**" glob can still be one of several patterns a tiered read combines,
 // so an empty answer for it is only as right as it was before this check.
 func (h *QueryHandler) classifyNoFiles(err error) noFilesKind {
@@ -3018,11 +3030,41 @@ func (h *QueryHandler) classifyNoFiles(err error) noFilesKind {
 		return noFilesOther
 	}
 	pattern, ok := noFilesPattern(err)
-	if !ok || strings.HasSuffix(pattern, "**/*.parquet") {
+	// A day read through one recursive glob because its listing failed
+	// (pruning.IsDayWideGlob) also ends in "**/*.parquet". It matching
+	// nothing does not mean the measurement is empty: it stood in for that
+	// day's partitions, and an empty answer for it would be the whole
+	// query's answer. It is a pruned partition like any other.
+	if !ok {
 		return noFilesEmpty
+	}
+	if strings.HasSuffix(pattern, "**/*.parquet") {
+		// The date shape is checked without a root first, so a query on an
+		// empty measurement does not derive the storage root for nothing.
+		if !pruning.IsDayWideGlob(pattern, "") || !pruning.IsDayWideGlob(pattern, h.storageRoot()) {
+			return noFilesEmpty
+		}
+		h.logger.Warn().Str("pattern", pattern).
+			Msg("A day was read whole because its storage listing failed, and it holds no files; answering 503 so the query is retried once the listing works")
 	}
 	h.invalidateAfterVanished(pattern, false)
 	return noFilesVanished
+}
+
+// storageRoot is the root every glob of the primary storage is built under
+// ("s3://bucket/prefix/", a local directory with its separator), or "" when
+// it cannot be derived. It is GetStoragePath's own root, taken from a path
+// it builds, so the two cannot disagree.
+func (h *QueryHandler) storageRoot() string {
+	if h.storage == nil {
+		return ""
+	}
+	const tail = "d/m/**/*.parquet"
+	path, err := storage.GetStoragePath(h.storage, "d", "m")
+	if err != nil || !strings.HasSuffix(path, tail) {
+		return ""
+	}
+	return strings.TrimSuffix(path, tail)
 }
 
 // vanishedFile returns the file a DuckDB scan could not open because it no

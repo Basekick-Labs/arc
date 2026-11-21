@@ -268,7 +268,18 @@ func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []str
 			err := errTierListingFailed
 			if !listing.skip() {
 				listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				subdirs, err = lister.ListDirectories(listCtx, parent+"/")
+				if level, ok := lister.(storage.LevelLister); ok {
+					// The day's level listing also says whether the day
+					// holds daily files: kept for the day-level check
+					// below, which then makes no request of its own.
+					var files []string
+					subdirs, files, err = level.ListLevel(listCtx, parent+"/")
+					if err == nil {
+						p.globCache.setScoped("tier:dayfiles:"+rootURL+parent+"/", parquetNames(files), scope)
+					}
+				} else {
+					subdirs, err = lister.ListDirectories(listCtx, parent+"/")
+				}
 				cancel()
 			}
 			if err != nil {
@@ -315,9 +326,7 @@ func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []str
 			var files []string
 			err := errTierListingFailed
 			if !listing.skip() {
-				listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				files, err = backend.List(listCtx, prefix)
-				cancel()
+				files, err = listDirectParquet(ctx, backend, prefix)
 			}
 			if err != nil {
 				listing.failed = true
@@ -327,15 +336,8 @@ func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []str
 				verified = false
 				continue
 			}
-			var directFiles []string
-			for _, f := range files {
-				remaining := strings.TrimPrefix(f, prefix)
-				if remaining != "" && !strings.Contains(remaining, "/") && strings.HasSuffix(remaining, ".parquet") {
-					directFiles = append(directFiles, remaining)
-				}
-			}
-			p.globCache.setScoped(cacheKey, directFiles, scope)
-			hasFiles = len(directFiles) > 0
+			p.globCache.setScoped(cacheKey, files, scope)
+			hasFiles = len(files) > 0
 		}
 		if hasFiles {
 			existing = append(existing, path)
