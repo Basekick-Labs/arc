@@ -720,8 +720,8 @@ func (r *flightSQLResponseReader) Err() error {
 		// reads (poisonArrowStream), then names the cut in a trailer. Report
 		// the cut, not the decoder's complaint about the marker. Any other
 		// decoder error takes precedence over the completion metadata.
-		if r.response.Trailer.Get(arrowStreamTruncatedTrailer) != "" {
-			return status.Error(codes.Internal, "Arc query stream was truncated")
+		if reason := r.response.Trailer.Get(arrowStreamTruncatedTrailer); reason != "" {
+			return flightTruncationError(reason)
 		}
 		return decodeErr
 	}
@@ -744,8 +744,8 @@ func flightSQLResponseCompletion(ctx context.Context, response *http.Response) e
 	if !errors.Is(err, io.EOF) {
 		return status.Error(codes.Internal, "could not read Arc query completion trailers")
 	}
-	if response.Trailer.Get(arrowStreamTruncatedTrailer) != "" {
-		return status.Error(codes.Internal, "Arc query stream was truncated")
+	if reason := response.Trailer.Get(arrowStreamTruncatedTrailer); reason != "" {
+		return flightTruncationError(reason)
 	}
 	if value := response.Trailer.Get(arrowRowsCappedTrailer); value != "" {
 		rowCap, err := strconv.ParseUint(value, 10, 64)

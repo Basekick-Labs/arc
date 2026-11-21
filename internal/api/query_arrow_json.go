@@ -161,6 +161,32 @@ func executeArrowJSONQuery(
 		return -1, true
 	}
 
+	// A value the response cannot carry in the first batch is answered as a
+	// 400 here, before any header is set (#1784).
+	if peeked, overflow := peekDecimalOverflow(reader, governanceMaxRows); overflow != nil {
+		reader.Release()
+		if conn != nil {
+			conn.Close()
+		}
+		if cancel != nil {
+			cancel()
+		}
+		m.IncQueryErrors()
+		if onFail != nil {
+			onFail(overflow.Error())
+		}
+		h.logger.Warn().Err(overflow).Str("sql", sqlutil.ForLog(convertedSQL)).Msg("Arrow JSON query refused: a decimal value does not fit int64")
+		c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
+			Success:         false,
+			Error:           overflow.Error(),
+			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+			Timestamp:       timestamp,
+		})
+		return -1, true
+	} else {
+		reader = peeked
+	}
+
 	// Capture token name before async callback (Fiber context not safe in callbacks)
 	tokenName := getTokenName(c)
 	tokenID := getTokenID(c)
@@ -386,35 +412,42 @@ batchLoop:
 			break
 		}
 
+		// The governance cap is decided here, for the batch as a whole: the
+		// rows to encode, and whether the cap stops the stream after them.
+		// A cap reached exactly at the end of a batch is only noticed at the
+		// next batch, as before (one more Next). It is decided before the
+		// decimal cast, so the cast only sees rows that will be sent, as on
+		// the Arrow and msgpack paths: a value that does not fit int64 past
+		// the cap no longer cuts a capped result short (#1784).
+		nRows := int(batch.NumRows())
+		if governanceMaxRows > 0 && dispatched >= governanceMaxRows && nRows > 0 {
+			capped = true
+			break
+		}
+		n := nRows
+		if governanceMaxRows > 0 && dispatched+n > governanceMaxRows {
+			n = governanceMaxRows - dispatched
+		}
+
 		var casted arrow.Record
 		if castInfo != nil {
+			toCast := batch
+			if n < nRows {
+				toCast = batch.NewSlice(0, int64(n))
+			}
 			var err error
-			casted, err = castDecimalBatch(batch, castInfo)
+			casted, err = castDecimalBatchAt(toCast, castInfo, int64(dispatched))
+			if toCast != batch {
+				toCast.Release()
+			}
 			if err != nil {
-				streamErr = fmt.Errorf("decimal cast failed at row %d: %w", rowCount, err)
+				streamErr = wrapDecimalCastError(err, "decimal cast failed at row %d", rowCount)
 				break batchLoop
 			}
 		}
 		encoded := batch
 		if casted != nil {
 			encoded = casted
-		}
-
-		// The governance cap is decided here, for the batch as a whole: the
-		// rows to encode, and whether the cap stops the stream after them.
-		// A cap reached exactly at the end of a batch is only noticed at the
-		// next batch, as before (one more Next).
-		nRows := int(encoded.NumRows())
-		if governanceMaxRows > 0 && dispatched >= governanceMaxRows && nRows > 0 {
-			capped = true
-			if casted != nil {
-				casted.Release()
-			}
-			break
-		}
-		n := nRows
-		if governanceMaxRows > 0 && dispatched+n > governanceMaxRows {
-			n = governanceMaxRows - dispatched
 		}
 		cols := make([]arrow.Array, numCols)
 		for c := 0; c < numCols; c++ {

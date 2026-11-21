@@ -270,9 +270,9 @@ streamLoop:
 			// reader.Next() releases the prior record automatically.
 			if castInfo != nil {
 				var castErr error
-				castedBatch, castErr = castDecimalBatch(batch, castInfo)
+				castedBatch, castErr = castDecimalBatchAt(batch, castInfo, totalRows-batch.NumRows())
 				if castErr != nil {
-					streamErr = fmt.Errorf("failed to cast decimal columns at row %d: %w", totalRows, castErr)
+					streamErr = wrapDecimalCastError(castErr, "failed to cast decimal columns at row %d", totalRows)
 					return true
 				}
 				batch = castedBatch
@@ -891,6 +891,29 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			"success": false,
 			"error":   err.Error(),
 		})
+	}
+
+	// A value the response cannot carry in the first batch is answered as a
+	// 400 here, before any header or trailer is set (#1784).
+	if peeked, overflow := peekDecimalOverflow(reader, governanceMaxRows); overflow != nil {
+		reader.Release()
+		if conn != nil {
+			conn.Close()
+		}
+		if cancel != nil {
+			cancel()
+		}
+		m.IncQueryErrors()
+		if h.queryRegistry != nil && queryID != "" {
+			h.queryRegistry.Fail(queryID, sqlutil.SanitizeErrText(overflow.Error()))
+		}
+		h.logger.Warn().Err(overflow).Str("sql", sqlutil.ForLog(req.SQL)).Msg("Arrow query refused: a decimal value does not fit int64")
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   overflow.Error(),
+		})
+	} else {
+		reader = peeked
 	}
 
 	schema := reader.Schema()

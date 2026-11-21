@@ -218,6 +218,18 @@ func executeArrowMsgPackQuery(
 			return -1, true
 		}
 		m.IncQueryErrors()
+		// A value outside int64 is the query's, not the server's: a 400 with
+		// the error's own text, which already names its row (#1784).
+		var overflow *decimalOverflowError
+		if errors.As(drainErr, &overflow) {
+			if onFail != nil {
+				onFail(overflow.Error())
+			}
+			h.logger.Warn().Err(overflow).Str("format", "msgpack").
+				Str("sql", sqlutil.ForLog(convertedSQL)).Msg("Arrow MsgPack query refused: a decimal value does not fit int64")
+			_ = respondError(c, fiber.StatusBadRequest, overflow.Error(), timestamp, start)
+			return -1, true
+		}
 		if onFail != nil {
 			onFail(drainErr.Error())
 		}
@@ -336,12 +348,12 @@ func drainArrowBatches(ctx context.Context, reader array.RecordReader, governanc
 	// castInfo is set (castDecimalBatch returns an already-owned record,
 	// so no extra Retain), otherwise take a reference on the reader's
 	// batch, which is only valid until the next Next() call.
-	retain := func(batch arrow.Record) (arrow.Record, error) {
+	retain := func(batch arrow.Record, offset int64) (arrow.Record, error) {
 		if castInfo == nil {
 			batch.Retain()
 			return batch, nil
 		}
-		return castDecimalBatch(batch, castInfo)
+		return castDecimalBatchAt(batch, castInfo, offset)
 	}
 
 	rowCap := 0
@@ -374,19 +386,19 @@ func drainArrowBatches(ctx context.Context, reader array.RecordReader, governanc
 				// takes a second reference (castInfo == nil) or builds
 				// a new casted record. Either way the slice itself must
 				// be released once we no longer need it directly.
-				kept, err := retain(trimmed)
+				kept, err := retain(trimmed, int64(rowCount))
 				trimmed.Release()
 				if err != nil {
-					return batches, rowCount, fmt.Errorf("decimal cast failed at row %d: %w", rowCount, err)
+					return batches, rowCount, wrapDecimalCastError(err, "decimal cast failed at row %d", rowCount)
 				}
 				batches = append(batches, kept)
 				rowCount = rowCap
 				break
 			}
 		}
-		kept, err := retain(batch)
+		kept, err := retain(batch, int64(rowCount))
 		if err != nil {
-			return batches, rowCount, fmt.Errorf("decimal cast failed at row %d: %w", rowCount, err)
+			return batches, rowCount, wrapDecimalCastError(err, "decimal cast failed at row %d", rowCount)
 		}
 		batches = append(batches, kept)
 		rowCount += n
