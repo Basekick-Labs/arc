@@ -15,6 +15,12 @@ func dirGone(err error) bool {
 	return dirGoneOn(dirGoneGOOS, err)
 }
 
+// IsDirGone is dirGone for code outside the package that creates entries
+// under the storage root directly (internal/cluster/stale_local.go).
+func IsDirGone(err error) bool {
+	return dirGone(err)
+}
+
 // dirGoneGOOS is the platform dirGone classifies for, a variable so Linux CI
 // can run each retry site under the darwin rule.
 var dirGoneGOOS = runtime.GOOS
