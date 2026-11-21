@@ -26,12 +26,15 @@ var dirGoneGOOS = runtime.GOOS
 // directory being removed (#1767); the name is already gone when the EINVAL
 // returns, so one retry recreates it. EINVAL also has its usual meaning
 // there, a request the filesystem rejects, so a caller treating it as gone
-// retries once and then reports what the retry returned. That retry forgets
-// the cached directory chain, as an ENOENT retry does, so a path the
-// filesystem rejects on every write also re-walks its directories on every
-// write, and bumps dirGen, so a directory chain another write is creating at
-// that moment is not cached either. Keys are validated, so a valid key is not
-// expected to meet a genuine EINVAL here.
+// retries a bounded number of times (once per directory level in ensureDir,
+// once around the create in Write) and then reports what the last attempt
+// returned. Each retry forgets the cached directory chain, as an ENOENT
+// retry does, so a path the filesystem rejects on every write also re-walks
+// its directories, with their fsyncs, up to that bound on every write, and
+// bumps dirGen, so a directory chain another write is creating at that
+// moment is not cached either. Keys are validated, so a valid key is not
+// expected to meet a genuine EINVAL here; a persistent ENOENT (a missing
+// storage root) fails at the first mkdir, before any fsync.
 func dirGoneOn(goos string, err error) bool {
 	if errors.Is(err, fs.ErrNotExist) {
 		return true

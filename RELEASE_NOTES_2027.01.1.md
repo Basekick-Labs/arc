@@ -2,6 +2,25 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: a write is no longer lost to a directory cleanup climbing the same partition ([#1804](https://github.com/Basekick-Labs/arc/issues/1804))
+
+**Who is affected:** Arc with local storage, mostly on macOS, while tiering, a database delete, retention or compaction removes empty directories. Linux is rarely affected; object storage is unchanged.
+
+When a directory cleanup removes a partition's emptied directories while a file is being written into that partition, Arc recreates the directories and retries (#1425). It retried once. Tiering's cleanup and a database delete's directory sweep climb from the partition up to the database directory, removing one level after another, and Arc spends a directory fsync on each level it recreates, so the cleanup could remove a level again during that one retry. On macOS, where a directory fsync is a full flush to disk, two of three racing writes failed this way when measured; the same test did not fail on Linux.
+
+What a failed ingest flush cost depends on the WAL:
+
+- **WAL off (the default):** the flush's rows were dropped, with the log line `Flush failed; rows without a WAL copy were lost`, although the write had been acknowledged.
+- **WAL on:** the rows were kept for WAL recovery, and until it ran, `DELETE` requests that need a flush were refused.
+
+Arc now retries recreating the directories once for each level of the path, so one cleanup climbing the path cannot fail the write. Two cleanups at once on the same path still can, with the costs above.
+
+**Details:**
+
+- **Moving a staged compaction output into place** (cluster with local storage) now also recreates a destination directory removed under it and retries, instead of falling back to the next attempt or a copy from a peer.
+- **The spelling check for a new database or measurement name** (#1509, on volumes that fold letter case, such as default macOS) is no longer skipped when a database delete removes the database directory at the same moment. The check recreates the directories and runs. Before, the write was admitted without the check.
+- **Unchanged:** the conditional write that publishes Iceberg metadata. It writes into a directory that holds the metadata file it has just read, so a cleanup cannot remove that directory.
+
 ## Fix: on macOS, a write no longer fails when its directory is removed at the same moment ([#1767](https://github.com/Basekick-Labs/arc/issues/1767))
 
 **Who is affected:** Arc on macOS with local storage. Object storage is unchanged; on Linux and Windows only the "removed between its creation and the check" case below changes.

@@ -174,6 +174,14 @@ func (b *LocalBackend) Write(ctx context.Context, path string, data []byte) erro
 // (ConditionalWriter). The bytes go to a temporary file first and are linked
 // into place: link fails when the target exists and never exposes a partial
 // file, which a plain O_EXCL create of the target would.
+//
+// Unlike Write it does not recreate a directory removed under it (#1804).
+// Directory removers take only empty directories, and its callers write into
+// one that is not: the Iceberg publish puts vN.metadata.json beside the
+// metadata file it just read, and the link cannot be struck because the
+// temporary file is already in the directory. The edgesync relay falls back
+// to Write on any error. A new caller writing into a directory that can be
+// empty needs the retry Write has.
 func (b *LocalBackend) WriteIfAbsent(ctx context.Context, path string, data []byte) (bool, error) {
 	fullPath, err := b.validatePath(path)
 	if err != nil {
