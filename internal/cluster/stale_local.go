@@ -748,6 +748,31 @@ func (c *Coordinator) staleCandidates(ctx context.Context, seen *seenLocal, now 
 	return out
 }
 
+// staleLinkFn and staleBeforeAside are test seams: the link that puts a
+// replaced file back, and a hook just before the rename that moves a stale
+// copy aside (nil in production).
+var (
+	staleLinkFn      = os.Link
+	staleBeforeAside func(full string)
+)
+
+// putBackAside links aside back at full. The rename emptied full's
+// directory, and a remover climbing the partition (tiering's cleanup,
+// retention, a DELETE's sweep) may have taken it since: recreate it and link
+// again, once per directory level, the bound LocalBackend.ensureDir uses
+// (#1804, #1807). Any other failure is returned, and the caller keeps the
+// file aside under a name the next start does not remove.
+func putBackAside(aside, full string, levels int) error {
+	err := staleLinkFn(aside, full)
+	for left := levels; storage.IsDirGone(err) && left > 0; left-- {
+		if mkErr := os.MkdirAll(filepath.Dir(full), 0o700); mkErr != nil && !storage.IsDirGone(mkErr) {
+			return mkErr
+		}
+		err = staleLinkFn(aside, full)
+	}
+	return err
+}
+
 func (c *Coordinator) coldPathCheck() func(context.Context, string) bool {
 	c.repair.mu.Lock()
 	defer c.repair.mu.Unlock()
@@ -800,6 +825,9 @@ func (c *Coordinator) unlinkStale(ctx context.Context, path string) bool {
 		return false
 	}
 	aside := filepath.Join(asideDir, randomSuffix())
+	if staleBeforeAside != nil {
+		staleBeforeAside(full)
+	}
 	if err := os.Rename(full, aside); err != nil {
 		c.logger.Warn().Err(err).Str("path", path).Msg("Could not remove a stale local copy; the next pass retries")
 		return false
@@ -807,7 +835,7 @@ func (c *Coordinator) unlinkStale(ctx context.Context, path string) bool {
 	moved, ok := localIdentity(aside)
 	if !ok || moved.size != rec.size || moved.mtime != rec.mtime || moved.ino != rec.ino {
 		// Replaced between the check and the rename: put it back.
-		if err := os.Link(aside, full); err != nil {
+		if err := putBackAside(aside, full, strings.Count(path, "/")+1); err != nil {
 			keep := filepath.Join(asideDir, staleLocalKeepAside+randomSuffix())
 			_ = os.Rename(aside, keep)
 			c.logger.Error().Err(err).Str("path", path).Str("kept_at", keep).

@@ -73,6 +73,9 @@ type stagedReplica struct {
 	// settlingWarned: per job, when the finisher last warned that an input's
 	// registration has not settled (#1358).
 	settlingWarned sync.Map
+	// keptWarned: per job, when this node last warned that it keeps a staged
+	// copy it could not move into place (#1807).
+	keptWarned sync.Map
 }
 
 // SetStagedCompactionHooks wires the compactor's and the outbox's views:
@@ -352,6 +355,13 @@ func (c *Coordinator) adoptStagedCopy(ctx context.Context, e *raft.FileEntry, pr
 	if err != nil || size != e.SizeBytes {
 		return false, err
 	}
+	// Checked before the move as well as after: a move of an output that
+	// already left the manifest (a DELETE or retention removed it) or went
+	// cold recreates its partition directories only to delete the file
+	// again (#1807). e can be the entry as it was at the commit.
+	if cur, ok := c.raftNode.FSM().GetFile(e.Path); !ok || cur.CompactionJob != e.CompactionJob || cur.SHA256 != e.SHA256 || !raft.HotTier(cur.Tier) {
+		return false, errors.New("the output left the manifest before it moved into place")
+	}
 	if err := mover.MoveObject(ctx, key, e.Path); err != nil {
 		return false, err
 	}
@@ -416,9 +426,59 @@ func (c *Coordinator) endStagedCopy(s raft.StagedCompaction) {
 	if c.stagedLocalJob(s.Job) {
 		return
 	}
-	if mover, ok := c.storage.(storage.ObjectMover); ok {
-		_ = mover.RemoveAll(c.ctx, compaction.StagedJobDir(s.Job))
+	c.removeStagedCopyUnlessNeeded(c.ctx, s.Job, s.Output.Path)
+}
+
+// stagedKeptWarnEvery spaces the warnings about one kept staged copy.
+const stagedKeptWarnEvery = 10 * time.Minute
+
+// removeStagedCopyUnlessNeeded removes this node's staged directory of job
+// once nothing can need it, and otherwise keeps it for the next sweep
+// (stagedReplicaLoop) to move into place (#1807). path is the job's output
+// path, empty when the manifest names none.
+func (c *Coordinator) removeStagedCopyUnlessNeeded(ctx context.Context, job, path string) {
+	mover, ok := c.storage.(storage.ObjectMover)
+	if !ok {
+		return
 	}
+	if !c.stagedCopyUseless(ctx, job, path) {
+		now := time.Now()
+		if last, ok := c.staged.keptWarned.Load(job); !ok || now.Sub(last.(time.Time)) >= stagedKeptWarnEvery {
+			c.staged.keptWarned.Store(job, now)
+			c.logger.Warn().Str("job", job).Str("path", path).
+				Msg("Committed compaction output could not be moved into place from this node's staged copy, which may be its only copy; keeping the copy and retrying on the next sweep")
+		}
+		return
+	}
+	c.staged.keptWarned.Delete(job)
+	_ = mover.RemoveAll(ctx, compaction.StagedJobDir(job))
+}
+
+// stagedCopyUseless reports whether this node's staged copy of job's output
+// can go: only on positive proof, so any failed check keeps it. A holder's
+// copy can be the last one (the origin may have adopted, unlinked its inputs
+// and removed its own copy before losing its disk), and the origin's own
+// copy is the only one when its compactor's hook is not wired (#1807).
+func (c *Coordinator) stagedCopyUseless(ctx context.Context, job, path string) bool {
+	if path == "" {
+		return true // the manifest registers no output of this job
+	}
+	cur, ok := c.raftNode.FSM().GetFile(path)
+	if !ok || cur.CompactionJob != job || !raft.HotTier(cur.Tier) {
+		return true // left the manifest, replaced, or moved to the cold tier
+	}
+	size, err := c.storage.StatFile(ctx, path)
+	if err != nil {
+		return false
+	}
+	if size == cur.SizeBytes {
+		return true // the path holds it (moved, or pulled from a peer)
+	}
+	size, err = c.storage.StatFile(ctx, raft.StagedCompactionKey(job, path))
+	if err != nil {
+		return false
+	}
+	return size != cur.SizeBytes // absent or partial: not a copy of it
 }
 
 func (c *Coordinator) wakeStaged() {
@@ -585,6 +645,7 @@ func (c *Coordinator) sweepStagedDirs(ctx context.Context) {
 		if s, ok := fsm.StagedCompactionByJob(job); ok && !s.Finalizing {
 			continue
 		}
+		path := ""
 		if e, ok := fsm.FileByCompactionJob(job); ok {
 			if c.puller != nil && c.puller.AdoptNow(e) {
 				continue
@@ -592,10 +653,9 @@ func (c *Coordinator) sweepStagedDirs(ctx context.Context) {
 			if ok, _ := c.adoptStaged(ctx, e); ok {
 				continue
 			}
+			path = e.Path
 		}
-		if mover, ok := c.storage.(storage.ObjectMover); ok {
-			_ = mover.RemoveAll(ctx, compaction.StagedJobDir(job))
-		}
+		c.removeStagedCopyUnlessNeeded(ctx, job, path)
 	}
 }
 
