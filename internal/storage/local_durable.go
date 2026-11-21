@@ -152,9 +152,11 @@ func (b *LocalBackend) ensureDir(dir string) error {
 		// the strikes one remover can cause. The walk spends a directory
 		// fsync per level while the remover spends microseconds, so a
 		// single retry lost most such races when measured (#1804).
-		for left := b.levelsBelowRoot(dir); dirGone(err) && left > 0; left-- {
-			b.forgetDir(dir)
-			err = b.createDurable(dir)
+		if dirGone(err) {
+			for left := b.levelsBelowRoot(dir); dirGone(err) && left > 0; left-- {
+				b.forgetDir(dir)
+				err = b.createDurable(dir)
+			}
 		}
 		return nil, err
 	})

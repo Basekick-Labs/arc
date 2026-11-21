@@ -56,7 +56,9 @@ func probeClimbRemove(ctx context.Context, b *LocalBackend, dir string) {
 // A write into a partition whose directories a climbing remover is taking,
 // all the way up to the database: with one retry, most of these failed on
 // macOS (#1804). Real removers, real syscalls; the remover starts at the
-// writer's first mkdir.
+// writer's first mkdir. It discriminates only on APFS, where each directory
+// fsync is a full flush: on Linux the single retry passes it too, and the
+// loop's Linux coverage is TestEnsureDirRetriesOncePerLevel.
 func TestWriteSurvivesAClimbingRemover(t *testing.T) {
 	b, _ := adoptRig(t)
 	ctx := context.Background()

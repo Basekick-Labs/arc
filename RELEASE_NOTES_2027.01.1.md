@@ -4,11 +4,16 @@
 
 ## Fix: a write is no longer lost to a directory cleanup climbing the same partition ([#1804](https://github.com/Basekick-Labs/arc/issues/1804))
 
-**Who is affected:** Arc with local storage, while tiering, retention or a database delete removes empty directories. Object storage is unchanged.
+**Who is affected:** Arc with local storage, mostly on macOS, while tiering, a database delete, retention or compaction removes empty directories. Linux is rarely affected; object storage is unchanged.
 
-When a directory cleanup removes a partition's emptied directories while a file is being written into that partition, Arc recreates the directories and retries (#1425). It retried once. Tiering's cleanup and a database delete's directory sweep climb from the partition up to the database directory, removing one level after another, and Arc spends a directory fsync on each level it recreates, so the cleanup could remove a level again during that one retry. Measured with a cleanup climbing to the database directory, two of three racing writes failed this way.
+When a directory cleanup removes a partition's emptied directories while a file is being written into that partition, Arc recreates the directories and retries (#1425). It retried once. Tiering's cleanup and a database delete's directory sweep climb from the partition up to the database directory, removing one level after another, and Arc spends a directory fsync on each level it recreates, so the cleanup could remove a level again during that one retry. On macOS, where a directory fsync is a full flush to disk, two of three racing writes failed this way when measured; the same test did not fail on Linux.
 
-On ingest, a failed flush keeps its rows for WAL recovery, and until that recovery runs, `DELETE` requests that need a flush are refused. Arc now retries recreating the directories once for each level of the path, so one cleanup climbing the path cannot fail the write. Two cleanups at once still can; the next flush or cycle repeats the write, as before.
+What a failed ingest flush cost depends on the WAL:
+
+- **WAL off (the default):** the flush's rows were dropped, with the log line `Flush failed; rows without a WAL copy were lost`, although the write had been acknowledged.
+- **WAL on:** the rows were kept for WAL recovery, and until it ran, `DELETE` requests that need a flush were refused.
+
+Arc now retries recreating the directories once for each level of the path, so one cleanup climbing the path cannot fail the write. Two cleanups at once on the same path still can, with the costs above.
 
 **Details:**
 
