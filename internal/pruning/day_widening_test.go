@@ -162,11 +162,50 @@ func TestNewestPartitionShortcutIgnoresAWidenedDay(t *testing.T) {
 		t.Fatalf("precondition: got %v %v, want the newest day glob %s", r, ok, lvlDayG)
 	}
 
-	p.InvalidateGlobCache()
+	// The directory listings stay remembered, so the resolver still finds
+	// the newest day; only the day's "has daily files" answer is gone (it
+	// can expire separately), and the listing that would restore it fails.
 	p.InvalidatePartitionCache()
+	p.globCache.mu.Lock()
+	delete(p.globCache.entries, "remote:dayfiles:"+lvlDay)
+	p.globCache.mu.Unlock()
 	b.fail[lvlDay] = errListing
+	before := b.callsFor(lvlDay)
 	if r, ok := p.OptimizeTablePath(WithCompleteSchemaAnchor(context.Background()), glob, sql); ok || r != glob {
 		t.Fatalf("got %v %v, want the unpruned glob", r, ok)
+	}
+	if b.callsFor(lvlDay) == before {
+		t.Fatal("the day was not listed again: this did not exercise the shortcut with a failed day listing")
+	}
+}
+
+// The open-ended resolver lists a day's directory too; its listing answers
+// the day-level check, which then makes no request.
+func TestOpenEndResolverListingAnswersTheDayCheck(t *testing.T) {
+	now := time.Date(2025, 1, 17, 12, 30, 0, 0, time.UTC)
+	b := &levelBackend{
+		mockS3Backend: &mockS3Backend{},
+		t:             t,
+		levels: map[string]level{
+			"db/cpu/":      {dirs: []string{"2025"}},
+			"db/cpu/2025/": {dirs: []string{"01"}},
+			lvlMonth:       {dirs: []string{"15"}},
+			lvlDay:         {files: []string{"cpu_daily.parquet"}},
+		},
+		fail:      map[string]error{},
+		failFirst: map[string]int{},
+	}
+	p := NewPartitionPruner(zerolog.Nop())
+	p.nowFn = func() time.Time { return now }
+	p.SetStorageBackend(b)
+
+	r, ok := p.OptimizeTablePath(WithCompleteSchemaAnchor(context.Background()),
+		"s3://bucket/db/cpu/**/*.parquet", "SELECT * FROM t WHERE time > NOW() - INTERVAL '1 hour'")
+	if !ok || !resultHasPath(r, lvlDayG) {
+		t.Fatalf("got %v %v, want the newest day glob %s", r, ok, lvlDayG)
+	}
+	if n := b.callsFor(lvlDay); n != 1 {
+		t.Errorf("the day directory was listed %d times, want 1", n)
 	}
 }
 

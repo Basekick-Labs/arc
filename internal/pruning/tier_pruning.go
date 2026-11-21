@@ -268,7 +268,18 @@ func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []str
 			err := errTierListingFailed
 			if !listing.skip() {
 				listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				subdirs, err = lister.ListDirectories(listCtx, parent+"/")
+				if level, ok := lister.(storage.LevelLister); ok {
+					// The day's level listing also says whether the day
+					// holds daily files: kept for the day-level check
+					// below, which then makes no request of its own.
+					var files []string
+					subdirs, files, err = level.ListLevel(listCtx, parent+"/")
+					if err == nil {
+						p.globCache.setScoped("tier:dayfiles:"+rootURL+parent+"/", parquetNames(files), scope)
+					}
+				} else {
+					subdirs, err = lister.ListDirectories(listCtx, parent+"/")
+				}
 				cancel()
 			}
 			if err != nil {

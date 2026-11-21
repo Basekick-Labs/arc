@@ -2990,7 +2990,8 @@ const vanishedPartitionMessage = "data read by this query was removed while it r
 //
 // Only the measurement's unpruned "**/*.parquet" glob matching nothing means
 // "no rows". Every other pattern Arc hands DuckDB (an hour or day partition
-// glob, an explicit file from file-time pruning) was listed when the query
+// glob, a day-wide glob standing in for a day whose listing failed, an
+// explicit file from file-time pruning) was listed when the query
 // was planned, so its absence at execution means files were removed in
 // between: retention, compaction or a DELETE took that hour while the query
 // was in flight, or a cached transform outlived the files. Answering an empty
@@ -3018,11 +3019,32 @@ func (h *QueryHandler) classifyNoFiles(err error) noFilesKind {
 		return noFilesOther
 	}
 	pattern, ok := noFilesPattern(err)
-	if !ok || strings.HasSuffix(pattern, "**/*.parquet") {
+	// A day read through one recursive glob because its listing failed
+	// (pruning.IsDayWideGlob) also ends in "**/*.parquet". It matching
+	// nothing does not mean the measurement is empty: it stood in for that
+	// day's partitions, and an empty answer for it would be the whole
+	// query's answer. It is a pruned partition like any other.
+	if !ok || (strings.HasSuffix(pattern, "**/*.parquet") && !pruning.IsDayWideGlob(pattern, h.storageRoot())) {
 		return noFilesEmpty
 	}
 	h.invalidateAfterVanished(pattern, false)
 	return noFilesVanished
+}
+
+// storageRoot is the root every glob of the primary storage is built under
+// ("s3://bucket/prefix/", a local directory with its separator), or "" when
+// it cannot be derived. It is GetStoragePath's own root, taken from a path
+// it builds, so the two cannot disagree.
+func (h *QueryHandler) storageRoot() string {
+	if h.storage == nil {
+		return ""
+	}
+	const tail = "d/m/**/*.parquet"
+	path, err := storage.GetStoragePath(h.storage, "d", "m")
+	if err != nil || !strings.HasSuffix(path, tail) {
+		return ""
+	}
+	return strings.TrimSuffix(path, tail)
 }
 
 // vanishedFile returns the file a DuckDB scan could not open because it no

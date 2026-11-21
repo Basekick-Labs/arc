@@ -207,8 +207,21 @@ func (p *PartitionPruner) remoteDirLister(basePath string) dirLister {
 		if !ok {
 			return nil, errors.New("cannot resolve the storage prefix")
 		}
+		var subdirs []string
+		var err error
 		listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		subdirs, err := lister.ListDirectories(listCtx, prefix)
+		if level, ok := lister.(storage.LevelLister); ok {
+			// A day directory's level listing also says whether the day
+			// holds daily files; the pruner's day-level check reads it from
+			// the cache instead of listing the day again.
+			var files []string
+			subdirs, files, err = level.ListLevel(listCtx, prefix)
+			if err == nil && isDayPrefix(prefix) {
+				p.globCache.setScoped("remote:dayfiles:"+prefix, parquetNames(files), scopeFrom(ctx))
+			}
+		} else {
+			subdirs, err = lister.ListDirectories(listCtx, prefix)
+		}
 		cancel()
 		if err != nil {
 			return nil, err

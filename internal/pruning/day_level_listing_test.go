@@ -141,11 +141,13 @@ func TestDayLevelCheckUsesOneLevelListing(t *testing.T) {
 // List fails the test.
 type tierLevelMock struct {
 	*tierMock
-	t      *testing.T
-	levels map[string][]string // day prefix -> files directly in it
+	t          *testing.T
+	levels     map[string][]string // day prefix -> files directly in it
+	levelCalls []string
 }
 
 func (m *tierLevelMock) ListLevel(ctx context.Context, prefix string) ([]string, []string, error) {
+	m.levelCalls = append(m.levelCalls, prefix)
 	dirs, err := m.tierMock.ListDirectories(ctx, prefix)
 	return dirs, m.levels[prefix], err
 }
@@ -190,6 +192,16 @@ func TestTierDayLevelCheckUsesOneLevelListing(t *testing.T) {
 			sort.Strings(got)
 			if !reflect.DeepEqual(got, c.want) {
 				t.Errorf("paths = %v, want %v", got, c.want)
+			}
+			// The hour check's listing of the day answers the day check.
+			n := 0
+			for _, c := range backend.levelCalls {
+				if c == "db/cpu/2024/03/15/" {
+					n++
+				}
+			}
+			if n != 1 {
+				t.Errorf("the day directory was listed %d times, want 1 (calls: %v)", n, backend.levelCalls)
 			}
 		})
 	}
