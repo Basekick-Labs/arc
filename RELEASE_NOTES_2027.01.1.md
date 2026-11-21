@@ -2,6 +2,20 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: on macOS, a write no longer fails when its directory is removed at the same moment ([#1767](https://github.com/Basekick-Labs/arc/issues/1767))
+
+**Who is affected:** Arc on macOS with local storage. Object storage is unchanged; on Linux and Windows only the "removed between its creation and the check" case below changes.
+
+When a database is deleted, or retention or compaction removes a directory that has just emptied, a write into that same directory at that moment, such as a field-schema anchor, a compaction manifest or an ingested file, finds it gone. Arc recreates the directory and retries once (#1425). Linux reports the missing directory as `ENOENT`. macOS (APFS) reports it either as `ENOENT` or, when the call reached the directory just before the removal finished, as `EINVAL` ("invalid argument"). Arc retried only on `ENOENT`, so on macOS the write failed with `failed to create temp file: … invalid argument`, or `failed to create staging file`, or `failed to create directory`, and the next anchor flush or compaction cycle had to repeat it. On macOS, Arc now treats that `EINVAL` the same as `ENOENT`.
+
+**Details:**
+
+- **Covered:** the paths that already retried: creating the temporary file of an ordinary write (anchors, manifests, ingested files), creating the staging file of a streamed write, creating a missing directory level, and moving a compacted file into place.
+- **Not covered:** the conditional write that publishes Iceberg metadata, and moving an object within storage, which do not retry on any platform ([#1804](https://github.com/Basekick-Labs/arc/issues/1804)).
+- **Compaction keeps its copy fallback.** When the retried move into place is refused again, the compacted file is copied in, as for any other refused move. If recreating the directory itself fails, the compaction job fails and the next cycle runs it again, as on Linux.
+- **A directory removed between its creation and the check that it exists** is now recreated and retried, on every platform, instead of failing with `… exists and is not a directory`, which was not true of a directory that had simply gone.
+- **Still fails:** a write whose directory is removed again during the retry. The next flush or cycle repeats it, as before.
+
 ## Fix: the JSON metrics no longer report a query count that is always 0 ([#1747](https://github.com/Basekick-Labs/arc/issues/1747))
 
 **Who is affected:** anyone reading the keys below from Arc's JSON metrics endpoints: dashboards, scripts, or an agent through the arc-mcp `arc_query_pool_metrics` or `arc_metrics` tools. They always read `0`, because nothing ever counted them, and they are now gone from the response. **This is a response-shape change**: a client that requires these keys must stop reading them. Prometheus `/metrics` (text format) is unchanged: it stopped serving `arc_db_queries_total` in v26.09.2 (#802) and never served a DuckDB-level error counter.

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -105,15 +106,15 @@ func (b *LocalBackend) Write(ctx context.Context, path string, data []byte) erro
 	}
 
 	// Write to temporary file with cryptographically random name (prevents TOCTOU attacks)
-	tmpFile, err := os.CreateTemp(dir, ".arc-*.tmp")
+	tmpFile, err := createTempFn(dir, ".arc-*.tmp")
 	if err != nil {
 		// Directory might have been deleted externally — invalidate cache and retry
-		if os.IsNotExist(err) {
+		if dirGone(err) {
 			b.forgetDir(dir)
 			if err := b.ensureDir(dir); err != nil {
 				return err
 			}
-			tmpFile, err = os.CreateTemp(dir, ".arc-*.tmp")
+			tmpFile, err = createTempFn(dir, ".arc-*.tmp")
 			if err != nil {
 				return fmt.Errorf("failed to create temp file: %w", err)
 			}
@@ -259,14 +260,14 @@ func (b *LocalBackend) WriteReader(ctx context.Context, path string, reader io.R
 	}
 
 	stagingPath := partPath(fullPath)
-	stagingFile, err := os.OpenFile(stagingPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	stagingFile, err := createStagingFn(stagingPath)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if dirGone(err) {
 			b.forgetDir(dir)
 			if err := b.ensureDir(dir); err != nil {
 				return err
 			}
-			stagingFile, err = os.OpenFile(stagingPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+			stagingFile, err = createStagingFn(stagingPath)
 			if err != nil {
 				return fmt.Errorf("failed to create staging file: %w", err)
 			}
@@ -334,6 +335,17 @@ var renameFile = os.Rename
 // chmodFile is the mode normalization AdoptFile applies, a variable for the
 // same reason: a filesystem that refuses chmod is hard to arrange in a test.
 var chmodFile = os.Chmod
+
+// createTempFn and createStagingFn create the temporary file Write and the
+// staging file WriteReader write into. Variables so a test can return the
+// error a directory removed under the call produces on another platform
+// (#1767: EINVAL on macOS), which CI cannot arrange on Linux.
+var (
+	createTempFn    = os.CreateTemp
+	createStagingFn = func(path string) (*os.File, error) {
+		return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	}
+)
 
 // AdoptFile implements FileAdopter: it moves an already-written local file into
 // the backend instead of copying it, which is what makes compaction output cost
@@ -407,18 +419,28 @@ func (b *LocalBackend) AdoptFile(ctx context.Context, path, localPath string) er
 
 	existed := keyExists(fullPath)
 	if err := renameFile(localPath, fullPath); err != nil {
-		// ENOENT first, and it is the only errno worth retrying: it is also the
-		// only one WriteReader retries, for the same cause -- a cached
-		// directory an operator removed under us. Note ENOENT from rename is
-		// ambiguous in a way it is not from OpenFile, because the SOURCE may be
-		// the missing path, so the message below asserts only what is known.
-		if os.IsNotExist(err) {
+		// A directory removed under us first, the one cause worth retrying,
+		// and the one WriteReader retries too: a cached directory an operator,
+		// retention or a database delete removed. dirGone is ENOENT, and on
+		// macOS also EINVAL, which APFS returns for the same race (#1767).
+		// ENOENT from rename is ambiguous in a way it is not from OpenFile,
+		// because the SOURCE may be the missing path, so the message below
+		// asserts only what is known.
+		if dirGone(err) {
 			b.forgetDir(dir)
 			if mkErr := b.ensureDir(dir); mkErr != nil {
 				metrics.Get().IncStorageErrors()
 				return mkErr
 			}
 			if retryErr := renameFile(localPath, fullPath); retryErr != nil {
+				if !errors.Is(err, fs.ErrNotExist) {
+					// The first refusal was EINVAL, which is also a plain
+					// refusal from a filesystem that will not take this
+					// rename. That one still means "copy instead" (below),
+					// as before the retry existed.
+					return fmt.Errorf("%w: cannot rename %s to %s (refused with %v, then again after re-creating its directory): %w",
+						ErrAdoptUnsupported, localPath, fullPath, err, retryErr)
+				}
 				metrics.Get().IncStorageErrors()
 				return fmt.Errorf("failed to adopt local file into %s after re-creating its parent directory: %w",
 					fullPath, retryErr)
