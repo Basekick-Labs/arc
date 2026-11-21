@@ -138,6 +138,13 @@ func (b *LocalBackend) CheckNameSpelling(segments ...string) error {
 	return err
 }
 
+// mkdirAllFn is the MkdirAll AdmitNameSpelling creates a new name with, a
+// variable so a test can return the error a concurrent removal produces.
+var mkdirAllFn = os.MkdirAll
+
+// readDirFn is the listing entryOnce takes, a variable for the same reason.
+var readDirFn = os.ReadDir
+
 // AdmitNameSpelling implements NameSpellingGuard.
 func (b *LocalBackend) AdmitNameSpelling(database, measurement string) error {
 	if !b.spelling.armed {
@@ -153,8 +160,17 @@ func (b *LocalBackend) AdmitNameSpelling(database, measurement string) error {
 	// in that directory and the second check refuses.
 	b.spelling.admitMu.Lock()
 	defer b.spelling.admitMu.Unlock()
-	if err := os.MkdirAll(filepath.Join(b.basePath, database, measurement), 0o700); err != nil {
-		return fmt.Errorf("create %s/%s: %w", database, measurement, err)
+	dir := filepath.Join(b.basePath, database, measurement)
+	if err := mkdirAllFn(dir, 0o700); err != nil {
+		if !dirGone(err) {
+			return fmt.Errorf("create %s/%s: %w", database, measurement, err)
+		}
+		// A database delete removed <database> mid-call (#1804). Create
+		// it again, once: the write being admitted creates these
+		// directories at its flush anyway, and the check below still runs.
+		if err := mkdirAllFn(dir, 0o700); err != nil {
+			return fmt.Errorf("create %s/%s: %w", database, measurement, err)
+		}
 	}
 	_, err = b.checkSpelling([]string{database, measurement})
 	return err
@@ -224,8 +240,13 @@ func (s *nameSpelling) entryOnce(parent, seg string) (exists bool, onDisk string
 		}
 	}
 	takenAt := time.Now()
-	entries, err := os.ReadDir(parent)
+	entries, err := readDirFn(parent)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// Removed since the Stat (a database delete): nothing there
+			// under any spelling, as when the Stat itself finds nothing.
+			return false, "", false, nil
+		}
 		return false, "", false, err
 	}
 	names := make(map[string]struct{}, len(entries))

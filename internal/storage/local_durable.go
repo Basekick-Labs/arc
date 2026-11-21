@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -143,15 +144,31 @@ func (b *LocalBackend) ensureDir(dir string) error {
 	}
 	_, err, _ := b.dirFlight.Do(dir, func() (any, error) {
 		err := b.createDurable(dir)
-		if dirGone(err) {
-			// An ancestor the cache vouched for was removed under us
-			// (retention, an operator). Forget the chain and walk it again.
+		// A level was removed under us (retention, tiering, a database
+		// delete, an operator). Forget the chain and walk it again, once per
+		// level at most: a remover climbing toward the root (tiering's
+		// cleanup, a DELETE's directory sweep) removes each level once, and
+		// each strike needs it to have taken one more, so the depth bounds
+		// the strikes one remover can cause. The walk spends a directory
+		// fsync per level while the remover spends microseconds, so a
+		// single retry lost most such races when measured (#1804).
+		for left := b.levelsBelowRoot(dir); dirGone(err) && left > 0; left-- {
 			b.forgetDir(dir)
 			err = b.createDurable(dir)
 		}
 		return nil, err
 	})
 	return err
+}
+
+// levelsBelowRoot is the number of path segments between the storage root
+// and dir (at least 1).
+func (b *LocalBackend) levelsBelowRoot(dir string) int {
+	rel, err := filepath.Rel(b.basePath, dir)
+	if err != nil || rel == "." {
+		return 1
+	}
+	return strings.Count(rel, string(filepath.Separator)) + 1
 }
 
 // createDurable creates every uncached level of dir top-down and fsyncs each

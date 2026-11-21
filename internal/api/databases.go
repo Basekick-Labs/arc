@@ -1947,12 +1947,12 @@ func removeEmptyDirectoryTree(ctx context.Context, lister storage.DirectoryListe
 // removeEmptyDirectories: local storage only, a directory that holds anything
 // stays (any manifest left in it, in flight or parked .quarantined, or an
 // anchor a concurrent ingest just wrote). LocalBackend.Write recreates a
-// directory removed under it and retries once (on macOS the removal can
-// surface as EINVAL rather than ENOENT, handled the same way, #1767); a
-// write whose directory is removed again inside that retry fails, which the
-// next anchor flush or compaction cycle repeats. Two concurrent DELETEs of
-// the same database can do that, and so can one removal walking bottom-up
-// past an ancestor the retry is recreating. The tier directories and the
+// directory removed under it and retries (on macOS the removal can surface
+// as EINVAL rather than ENOENT, handled the same way, #1767); recreating the
+// chain is retried once per level, so one removal walking bottom-up past the
+// levels it recreates cannot fail it (#1804). Two removers at once (two
+// concurrent DELETEs of the same database) still can, and the next anchor
+// flush or compaction cycle repeats the write. The tier directories and the
 // roots, which other databases share, stay.
 func removeDatabaseStateDirectories(ctx context.Context, backend storage.Backend, name string, logger zerolog.Logger) {
 	// Checked first so an object store, which has no directories to remove,
