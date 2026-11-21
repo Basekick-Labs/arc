@@ -520,7 +520,7 @@ func (j *Job) Run(ctx context.Context) error {
 	//
 	// Failing here does NOT unwind the upload, and it does not get retried
 	// into a good state either: next cycle recoverLoadedManifest finds the
-	// output present with a matching size (manifest.go:397-460), deletes the
+	// output present with a matching size (recoverLoadedManifest), deletes the
 	// inputs and deletes the compaction manifest without ever writing a
 	// completion manifest, so the Raft RegisterFile never fires and the output
 	// is a file no manifest entry describes. We still fail the job, because a

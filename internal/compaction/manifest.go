@@ -451,14 +451,31 @@ func (m *ManifestManager) recoverLoadedManifest(ctx context.Context, manifestPat
 		return m.DeleteManifest(ctx, manifestPath)
 	}
 
-	// Output file exists - verify size if we have ObjectLister
-	if objectLister, ok := m.backend.(storage.ObjectLister); ok {
-		objects, err := objectLister.ListObjects(ctx, manifest.OutputPath)
-		if err == nil && len(objects) > 0 {
-			if actualSize := objects[0].Size; actualSize != manifest.OutputSize {
-				return m.discardPartialOutput(ctx, manifestPath, manifest, actualSize)
-			}
-		}
+	// The output exists. Its stored size must be CONFIRMED equal to the size
+	// the job recorded before any input is deleted: this is the only check
+	// between a short upload and the removal of the rows it was meant to
+	// replace. StatFile is on storage.Backend, so every backend can answer;
+	// "could not find out" keeps the manifest and the inputs and is retried
+	// next cycle. Until it clears, the inputs and the output both stay in
+	// storage and stay out of compaction (GetFilesInManifests).
+	if manifest.OutputSize <= 0 {
+		// Arc's jobs always record the size of the file they uploaded, and
+		// no Parquet file is empty. Without it there is nothing to confirm
+		// the output against, so the inputs are not deleted on its account.
+		return fmt.Errorf("manifest %s records no size for output %s; inputs kept, remove the manifest by hand once the output is checked", manifestPath, manifest.OutputPath)
+	}
+	actualSize, err := m.backend.StatFile(ctx, manifest.OutputPath)
+	if err != nil {
+		return fmt.Errorf("failed to read the size of output %s; manifest and inputs kept: %w", manifest.OutputPath, err)
+	}
+	if actualSize < 0 {
+		// StatFile's "no such object", after Exists said it was there: the
+		// output went away in between. Not the partial-upload case, so
+		// nothing is deleted on this pass; the next one sees it missing.
+		return fmt.Errorf("output %s disappeared between the existence check and the size check; manifest and inputs kept", manifest.OutputPath)
+	}
+	if actualSize != manifest.OutputSize {
+		return m.discardPartialOutput(ctx, manifestPath, manifest, actualSize)
 	}
 
 	// Record the kept output for the cluster BEFORE deleting the inputs, so a
@@ -475,8 +492,7 @@ func (m *ManifestManager) recoverLoadedManifest(ctx context.Context, manifestPat
 	//     output every cycle forever -- the #747 shape this file already
 	//     guards against above.
 	//   - a short output: hand it to the same partial-upload path the
-	//     ObjectLister check above uses, so the handling does not depend on
-	//     which backend is in play.
+	//     size check above uses.
 	//   - anything else is transient: return it and retry next cycle.
 	if hooks.beforeInputDelete != nil {
 		if err := hooks.beforeInputDelete(ctx, manifest); err != nil {
@@ -612,10 +628,55 @@ func quarantinePathFor(manifestPath string) (string, error) {
 // manifest: a partial upload. The output and the manifest both go, so the next
 // cycle rediscovers the inputs and redoes the job from scratch.
 //
-// Shared by the ObjectLister size check and the recovery completion hook, which
-// catches the same condition while streaming the output to hash it -- on a
-// backend that is not an ObjectLister, the hook is the only check that runs.
+// Shared by the size check in recoverLoadedManifest and the recovery
+// completion hook, which reports the same condition when a read of the output
+// ends before the recorded size.
+//
+// Two things must hold before anything is deleted, because the output may be
+// the only copy of the rows:
+//
+//   - every input is known to be in storage. A manifest can outlive some or
+//     all of its inputs (a partial source deletion is the usual reason one
+//     lingers, and Job.Run leaves it for the parent to finalize after
+//     deleting them), and then the output, whatever its size, is all that is
+//     left. A manifest naming no inputs, or an input whose presence cannot
+//     be established, is treated the same way. Nothing is deleted and the
+//     manifest is KEPT, not parked: while it exists the output and the
+//     surviving inputs stay out of compaction, queries keep reading one copy
+//     of the rows (OpenJobs) and the Iceberg export keeps skipping the
+//     output (PendingOutputsUnder). Parking would release all three. The
+//     price is this error on every cycle, for a few existence checks, until
+//     the manifest is removed by hand.
+//   - the output is really gone before the manifest is. A manifest removed
+//     while its output remains leaves the output and the inputs side by side
+//     with nothing keeping them out of the next compaction, which would
+//     merge them into duplicate rows.
 func (m *ManifestManager) discardPartialOutput(ctx context.Context, manifestPath string, manifest *Manifest, actualSize int64) error {
+	var missing []string
+	for _, inputFile := range manifest.InputFiles {
+		exists, err := m.backend.Exists(ctx, inputFile)
+		if err != nil {
+			return fmt.Errorf("output %s has size %d, manifest records %d; could not confirm input %s is still stored, nothing deleted: %w",
+				manifest.OutputPath, actualSize, manifest.OutputSize, inputFile, err)
+		}
+		if !exists {
+			missing = append(missing, inputFile)
+		}
+	}
+	if len(missing) > 0 || len(manifest.InputFiles) == 0 {
+		m.logger.Error().
+			Str("manifest", manifestPath).
+			Str("job_id", manifest.JobID).
+			Str("output", manifest.OutputPath).
+			Int64("expected_size", manifest.OutputSize).
+			Int64("actual_size", actualSize).
+			Int("inputs", len(manifest.InputFiles)).
+			Strs("missing_inputs", missing).
+			Msg("Compaction output size differs from its manifest and its inputs are not all in storage. Nothing was deleted: the output may be the only copy of those rows. The manifest is kept, so the output and the remaining inputs stay out of compaction, and this is reported again on every compaction cycle. Compare the output with the remaining inputs, then remove the manifest by hand")
+		return fmt.Errorf("output %s has size %d, manifest records %d, and %d of %d inputs are not in storage; nothing deleted, manifest kept",
+			manifest.OutputPath, actualSize, manifest.OutputSize, len(missing), len(manifest.InputFiles))
+	}
+
 	m.logger.Warn().
 		Str("manifest", manifestPath).
 		Int64("expected_size", manifest.OutputSize).
@@ -623,7 +684,10 @@ func (m *ManifestManager) discardPartialOutput(ctx context.Context, manifestPath
 		Msg("Output file size mismatch, deleting for retry")
 
 	if err := m.backend.Delete(ctx, manifest.OutputPath); err != nil {
-		m.logger.Warn().Err(err).Str("output", manifest.OutputPath).Msg("Failed to delete partial output")
+		// Already gone counts as deleted; anything else keeps the manifest.
+		if exists, checkErr := m.backend.Exists(ctx, manifest.OutputPath); checkErr != nil || exists {
+			return fmt.Errorf("failed to delete partial output %s; manifest kept: %w", manifest.OutputPath, err)
+		}
 	}
 	return m.DeleteManifest(ctx, manifestPath)
 }
