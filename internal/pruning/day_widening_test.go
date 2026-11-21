@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
 
@@ -133,6 +134,45 @@ func TestHoursOfADayTheMonthDoesNotShowAreDropped(t *testing.T) {
 	}
 }
 
+// A REMEMBERED month listing that does not show the day proves nothing: the
+// day may have been created since. Its hours stay assumed, as before.
+func TestHoursOfADayARememberedMonthDoesNotShowAreKept(t *testing.T) {
+	p, b := newLevelPruner(t, level{dirs: []string{"10"}})
+	// First pass, before the day exists: the month is remembered without it.
+	b.levels[lvlMonth] = level{dirs: []string{"14"}}
+	p.filterExistingRemotePathsOpts(context.Background(), []string{"s3://bucket/db/cpu/2025/01/14/*.parquet"}, lvlBase, 0)
+
+	// The day now exists, and its own listing fails.
+	b.levels[lvlMonth] = level{dirs: []string{"14", "15"}}
+	b.fail[lvlDay] = errListing
+	// The day glob is in the input, as the pruner always generates it: the
+	// remembered month says the day is absent.
+	got, verified, _ := p.filterExistingRemotePathsOpts(context.Background(), []string{lvlDayG, lvlHourG, lvlHour11G}, lvlBase, 0)
+	if want := []string{lvlHourG, lvlHour11G}; !reflect.DeepEqual(got, want) || verified {
+		t.Errorf("paths = %v, verified = %v; want %v, false: a remembered month listing must not drop them", got, verified, want)
+	}
+	if n := b.callsFor(lvlMonth); n != 1 {
+		t.Fatalf("the month was listed %d times, want 1: the second pass must have used the remembered listing", n)
+	}
+}
+
+// The counter counts days in the plan that is returned, once each, and not
+// the filter's other runs.
+func TestDaysReadUnlistedCountsTheReturnedPlan(t *testing.T) {
+	p, b := newLevelPruner(t, level{dirs: []string{"10"}, files: []string{"cpu_daily.parquet"}})
+	b.fail[lvlDay] = errListing
+	before, _ := metrics.Get().Snapshot()["query_days_read_unlisted_total"].(int64)
+	r, ok := p.OptimizeTablePath(context.Background(), "s3://bucket/db/cpu/**/*.parquet",
+		"SELECT * FROM cpu WHERE time >= '2025-01-15 10:00:00' AND time < '2025-01-15 11:00:00'")
+	if !ok || !resultHasPath(r, lvlDayWide) {
+		t.Fatalf("got %v %v, want the day-wide glob", r, ok)
+	}
+	after, _ := metrics.Get().Snapshot()["query_days_read_unlisted_total"].(int64)
+	if after-before != 1 {
+		t.Errorf("counter moved by %d, want 1", after-before)
+	}
+}
+
 // The newest-partition shortcut reads its glob alone. When that glob is a
 // day whose listing fails, the answer is a day-wide glob, not the glob asked
 // about: the unpruned fallback answers, as it did when the glob was dropped.
@@ -172,11 +212,16 @@ func TestNewestPartitionShortcutIgnoresAWidenedDay(t *testing.T) {
 	p.globCache.mu.Unlock()
 	b.fail[lvlDay] = errListing
 	before := b.callsFor(lvlDay)
+	counted, _ := metrics.Get().Snapshot()["query_days_read_unlisted_total"].(int64)
 	if r, ok := p.OptimizeTablePath(WithCompleteSchemaAnchor(context.Background()), glob, sql); ok || r != glob {
 		t.Fatalf("got %v %v, want the unpruned glob", r, ok)
 	}
 	if b.callsFor(lvlDay) == before {
 		t.Fatal("the day was not listed again: this did not exercise the shortcut with a failed day listing")
+	}
+	// The widened answer was discarded, so no day was read unlisted.
+	if after, _ := metrics.Get().Snapshot()["query_days_read_unlisted_total"].(int64); after != counted {
+		t.Errorf("counter moved by %d for a plan that was not used", after-counted)
 	}
 }
 

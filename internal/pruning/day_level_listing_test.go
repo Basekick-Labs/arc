@@ -44,9 +44,8 @@ func (b *levelBackend) ListLevel(_ context.Context, prefix string) ([]string, []
 	return l.dirs, l.files, nil
 }
 
-// ListDirectories answers from the same levels but is not subject to fail:
-// the open-ended resolver lists with it, and a test needs to fail the day
-// check alone.
+// ListDirectories answers from the same levels and is not subject to fail.
+// (The pruner lists with ListLevel on a backend that has it.)
 func (b *levelBackend) ListDirectories(_ context.Context, prefix string) ([]string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

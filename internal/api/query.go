@@ -2990,8 +2990,7 @@ const vanishedPartitionMessage = "data read by this query was removed while it r
 //
 // Only the measurement's unpruned "**/*.parquet" glob matching nothing means
 // "no rows". Every other pattern Arc hands DuckDB (an hour or day partition
-// glob, a day-wide glob standing in for a day whose listing failed, an
-// explicit file from file-time pruning) was listed when the query
+// glob, an explicit file from file-time pruning) was listed when the query
 // was planned, so its absence at execution means files were removed in
 // between: retention, compaction or a DELETE took that hour while the query
 // was in flight, or a cached transform outlived the files. Answering an empty
@@ -3004,6 +3003,18 @@ const vanishedPartitionMessage = "data read by this query was removed while it r
 // so a file removed in between fails with a different text (vanishedFile):
 // compaction deleting a batch's inputs while a query reads the hour (#1355).
 // That is the same condition and gets the same answer.
+//
+// One more pattern ends in "**/*.parquet" and is NOT the measurement's: the
+// day-wide glob a day is read through when its listing FAILED
+// (pruning.IsDayWideGlob). It was never listed, so its matching nothing is
+// not a removal; but it stood in for that day's partitions, and an empty
+// answer for it would be the whole query's. It gets the retryable answer,
+// with its own log line, since the client message's "removed while it ran"
+// is not what happened.
+// Measured through the built binary on SeaweedFS S3 (DuckDB 1.5.6,
+// 2026-11-21): DuckDB names that glob as Arc wrote it,
+// "s3://bucket/prefix/db/m/2026/11/17/**/*.parquet", and the query answers
+// 503 where it would have answered an empty result.
 //
 // A "**" glob can still be one of several patterns a tiered read combines,
 // so an empty answer for it is only as right as it was before this check.
@@ -3024,8 +3035,17 @@ func (h *QueryHandler) classifyNoFiles(err error) noFilesKind {
 	// nothing does not mean the measurement is empty: it stood in for that
 	// day's partitions, and an empty answer for it would be the whole
 	// query's answer. It is a pruned partition like any other.
-	if !ok || (strings.HasSuffix(pattern, "**/*.parquet") && !pruning.IsDayWideGlob(pattern, h.storageRoot())) {
+	if !ok {
 		return noFilesEmpty
+	}
+	if strings.HasSuffix(pattern, "**/*.parquet") {
+		// The date shape is checked without a root first, so a query on an
+		// empty measurement does not derive the storage root for nothing.
+		if !pruning.IsDayWideGlob(pattern, "") || !pruning.IsDayWideGlob(pattern, h.storageRoot()) {
+			return noFilesEmpty
+		}
+		h.logger.Warn().Str("pattern", pattern).
+			Msg("A day was read whole because its storage listing failed, and it holds no files; answering 503 so the query is retried once the listing works")
 	}
 	h.invalidateAfterVanished(pattern, false)
 	return noFilesVanished

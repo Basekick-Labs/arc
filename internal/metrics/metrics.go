@@ -573,7 +573,10 @@ func (m *Metrics) IncSlowQueries()   { m.querySlowTotal.Add(1) }
 // cold tier could not list, on tier metadata's word that the range has no
 // cold rows (#1550).
 func (m *Metrics) IncQueryColdUnlistedSkipped() { m.queryColdUnlistedSkipped.Add(1) }
-func (m *Metrics) IncQueryDaysReadUnlisted()    { m.queryDaysReadUnlisted.Add(1) }
+
+// IncQueryDaysReadUnlisted counts one day a returned query plan reads whole
+// because the day's storage listing failed (#1810).
+func (m *Metrics) IncQueryDaysReadUnlisted() { m.queryDaysReadUnlisted.Add(1) }
 
 // IncQueryColdMarkSkipped counts one cluster read answered without the cold
 // partitions it could not list, on the cold mark's word (#1552).
