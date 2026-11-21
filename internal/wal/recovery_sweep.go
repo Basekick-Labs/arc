@@ -20,9 +20,9 @@ var statWALFileFn = os.Stat
 //   - `.wal-recovery-*` temporaries, one per sidecar write, removed by
 //     writeReplayAttempts' deferred remove — so a crash in between leaks one.
 //   - attempt sidecars whose WAL file is gone. Quarantine removes the sidecar
-//     and a successful replay clears it, but no purge does: PurgeFlushed, and
-//     purgeWALFiles via PurgeAll (the clean-shutdown purge) and PurgeInactive,
-//     all remove `*.wal` and leave `*.wal.recovery` behind.
+//     and a successful replay clears it, but no purge does: PurgeFlushed and
+//     PurgeAll (the clean-shutdown purge) both remove `*.wal` and leave
+//     `*.wal.recovery` behind.
 //
 // Errors are reported and never fail the pass; reclaiming inodes is not worth
 // refusing to recover data.

@@ -2361,9 +2361,13 @@ func (w *Writer) Close() error {
 	return nil
 }
 
-// purgeWALFiles deletes WAL files matching the given filter function.
-// Returns the count of deleted files.
-func (w *Writer) purgeWALFiles(shouldDelete func(path string) bool) (int, error) {
+// PurgeAll deletes all WAL files in the directory.
+// Call this after a clean shutdown where all data has been flushed to storage,
+// so that recovery on next startup doesn't replay already-persisted data.
+//
+// It does not look at what a file holds or whether its entries were flushed;
+// the caller vouches for that. During operation, use PurgeFlushed.
+func (w *Writer) PurgeAll() (int, error) {
 	pattern := filepath.Join(w.config.WALDir, "*.wal")
 	files, err := filepath.Glob(pattern)
 	if err != nil {
@@ -2372,50 +2376,23 @@ func (w *Writer) purgeWALFiles(shouldDelete func(path string) bool) (int, error)
 
 	deleted := 0
 	for _, f := range files {
-		if shouldDelete(f) {
-			if err := os.Remove(f); err != nil {
-				w.logger.Error().Err(err).Str("file", f).Msg("Failed to purge WAL file")
-			} else {
-				deleted++
-				// Keep the sequence bookkeeping in step. A stale entry would
-				// leave PurgeFlushed walking to a path that no longer exists,
-				// where the delete fails and — because it stops rather than
-				// skips — nothing after it is ever reclaimed.
-				w.mu.Lock()
-				w.forgetFileLocked(f)
-				w.mu.Unlock()
-			}
+		if err := os.Remove(f); err != nil {
+			w.logger.Error().Err(err).Str("file", f).Msg("Failed to purge WAL file")
+			continue
 		}
+		deleted++
+		// Keep the sequence bookkeeping in step. A stale entry would
+		// leave PurgeFlushed walking to a path that no longer exists,
+		// where the delete fails and — because it stops rather than
+		// skips — nothing after it is ever reclaimed.
+		w.mu.Lock()
+		w.forgetFileLocked(f)
+		w.mu.Unlock()
 	}
-	return deleted, nil
-}
-
-// PurgeAll deletes all WAL files in the directory.
-// Call this after a clean shutdown where all data has been flushed to storage,
-// so that recovery on next startup doesn't replay already-persisted data.
-func (w *Writer) PurgeAll() (int, error) {
-	deleted, err := w.purgeWALFiles(func(_ string) bool { return true })
 	if deleted > 0 {
 		w.logger.Info().Int("deleted", deleted).Msg("Purged WAL files after clean shutdown")
 	}
-	return deleted, err
-}
-
-// PurgeInactive deletes all WAL files except the currently active one.
-// Use this during normal operation (unlike PurgeAll which is for shutdown)
-// to clean up rotated WAL files after their data has been flushed to storage.
-func (w *Writer) PurgeInactive() (int, error) {
-	w.mu.Lock()
-	activePath := w.currentPath
-	w.mu.Unlock()
-
-	deleted, err := w.purgeWALFiles(func(path string) bool {
-		return path != activePath
-	})
-	if deleted > 0 {
-		w.logger.Info().Int("deleted", deleted).Msg("Purged inactive WAL files")
-	}
-	return deleted, err
+	return deleted, nil
 }
 
 // noteWrittenLocked records an entry against w.currentPath. Caller holds w.mu.
