@@ -4,20 +4,22 @@
 
 ## Fix: in a cluster with local storage, a compacted file's last copy is no longer removed when moving it into place fails ([#1807](https://github.com/Basekick-Labs/arc/issues/1807))
 
-**Who is affected:** clusters with local storage and staged compaction (#1207). Object storage and single nodes are unchanged.
+**Who is affected:** clusters with local storage, replication on and staged compaction (#1207). Object storage and single nodes are unchanged.
 
 A node that holds a staged copy of a committed compaction output moves it into place. When that move failed, the node's cleanup removed the staged copy anyway and asked a peer for the file. The staged copy can be the last copy. That happens on a holder node when the compacting node has already removed its own copy and lost its disk, or on the compacting node itself when its compaction watcher did not start. In those cases nothing was left to pull, and the file the manifest registers was gone from that node. Arc now removes a staged copy only on positive proof that it is not needed:
 
 - the output left the manifest or moved to the cold tier;
-- the output is already at its path;
+- a file of the output's size is already at its path (the check the compacting node itself makes before it removes its copy);
 - the staged copy is missing or incomplete.
 
 Any failed check keeps the copy, and the next sweep (every 30 s) tries the move again. While a copy is kept, a warning names the job, at most once every 10 minutes.
 
 **Also:**
 
-- **No pointless move.** A staged output that already left the manifest, or moved to the cold tier, is no longer moved into place first and deleted after. That move recreated the output's partition directories and left them empty.
-- **Stale local copy put back on the first try.** A stale local copy is moved aside before it is removed. If a new file was written to its path in that moment, it is moved back. When a directory cleanup took the emptied partition directory in between, Arc now recreates the directory and puts the file back. Before, it kept the file aside and logged an error asking for a manual move.
+- **No pointless move.** A staged output is checked against the manifest before it is moved into place, not only after.
+  - One that already left the manifest was moved in and then deleted, which recreated its partition directories and left them empty.
+  - One that had moved to the cold tier was moved in as a hot copy of a cold file.
+- **A replaced stale copy is put back.** A stale local copy is moved aside before it is removed. If a new file was written to its path in that moment, it is moved back. When a directory cleanup took the emptied partition directory in between, Arc now recreates the directory and puts the file back. Before, it kept the file aside and logged an error asking for a manual move.
 
 ## Fix: compaction recovery confirms an output before it deletes the inputs ([#1809](https://github.com/Basekick-Labs/arc/pull/1809))
 

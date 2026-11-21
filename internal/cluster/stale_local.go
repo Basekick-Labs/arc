@@ -764,6 +764,11 @@ var (
 // file aside under a name the next start does not remove.
 func putBackAside(aside, full string, levels int) error {
 	err := staleLinkFn(aside, full)
+	if err != nil {
+		if _, serr := os.Lstat(aside); serr != nil {
+			return err // the file aside went, not full's directory
+		}
+	}
 	for left := levels; storage.IsDirGone(err) && left > 0; left-- {
 		if mkErr := os.MkdirAll(filepath.Dir(full), 0o700); mkErr != nil && !storage.IsDirGone(mkErr) {
 			return mkErr

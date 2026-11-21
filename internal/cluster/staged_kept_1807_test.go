@@ -3,12 +3,14 @@ package cluster
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/compaction"
 	"github.com/basekick-labs/arc/internal/storage"
 )
@@ -19,6 +21,7 @@ type faultyStore struct {
 	*storage.LocalBackend
 	failMove atomic.Bool
 	failStat atomic.Bool
+	failOn   atomic.Value // string: the one key whose stat fails
 	moves    atomic.Int64
 }
 
@@ -31,7 +34,7 @@ func (f *faultyStore) MoveObject(ctx context.Context, src, dst string) error {
 }
 
 func (f *faultyStore) StatFile(ctx context.Context, path string) (int64, error) {
-	if f.failStat.Load() {
+	if k, _ := f.failOn.Load().(string); f.failStat.Load() || (k != "" && k == path) {
 		return 0, errors.New("injected stat failure")
 	}
 	return f.LocalBackend.StatFile(ctx, path)
@@ -187,5 +190,79 @@ func TestStaleLocalPutBackRecreatesARemovedDirectory(t *testing.T) {
 	kept, _ := filepath.Glob(filepath.Join(r.root, staleLocalAsideDir, staleLocalKeepAside+"*"))
 	if len(kept) != 0 {
 		t.Fatalf("file kept aside: %v", kept)
+	}
+}
+
+// Each branch of the removal rule, called directly: removed only on proof,
+// kept on any failed check (#1807).
+func TestRemoveStagedCopyUnlessNeeded(t *testing.T) {
+	cases := []struct {
+		name     string
+		prepare  func(r *stagedRigT, f *faultyStore, job compaction.StagedJob) (jobArg string)
+		wantKept bool
+	}{
+		{"complete copy, output not at its path", func(*stagedRigT, *faultyStore, compaction.StagedJob) string { return "" }, true},
+		{"stat of the path fails", func(_ *stagedRigT, f *faultyStore, j compaction.StagedJob) string {
+			f.failOn.Store(j.Output.Path)
+			return ""
+		}, true},
+		{"stat of the staged key fails", func(_ *stagedRigT, f *faultyStore, j compaction.StagedJob) string {
+			f.failOn.Store(j.StagedKey)
+			return ""
+		}, true},
+		{"left the manifest", func(r *stagedRigT, _ *faultyStore, j compaction.StagedJob) string {
+			if err := r.c.raftNode.DeleteFile(j.Output.Path, "delete", 5*time.Second); err != nil {
+				t.Fatal(err)
+			}
+			return ""
+		}, false},
+		{"registered by another job", func(r *stagedRigT, _ *faultyStore, j compaction.StagedJob) string {
+			other := "other-" + j.JobID
+			r.write(compaction.StagedKey(other, j.Output.Path), "output of "+j.JobID)
+			return other
+		}, false},
+		{"moved to the cold tier", func(r *stagedRigT, _ *faultyStore, j compaction.StagedJob) string {
+			e, _ := r.c.raftNode.FSM().GetFile(j.Output.Path)
+			e.Tier = "cold"
+			if err := r.c.raftNode.UpdateFile(*e, 5*time.Second); err != nil && !raft.IsManifestChanged(err) {
+				t.Fatal(err)
+			}
+			if cur, _ := r.c.raftNode.FSM().GetFile(j.Output.Path); raft.HotTier(cur.Tier) {
+				t.Fatal("tier not updated")
+			}
+			return ""
+		}, false},
+		{"path holds the output at its size", func(r *stagedRigT, _ *faultyStore, j compaction.StagedJob) string {
+			r.write(j.Output.Path, "output of "+j.JobID)
+			return ""
+		}, false},
+		{"staged copy partial", func(r *stagedRigT, _ *faultyStore, j compaction.StagedJob) string {
+			if err := os.Truncate(filepath.Join(r.root, j.StagedKey), 3); err != nil {
+				t.Fatal(err)
+			}
+			return ""
+		}, false},
+		{"staged copy absent", func(r *stagedRigT, _ *faultyStore, j compaction.StagedJob) string {
+			if err := os.Remove(filepath.Join(r.root, j.StagedKey)); err != nil {
+				t.Fatal(err)
+			}
+			r.write(compaction.StagedJobDir(j.JobID)+"/marker", "x")
+			return ""
+		}, false},
+	}
+	for i, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r, f := faultyRig(t)
+			job := r.job(fmt.Sprintf("k%d", i))
+			r.commitJob(job)
+			jobArg := c.prepare(r, f, job)
+			if jobArg == "" {
+				jobArg = job.JobID
+			}
+			r.c.removeStagedCopyUnlessNeeded(context.Background(), jobArg, job.Output.Path)
+			if kept := r.exists(compaction.StagedJobDir(jobArg)); kept != c.wantKept {
+				t.Fatalf("staged directory kept %v, want %v", kept, c.wantKept)
+			}
+		})
 	}
 }
