@@ -2,6 +2,25 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: a sum or a stored decimal beyond the int64 range is answered as a 400 with the reason ([#1784](https://github.com/Basekick-Labs/arc/issues/1784))
+
+Arc sends a scale-0 decimal result column as `int64` (#599). DuckDB returns `sum()` of any integer column as a 128-bit integer (HUGEINT, exported as `DECIMAL(38,0)`), and a column stored with `ingest.decimal_columns` (#276) can be that wide too, so a value beyond the int64 range failed the conversion after the response had started:
+
+| Endpoint | Before | Now |
+|---|---|---|
+| `POST /api/v1/query` (JSON) | 200, `success: true`, no rows, `truncated` | **400** with the reason |
+| `POST /api/v1/query/arrow` | 200, a cut stream, the reason in the trailer | **400** with the reason |
+| `POST /api/v1/query/msgpack` | 500 | **400** with the reason |
+| Flight SQL | `INTERNAL: … unexpected EOF`, reason lost | `INVALID_ARGUMENT` with the reason |
+
+The reason names the column and the row, and the SQL cast that returns the value: `decimal value beyond the int64 range: column "s" (DECIMAL(38,0)/HUGEINT) at row 0; cast it in SQL: ::DOUBLE (approximate) or ::VARCHAR (exact digits)`.
+
+- **This changes a published status:** clients that read a 200 with `truncated` (JSON), a cut Arrow stream or a 500 (msgpack) for this case now get a 400.
+- **Limit:** JSON, Arrow and Flight SQL check the first chunk of the result (2,048 rows) before answering. A value that first appears later still cuts the response as before (`truncated` on JSON, the trailer on Arrow); the reason is now this message with the value's row, and Flight SQL now ends with `INVALID_ARGUMENT` and the reason instead of a generic error. In those later-chunk reasons the column name is masked (`column "..."`), as Arc masks quoted text in every error it logs or sends as a trailer. msgpack, which reads the whole result first, answers 400 for any row.
+- **Governance row cap:** only rows within the cap are checked. On JSON, a value beyond the cap used to cut a capped result short; it now returns the capped rows, as Arrow and msgpack already did.
+- **Unchanged:** values that fit (still `int64`), decimals with a scale (still `float64`), the `types` field on msgpack, and the schema a Flight SQL prepare reports.
+- **Workaround on older versions:** cast in SQL, `sum(x)::DOUBLE` (approximate) or `sum(x)::VARCHAR` (exact digits).
+
 ## Fix: on a shared bucket, an Iceberg table recreated with a column of another type, or restored after a delete, stopped exporting ([#1801](https://github.com/Basekick-Labs/arc/issues/1801), [#1799](https://github.com/Basekick-Labs/arc/issues/1799), [#1796](https://github.com/Basekick-Labs/arc/issues/1796))
 
 Two failures on a shared bucket (where the node that handles a `DELETE` is not the node that exports), both permanent: every reconcile pass of the table failed until the process was restarted or the table was dropped by hand.
