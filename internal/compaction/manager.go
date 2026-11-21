@@ -1346,6 +1346,19 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 	// Run compaction in subprocess for memory isolation
 	result, err := runJobInSubprocess(ctx, config, m.logger)
 
+	// The subprocess writes and deletes crash-recovery manifests through its
+	// OWN ManifestManager, so this process's remembered set of manifest-held
+	// files knows nothing of them. A job that could not delete its inputs
+	// leaves its manifest behind precisely so those inputs stay out of
+	// compaction; the daily tier later in this same cycle (which groups the
+	// day's hour files, under a different partition lock) and a cycle that
+	// starts right after this one would both filter against the stale set and
+	// compact the kept output together with the inputs it replaces. Forget
+	// the set whenever a subprocess has returned, whatever its result.
+	if m.ManifestManager != nil {
+		m.ManifestManager.invalidateCache()
+	}
+
 	// Always clean up temp directories for this partition after subprocess completes.
 	// The subprocess has its own defer cleanup, but if it crashes or gets OOM-killed,
 	// the defer never runs. This ensures cleanup happens from the parent process.
