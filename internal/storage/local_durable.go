@@ -143,7 +143,7 @@ func (b *LocalBackend) ensureDir(dir string) error {
 	}
 	_, err, _ := b.dirFlight.Do(dir, func() (any, error) {
 		err := b.createDurable(dir)
-		if errors.Is(err, fs.ErrNotExist) {
+		if dirGone(err) {
 			// An ancestor the cache vouched for was removed under us
 			// (retention, an operator). Forget the chain and walk it again.
 			b.forgetDir(dir)
@@ -169,11 +169,24 @@ func (b *LocalBackend) createDurable(dir string) error {
 	}
 	for i := len(chain) - 1; i >= 0; i-- {
 		d := chain[i]
-		if err := os.Mkdir(d, 0700); err != nil {
+		if err := mkdirFn(d, 0700); err != nil {
 			if !errors.Is(err, fs.ErrExist) {
 				return fmt.Errorf("failed to create directory: %w", err)
 			}
-			if info, serr := os.Stat(d); serr != nil || !info.IsDir() {
+			info, serr := os.Stat(d)
+			if serr != nil {
+				if li, lerr := os.Lstat(d); errors.Is(serr, fs.ErrNotExist) && lerr == nil && !li.IsDir() {
+					// Something is there that Stat cannot follow: a
+					// symlink to nothing, not a directory. (A directory
+					// here was recreated by another writer since the
+					// Stat; that falls through to the retry.)
+					return fmt.Errorf("failed to create directory: %s exists and is not a directory", d)
+				}
+				// Removed between the Mkdir and the Stat: kept wrapped, so
+				// ensureDir sees the ENOENT and walks the chain again.
+				return fmt.Errorf("failed to create directory: %w", serr)
+			}
+			if !info.IsDir() {
 				return fmt.Errorf("failed to create directory: %s exists and is not a directory", d)
 			}
 		}
@@ -200,6 +213,10 @@ func (b *LocalBackend) createDurable(dir string) error {
 	}
 	return nil
 }
+
+// mkdirFn is the Mkdir createDurable creates each level with, a variable for
+// the reason createTempFn is (local.go).
+var mkdirFn = os.Mkdir
 
 func (b *LocalBackend) dirCached(dir string) bool {
 	b.dirMu.RLock()
