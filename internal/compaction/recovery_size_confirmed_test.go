@@ -21,7 +21,9 @@ type faultyBackend struct {
 
 func (b *faultyBackend) Exists(ctx context.Context, path string) (bool, error) {
 	if path != "" && path == b.failExists {
-		return false, errors.New("injected exists failure")
+		// true alongside the error: code that ignores the error would take
+		// the input for present and go on to delete the output.
+		return true, errors.New("injected exists failure")
 	}
 	return b.Backend.Exists(ctx, path)
 }
