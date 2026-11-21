@@ -2,6 +2,15 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Improvement: on object storage, checking a day for daily files no longer lists everything under it ([#1810](https://github.com/Basekick-Labs/arc/issues/1810))
+
+For a time-ranged query on S3, Azure or GCS, Arc checks whether each day in the range holds daily files, which sit directly in the day's directory. It did that by listing every object under the day, hour directories included, and picking out the ones at the top. On a day with many files not yet compacted that is thousands of keys to answer yes or no, under a 5 second limit; when the limit ran out, the day's daily files were left out of the query (the query still answered).
+
+Arc now asks storage for that one level only. The answer is the day's hour directories plus its daily files, whatever the hours hold.
+
+- **Usually no extra request at all.** The check for which hours exist already lists the day's directory, and that same listing now says whether the day holds daily files.
+- **Measured** on SeaweedFS S3 with the built binary, a day holding 3,003 files in three hours plus one daily file, first query after start: listings of everything under the day went from 6 requests to 2, and the answer was the same. Query time on that local store did not change (0.63 s); the difference is requests, and on a large day, staying under the limit.
+- **Not changed:** if the listing still fails, that query still answers without the day's daily files, and the result is not remembered (#1809). The cold tier read makes the same one-level request for the day check but still lists the day separately for its hours.
 ## Fix: in a cluster with local storage, a compacted file's last copy is no longer removed when moving it into place fails ([#1807](https://github.com/Basekick-Labs/arc/issues/1807))
 
 **Who is affected:** clusters with local storage, replication on and staged compaction (#1207). Object storage and single nodes are unchanged.
