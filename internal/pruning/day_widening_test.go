@@ -36,10 +36,10 @@ func TestUnknownDayIsReadThroughOneRecursiveGlob(t *testing.T) {
 	if verified {
 		t.Error("verified = true although a day could not be listed")
 	}
-	// Two attempts at the day, not three: the retry stands in for the
-	// attempt the day-level check used to make by itself.
-	if n := b.callsFor(lvlDay); n != 2 {
-		t.Errorf("the day directory was listed %d times, want 2", n)
+	// One attempt at the day: the storage client retries by itself, and a
+	// second listing would only be more seconds against a failing store.
+	if n := b.callsFor(lvlDay); n != 1 {
+		t.Errorf("the day directory was listed %d times, want 1", n)
 	}
 
 	// Storage answers again: the day is planned normally.
@@ -64,19 +64,20 @@ func TestFailedDayListingIsNotRememberedAsEmpty(t *testing.T) {
 	}
 }
 
-// One failure, then an answer: the retry verifies the hours and the daily
-// files together, and nothing is widened.
-func TestDayListingRetryVerifiesTheDay(t *testing.T) {
+// Off s3:// the day-level check still makes its own attempt after the hour
+// check's listing failed, as before: when it answers, the day glob is kept
+// on a verified answer (the hours stay assumed).
+func TestDayCheckStillRetriesOffS3(t *testing.T) {
 	p, b := newLevelPruner(t, level{dirs: []string{"10"}, files: []string{"cpu_daily.parquet"}})
 	b.failFirst[lvlDay] = 1
-
-	got, verified, _ := p.filterExistingRemotePathsOpts(context.Background(), []string{lvlDayG, lvlHourG, lvlHour11G}, lvlBase, 0)
-	// Hour 11 does not exist and is dropped on the strength of the retry.
-	if want := []string{lvlDayG, lvlHourG}; !reflect.DeepEqual(got, want) {
+	const base = "gs://bucket"
+	day, hour := base+"/db/cpu/2025/01/15/*.parquet", base+"/db/cpu/2025/01/15/10/*.parquet"
+	got, _, _ := p.filterExistingRemotePathsOpts(context.Background(), []string{day, hour}, base, 0)
+	if want := []string{day, hour}; !reflect.DeepEqual(got, want) {
 		t.Errorf("paths = %v, want %v", got, want)
 	}
-	if !verified {
-		t.Error("verified = false although the retry answered")
+	if n := b.callsFor(lvlDay); n != 2 {
+		t.Errorf("the day directory was listed %d times, want 2", n)
 	}
 }
 

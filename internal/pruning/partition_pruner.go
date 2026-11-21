@@ -1093,18 +1093,13 @@ func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, pat
 			subdirs, err = lister.ListDirectories(listCtx, storagePrefix)
 		}
 		cancel()
-		if err != nil && hasLevel && isDayPrefix(storagePrefix) && ctx.Err() == nil {
+		if err != nil && hasLevel && isDayPrefix(storagePrefix) {
 			// The day's level listing answers for its hours and its daily
-			// files at once, so a failure leaves the whole day unknown. One
-			// more attempt, in place of the separate attempt the day-level
-			// check used to make for the same prefix: the request is small,
-			// and when it succeeds both answers are verified.
-			retryCtx, retryCancel := context.WithTimeout(ctx, 5*time.Second)
-			subdirs, levelFiles, err = level.ListLevel(retryCtx, storagePrefix)
-			retryCancel()
-			if err != nil {
-				unknownDays[storagePrefix] = true
-			}
+			// files at once, so a failure leaves the whole day unknown.
+			// Not retried here: the storage client has already retried the
+			// request, and each further attempt against a failing store is
+			// seconds of the query's time.
+			unknownDays[storagePrefix] = true
 		}
 		if err == nil && hasLevel && isDayPrefix(storagePrefix) {
 			direct := parquetNames(levelFiles)
@@ -1191,12 +1186,11 @@ func (p *PartitionPruner) filterExistingRemotePathsOpts(ctx context.Context, pat
 			// Check cache first for day-level file existence
 			cacheKey := "remote:dayfiles:" + prefix
 			var hasFiles bool
-			if unknownDays[prefix] {
-				// Its level listing already failed twice in this pass.
+			if unknownDays[prefix] && canWidenDay(path) {
+				// Its level listing already failed in this pass, and the
+				// day can be read without that answer: no second attempt.
 				verified = false
-				if canWidenDay(path) {
-					widened[dir] = true
-				}
+				widened[dir] = true
 				continue
 			} else if listed, ok := dayFiles[prefix]; ok {
 				hasFiles = len(listed) > 0
