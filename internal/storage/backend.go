@@ -192,6 +192,24 @@ type DirectoryLister interface {
 	ListDirectories(ctx context.Context, prefix string) ([]string, error)
 }
 
+// LevelLister lists ONE level under a prefix: the names of the directories
+// directly under it and of the objects directly in it, neither recursed into.
+// Both are bare names (one path segment), not keys.
+//
+// It is the listing ListDirectories already performs: an object store's
+// delimiter listing returns the level's own objects alongside its common
+// prefixes, and ListDirectories discards them. A caller that needs to know
+// whether a directory holds files of its own (as opposed to files somewhere
+// beneath it) asks this instead of List, whose cost is every object under
+// the prefix.
+//
+// files leaves out names this backend would refuse as a key segment and, on
+// local disk, dot-prefixed names, as List does for the keys it returns; a
+// name is never a deeper key. dirs is exactly ListDirectories' result.
+type LevelLister interface {
+	ListLevel(ctx context.Context, prefix string) (dirs []string, files []string, err error)
+}
+
 // BatchDeleter supports efficient batch deletion of multiple objects.
 // Implementations should handle batching internally (e.g., S3 supports up to 1000 objects per batch).
 type BatchDeleter interface {

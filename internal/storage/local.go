@@ -836,36 +836,47 @@ func (b *LocalBackend) ConfigJSON() string {
 // ListDirectories lists immediate subdirectories at a prefix.
 // Implements the DirectoryLister interface.
 func (b *LocalBackend) ListDirectories(ctx context.Context, prefix string) ([]string, error) {
+	dirs, _, err := b.ListLevel(ctx, prefix)
+	return dirs, err
+}
+
+var _ LevelLister = (*LocalBackend)(nil)
+
+// ListLevel implements LevelLister: one directory read, returning the
+// directories directly under prefix and the files directly in it.
+func (b *LocalBackend) ListLevel(ctx context.Context, prefix string) ([]string, []string, error) {
 	// Reject the prefix unless it names something inside the root
 	searchPath, err := b.validateListPath(prefix)
 	if err != nil {
-		return nil, fmt.Errorf("invalid prefix: %w", err)
+		return nil, nil, fmt.Errorf("invalid prefix: %w", err)
 	}
 
 	entries, err := os.ReadDir(searchPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return []string{}, nil
+			return []string{}, nil, nil
 		}
-		return nil, fmt.Errorf("failed to read directory: %w", err)
+		return nil, nil, fmt.Errorf("failed to read directory: %w", err)
 	}
 
-	var dirs []string
+	var dirs, files []string
 	for _, entry := range entries {
+		// Callers join this name into a key, so a name the contract would
+		// refuse produces an unusable key. Same rule as List (#743), and
+		// the same function, so the listings cannot drift apart about
+		// what they drop (#756). A name here is one segment, so it is
+		// both the base name and the relative path.
+		if omittedFromListing(entry.Name(), entry.Name()) != nil {
+			continue
+		}
 		if entry.IsDir() {
-			// Callers join this name into a key, so a name the contract would
-			// refuse produces an unusable key. Same rule as List (#743), and
-			// the same function, so the four listings cannot drift apart about
-			// what they drop (#756). A directory name is one segment, so it is
-			// both the base name and the relative path here.
-			if omittedFromListing(entry.Name(), entry.Name()) != nil {
-				continue
-			}
 			dirs = append(dirs, entry.Name())
+		} else {
+			files = append(files, entry.Name())
 		}
 	}
 
-	return dirs, nil
+	return dirs, files, nil
 }
 
 // DeleteBatch deletes multiple objects at the specified paths.

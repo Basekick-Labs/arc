@@ -775,7 +775,22 @@ func (b *AzureBlobBackend) ConfigJSON() string {
 // ListDirectories lists immediate subdirectories at a prefix.
 // Implements the DirectoryLister interface.
 // Uses Azure's hierarchy delimiter feature to efficiently list only "directories" (common prefixes).
-func (b *AzureBlobBackend) ListDirectories(ctx context.Context, prefix string) (_ []string, retErr error) {
+func (b *AzureBlobBackend) ListDirectories(ctx context.Context, prefix string) ([]string, error) {
+	dirs, _, err := b.listLevel(ctx, prefix, false)
+	return dirs, err
+}
+
+// ListLevel implements LevelLister: one hierarchy listing, returning the
+// level's directories and the blobs directly in it.
+func (b *AzureBlobBackend) ListLevel(ctx context.Context, prefix string) ([]string, []string, error) {
+	return b.listLevel(ctx, prefix, true)
+}
+
+var _ LevelLister = (*AzureBlobBackend)(nil)
+
+// listLevel is the hierarchy listing behind ListDirectories and ListLevel;
+// the level's own blobs are collected only when wantFiles is set.
+func (b *AzureBlobBackend) listLevel(ctx context.Context, prefix string, wantFiles bool) (_ []string, _ []string, retErr error) {
 	defer b.scrub(&retErr)
 	// Ensure prefix ends with / for proper directory listing (unless empty)
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
@@ -784,10 +799,10 @@ func (b *AzureBlobBackend) ListDirectories(ctx context.Context, prefix string) (
 
 	fullPrefix, err := b.prefixedListPrefix(prefix)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	var dirs []string
+	var dirs, files []string
 	delimiter := "/"
 
 	containerClient := b.client.ServiceClient().NewContainerClient(b.containerName)
@@ -797,12 +812,12 @@ func (b *AzureBlobBackend) ListDirectories(ctx context.Context, prefix string) (
 
 	for pager.More() {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		page, err := pager.NextPage(ctx)
 		if err != nil {
-			return nil, azureListError("failed to list Azure directories", err)
+			return nil, nil, azureListError("failed to list Azure directories", err)
 		}
 
 		// BlobPrefixes contains the "directories"
@@ -820,9 +835,24 @@ func (b *AzureBlobBackend) ListDirectories(ctx context.Context, prefix string) (
 				}
 			}
 		}
+
+		// BlobItems holds the blobs directly at this level. Same rule as
+		// List: a key this backend would refuse is left out.
+		for _, blobItem := range page.Segment.BlobItems {
+			if !wantFiles || blobItem.Name == nil {
+				continue
+			}
+			if _, err := b.prefixedKey(strings.TrimPrefix(*blobItem.Name, b.prefix)); err != nil {
+				continue
+			}
+			// A bare name only (see S3Backend.listLevel).
+			if name := strings.TrimPrefix(*blobItem.Name, fullPrefix); name != "" && !strings.Contains(name, "/") {
+				files = append(files, name)
+			}
+		}
 	}
 
-	return dirs, nil
+	return dirs, files, nil
 }
 
 // ListObjects lists blobs with their metadata at a prefix.

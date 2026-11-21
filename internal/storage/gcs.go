@@ -758,14 +758,29 @@ func (b *GCSBackend) ListUnusable(ctx context.Context, prefix string) ([]Unusabl
 // ListDirectories lists immediate subdirectories at a prefix, from the
 // listing's delimiter prefixes.
 func (b *GCSBackend) ListDirectories(ctx context.Context, prefix string) ([]string, error) {
+	dirs, _, err := b.listLevel(ctx, prefix, false)
+	return dirs, err
+}
+
+// ListLevel implements LevelLister: one delimiter listing, returning the
+// level's directories and the objects directly in it.
+func (b *GCSBackend) ListLevel(ctx context.Context, prefix string) ([]string, []string, error) {
+	return b.listLevel(ctx, prefix, true)
+}
+
+var _ LevelLister = (*GCSBackend)(nil)
+
+// listLevel is the delimiter listing behind ListDirectories and ListLevel;
+// the level's own objects are collected only when wantFiles is set.
+func (b *GCSBackend) listLevel(ctx context.Context, prefix string, wantFiles bool) ([]string, []string, error) {
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
 	fullPrefix, err := b.prefixedListPrefix(prefix)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var dirs []string
+	var dirs, files []string
 	err = b.listPages(ctx, fullPrefix, "/", func(page *gcs.Objects) bool {
 		for _, p := range page.Prefixes {
 			// Trim fullPrefix, not the caller's prefix: the names come back
@@ -775,12 +790,26 @@ func (b *GCSBackend) ListDirectories(ctx context.Context, prefix string) ([]stri
 				dirs = append(dirs, dir)
 			}
 		}
+		// Items holds the objects directly at this level. Same rule as List:
+		// a key this backend would refuse is left out.
+		for _, item := range page.Items {
+			if !wantFiles || item == nil {
+				continue
+			}
+			if _, err := b.prefixedKey(strings.TrimPrefix(item.Name, b.prefix)); err != nil {
+				continue
+			}
+			// A bare name only (see S3Backend.listLevel).
+			if name := strings.TrimPrefix(item.Name, fullPrefix); name != "" && !strings.Contains(name, "/") {
+				files = append(files, name)
+			}
+		}
 		return true
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return dirs, nil
+	return dirs, files, nil
 }
 
 // Close closes the GCS backend (no-op: the service holds no connections of

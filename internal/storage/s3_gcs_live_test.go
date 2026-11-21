@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -78,6 +79,19 @@ func TestS3GCSInterop(t *testing.T) {
 					dirs, err := backend.ListDirectories(ctx, "")
 					if err != nil || len(dirs) != 1 {
 						t.Fatalf("ListDirectories: count=%d err=%v", len(dirs), err)
+					}
+					// One level at a time: the root holds a directory and no
+					// object of its own; the object's directory holds exactly
+					// that object, by its bare name.
+					var level LevelLister = backend
+					if d, f, err := level.ListLevel(ctx, ""); err != nil || len(d) != 1 || len(f) != 0 {
+						t.Fatalf("ListLevel(root): dirs=%v files=%v err=%v", d, f, err)
+					}
+					if i := strings.LastIndex(name, "/"); i >= 0 {
+						d, f, err := level.ListLevel(ctx, name[:i+1])
+						if err != nil || len(d) != 0 || len(f) != 1 || f[0] != name[i+1:] {
+							t.Fatalf("ListLevel(%q): dirs=%v files=%v err=%v, want only %q", name[:i+1], d, f, err, name[i+1:])
+						}
 					}
 					found, err := backend.HasObjectsUnderPrefix(ctx, "")
 					if err != nil || !found {
