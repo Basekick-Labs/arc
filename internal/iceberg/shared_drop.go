@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"path"
 	"strings"
@@ -34,9 +35,13 @@ import (
 // per database, in the reserved marker root, that every node reads:
 //
 //   - The dropping node writes it before it lists anything, with a new id
-//     and "not done", and rewrites it "done" when the drop has finished. The
-//     record stays from then on, also when the drop found nothing to remove:
-//     a first export may be about to create the table.
+//     and "not done", and rewrites it "done" when it has stopped deleting:
+//     at the drop's end, or when the drop failed with its context still live
+//     (an expired or cancelled one can leave deletes in flight, and keeps the
+//     record "running" until it is stale). The record stays from then on,
+//     also when the drop found nothing to remove: a first export may be
+//     about to create the table. A restore does not remove it either
+//     (#1796): what it brought back is judged against it like anything else.
 //   - The exporting node reads it in each pass that is about to read or
 //     write a table of that database (not in one that finds the table's
 //     files unchanged). While a drop is running it gives way, as it does for
@@ -72,8 +77,10 @@ import (
 // (icebergIngestInterval, cmd/arc/cluster_topology.go); the exporting node
 // runs timed passes only.
 //
-// The per-table drop markers (dropped.go) stay what they were: what lets a
-// node forget a catalog row whose metadata is gone.
+// The per-table drop markers (dropped.go) are what lets a node forget a
+// catalog row whose metadata is gone. While one is set the #1613 fallbacks
+// are off, as during a drop; the record says when that drop is over
+// (dropInProgress, #1799).
 
 // tableDropIDProp is the table property holding the id of the database's
 // drop record when the table was created; absent when there was none.
@@ -90,7 +97,10 @@ var dropRecordStale = 15 * time.Minute
 type dropRecord struct {
 	ID      string    `json:"id"`
 	Started time.Time `json:"started"`
-	Done    bool      `json:"done"`
+	// Done: the dropping node has stopped deleting, at Finished: the drop
+	// ended, or failed in a way that leaves no delete in flight (DropDatabase).
+	Done     bool      `json:"done"`
+	Finished time.Time `json:"finished,omitzero"`
 }
 
 // dropRecordKey is the storage key of a database's drop record. "%drop" is
@@ -148,6 +158,24 @@ func (e *Exporter) beginDropRecord(ctx context.Context, database string) (dropRe
 	return rec, true, nil
 }
 
+// stopped is when the drop of rec stopped deleting, and whether it has: at
+// Finished when it is done, at its deadline when it is stale (a dropping node
+// that died), not yet when it is running.
+func (rec dropRecord) stopped() (time.Time, bool) {
+	switch {
+	case rec.Done:
+		if rec.Finished.IsZero() {
+			// Written by a build without Finished: the drop's markers are
+			// stamped before its deadline, which it never ran past.
+			return dropDeadline(rec.Started), true
+		}
+		return rec.Finished, true
+	case time.Since(rec.Started) >= dropRecordStale:
+		return dropDeadline(rec.Started), true
+	}
+	return time.Time{}, false
+}
+
 // dropDeadline is when a drop whose record began at started stops deleting:
 // half of what the record is believed for, the other half being what the
 // nodes' clocks may differ by.
@@ -158,17 +186,20 @@ func dropDeadline(started time.Time) time.Time { return started.Add(dropRecordSt
 // A failure is logged and not returned: the tables are dropped, and all the
 // record still does is hold the database's export back until it is stale.
 func (e *Exporter) finishDropRecord(ctx context.Context, database string, mine dropRecord) {
+	// Also when the drop's own context has ended (it failed on it).
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dropEndCheckTimeout)
+	defer cancel()
 	cur, exists, err := e.readDropRecord(ctx, database)
 	if err == nil && exists && cur.ID != mine.ID {
 		return
 	}
 	if err == nil {
-		mine.Done = true
+		mine.Done, mine.Finished = true, time.Now().UTC()
 		err = e.writeDropRecord(ctx, database, mine)
 	}
 	if err != nil {
 		e.logger.Warn().Err(err).Str("database", database).Dur("paused_for_up_to", dropRecordStale).
-			Msg("Iceberg: the database's tables were dropped, but the drop's record could not be marked done; the export of a database written again under this name waits until the record is stale")
+			Msg("Iceberg: the drop's record could not be marked done; the export of a database written again under this name waits until the record is stale")
 	}
 }
 
@@ -208,7 +239,7 @@ func (e *Exporter) settleDroppedTable(ctx context.Context, database, measurement
 	if canCommit != nil && !canCommit() {
 		return nil
 	}
-	return e.removeTableOfAnEarlierDrop(ctx, database, measurement, rec.ID)
+	return e.removeTableOfAnEarlierDrop(ctx, database, measurement, rec)
 }
 
 // noteDropSeen remembers that the table carries the drop record id.
@@ -225,7 +256,8 @@ func (e *Exporter) noteDropSeen(database, measurement, id string) {
 // before the drop whose record has id: its metadata objects and its catalog
 // row. A table with no row here, one that does not load, and one created
 // under id are left to the pass.
-func (e *Exporter) removeTableOfAnEarlierDrop(ctx context.Context, database, measurement, id string) error {
+func (e *Exporter) removeTableOfAnEarlierDrop(ctx context.Context, database, measurement string, rec dropRecord) error {
+	id := rec.ID
 	// The table as the warehouse has it, where another node published it
 	// since this node's row was written (or this node has no row): what is
 	// judged, and removed, is what the pass would load.
@@ -239,8 +271,25 @@ func (e *Exporter) removeTableOfAnEarlierDrop(ctx context.Context, database, mea
 		return err
 	}
 	tbl, err := e.catalog.LoadTable(ctx, ident)
+	if errors.Is(err, fs.ErrNotExist) {
+		// A row whose metadata is gone, which the drop deleted: recovered
+		// here (dropped.go), before the pass reads anything of the table,
+		// so that what was cached of it is let go of in time.
+		recovered, rerr := e.recoverDeadRow(ctx, ident)
+		if rerr != nil || !recovered {
+			return rerr
+		}
+		// Moved onto a published version (a restore, another node's
+		// table): judged like any other below. Forgotten: nothing left.
+		if loc, rowExists, err = e.catalogRow(ctx, nsKey, measurement); err != nil || !rowExists {
+			return err
+		}
+		if tbl, err = e.catalog.LoadTable(ctx, ident); err != nil {
+			return nil // the pass's own load reports it
+		}
+	}
 	if err != nil {
-		return nil // a row whose metadata is gone: dropped.go's recovery
+		return nil // the pass's own load reports it
 	}
 	if tbl.Properties()[tableDropIDProp] == id {
 		e.noteDropSeen(database, measurement, id)
@@ -251,7 +300,12 @@ func (e *Exporter) removeTableOfAnEarlierDrop(ctx context.Context, database, mea
 	// metadata is gone, and only the marker lets a later pass (here or on a
 	// node that exported the table before) forget it (dropped.go). The
 	// overlapped pass's own publish may have cleared the drop's marker.
-	if err := e.backend.Write(ctx, droppedMarkerKey(nsKey, measurement), []byte(time.Now().UTC().Format(time.RFC3339))); err != nil {
+	// Stamped with when the drop stopped, not now: the marker is that
+	// drop's, and must not read as one of a drop still running
+	// (dropInProgress). A record still running gives the zero time, which
+	// reads as running anyway.
+	at, _ := rec.stopped()
+	if err := e.backend.Write(ctx, droppedMarkerKey(nsKey, measurement), []byte(at.UTC().Format(time.RFC3339)+"\n")); err != nil {
 		return fmt.Errorf("write the drop marker of %s.%s: %w", database, measurement, err)
 	}
 	e.publishedMu.Lock()
@@ -283,13 +337,13 @@ func (e *Exporter) removeTableOfAnEarlierDrop(ctx context.Context, database, mea
 		return err
 	}
 	e.removeEmptiedTableDirs(ctx, database, tbl.MetadataLocation())
-	// What this node remembered of the table, and of its database's tables
-	// for the scheduler: as after a drop in this process.
-	e.countDatabaseDrop(database)
-	e.forgetDatabaseMemory(database)
-	if e.onDatabaseDropped != nil {
-		e.onDatabaseDropped(database)
-	}
+	// What this node remembered of the table, and the stamp the scheduler
+	// compares its cache with: of this table only, the database's other
+	// tables are not touched. The scheduler's own per-table bookkeeping
+	// for ingest appends is not told: there are no appends where drop
+	// records are kept (shared_drop.go's header).
+	e.countTableRemoval(database, measurement)
+	e.forgetTableMemory(database, measurement)
 	return nil
 }
 
@@ -347,7 +401,7 @@ func (e *Exporter) droppedUnderPass(ctx context.Context, database, measurement s
 	if canCommit != nil && !canCommit() {
 		return false // no longer the exporter: the node that is decides
 	}
-	if err := e.removeTableOfAnEarlierDrop(ctx, database, measurement, rec.ID); err != nil {
+	if err := e.removeTableOfAnEarlierDrop(ctx, database, measurement, rec); err != nil {
 		e.logger.Warn().Err(err).Str("database", database).Str("measurement", measurement).
 			Msg("Iceberg: could not remove a table whose database was dropped on another node during its pass; the next pass tries again")
 	}

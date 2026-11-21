@@ -514,8 +514,10 @@ func TestSharedDrop1792_TheEndOfAPassWhoseDatabaseWasDropped(t *testing.T) {
 	}
 	var told []string
 	b.SetOnDatabaseDropped(func(db string) { told = append(told, db) })
-	drops := b.databaseDrops("mydb")
+	stamp, other := b.tableDropStamp("mydb", "cpu"), b.tableDropStamp("mydb", "mem")
 	b.setSmallManifests("mydb\x00cpu", 2)
+	b.setSmallManifests("mydb\x00mem", 3)
+	b.noteLeftAt("mydb\x00cpu", "somewhere")
 	// With the pass's own context already ended: a pass that ran out of
 	// time after a commit still has to look.
 	ended, cancel := context.WithCancel(ctx)
@@ -526,14 +528,23 @@ func TestSharedDrop1792_TheEndOfAPassWhoseDatabaseWasDropped(t *testing.T) {
 	if left, _ := os.ReadDir(r.metaDir()); len(left) != 0 {
 		t.Fatalf("%d objects of the dropped table are left", len(left))
 	}
-	if b.databaseDrops("mydb") != drops+1 {
-		t.Error("the exporter did not count the drop: a pass would trust what was cached for the dropped table")
+	if b.tableDropStamp("mydb", "cpu") == stamp {
+		t.Error("the removal did not move the table's stamp: a pass would trust what was cached for the removed table")
+	}
+	if b.tableDropStamp("mydb", "mem") != other {
+		t.Error("the removal of one table moved another table's stamp: its cache would be thrown away")
 	}
 	if _, ok := b.smallManifests("mydb\x00cpu"); ok {
-		t.Error("the exporter kept what it knew of the dropped table")
+		t.Error("the exporter kept what it knew of the removed table")
 	}
-	if len(told) != 1 || told[0] != "mydb" {
-		t.Errorf("the scheduler was told %v, want mydb once", told)
+	if _, ok := b.leftAtLoc("mydb\x00cpu"); ok {
+		t.Error("the exporter kept where an append left the removed table")
+	}
+	if n, ok := b.smallManifests("mydb\x00mem"); !ok || n != 3 {
+		t.Error("the exporter forgot what it knew of another table of the database")
+	}
+	if len(told) != 0 {
+		t.Errorf("the scheduler was told the whole database %v was dropped, for one table removed", told)
 	}
 	// The same record again is not another drop.
 	b.dropID = rec.ID

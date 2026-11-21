@@ -185,7 +185,7 @@ func (e *Exporter) adoptPublished(ctx context.Context, ident icetable.Identifier
 
 	vKey := path.Join(dirKey, "v"+strconv.Itoa(target)+".metadata.json")
 	body, err := e.backend.Read(ctx, vKey)
-	if err != nil && storage.IsNotFound(err) && rowExists && target == hintN && !e.dropInProgress(ctx, nsKey, measurement) {
+	if err != nil && storage.IsNotFound(err) && rowExists && target == hintN && !e.dropInProgress(ctx, database, nsKey, measurement) {
 		// The hint names a version that is not there: a backup copies the
 		// hint as it is at copy time, which can be newer than the v<N> files
 		// it listed (#1613). Decide again, once, from the newest v<N>
@@ -218,14 +218,47 @@ func (e *Exporter) adoptPublished(ctx context.Context, ident icetable.Identifier
 		return false, err
 	}
 	newLoc := dirLoc + "/v" + strconv.Itoa(target) + ".metadata.json"
+	// Another lineage than the row's (its file gone, or another
+	// table-uuid): read before the row moves.
+	otherLineage := rowExists && e.otherLineage(ctx, rowLoc, body)
 	if err := e.pointCatalogRow(ctx, nsKey, measurement, rowLoc, rowExists, newLoc); err != nil {
 		return false, err
+	}
+	if otherLineage {
+		// What the scheduler cached of the table, and what the export
+		// learnt of working on it, are of the old lineage (#1801): a
+		// table recreated by another node with a column of another type
+		// was otherwise exported here with the old one's.
+		e.countTableRemoval(database, measurement)
+		e.forgetTableWork(database, measurement)
 	}
 	e.markPublished(ident, newLoc)
 	e.logger.Warn().Str("table", strings.Join(ident, ".")).Int("from_version", rowN).Int("to_version", target).
 		Bool("had_row", rowExists).
 		Msg("Iceberg: adopted the table version published in the warehouse (another node advanced the table, or this node's catalog row was missing)")
 	return true, nil
+}
+
+// otherLineage reports whether the published metadata body is another
+// table than the row's: the row's file is gone or unreadable, or carries
+// another table-uuid. Unsure counts as another: it only costs the scheduler
+// one look at the table.
+func (e *Exporter) otherLineage(ctx context.Context, rowLoc string, body []byte) bool {
+	key, ok := e.warehouseRelKey(rowLoc)
+	if !ok {
+		return true
+	}
+	rowUUID, err := e.tableUUIDAt(ctx, key)
+	if err != nil || rowUUID == "" {
+		return true
+	}
+	var meta struct {
+		TableUUID string `json:"table-uuid"`
+	}
+	if err := json.Unmarshal(body, &meta); err != nil {
+		return true
+	}
+	return meta.TableUUID != rowUUID
 }
 
 // sameTableLineage reports whether v<newest> carries the table-uuid of the

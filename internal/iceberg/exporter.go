@@ -591,7 +591,7 @@ func (e *Exporter) tableExists(ctx context.Context, database, measurement string
 			return false, err
 		}
 		if coloc, cerr := e.colocatedTableLocation(database, measurement); cerr == nil && sameLocation(dir, coloc+"/metadata") &&
-			(!e.forgetDroppedRows || e.dropInProgress(ctx, nsKey, measurement)) {
+			(!e.forgetDroppedRows || e.markerSet(ctx, nsKey, measurement)) {
 			return false, nil
 		}
 	}
@@ -2377,8 +2377,10 @@ func isAlreadyExists(err error) bool {
 // On a shared bucket the exports run on another node, which that lock does
 // not hold: the drop writes the database's drop record first, stops deleting
 // at dropDeadline, and marks the record done at its end (shared_drop.go,
-// #1792). A drop that fails or runs out of time leaves the record "running",
-// and re-run (the DELETE repeated) starts a new one.
+// #1792), also when it fails, unless its context ended (it ran out of time,
+// or its request went away): then deletes may still be in flight, the record
+// stays "running" until it is stale, and the DELETE repeated starts a new
+// one.
 func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 	ctx = e.withAWS(ctx)
 	if strings.ContainsAny(database, "/\\") {
@@ -2414,8 +2416,18 @@ func (e *Exporter) DropDatabase(ctx context.Context, database string) error {
 		dctx, cancel := context.WithDeadline(ctx, dropDeadline(rec.Started))
 		defer cancel()
 		if err := e.dropDatabase(dctx, database); err != nil {
-			// The record stays "not done": the database's export waits for
-			// the DELETE to be repeated, or for the record to go stale.
+			// A drop that failed has stopped deleting, unless it failed on
+			// its context: a backend need not end a delete when its context
+			// does, and the record's half-life margin is what covers those
+			// (dropDeadline). So the record is finished now (the exporting
+			// node then removes what predates it, whenever the database is
+			// written again) except after a deadline or a cancel, where it
+			// stays "running" until it is stale.
+			// The drop's context, not the error: a delete that failed on
+			// it can hide behind an earlier error the drop kept instead.
+			if dctx.Err() == nil {
+				e.finishDropRecord(ctx, database, rec)
+			}
 			return err
 		}
 		// Kept also when the drop found nothing: a first export of one of
