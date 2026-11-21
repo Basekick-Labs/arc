@@ -24,8 +24,8 @@ func poolMetricInt(t *testing.T, key string) int64 {
 // TestSampleDBStats_PublishesPoolGauges pins that the pool gauges are sampled
 // from the wired source.
 //
-// Regression test for #809: arc_db_connections_open, _in_use and _queries_total
-// were exported and never set, so /metrics and the `pool` block of
+// Regression test for #809: arc_db_connections_open and _in_use were exported
+// and never set, so /metrics and the `pool` block of
 // /api/v1/metrics/query-pool reported zeros forever. Any "is DuckDB saturated?"
 // dashboard built on connections_in_use / connections_open was 0/0.
 func TestSampleDBStats_PublishesPoolGauges(t *testing.T) {

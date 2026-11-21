@@ -158,17 +158,23 @@ type Metrics struct {
 	dbConnectionsIdle  atomic.Int64
 	dbWaitCount        atomic.Int64 // Cumulative connections waited for
 	dbWaitMicros       atomic.Int64 // Cumulative time blocked waiting, microseconds
-	// dbQueriesTotal and dbQueryErrorsTotal are NOT wired, deliberately.
+	// There is deliberately no DuckDB-level query counter. db_queries_total
+	// and db_query_errors_total existed and were never incremented.
+	// arc_db_queries_total left /metrics in #802 (the error counter was never
+	// on it); both left the JSON snapshot, the `api` timeseries and
+	// /api/v1/metrics/query-pool in #1747, where they had still been served
+	// as a permanent 0.
 	//
-	// Counting them at the DuckDB wrapper (DuckDB.Query/QueryContext/Exec)
-	// misses the hot path: shipped builds answer queries through
+	// Counting at the DuckDB wrapper (DuckDB.Query/QueryContext/Exec) would
+	// miss the hot path: shipped builds answer queries through
 	// DuckDB.ArrowQueryContext (and the arcx engine, when built), which never
 	// pass through those wrappers. A counter named "total" that silently
-	// omits most queries is the failure mode #801 was filed for, so it is
-	// better absent than partial. Use arc_query_requests_total / arc_query_errors_total,
-	// which are counted at every API entry point (#809).
-	dbQueriesTotal     atomic.Int64
-	dbQueryErrorsTotal atomic.Int64
+	// omits most queries is the failure mode #801 was filed for, and one that
+	// is never incremented reads as "this node served no queries". Better
+	// absent than partial. Use arc_query_requests_total / arc_query_errors_total
+	// (query_requests_total / query_errors_total in the snapshot), which are
+	// counted at every API entry point (#809). Do not re-add a DuckDB-level
+	// counter without counting on every query path.
 
 	// MQTT metrics
 	mqttMessagesReceived atomic.Int64
@@ -729,9 +735,6 @@ func (m *Metrics) SetDBPoolStats(st sql.DBStats) {
 	m.dbWaitCount.Store(st.WaitCount)
 	m.dbWaitMicros.Store(st.WaitDuration.Microseconds())
 }
-
-func (m *Metrics) IncDBQueries()     { m.dbQueriesTotal.Add(1) }
-func (m *Metrics) IncDBQueryErrors() { m.dbQueryErrorsTotal.Add(1) }
 
 // Audit Metrics
 //
@@ -1415,8 +1418,6 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"db_wait_micros":        m.dbWaitMicros.Load(),
 		"db_connections_in_use": m.dbConnectionsInUse.Load(),
 		"db_connections_idle":   m.dbConnectionsIdle.Load(),
-		"db_queries_total":      m.dbQueriesTotal.Load(),
-		"db_query_errors_total": m.dbQueryErrorsTotal.Load(),
 
 		// Audit
 		"audit_events_total":   m.auditEventsTotal.Load(),

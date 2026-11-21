@@ -2,6 +2,20 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: the JSON metrics no longer report a query count that is always 0 ([#1747](https://github.com/Basekick-Labs/arc/issues/1747))
+
+**Who is affected:** anyone reading the keys below from Arc's JSON metrics endpoints: dashboards, scripts, or an agent through the arc-mcp `arc_query_pool_metrics` or `arc_metrics` tools. They always read `0`, because nothing ever counted them, and they are now gone from the response. **This is a response-shape change**: a client that requires these keys must stop reading them. Prometheus `/metrics` (text format) is unchanged: it stopped serving `arc_db_queries_total` in v26.09.2 (#802) and never served a DuckDB-level error counter.
+
+| Endpoint | Removed keys | Read instead |
+|---|---|---|
+| `GET /api/v1/metrics/query-pool` | `pool.queries_total`, `pool.query_errors_total` | `pool.query_requests`, `pool.query_success`, `pool.query_errors` (same object) |
+| `GET /api/v1/metrics`, and `GET /metrics` with `Accept: application/json` | `db_queries_total`, `db_query_errors_total` | `query_requests_total`, `query_success_total`, `query_errors_total` |
+| `GET /api/v1/metrics/timeseries/api` | `db_queries_total`, `db_query_errors_total` | `query_requests_total` in `GET /api/v1/metrics/timeseries/application`; no series carries query errors, so read `query_errors_total` from the snapshot |
+
+Why they read 0: nothing ever incremented them. They were meant to count queries at Arc's DuckDB wrapper, but most queries run through DuckDB's Arrow path and the arcx engine, which never pass through it, so #802 removed the Prometheus counter rather than wire a partial count. The JSON endpoints kept serving them. On the query-pool endpoint this put `queries_total: 0` next to a real `query_requests`, and `query_errors_total` (always `0`) next to the real `query_errors`. A panel built on the wrong one stayed at zero, and `queries_total` read as "this node served no queries".
+
+The counters that replace them are counted at every query entry point (`POST /api/v1/query`, `GET /api/v1/query/:measurement`, `/api/v1/query/arrow`, msgpack, Flight SQL). The `connections_*` pool fields are unchanged.
+
 ## Fix: a sum or a stored decimal beyond the int64 range is answered as a 400 with the reason ([#1784](https://github.com/Basekick-Labs/arc/issues/1784))
 
 **Who is affected:** only queries that already failed. A query whose result contains a scale-0 decimal value outside the int64 range (−9,223,372,036,854,775,808 to 9,223,372,036,854,775,807), such as `sum()` of a large integer column or a `DECIMAL(38,0)` column stored with `ingest.decimal_columns` (#276), now gets an error status with a clear reason instead of an empty or cut result. **Every query that returned a complete result before returns exactly the same now.**

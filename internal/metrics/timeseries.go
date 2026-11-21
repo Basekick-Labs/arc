@@ -195,8 +195,6 @@ func (c *TimeSeriesCollector) collect() {
 			"query_latency_avg_us":  calculateAvgLatency(m.queryLatencySum.Load(), m.queryLatencyCount.Load()),
 			"db_connections_open":   m.dbConnectionsOpen.Load(),
 			"db_connections_in_use": m.dbConnectionsInUse.Load(),
-			"db_queries_total":      m.dbQueriesTotal.Load(),
-			"db_query_errors_total": m.dbQueryErrorsTotal.Load(),
 			"auth_requests_total":   m.authRequestsTotal.Load(),
 			"auth_cache_hits":       m.authCacheHits.Load(),
 			"auth_cache_misses":     m.authCacheMisses.Load(),
