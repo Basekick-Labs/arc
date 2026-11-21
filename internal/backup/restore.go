@@ -354,6 +354,30 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 	// the final Lost check below, with a fresh context because the run's own
 	// may be done by then. The pause expires on its own within its TTL if
 	// this process dies, so a failed resume is a warning, not a failure.
+	// A restore that stages a catalog pauses the Iceberg export before it
+	// writes anything, until the restart that applies the catalog (#1813):
+	// the export's commits in between are thrown away at the restart, and on
+	// a warehouse outside the storage root they can delete the metadata file
+	// the restored row points at. Lifted only if the catalog is not staged.
+	catalogStaged := false
+	if opts.RestoreMetadata && manifest.HasMetadata && m.icebergPauser != nil {
+		resume, err := m.icebergPauser.PauseExportForRestore(ctx, "restore "+opts.BackupID)
+		if err != nil {
+			err = fmt.Errorf("restore refused: %w", err)
+			progress.Status = "failed"
+			progress.Error = err.Error()
+			return nil, err
+		}
+		progress.IcebergExportPause = "paused_until_restart"
+		m.setProgress(progress)
+		defer func() {
+			if !catalogStaged {
+				resume()
+				progress.IcebergExportPause = "resumed"
+			}
+		}()
+	}
+
 	var pause CompactionPause
 	if opts.RestoreData && m.cluster != nil {
 		progress.CompactionPause = "waiting"
@@ -433,6 +457,7 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 			progress.Error = err.Error()
 			return nil, fmt.Errorf("failed to restore SQLite database: %w", err)
 		}
+		catalogStaged = true
 	}
 
 	// ── 4. Restore config ───────────────────────────────────────────────
@@ -993,6 +1018,7 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 		m.setProgress(progress)
 	}()
 
+	discovery := newDiscoveryGuard(m.dataStorage)
 	for _, leg := range legs {
 		for _, srcPath := range leg.files {
 			select {
@@ -1016,6 +1042,29 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 			if alreadyCold[destPath] {
 				atomic.AddInt64(&progress.ColdFilesSkippedAlreadyCold, 1)
 				m.setProgress(progress)
+				continue
+			}
+			// An Iceberg version-hint.text or v<N>.metadata.json: never over
+			// a live hint's directory, and never over a file already there
+			// (#1813, discoveryGuard).
+			if isIcebergDiscoveryFile(destPath) {
+				written, n, err := m.restoreDiscoveryFile(ctx, discovery, leg.target, srcPath, destPath)
+				if err != nil {
+					if !isRestoreReadError(err) {
+						return fmt.Errorf("failed to restore %s: %w", srcPath, err)
+					}
+					skipped++
+					if len(sample) < unaddressableSampleCap {
+						sample = append(sample, srcPath)
+					}
+					m.logger.Warn().Str("path", srcPath).Err(err).Msg("Failed to read backup file, skipping")
+					continue
+				}
+				if !written {
+					atomic.AddInt64(&progress.IcebergDiscoveryFilesKept, 1)
+				}
+				atomic.AddInt64(&progress.ProcessedFiles, 1)
+				atomic.AddInt64(&progress.ProcessedBytes, n)
 				continue
 			}
 

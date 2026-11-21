@@ -5851,6 +5851,11 @@ func main() {
 					log.Warn().Msg("Cluster coordinator has no Raft file manifest: backups run without the manifest cross-check and restores register nothing")
 				}
 			}
+			if icebergExporter != nil {
+				// A restore that stages a catalog pauses the export until the
+				// restart that applies it (#1813).
+				backupManager.SetIcebergExportPauser(icebergExporter)
+			}
 			if tieringManager != nil {
 				backupManager.SetTierRecorder(tieringManager)
 				// The known-database check of a scoped backup (#1084) asks

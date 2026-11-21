@@ -243,6 +243,7 @@ type exporterShared struct {
 	// dbLocks keeps a database's tables from being exported and dropped at
 	// once, and onDatabaseDropped is told after a drop (database_lock.go).
 	dbLocks           databaseLocks
+	restorePause      exportPause // a restore staging a catalog (restore_pause.go, #1813)
 	onDatabaseDropped func(database string)
 	// dropAfterListing, when set, runs inside a drop once it has listed what
 	// it will delete and written its markers, before it deletes anything.

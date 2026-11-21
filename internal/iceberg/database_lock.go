@@ -170,28 +170,44 @@ var errDatabaseBeingDropped = errors.New("iceberg: the database is being dropped
 // waiting its turn, keeps an export out, and then it returns
 // errDatabaseBeingDropped.
 func (e *Exporter) holdDatabase(database string) (release func(), err error) {
+	// While a restore stages a catalog no export starts (restore_pause.go).
+	// The pass gives way as it does to a drop, and is tried again after the
+	// restart.
+	paused, err := e.holdExport()
+	if err != nil {
+		return nil, fmt.Errorf("database %q: %w: %w", database, errDatabaseBeingDropped, err)
+	}
 	sem := e.dbLocks.of(database)
 	if !sem.TryAcquire(1) {
+		paused()
 		return nil, fmt.Errorf("database %q: %w", database, errDatabaseBeingDropped)
 	}
-	return func() { sem.Release(1) }, nil
+	return func() { sem.Release(1); paused() }, nil
 }
 
 // lockDatabaseForDrop holds the database's lock alone, once no export of
 // its tables is running, and returns the release. It gives up after
 // dropLockWait or when ctx ends, whichever is first.
 func (e *Exporter) lockDatabaseForDrop(ctx context.Context, database string) (release func(), err error) {
+	// Not while a restore stages a catalog (restore_pause.go): the restored
+	// catalog would bring back rows for the tables this drop deletes.
+	paused, err := e.holdExport()
+	if err != nil {
+		return nil, fmt.Errorf("the Iceberg tables of database %q were not dropped because a restore is waiting for the server to restart; "+
+			"repeat the DELETE after the restart to drop them: %w", database, err)
+	}
 	sem := e.dbLocks.of(database)
 	if sem.TryAcquire(databaseLockShares) {
-		return func() { sem.Release(databaseLockShares) }, nil
+		return func() { sem.Release(databaseLockShares); paused() }, nil
 	}
 	wctx, cancel := context.WithTimeout(ctx, dropLockWait)
 	defer cancel()
 	if err := sem.Acquire(wctx, databaseLockShares); err != nil {
+		paused()
 		return nil, fmt.Errorf("an Iceberg export of database %q was still running and its tables were not dropped; "+
 			"repeat the DELETE to drop them: %w", database, err)
 	}
-	return func() { sem.Release(databaseLockShares) }, nil
+	return func() { sem.Release(databaseLockShares); paused() }, nil
 }
 
 // forgetDatabaseMemory drops what the exporter remembers of a dropped

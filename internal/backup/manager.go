@@ -96,7 +96,10 @@ type Manager struct {
 	// "Iceberg is off here and the catalog rows are inert".
 	icebergWarehouseConfigured string
 	icebergEnabled             bool
-	icebergNSPrefix            string
+	// icebergPauser stops the Iceberg export while a restore stages a
+	// catalog (#1813); nil when export is off or not wired.
+	icebergPauser   IcebergExportPauser
+	icebergNSPrefix string
 	// icebergWarehouseKeyPrefix is the storage key prefix of an under-root
 	// warehouse: "" when the warehouse IS the storage root (the default) and
 	// "<sub>/" when it is a subdirectory of it (#534 layout). Only a scoped

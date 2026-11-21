@@ -412,7 +412,11 @@ type Progress struct {
 	// restore left out because this node has no Iceberg warehouse outside its
 	// storage root to put them in (the log names the fix).
 	IcebergWarehouseFilesSkipped int64 `json:"iceberg_warehouse_files_skipped,omitempty"`
-	BackupUnaddressableFiles     int64 `json:"backup_unaddressable_files,omitempty"`
+	// IcebergDiscoveryFilesKept counts Iceberg version-hint.text and
+	// v<N>.metadata.json files a restore did not write because the table's
+	// metadata directory here already has a live hint (#1813). Restore only.
+	IcebergDiscoveryFilesKept int64 `json:"iceberg_discovery_files_kept,omitempty"`
+	BackupUnaddressableFiles  int64 `json:"backup_unaddressable_files,omitempty"`
 	// ColdFilesExcluded: for a backup, the run-level cold-tier gap, published
 	// once with the other pre-copy decisions — which is BEFORE the copy
 	// phase, so a run that fails later keeps the figure here beside
@@ -496,22 +500,26 @@ type Progress struct {
 	// publishes a SHALLOW copy, so every published snapshot shares this slice
 	// header, and an element written after publication races every reader. The
 	// same reason SkippedSample is handed over once and never appended to.
-	Targets                   []TargetProgress `json:"targets,omitempty"`
-	Mode                      string           `json:"mode,omitempty"`
-	FilesRegistered           int64            `json:"files_registered,omitempty"`
-	RegistrationFailed        int64            `json:"registration_failed,omitempty"`
-	RegistrationFailedSample  []string         `json:"registration_failed_sample,omitempty"`
-	SidecarMismatches         int64            `json:"sidecar_mismatches,omitempty"`
-	SidecarMismatchSample     []string         `json:"sidecar_mismatch_sample,omitempty"`
-	ReplacedFiles             int64            `json:"replaced_files,omitempty"`
-	CompactionPause           string           `json:"compaction_pause,omitempty"`
-	BackupUnregisteredSkipped int64            `json:"backup_unregistered_skipped,omitempty"`
-	BackupManifestOnlyFiles   int64            `json:"backup_manifest_only_files,omitempty"`
-	TotalBytes                int64            `json:"total_bytes"`
-	ProcessedBytes            int64            `json:"processed_bytes"`
-	StartedAt                 time.Time        `json:"started_at"`
-	CompletedAt               *time.Time       `json:"completed_at,omitempty"`
-	Error                     string           `json:"error,omitempty"`
+	Targets                  []TargetProgress `json:"targets,omitempty"`
+	Mode                     string           `json:"mode,omitempty"`
+	FilesRegistered          int64            `json:"files_registered,omitempty"`
+	RegistrationFailed       int64            `json:"registration_failed,omitempty"`
+	RegistrationFailedSample []string         `json:"registration_failed_sample,omitempty"`
+	SidecarMismatches        int64            `json:"sidecar_mismatches,omitempty"`
+	SidecarMismatchSample    []string         `json:"sidecar_mismatch_sample,omitempty"`
+	ReplacedFiles            int64            `json:"replaced_files,omitempty"`
+	CompactionPause          string           `json:"compaction_pause,omitempty"`
+	// IcebergExportPause is "paused_until_restart" when a restore that stages
+	// a catalog paused the Iceberg export, "resumed" when it failed before
+	// staging it (#1813).
+	IcebergExportPause        string     `json:"iceberg_export_pause,omitempty"`
+	BackupUnregisteredSkipped int64      `json:"backup_unregistered_skipped,omitempty"`
+	BackupManifestOnlyFiles   int64      `json:"backup_manifest_only_files,omitempty"`
+	TotalBytes                int64      `json:"total_bytes"`
+	ProcessedBytes            int64      `json:"processed_bytes"`
+	StartedAt                 time.Time  `json:"started_at"`
+	CompletedAt               *time.Time `json:"completed_at,omitempty"`
+	Error                     string     `json:"error,omitempty"`
 }
 
 // TargetProgress is one leg's share of a running backup (#1085 stage B2b-2).
