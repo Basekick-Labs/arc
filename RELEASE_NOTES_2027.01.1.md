@@ -19,7 +19,7 @@ Why it failed: Arc sends a scale-0 decimal result column as `int64` (#599), and 
 
 **The error text changes**, for clients that match on it:
 
-- Before: `decimal cast failed at row N: invalid: integer value out of bounds` (JSON, msgpack) or `failed to cast decimal columns at row N: …` (Arrow trailer); N was the start of a batch, not the row of the value.
+- Before: `decimal cast failed at row N: invalid: integer value out of bounds` (JSON, msgpack) or `failed to cast decimal columns at row N: …` (Arrow trailer); N was a batch boundary, not the row of the value.
 - Now: `decimal value beyond the int64 range: column "s" (DECIMAL(38,0)/HUGEINT) at row N; cast it in SQL: ::DOUBLE (approximate) or ::VARCHAR (exact digits)`, with N the value's own row.
 
 **Details:**
