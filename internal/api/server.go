@@ -605,8 +605,6 @@ func (s *Server) queryPoolMetricsHandler(c *fiber.Ctx) error {
 			"connections_open":     snapshot["db_connections_open"],
 			"connections_in_use":   snapshot["db_connections_in_use"],
 			"connections_idle":     snapshot["db_connections_idle"],
-			"queries_total":        snapshot["db_queries_total"],
-			"query_errors_total":   snapshot["db_query_errors_total"],
 			"query_requests":       snapshot["query_requests_total"],
 			"query_success":        snapshot["query_success_total"],
 			"query_errors":         snapshot["query_errors_total"],
