@@ -17,7 +17,8 @@ import (
 // stored with ingest.decimal_columns can be wider than 18 digits too. It is the
 // client's query that asks for the value, so it is answered as a 400 when the
 // response has not started yet. The text names the column and the SQL cast
-// that returns the value, and never the query (plannings#49).
+// that returns the value, and never the rewritten SQL (plannings#49); an
+// unaliased column is named by its expression, as the client wrote it.
 type decimalOverflowError struct {
 	Column    string
 	Precision int32
@@ -162,4 +163,28 @@ func peekDecimalOverflow(reader array.RecordReader, maxRows int) (array.RecordRe
 		return peeked, overflow
 	}
 	return peeked, nil
+}
+
+// peekDecimalOverflowGuarded runs peekDecimalOverflow where nothing else
+// would clean up after a panic: the first Next runs in the handler, before the
+// stream writer and its deferred release exist (#716, #717). A panic releases
+// what the response owns (release: reader, connection, timeout, in that
+// order), records the failure (onPanic) and is raised again for Fiber's
+// recover to answer.
+func peekDecimalOverflowGuarded(reader array.RecordReader, maxRows int, release, onPanic func()) (array.RecordReader, error) {
+	defer func() {
+		if p := recover(); p != nil {
+			func() {
+				// A second panic in the cleanup must not replace the first.
+				defer func() { _ = recover() }()
+				release()
+			}()
+			func() {
+				defer func() { _ = recover() }()
+				onPanic()
+			}()
+			panic(p)
+		}
+	}()
+	return peekDecimalOverflow(reader, maxRows)
 }

@@ -163,7 +163,7 @@ func executeArrowJSONQuery(
 
 	// A value the response cannot carry in the first batch is answered as a
 	// 400 here, before any header is set (#1784).
-	if peeked, overflow := peekDecimalOverflow(reader, governanceMaxRows); overflow != nil {
+	releaseResult := func() {
 		reader.Release()
 		if conn != nil {
 			conn.Close()
@@ -171,6 +171,14 @@ func executeArrowJSONQuery(
 		if cancel != nil {
 			cancel()
 		}
+	}
+	peeked, overflow := peekDecimalOverflowGuarded(reader, governanceMaxRows, releaseResult, func() {
+		if onFail != nil {
+			onFail("handler panicked")
+		}
+	})
+	if overflow != nil {
+		releaseResult()
 		m.IncQueryErrors()
 		if onFail != nil {
 			onFail(overflow.Error())
@@ -183,9 +191,8 @@ func executeArrowJSONQuery(
 			Timestamp:       timestamp,
 		})
 		return -1, true
-	} else {
-		reader = peeked
 	}
+	reader = peeked
 
 	// Capture token name before async callback (Fiber context not safe in callbacks)
 	tokenName := getTokenName(c)

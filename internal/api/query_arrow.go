@@ -895,7 +895,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 
 	// A value the response cannot carry in the first batch is answered as a
 	// 400 here, before any header or trailer is set (#1784).
-	if peeked, overflow := peekDecimalOverflow(reader, governanceMaxRows); overflow != nil {
+	releaseResult := func() {
 		reader.Release()
 		if conn != nil {
 			conn.Close()
@@ -903,6 +903,14 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		if cancel != nil {
 			cancel()
 		}
+	}
+	peeked, overflow := peekDecimalOverflowGuarded(reader, governanceMaxRows, releaseResult, func() {
+		if h.queryRegistry != nil && queryID != "" {
+			h.queryRegistry.Fail(queryID, "handler panicked")
+		}
+	})
+	if overflow != nil {
+		releaseResult()
 		m.IncQueryErrors()
 		if h.queryRegistry != nil && queryID != "" {
 			h.queryRegistry.Fail(queryID, sqlutil.SanitizeErrText(overflow.Error()))
@@ -912,9 +920,8 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			"success": false,
 			"error":   overflow.Error(),
 		})
-	} else {
-		reader = peeked
 	}
+	reader = peeked
 
 	schema := reader.Schema()
 

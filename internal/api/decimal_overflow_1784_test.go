@@ -472,3 +472,78 @@ func TestDecimalOverflowPastTheCapArrowAndMsgpack(t *testing.T) {
 	}
 	reader.Release()
 }
+
+// panickingReader panics on its first Next, as the cgo reader path can.
+type panickingReader struct {
+	array.RecordReader
+	schema   *arrow.Schema
+	released bool
+}
+
+func (p *panickingReader) Schema() *arrow.Schema { return p.schema }
+func (p *panickingReader) Next() bool            { panic("reader broke") }
+func (p *panickingReader) Release()              { p.released = true }
+
+// The peek runs in the handler, before the stream writer's deferred release
+// exists: a panic there releases what the response owns, records the
+// failure, and is raised again (#716, #717).
+func TestDecimalOverflowPeekPanicReleases(t *testing.T) {
+	schema := arrow.NewSchema([]arrow.Field{{Name: "v", Type: &arrow.Decimal128Type{Precision: 38, Scale: 0}}}, nil)
+	r := &panickingReader{schema: schema}
+	var released, failed bool
+	require.PanicsWithValue(t, "reader broke", func() {
+		_, _ = peekDecimalOverflowGuarded(r, 0, func() { released = true; r.Release() }, func() { failed = true })
+	})
+	require.True(t, released, "the reader, connection and timeout must be released")
+	require.True(t, r.released)
+	require.True(t, failed, "the query must be recorded as failed")
+
+	// A panic in the cleanup does not replace the original one.
+	require.PanicsWithValue(t, "reader broke", func() {
+		_, _ = peekDecimalOverflowGuarded(&panickingReader{schema: schema}, 0, func() { panic("cleanup broke") }, func() {})
+	})
+}
+
+// Every 400 gives its connection back: more refused queries than the pool
+// holds, then a query that must still get a connection.
+func TestDecimalOverflow400ReleasesTheConnection(t *testing.T) {
+	r := newOverflowRig(t)
+	for i := 0; i < 6; i++ { // MaxConnections is 4
+		for _, route := range []string{"/api/v1/query", "/api/v1/query/arrow", "/api/v1/query/msgpack"} {
+			resp := r.post(route, overflowRepro)
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode, route)
+			resp.Body.Close()
+		}
+	}
+	r.client.Timeout = 10 * time.Second
+	resp := r.post("/api/v1/query", "SELECT 1 AS one")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode, "a connection leaked by a 400 would leave none for this query")
+}
+
+// The JSON cap now cuts the batch before the cast: a cap in the middle of a
+// later batch (the parallel pipeline starts at batch 3) writes exactly the
+// capped rows, in order, and marks the body capped, not truncated.
+func TestDecimalOverflowJSONCapMidBatchPipeline(t *testing.T) {
+	r := newOverflowRig(t)
+	const capRows = 5000 // inside the third 2,048-row batch
+	reader, conn, err := r.duck.ArrowQueryContext(context.Background(), hugeAt(10000, -1))
+	require.NoError(t, err)
+	defer conn.Close()
+	var buf bytes.Buffer
+	w := bufio.NewWriter(&buf)
+	rows, streamErr := streamArrowJSON(context.Background(), w, reader, capRows, nil, time.Now(), "ts")
+	require.NoError(t, streamErr)
+	require.NoError(t, w.Flush())
+	reader.Release()
+	require.Equal(t, capRows, rows)
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &doc))
+	require.Nil(t, doc["truncated"])
+	require.Equal(t, true, doc["rows_capped"])
+	data := doc["data"].([]any)
+	require.Len(t, data, capRows)
+	for i, row := range data {
+		require.Equal(t, float64(i), row.([]any)[0], "row %d", i)
+	}
+}
