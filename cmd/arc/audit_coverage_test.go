@@ -14,15 +14,14 @@ func noop(c *fiber.Ctx) error     { return c.SendStatus(fiber.StatusOK) }
 func passAuth(c *fiber.Ctx) error { return c.Next() }
 
 // newCoverageApp builds the stack the way main does: public routes, then the
-// auth middleware, then audit, then the admin and API routes. misorder
-// registers the token routes before audit, as main did until #1630.
+// auth middleware, then audit, then the logs and metrics routes and the admin
+// and API routes. misorder registers the token routes before audit, as main
+// did until #1630.
 func newCoverageApp(misorder bool, audits int) (*fiber.App, fiber.Handler) {
 	app := fiber.New()
 	mw := audit.Middleware(nil, false) // never invoked: identity is all the check needs
 	app.Get("/health", noop)
 	app.Get("/ready/write", noop)
-	app.Get("/metrics", noop)
-	app.Get("/api/v1/metrics/timeseries/:type", noop)
 	app.Use(passAuth)
 	if misorder {
 		app.Post("/api/v1/auth/tokens", noop)
@@ -32,6 +31,8 @@ func newCoverageApp(misorder bool, audits int) (*fiber.App, fiber.Handler) {
 		app.Use(mw)
 	}
 	app.Get("/api/v1/logs", noop)
+	app.Get("/metrics", noop)
+	app.Get("/api/v1/metrics/timeseries/:type", noop)
 	if !misorder {
 		app.Post("/api/v1/auth/tokens", noop)
 		app.Post("/api/v1/auth/tokens/:id/revoke", noop)
@@ -45,21 +46,44 @@ func newCoverageApp(misorder bool, audits int) (*fiber.App, fiber.Handler) {
 }
 
 func TestAuditCoverageAcceptsMainsOrder(t *testing.T) {
-	routes, prefixes := authPublicPaths()
-	app, mw := newCoverageApp(false, 1)
-	cov := auditCoverageOf(app, mw, routes, prefixes)
-	if cov.unreadable {
-		t.Fatal("Fiber's route layout could not be read: the check would be skipped in production")
+	for _, metricsPublic := range []bool{false, true} {
+		routes, prefixes := authPublicPaths(metricsPublic)
+		app, mw := newCoverageApp(false, 1)
+		cov := auditCoverageOf(app, mw, routes, prefixes)
+		if cov.unreadable {
+			t.Fatal("Fiber's route layout could not be read: the check would be skipped in production")
+		}
+		if len(cov.gaps) != 0 || cov.maxEntries != 1 || len(cov.missing) != 0 {
+			t.Fatalf("metricsPublic %v: coverage = %+v, want no gaps and exactly one audit entry", metricsPublic, cov)
+		}
 	}
-	if len(cov.gaps) != 0 || cov.maxEntries != 1 || len(cov.missing) != 0 {
-		t.Fatalf("coverage = %+v, want no gaps and exactly one audit entry", cov)
+}
+
+// Metrics routes registered ahead of audit while they need a token are
+// reported: that order would also have put them ahead of the auth middleware
+// (GHSA-m3qr-fvp4-78xj).
+func TestAuditCoverageReportsMetricsAheadOfAudit(t *testing.T) {
+	routes, prefixes := authPublicPaths(false)
+	app := fiber.New()
+	mw := audit.Middleware(nil, false)
+	app.Get("/metrics", noop)
+	app.Use(passAuth)
+	app.Use(mw)
+	cov := auditCoverageOf(app, mw, routes, prefixes)
+	if strings.Join(cov.gaps, ",") != "GET /metrics" {
+		t.Fatalf("gaps = %v, want GET /metrics", cov.gaps)
+	}
+	// Public, the same order is not a gap.
+	routes, prefixes = authPublicPaths(true)
+	if cov := auditCoverageOf(app, mw, routes, prefixes); len(cov.gaps) != 0 {
+		t.Fatalf("gaps with metrics public = %v", cov.gaps)
 	}
 }
 
 // The #1630 shape: admin routes ahead of audit are reported, by method and
 // path. Public routes ahead of it are not.
 func TestAuditCoverageReportsRoutesAheadOfAudit(t *testing.T) {
-	routes, prefixes := authPublicPaths()
+	routes, prefixes := authPublicPaths(false)
 	app, mw := newCoverageApp(true, 1)
 	cov := auditCoverageOf(app, mw, routes, prefixes)
 	want := []string{"POST /api/v1/auth/tokens", "POST /api/v1/auth/tokens/:id/revoke"}
@@ -75,7 +99,7 @@ func TestAuditCoverageReportsRoutesAheadOfAudit(t *testing.T) {
 }
 
 func TestAuditCoverageReportsADuplicateAuditEntry(t *testing.T) {
-	routes, prefixes := authPublicPaths()
+	routes, prefixes := authPublicPaths(false)
 	app, mw := newCoverageApp(false, 2)
 	if cov := auditCoverageOf(app, mw, routes, prefixes); cov.maxEntries != 2 {
 		t.Fatalf("maxEntries = %d, want 2", cov.maxEntries)
@@ -83,7 +107,7 @@ func TestAuditCoverageReportsADuplicateAuditEntry(t *testing.T) {
 }
 
 func TestAuditCoverageReportsMissingAudit(t *testing.T) {
-	routes, prefixes := authPublicPaths()
+	routes, prefixes := authPublicPaths(false)
 	app, mw := newCoverageApp(false, 0)
 	cov := auditCoverageOf(app, mw, routes, prefixes)
 	if len(cov.missing) == 0 || len(cov.gaps) == 0 {
@@ -94,7 +118,7 @@ func TestAuditCoverageReportsMissingAudit(t *testing.T) {
 // A public prefix matches at a segment boundary only, as the auth middleware
 // matches it: /api/v1/metricsfoo is not public.
 func TestAuditCoveragePublicPrefixBoundary(t *testing.T) {
-	routes, prefixes := authPublicPaths()
+	routes, prefixes := authPublicPaths(true)
 	for path, want := range map[string]bool{
 		"/api/v1/metrics":                   true,
 		"/api/v1/metrics/memory":            true,
@@ -108,6 +132,16 @@ func TestAuditCoveragePublicPrefixBoundary(t *testing.T) {
 		if got := isPublicPath(path, routes, prefixes); got != want {
 			t.Errorf("isPublicPath(%s) = %v, want %v", path, got, want)
 		}
+	}
+	// Without auth.metrics_public the metrics paths need a token.
+	routes, prefixes = authPublicPaths(false)
+	for _, path := range []string{"/metrics", "/api/v1/metrics", "/api/v1/metrics/memory"} {
+		if isPublicPath(path, routes, prefixes) {
+			t.Errorf("isPublicPath(%s) = true without auth.metrics_public", path)
+		}
+	}
+	if !isPublicPath("/health", routes, prefixes) {
+		t.Error("/health is not public without auth.metrics_public")
 	}
 }
 

@@ -31,17 +31,16 @@ func setupLogsAuthServer(t *testing.T) (*fiber.App, *auth.AuthManager, func()) {
 
 	srv := &Server{app: fiber.New(), logger: logger}
 	// Mirror main.go: global auth middleware first, then the admin-gated
-	// logs route registered after it. /api/v1/metrics is whitelisted as a
-	// public prefix (parity with the Prometheus /metrics endpoint).
+	// logs route and the metrics routes registered after it. The metrics
+	// need a token (auth.metrics_public off, the default).
 	mwCfg := auth.DefaultMiddlewareConfig()
 	mwCfg.AuthManager = am
-	mwCfg.PublicPrefixes = append(mwCfg.PublicPrefixes, "/api/v1/metrics")
 	srv.app.Use(auth.NewMiddleware(mwCfg))
 	srv.RegisterLogsRoute(am)
-	// A representative public route + a public metrics route to assert they
-	// remain reachable. (/health is in DefaultMiddlewareConfig.PublicRoutes.)
+	srv.RegisterMetricsRoutes(am)
+	// A representative public route. (/health is in
+	// DefaultMiddlewareConfig.PublicRoutes.)
 	srv.app.Get("/health", func(c *fiber.Ctx) error { return c.SendStatus(fiber.StatusOK) })
-	srv.app.Get("/api/v1/metrics", func(c *fiber.Ctx) error { return c.JSON(fiber.Map{"ok": true}) })
 
 	cleanup := func() { am.Close(); os.RemoveAll(tmpDir) }
 	return srv.app, am, cleanup
@@ -81,7 +80,10 @@ func TestLogsEndpoint_RequiresAdmin(t *testing.T) {
 		{"logs read token forbidden", "/api/v1/logs?limit=5", readToken, fiber.StatusForbidden},
 		{"logs admin token ok", "/api/v1/logs?limit=5", adminToken, fiber.StatusOK},
 		{"health stays public", "/health", "", fiber.StatusOK},
-		{"metrics stays public", "/api/v1/metrics", "", fiber.StatusOK},
+		{"metrics need a token", "/api/v1/metrics", "", fiber.StatusUnauthorized},
+		{"prometheus metrics need a token", "/metrics", "", fiber.StatusUnauthorized},
+		{"metrics with a read token", "/api/v1/metrics", readToken, fiber.StatusOK},
+		{"prometheus metrics with a read token", "/metrics", readToken, fiber.StatusOK},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

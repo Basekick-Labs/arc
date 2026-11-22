@@ -244,15 +244,8 @@ func (s *Server) RegisterRoutes() {
 	s.app.Get("/ready", s.readyHandler)
 	s.app.Get("/ready/write", s.readyWriteHandler)
 
-	// Metrics endpoint (Prometheus format)
-	s.app.Get("/metrics", s.metricsHandler)
-
-	// API v1 metrics endpoints (JSON format)
-	s.app.Get("/api/v1/metrics", s.apiMetricsHandler)
-	s.app.Get("/api/v1/metrics/memory", s.memoryMetricsHandler)
-	s.app.Get("/api/v1/metrics/query-pool", s.queryPoolMetricsHandler)
-	s.app.Get("/api/v1/metrics/endpoints", s.endpointMetricsHandler)
-	s.app.Get("/api/v1/metrics/timeseries/:type", s.timeseriesMetricsHandler)
+	// NOTE: the metrics endpoints are not registered here either; see
+	// RegisterMetricsRoutes.
 
 	// NOTE: /api/v1/logs is intentionally NOT registered here. It exposes
 	// buffered application logs and must be admin-authenticated. Registering
@@ -273,6 +266,40 @@ func (s *Server) RegisterRoutes() {
 // is nil (authentication disabled), preserving no-auth deployment behaviour.
 func (s *Server) RegisterLogsRoute(authManager *auth.AuthManager) {
 	s.app.Get("/api/v1/logs", withAdminAuth(authManager), s.logsHandler)
+}
+
+// RegisterMetricsRoutes registers /metrics (Prometheus text) and the JSON
+// /api/v1/metrics family. main calls it right after the auth and audit
+// middleware, like RegisterLogsRoute: whether they are public is the auth
+// middleware's public-path list alone (auth.metrics_public). authManager,
+// when non-nil, also guards each route itself, so a registration moved ahead
+// of the auth middleware refuses every request instead of serving metrics
+// without a token (GHSA-m3qr-fvp4-78xj). nil: public (auth off, or
+// auth.metrics_public).
+func (s *Server) RegisterMetricsRoutes(authManager *auth.AuthManager) {
+	h := []fiber.Handler{}
+	if authManager != nil {
+		h = append(h, requireToken)
+	}
+	reg := func(path string, handler fiber.Handler) {
+		s.app.Get(path, append(append([]fiber.Handler{}, h...), handler)...)
+	}
+	reg("/metrics", s.metricsHandler)
+	reg("/api/v1/metrics", s.apiMetricsHandler)
+	reg("/api/v1/metrics/memory", s.memoryMetricsHandler)
+	reg("/api/v1/metrics/query-pool", s.queryPoolMetricsHandler)
+	reg("/api/v1/metrics/endpoints", s.endpointMetricsHandler)
+	reg("/api/v1/metrics/timeseries/:type", s.timeseriesMetricsHandler)
+}
+
+// requireToken refuses a request the auth middleware did not authenticate:
+// any valid token passes, read-only included, but a route reached without
+// one (registered too early, or listed public by mistake) is a 401.
+func requireToken(c *fiber.Ctx) error {
+	if auth.GetTokenInfo(c) == nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "authentication required"})
+	}
+	return c.Next()
 }
 
 // SetColdMissingObjects wires the /health "tiering" field source: the last
@@ -365,11 +392,11 @@ func (s *Server) sampleDBStats() {
 // healthHandler returns server health status.
 //
 // The "storage" field is served UNAUTHENTICATED by design, like the rest of
-// /health and like /metrics (see the PublicRoutes rationale in main.go): it
+// /health (see the PublicRoutes rationale in authPublicPaths): it
 // contains no bucket/container names, endpoints, prefixes, paths, or key
 // material — only tier names, backend types, credential modes, sanitized
 // provider labels, expiry timestamps and error counts. That is what probes
-// and Prometheus need, and they do not authenticate. Field-incident context:
+// need, and they do not authenticate. Field-incident context:
 // a reader served green /health for ~21h while every S3 query failed on
 // expired credentials (#603).
 //

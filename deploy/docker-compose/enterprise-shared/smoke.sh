@@ -336,7 +336,7 @@ while [[ $WRITTEN_SENT -lt $RECORDS ]]; do
   # Crash trigger
   if [[ "$SCENARIO" != "base" && "$KILLED" == "false" && $WRITTEN_SENT -ge $KILL_AT ]]; then
     log "  >>> killing $KILL_TARGET at record $WRITTEN_SENT"
-    target_records=$(docker exec "$KILL_TARGET" curl -fsS http://localhost:8000/metrics \
+    target_records=$(docker exec "$KILL_TARGET" curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:8000/metrics \
       | awk '$1 == "arc_ingest_records_total" {print $2}')
     if ! python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)' "$target_records"; then
       fail "$KILL_TARGET has accepted no records; refusing an idle-writer crash test"
@@ -383,7 +383,7 @@ for c in arc-writer1 arc-writer2 arc-writer3; do
     log "  $c: $state (killed by crash scenario)"
     continue
   fi
-  metric=$(docker exec "$c" curl -fsS http://localhost:8000/metrics 2>/dev/null \
+  metric=$(docker exec "$c" curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:8000/metrics 2>/dev/null \
     | grep -E '^arc_ingest_records_total' | head -1 | awk '{print $2}' || echo "?")
   log "  $c: arc_ingest_records_total = ${metric:-?}"
 done

@@ -2877,7 +2877,13 @@ func main() {
 	// The paths the auth middleware lets through without a token. The audit
 	// coverage check (below, before the server starts) allows them ahead of
 	// the audit middleware: they are registered before it on purpose.
-	authPublicRoutes, authPublicPrefixes := authPublicPaths()
+	authPublicRoutes, authPublicPrefixes := authPublicPaths(authManager == nil || cfg.Auth.MetricsPublic)
+	// The metrics routes' own guard (Server.RegisterMetricsRoutes): only
+	// when they need a token.
+	metricsGuard := authManager
+	if cfg.Auth.MetricsPublic {
+		metricsGuard = nil
+	}
 
 	// Apply auth middleware if enabled
 	var rbacManager *auth.RBACManager
@@ -2905,6 +2911,12 @@ func main() {
 		// middleware so it sits later in the Fiber stack and is actually
 		// gated (GHSA-m3qr-fvp4-78xj).
 		server.RegisterLogsRoute(authManager)
+		// Metrics after auth and audit too: public only with
+		// auth.metrics_public (authPublicPaths).
+		server.RegisterMetricsRoutes(metricsGuard)
+		if cfg.Auth.MetricsPublic {
+			log.Warn().Msg("auth.metrics_public is on: /metrics and /api/v1/metrics are served without a token")
+		}
 
 		// Initialize RBAC Manager (Enterprise feature)
 		rbacManager = auth.NewRBACManager(&auth.RBACManagerConfig{
@@ -3100,6 +3112,7 @@ func main() {
 			server.GetApp().Use(auditMiddleware)
 		}
 		server.RegisterLogsRoute(nil)
+		server.RegisterMetricsRoutes(nil)
 	}
 
 	// Register MessagePack handler with Arrow buffer
