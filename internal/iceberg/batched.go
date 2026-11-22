@@ -108,7 +108,30 @@ type reconcileResult struct {
 	droppedCold bool
 	// writerLost: the converged branch stopped because this node is no longer the writer.
 	writerLost bool
+	// leftOut is how many files the pass found that could not be given a day and left out of
+	// the table (file_day.go). It is every such file of the measurement only when the pass
+	// went through all its new files: not partial, not moved, the writer role kept.
+	leftOut int
 }
+
+// withoutPaths is paths less those in drop.
+func withoutPaths(paths []string, drop map[string]struct{}) []string {
+	if len(drop) == 0 {
+		return paths
+	}
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if _, ok := drop[p]; !ok {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// maxRedatedPerPass bounds the entries with no day that one pass re-registers. Each costs a
+// read of the file's time column, inside the pass's first commit, which has no chunking and
+// runs under the pass's deadline.
+const maxRedatedPerPass = 256
 
 // ReconcileMeasurementWithHint is ReconcileMeasurement plus whether the pass fully
 // SETTLED: the reader discovery files (version-hint.text, v<N>.metadata.json) were
@@ -321,13 +344,33 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 	// file_size_in_bytes, column bounds), so external engines keep counting deleted rows and
 	// can mis-plan reads against the shorter file. Such a path is dropped and re-registered
 	// in the same commit.
+	//
+	// An entry with no day is re-registered the same way (#1754): an earlier version
+	// registered a file whose footer has no min/max for the time column under a null day, which
+	// readers prune for any time filter. Rebuilding it reads its day from its rows
+	// (buildDataFiles). They go in the pass's first commit, which is not chunked, so a pass
+	// takes maxRedatedPerPass of them and reports itself partial while more remain. An entry
+	// whose file turns out to have no single day is removed and not added again.
 	var toAdd, toRemove, rewritten []string
+	redatedPaths := map[string]struct{}{}
+	redated, redatedLeft := 0, 0
+	spec := tbl.Spec()
 	for p, size := range want {
 		df, ok := live[p]
 		switch {
 		case !ok:
 			toAdd = append(toAdd, p)
 		case df.FileSizeBytes() != size:
+			rewritten = append(rewritten, p)
+			toRemove = append(toRemove, p)
+			toAdd = append(toAdd, p)
+		case missingPartitionValue(spec, df):
+			if redated == maxRedatedPerPass {
+				redatedLeft++
+				continue
+			}
+			redated++
+			redatedPaths[p] = struct{}{}
 			rewritten = append(rewritten, p)
 			toRemove = append(toRemove, p)
 			toAdd = append(toAdd, p)
@@ -389,7 +432,20 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 	if err != nil {
 		return reconcileResult{}, err
 	}
-	anchored, free := splitAnchored(toBuild, toRemove, database, measurement)
+	// An entry given its day is replaced by itself: it commits with its own removal, and
+	// brings no other file of its day into the first commit, which a real removal does.
+	anchored, free := splitAnchored(toBuild, withoutPaths(toRemove, redatedPaths), database, measurement)
+	if len(redatedPaths) > 0 {
+		kept := free[:0]
+		for _, p := range free {
+			if _, ok := redatedPaths[p]; ok {
+				anchored = append(anchored, p)
+				continue
+			}
+			kept = append(kept, p)
+		}
+		free = kept
+	}
 	if len(leftBehind) > 0 {
 		// Left behind by the first read of a new table (above): only free adds exist then.
 		kept := free[:0]
@@ -408,7 +464,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 	var (
 		commits    int
 		registered int
-		skippedAll []string
+		skippedAll []leftOutFile
 		loopErr    error
 		stopReason string
 	)
@@ -454,7 +510,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 	// before #1686, for the part of the diff it covers.
 	if len(removes) > 0 || len(cloned) > 0 || len(anchored) > 0 {
 		var built []iceberg.DataFile
-		var skipped []string
+		var skipped []leftOutFile
 		for round := 1; ; round++ {
 			tbl, sc, built, skipped, err = e.prepareChunk(ctx, ctx, tbl, sc, anchored, unread, req.readSchemas, want, canCommit, probe)
 			var ve *vanishedErr
@@ -512,8 +568,16 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 			// mid-pass never reaches, and the next writer, seeing nothing to remove, would never
 			// floor at all. finishPass retries a failed floor.
 			var floorOK bool
-			tbl, floorOK = e.expireSnapshots(ctx, tbl, database, measurement, expireModeFor(len(removes)))
-			if len(removes) > 0 {
+			// An entry given its day is the same file, still in storage: older snapshots that
+			// name it stay readable, so it does not count as a removal for the history floor.
+			gone := 0
+			for _, df := range removes {
+				if _, ok := redatedPaths[df.FilePath()]; !ok {
+					gone++
+				}
+			}
+			tbl, floorOK = e.expireSnapshots(ctx, tbl, database, measurement, expireModeFor(gone))
+			if gone > 0 {
 				e.setFloorOwed(tkey, !floorOK)
 			}
 			rewrote := make(map[string]struct{}, len(rewritten))
@@ -544,7 +608,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 		cctx, cancel := e.chunkContext(ctx)
 		start := time.Now()
 		var built []iceberg.DataFile
-		var skipped []string
+		var skipped []leftOutFile
 		tbl, sc, built, skipped, err = e.prepareChunk(cctx, ctx, tbl, sc, batch, unread, req.readSchemas, want, canCommit, probe)
 		// Read before cancel(), which would set it on every path.
 		chunkExpired := errors.Is(cctx.Err(), context.DeadlineExceeded)
@@ -610,12 +674,14 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 	}
 
 	if len(skippedAll) > 0 {
-		// Some files could not be partitioned (day-straddling data — see day() spec). They are
-		// omitted from the table but logged loudly; the rest of the measurement still exports.
+		// Files that could not be given a day (file_day.go). They are left out of the table
+		// and reported here and in arc_iceberg_files_left_out; the rest of the measurement
+		// still exports. Nothing registers them later: a pass finds them again and leaves
+		// them out again, until the file is rewritten or removed.
 		e.logger.Error().
 			Str("database", database).Str("measurement", measurement).
-			Int("skipped", len(skippedAll)).Strs("files", skippedAll).
-			Msg("Iceberg: skipped files that could not be partition-mapped (day-straddling time range)")
+			Int("skipped", len(skippedAll)).Strs("files", leftOutLines(skippedAll)).
+			Msg("Iceberg: files left out of the table because no single UTC day could be given to them; their rows are readable through Arc and missing from the Iceberg table")
 	}
 
 	// A node that lost the writer role mid-pass writes nothing more: no expiry commit, no
@@ -635,8 +701,8 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 			return reconcileResult{}, err
 		}
 	}
-	partial := len(free) > 0 && loopErr == nil
-	remaining := len(free) + deferredNew
+	partial := (len(free) > 0 || redatedLeft > 0) && loopErr == nil
+	remaining := len(free) + deferredNew + redatedLeft
 	if partial && commits == 0 && !writerGone && !moved {
 		// Nothing landed: no time was left for even one chunk (the listing and the table seed
 		// took the deadline), or the smallest chunk still did not fit. That is not progress, and
@@ -648,13 +714,13 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 	}
 	if stopReason == stopWriterLost && commits == 0 && len(removes)+len(cloned)+len(anchored) > 0 {
 		// The first commit itself was refused (writer role): nothing of this pass landed.
-		partial, remaining = true, newFiles
+		partial, remaining = true, newFiles+redatedLeft
 	}
 	if commits > 0 {
 		e.logger.Info().
 			Str("database", database).Str("measurement", measurement).
 			Int("added", registered).Int("removed", len(toRemove)-len(rewritten)).
-			Int("reregistered", len(rewritten)).Int("moved", len(cloned)).
+			Int("reregistered", len(rewritten)).Int("given_a_day", redated).Int("moved", len(cloned)).
 			Int("commits", commits).Int("remaining", remaining).
 			Bool("hint_published", hintOK).
 			Bool("history_settled", finishedOK).
@@ -687,6 +753,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 		droppedCold:  droppedCold,
 		writerLost:   writerGone && !partial && !moved,
 		pruneAgainAt: e.pruneAgainAt(),
+		leftOut:      len(skippedAll),
 	}
 	if loopErr != nil {
 		return res, loopErr
@@ -811,7 +878,7 @@ var errWriterLost = errors.New("iceberg: this node is no longer the writer")
 // A schema evolution is a commit, and it publishes the discovery files (evolveSchema), so it is
 // gated like the data commits: errWriterLost when canCommit is false, and the fence is checked
 // straight after it.
-func (e *Exporter) prepareChunk(readCtx, commitCtx context.Context, tbl *icetable.Table, sc ArcSchema, paths []string, unread map[string]FileRef, readSchemas func(context.Context, []FileRef) (ArcSchema, error), want map[string]int64, canCommit func() bool, probe probeFunc) (*icetable.Table, ArcSchema, []iceberg.DataFile, []string, error) {
+func (e *Exporter) prepareChunk(readCtx, commitCtx context.Context, tbl *icetable.Table, sc ArcSchema, paths []string, unread map[string]FileRef, readSchemas func(context.Context, []FileRef) (ArcSchema, error), want map[string]int64, canCommit func() bool, probe probeFunc) (*icetable.Table, ArcSchema, []iceberg.DataFile, []leftOutFile, error) {
 	if len(paths) == 0 {
 		return tbl, sc, nil, nil, nil
 	}

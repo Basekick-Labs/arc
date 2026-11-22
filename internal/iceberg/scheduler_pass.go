@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 	"golang.org/x/sync/errgroup"
@@ -68,6 +69,10 @@ type passJob struct {
 	outcome     reconcileOutcome
 	err         error
 	took        time.Duration
+	// leftOut is how many files the pass left out of the table because no day could be given
+	// to them; leftOutKnown: the pass went through every new file, so that is all of them.
+	leftOut      int
+	leftOutKnown bool
 }
 
 func (j *passJob) setState(st measurementState) {
@@ -188,6 +193,26 @@ func (s *Scheduler) applyPassState(job *passJob) {
 	case stateDrop:
 		delete(s.state, job.key)
 	}
+	if job.leftOutKnown {
+		// Here and not only at the end of runPass: an ingest-triggered pass of one table
+		// ends here too.
+		if job.leftOut > 0 {
+			s.leftOut[job.key] = job.leftOut
+		} else {
+			delete(s.leftOut, job.key)
+		}
+		s.reportLeftOut()
+	}
+}
+
+// reportLeftOut sets arc_iceberg_files_left_out to the files left out of every table, as of
+// each table's last pass that went through all its new files. Loop goroutine only.
+func (s *Scheduler) reportLeftOut() {
+	n := 0
+	for _, c := range s.leftOut {
+		n += c
+	}
+	metrics.Get().SetIcebergFilesLeftOut(n)
 }
 
 // finishPass records a pass that ran on another goroutine: everything
@@ -326,6 +351,7 @@ func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter)
 	// What this pass has seen is not offered to an append again (#1751).
 	job.recent = recentIngestKeys(files)
 	if len(files) == 0 {
+		job.leftOut, job.leftOutKnown = 0, true // no file, so none left out
 		// Every data file is gone (retention/compaction/manual delete). We still reach this code
 		// because Arc's Delete only os.Remove()s the file — the {db}/{measurement}/… directory
 		// tree survives, so Measurements() keeps yielding this measurement. Returning early here
@@ -469,6 +495,11 @@ func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter)
 		// Not cached, for the same reason: the next pass seeds from the table and continues.
 		job.dropState()
 		return outcomeInProgress, nil
+	}
+	if !res.writerLost {
+		// The pass went through every new file, whether or not the steps after its commits
+		// settled.
+		job.leftOut, job.leftOutKnown = res.leftOut, true
 	}
 
 	// Cache only when the pass fully settled. The snapshot is committed either way, but

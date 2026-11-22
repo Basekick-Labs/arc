@@ -67,7 +67,7 @@ func (e *Exporter) fileIOFor(ctx context.Context, tbl *icetable.Table, uri strin
 
 // cloneFromTable builds, for each added path, the DataFile of a live entry holding the same file
 // under another URI — the same storage key and the same size: a hot file now registered under its
-// cold URI, or the reverse. Those adds never open their file. keyOf maps an added URI to its
+// cold URI, or the reverse. Those adds never open their file. An entry with no day is not cloned. keyOf maps an added URI to its
 // storage key. Returns the clones and the paths still to build.
 func cloneFromTable(tbl *icetable.Table, live map[string]iceberg.DataFile, toAdd []string, keyOf map[string]string, want map[string]int64) (cloned []iceberg.DataFile, rest []string, err error) {
 	byBase := make(map[string][]iceberg.DataFile, len(live))
@@ -83,6 +83,11 @@ func cloneFromTable(tbl *icetable.Table, live map[string]iceberg.DataFile, toAdd
 					src = df
 					break
 				}
+			}
+			if src != nil && missingPartitionValue(tbl.Spec(), src) {
+				// An entry with no day (#1754) is not carried to the new URI: the file is
+				// built there, which reads its day from its rows.
+				src = nil
 			}
 		}
 		if src == nil {

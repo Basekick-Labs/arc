@@ -296,6 +296,11 @@ func (s *Scheduler) forgetDatabase(db string) {
 		s.publishIngestPendingLocked()
 	}
 	s.reqMu.Unlock()
+	for k := range s.leftOut {
+		if match(k) {
+			delete(s.leftOut, k)
+		}
+	}
 	for k := range s.state {
 		if match(k) {
 			delete(s.state, k)

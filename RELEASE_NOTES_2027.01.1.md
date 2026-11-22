@@ -2,6 +2,54 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: with `ingest.write_statistics = false`, Iceberg readers that filter by time no longer miss rows ([#1754](https://github.com/Basekick-Labs/arc/issues/1754))
+
+An Iceberg table is partitioned by day, and the export takes a file's day from the
+min/max of `time` in the file's Parquet footer. With `ingest.write_statistics = false`
+the footer has none, and the file was registered under no day at all, without an error
+or a log line. Readers skip such a file for any filter on time. Measured with DuckDB's
+Iceberg reader on five rows over three days: an unfiltered read returned 5, a read of
+one day returned 0 where Arc returned 2. With the default (`true`) nothing was wrong.
+
+- **The ingest writer always keeps min/max for `time`.** Every other column still
+  follows `ingest.write_statistics`. On a 1M-row flush with statistics off the writer
+  took 34.6 ms with the time statistics and 34.3 ms without (six runs each; the runs
+  overlap).
+- **A file whose footer has no min/max for `time` gets its day from its rows.** The
+  export reads the file's time column once and registers the file under that day. This
+  covers files written before this release and files that reach storage another way
+  (a restore, edge sync).
+- **Entries already registered without a day are corrected.** The first reconcile pass
+  of each table after the upgrade re-registers them under their day, up to 256 files per
+  pass; a table with more is finished over the following passes, on the short retry
+  interval. Nothing needs to be run, and the table's snapshot history is kept.
+- **An entry whose file has no single day leaves the table.** If the rows of such a
+  file span more than one UTC day, hold no time value, or cannot be read, the entry is
+  removed and the file is counted in the metric below. Before, an unfiltered Iceberg
+  read returned those rows and a read filtered by time did not.
+
+On the store from the measurement above, the first pass of the new binary changed the
+one-day reads from 0, 0 and 0 to 2, 2 and 1.
+
+### New metric: `arc_iceberg_files_left_out`
+
+A file that cannot be given a single day is left out of its table: its rows span more
+than one UTC day, its time column holds no value, or (for a file whose footer has no
+time statistics) its time column cannot be decoded. Those rows are readable through
+Arc and missing from the Iceberg table, and until now the only sign was an Error log
+line. `arc_iceberg_files_left_out` (gauge; `iceberg_files_left_out` in the JSON
+metrics) is how many such files there are, as of each table's last reconcile pass
+that went through all its new files. It is 0 on a node that does not run the export,
+and after a restart until each table's first pass. The log line names each file and
+gives the reason.
+
+Arc's own writers do not produce such a file: ingest splits every flush by the UTC
+hour of each row, and imports and continuous queries go through ingest. Compaction
+merges all the files of one directory without looking at their times, so a file that
+sits in the wrong day's directory becomes part of an output that spans two days. That
+was reproduced by placing a file by hand; it can also come from data written before
+26.06.2 with times before 1970, or restored or synced from such a store. The
+compaction side is tracked separately.
 ## Breaking: `/metrics` and `/api/v1/metrics` need a token while auth is on
 
 **Who is affected:** anyone scraping or polling Arc's metrics with authentication on, which is the default. That means Prometheus, Grafana panels, Telegraf, scripts, or a dashboard reading `/api/v1/metrics`. `/health`, `/ready` and `/ready/write` stay public for load balancers and probes. With auth off nothing changes.
@@ -2351,8 +2399,9 @@ off by default: nothing in Arc reads it yet, and its write cost grows with the
 row-group count (−3.7 % at 41 groups per flush). Compaction's DuckDB `COPY`
 does not preserve it, tiering moves files whole, and continuous-query output
 and `/api/v1/import` go through the same writer and get both settings. The
-column index needs `write_statistics = true` (the default); the offset index
-is always written when enabled. Values of `max_row_group_rows` between 1 and
+column index needs `write_statistics = true` (the default; with it off, only
+the time column has one, since that column always keeps its statistics); the
+offset index is always written when enabled. Values of `max_row_group_rows` between 1 and
 1023, or negative, are rejected at startup.
 
 ```toml

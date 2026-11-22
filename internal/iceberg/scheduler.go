@@ -17,6 +17,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/basekick-labs/arc/internal/colname"
+	"github.com/basekick-labs/arc/internal/metrics"
 )
 
 // measurementState caches per-measurement work between passes so an unchanged measurement is
@@ -108,6 +109,11 @@ type Scheduler struct {
 	// busySince is when each measurement last stopped making progress while busy: the first busy
 	// pass after one that committed or settled. Loop goroutine only, like state.
 	busySince map[string]time.Time
+	// leftOut is, per table, how many files its last pass that went through every new file
+	// left out because no day could be given to them (file_day.go); tables with none have no
+	// entry. Kept apart from state, which a pass that did not settle drops: the files are
+	// still left out then. Loop goroutine only (reportLeftOut).
+	leftOut map[string]int
 
 	// requested holds the measurements whose files a compaction just replaced
 	// (RequestReconcile), coalesced, until the loop goroutine reconciles
@@ -301,6 +307,7 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		gate:              cfg.Gate,
 		logger:            cfg.Logger.With().Str("component", "iceberg-scheduler").Logger(),
 		state:             make(map[string]measurementState),
+		leftOut:           make(map[string]int),
 		busySince:         make(map[string]time.Time),
 		requested:         make(map[string]Measurement),
 		requestedPaths:    make(map[string]struct{}),
@@ -869,6 +876,7 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 		if s.exporter != nil {
 			s.exporter.clearLastLag() // its publishes count now, not this node's (#1772)
 		}
+		metrics.Get().SetIcebergFilesLeftOut(0) // the exporting node reports them
 		return false
 	}
 	measurements, err := s.source.Measurements(ctx)
@@ -1047,6 +1055,12 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 			delete(s.lastReconciled, k)
 		}
 	}
+	for k := range s.leftOut {
+		if _, ok := seen[k]; !ok {
+			delete(s.leftOut, k)
+		}
+	}
+	s.reportLeftOut()
 	event := s.logger.Info().Int("reconciled", ok).Int("unchanged", skipped).Int("failed", failed)
 	if awaitingMigration > 0 {
 		event = event.Int("awaiting_namespace_migration", awaitingMigration)

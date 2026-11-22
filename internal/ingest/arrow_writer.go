@@ -247,6 +247,10 @@ func NewArrowWriter(cfg *config.IngestConfig, logger zerolog.Logger) *ArrowWrite
 		parquet.WithCompression(comp),
 		parquet.WithDictionaryDefault(cfg.UseDictionary),
 		parquet.WithStats(cfg.WriteStatistics),
+		// The time column keeps its min/max whatever write_statistics says: the Iceberg
+		// export takes a file's day from them, and a file without them had none (#1754).
+		// One int64 column; every other column follows the setting.
+		parquet.WithStatsFor("time", true),
 	}
 	if cfg.DataPageVersion == "2.0" {
 		writerOpts = append(writerOpts, parquet.WithDataPageVersion(parquet.DataPageV2))

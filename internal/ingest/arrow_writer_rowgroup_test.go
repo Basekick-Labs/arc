@@ -3,6 +3,7 @@ package ingest
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"testing"
 
@@ -98,5 +99,42 @@ func TestWriteParquetColumnar_PageIndex(t *testing.T) {
 			}
 		}
 		rdr.Close()
+	}
+}
+
+// The time column keeps its min/max with ingest.write_statistics off: the
+// Iceberg export takes a file's day from them, and a file without them was
+// registered under no day (#1754). Every other column follows the setting.
+func TestWriteParquetColumnar_TimeKeepsStatistics(t *testing.T) {
+	logger := zerolog.New(os.Stderr).Level(zerolog.Disabled)
+	cols := rowGroupCols(20_000)
+	for _, on := range []bool{false, true} {
+		t.Run(fmt.Sprintf("write_statistics=%v", on), func(t *testing.T) {
+			cfg := &config.IngestConfig{Compression: "snappy", WriteStatistics: on, DataPageVersion: "2.0", MaxRowGroupRows: 524288}
+			data, err := NewArrowWriter(cfg, logger).WriteParquetColumnar(context.Background(), "cpu", cols, nil, []string{"host"}, false, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rdr, err := file.NewParquetReader(bytes.NewReader(data))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rdr.Close()
+			rg := rdr.MetaData().RowGroup(0)
+			for i := 0; i < rg.NumColumns(); i++ {
+				cc, err := rg.ColumnChunk(i)
+				if err != nil {
+					t.Fatal(err)
+				}
+				name := cc.PathInSchema().String()
+				set, err := cc.StatsSet()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if want := on || name == "time"; set != want {
+					t.Errorf("column %q: statistics present = %v, want %v", name, set, want)
+				}
+			}
+		})
 	}
 }
