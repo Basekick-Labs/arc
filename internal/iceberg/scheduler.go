@@ -97,6 +97,8 @@ type Scheduler struct {
 	// Only the loop() goroutine touches it. A node demoted after having run
 	// does not re-warn; the startup case is the observability gap.
 	gatedWarnOnce bool
+	// pauseWarned: the restore pause was reported (pausedForRestore).
+	pauseWarned bool
 	// wasGated: the gate was closed at the last check (loop goroutine). While
 	// another node exports, this node's cached cold listings miss every
 	// cold-removal notice (the requests are dropped at the gate), so they are
@@ -804,11 +806,17 @@ func (s *Scheduler) loop(ctx context.Context) {
 			// touched, so the next timed pass keeps its time however many
 			// requests come in. Drops first: they run whatever the gate.
 			// Ingest requests last, and only the ones already due.
+			if s.pausedForRestore() {
+				continue
+			}
 			s.serviceDrops(ctx)
 			s.serviceRequests(ctx)
 			s.serviceIngest(ctx, ingestBatch)
 			continue
 		case <-ingestTimer.C:
+			if s.pausedForRestore() {
+				continue
+			}
 			s.serviceIngest(ctx, ingestBatch)
 			continue
 		case <-timer.C:
@@ -822,10 +830,30 @@ func (s *Scheduler) loop(ctx context.Context) {
 	}
 }
 
+// pausedForRestore reports that a restore holds the export paused until the
+// restart (restore_pause.go, #1813). The loop then does nothing: the waiting
+// ingest requests are dropped, since the restart reconciles every table, and
+// the pause is reported once rather than as every table being busy.
+func (s *Scheduler) pausedForRestore() bool {
+	if s.exporter == nil || !s.exporter.exportPausedForRestore() {
+		return false
+	}
+	s.dropIngest()
+	clear(s.busySince)
+	if !s.pauseWarned {
+		s.pauseWarned = true
+		s.logger.Warn().Msg("Iceberg export is paused until the server restarts: a restore staged a catalog that replaces this one at the next start, and nothing is exported or dropped until then")
+	}
+	return true
+}
+
 // runPass reconciles every measurement once. Gated per-tick so cluster failover/demotion
 // takes effect without a restart (nil gate = always run). It reports whether any measurement
 // was left partly registered, so the loop can come back sooner.
 func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
+	if s.pausedForRestore() {
+		return false
+	}
 	// A deleted database's tables are dropped on every node, exporting or not
 	// (#1731): this node's warehouse is its own.
 	s.passDrops = nil

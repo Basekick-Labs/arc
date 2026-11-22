@@ -180,7 +180,9 @@ func (b *LocalBackend) Write(ctx context.Context, path string, data []byte) erro
 // one that is not: the Iceberg publish puts vN.metadata.json beside the
 // metadata file it just read, and the link cannot be struck because the
 // temporary file is already in the directory. The edgesync relay falls back
-// to Write on any error. A new caller writing into a directory that can be
+// to Write on any error. A backup restore writes a table's discovery files
+// with it (#1813) after the table's 000NN-<uuid>.metadata.json, which sort
+// first, so the directory is not empty either. A new caller writing into a directory that can be
 // empty needs the retry Write has.
 func (b *LocalBackend) WriteIfAbsent(ctx context.Context, path string, data []byte) (bool, error) {
 	fullPath, err := b.validatePath(path)

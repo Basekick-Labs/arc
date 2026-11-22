@@ -413,8 +413,9 @@ type Progress struct {
 	// storage root to put them in (the log names the fix).
 	IcebergWarehouseFilesSkipped int64 `json:"iceberg_warehouse_files_skipped,omitempty"`
 	// IcebergDiscoveryFilesKept counts Iceberg version-hint.text and
-	// v<N>.metadata.json files a restore did not write because the table's
-	// metadata directory here already has a live hint (#1813). Restore only.
+	// v<N>.metadata.json files a restore did not write (#1813): the table's
+	// metadata directory here has a live hint (or the check for one failed,
+	// which is logged), or a file was already at that path. Restore only.
 	IcebergDiscoveryFilesKept int64 `json:"iceberg_discovery_files_kept,omitempty"`
 	BackupUnaddressableFiles  int64 `json:"backup_unaddressable_files,omitempty"`
 	// ColdFilesExcluded: for a backup, the run-level cold-tier gap, published

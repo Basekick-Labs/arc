@@ -42,7 +42,7 @@ func TestPauseExportForRestore(t *testing.T) {
 
 	// An export gives way at once, as to a drop.
 	began := time.Now()
-	if _, err := e.holdDatabase("other"); !errors.Is(err, errDatabaseBeingDropped) || !errors.Is(err, errExportPaused) {
+	if _, err := e.holdDatabase("other"); !errors.Is(err, errExportPaused) || errors.Is(err, errDatabaseBeingDropped) {
 		t.Fatalf("an export while paused: %v", err)
 	}
 	if took := time.Since(began); took > time.Second {
@@ -86,4 +86,47 @@ func TestPauseExportForRestoreGivesUp(t *testing.T) {
 		t.Fatalf("an export after a refused pause: %v", err)
 	}
 	other()
+}
+
+// A second restore before the restart is not held up by the first one's
+// pause, which is never lifted (the last restore before the restart wins);
+// its resume does not lift the first one's pause.
+func TestPauseExportForRestoreTwice(t *testing.T) {
+	e := newPassRig(t, 1, 1, 1).exp
+	old := restorePauseWait
+	restorePauseWait = 2 * time.Second
+	t.Cleanup(func() { restorePauseWait = old })
+	if _, err := e.PauseExportForRestore(context.Background(), "restore b1"); err != nil {
+		t.Fatal(err)
+	}
+	began := time.Now()
+	resume2, err := e.PauseExportForRestore(context.Background(), "restore b2")
+	if err != nil {
+		t.Fatalf("a second restore's pause: %v", err)
+	}
+	if took := time.Since(began); took > time.Second {
+		t.Fatalf("a second restore waited %v for the first one's pause", took)
+	}
+	resume2() // b2 failed before staging
+	if _, err := e.holdDatabase("db"); !errors.Is(err, errExportPaused) {
+		t.Fatalf("an export after the second restore's resume: %v, want still paused for b1", err)
+	}
+}
+
+// While paused, a pass does nothing and the waiting ingest requests go: the
+// restart reconciles every table.
+func TestSchedulerSkipsWhilePausedForRestore(t *testing.T) {
+	r := newPassRig(t, 1, 1, 1)
+	if r.sched.pausedForRestore() {
+		t.Fatal("paused before any restore")
+	}
+	if _, err := r.exp.PauseExportForRestore(context.Background(), "restore b1"); err != nil {
+		t.Fatal(err)
+	}
+	if !r.sched.pausedForRestore() || !r.sched.pauseWarned {
+		t.Fatal("not reported paused")
+	}
+	if partial := r.sched.runPass(context.Background()); partial {
+		t.Fatal("a pass while paused reported partial work")
+	}
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/semaphore"
@@ -38,6 +39,11 @@ var restorePauseWait = 150 * time.Second
 type exportPause struct {
 	once sync.Once
 	sem  *semaphore.Weighted
+	// held is set while a restore holds the pause. A second restore before
+	// the restart finds it held and goes on (the last restore before the
+	// restart wins, restore.go) instead of waiting for a pause that is
+	// never lifted.
+	held atomic.Bool
 }
 
 func (p *exportPause) get() *semaphore.Weighted {
@@ -47,6 +53,9 @@ func (p *exportPause) get() *semaphore.Weighted {
 
 // holdExport holds one share of the pause, or refuses while it is taken.
 func (e *Exporter) holdExport() (release func(), err error) {
+	if e.restorePause.held.Load() {
+		return nil, errExportPaused
+	}
 	sem := e.restorePause.get()
 	if !sem.TryAcquire(1) {
 		return nil, errExportPaused
@@ -60,19 +69,32 @@ func (e *Exporter) holdExport() (release func(), err error) {
 // when it fails before staging its catalog, and otherwise the pause lasts
 // until the process restarts.
 func (e *Exporter) PauseExportForRestore(ctx context.Context, reason string) (resume func(), err error) {
-	sem := e.restorePause.get()
+	p := &e.restorePause
+	sem := p.get()
+	if p.held.Load() {
+		// An earlier restore holds it until the restart; this one restages.
+		// Its resume must not lift the earlier one's pause.
+		return func() {}, nil
+	}
 	wctx, cancel := context.WithTimeout(ctx, restorePauseWait)
 	defer cancel()
 	if err := sem.Acquire(wctx, databaseLockShares); err != nil {
-		return nil, fmt.Errorf("an Iceberg export was still running, so the export could not be paused for the restore: %w", err)
+		return nil, fmt.Errorf("an Iceberg export or drop was still running (or the restore was cancelled), so the export could not be paused for the restore: %w", err)
 	}
+	p.held.Store(true)
 	e.logger.Warn().Str("reason", reason).
 		Msg("Iceberg export paused: a restore is staging a catalog, which replaces this one at the next start; no table is exported or dropped until the server restarts")
 	var once sync.Once
 	return func() {
 		once.Do(func() {
+			p.held.Store(false)
 			sem.Release(databaseLockShares)
 			e.logger.Info().Str("reason", reason).Msg("Iceberg export resumed: the restore did not stage a catalog")
 		})
 	}, nil
+}
+
+// exportPausedForRestore reports that a restore holds the pause.
+func (e *Exporter) exportPausedForRestore() bool {
+	return e.restorePause.held.Load()
 }

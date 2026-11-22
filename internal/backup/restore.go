@@ -345,15 +345,6 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 	}
 
 	// ── 2. Restore data files ───────────────────────────────────────────
-	// On a cluster node under the cluster-wide compaction pause (#1087), both
-	// modes: compaction commits in two Raft phases on the compactor, and a
-	// job whose phase 2 lands during the restore manifest-deletes inputs the
-	// restore has just registered (replace) or unlinks a freshly written
-	// input before its batched register (both modes). The pause returns once
-	// every node has quiesced; it is released by the deferred resume AFTER
-	// the final Lost check below, with a fresh context because the run's own
-	// may be done by then. The pause expires on its own within its TTL if
-	// this process dies, so a failed resume is a warning, not a failure.
 	// A restore that stages a catalog pauses the Iceberg export before it
 	// writes anything, until the restart that applies the catalog (#1813):
 	// the export's commits in between are thrown away at the restart, and on
@@ -378,6 +369,15 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 		}()
 	}
 
+	// On a cluster node under the cluster-wide compaction pause (#1087), both
+	// modes: compaction commits in two Raft phases on the compactor, and a
+	// job whose phase 2 lands during the restore manifest-deletes inputs the
+	// restore has just registered (replace) or unlinks a freshly written
+	// input before its batched register (both modes). The pause returns once
+	// every node has quiesced; it is released by the deferred resume AFTER
+	// the final Lost check below, with a fresh context because the run's own
+	// may be done by then. The pause expires on its own within its TTL if
+	// this process dies, so a failed resume is a warning, not a failure.
 	var pause CompactionPause
 	if opts.RestoreData && m.cluster != nil {
 		progress.CompactionPause = "waiting"
@@ -1018,7 +1018,7 @@ func (m *Manager) restoreDataFiles(ctx context.Context, backupID string, read *r
 		m.setProgress(progress)
 	}()
 
-	discovery := newDiscoveryGuard(m.dataStorage)
+	discovery := newDiscoveryGuard(m.dataStorage, m.logger)
 	for _, leg := range legs {
 		for _, srcPath := range leg.files {
 			select {

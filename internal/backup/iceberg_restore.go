@@ -6,6 +6,8 @@ import (
 	"path"
 	"strings"
 
+	"github.com/rs/zerolog"
+
 	"github.com/basekick-labs/arc/internal/storage"
 )
 
@@ -61,11 +63,12 @@ func isIcebergDiscoveryFile(key string) bool {
 // files can come from more than one.
 type discoveryGuard struct {
 	backend storage.Backend
+	logger  zerolog.Logger
 	live    map[string]bool // metadata dir → holds a live hint (or could not be checked)
 }
 
-func newDiscoveryGuard(b storage.Backend) *discoveryGuard {
-	return &discoveryGuard{backend: b, live: make(map[string]bool)}
+func newDiscoveryGuard(b storage.Backend, logger zerolog.Logger) *discoveryGuard {
+	return &discoveryGuard{backend: b, logger: logger, live: make(map[string]bool)}
 }
 
 // keep reports that the discovery file at key must not be restored. A
@@ -77,6 +80,10 @@ func (g *discoveryGuard) keep(ctx context.Context, key string) bool {
 		return live
 	}
 	exists, err := g.backend.Exists(ctx, dir+"/"+icebergHintName)
+	if err != nil {
+		g.logger.Warn().Err(err).Str("dir", dir).
+			Msg("Could not check for a live Iceberg version-hint.text; the backup's version-hint.text and v<N>.metadata.json for this table are not restored. If the table has no hint here, directory-based readers resolve it again at its next export")
+	}
 	live := err != nil || exists
 	g.live[dir] = live
 	return live
