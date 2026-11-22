@@ -36,8 +36,8 @@ var excludedPaths = map[string]bool{
 }
 
 // isMetricsPath reports the JSON metrics family, which monitoring dashboards
-// poll every few seconds: like /metrics, never audited, or include_reads
-// would record every poll.
+// poll every few seconds: its reads are never audited, or include_reads
+// would record every poll. A write to it (none exists today) is audited.
 func isMetricsPath(p string) bool {
 	return p == "/api/v1/metrics" || strings.HasPrefix(p, "/api/v1/metrics/")
 }
@@ -62,7 +62,7 @@ func Middleware(logger *Logger, includeReads bool) fiber.Handler {
 		// middleware matches public routes, so /api/v1/auth/verify/ is
 		// excluded too.
 		clean := pathpkg.Clean(path)
-		if excludedPaths[clean] || isMetricsPath(clean) {
+		if excludedPaths[clean] || (isMetricsPath(clean) && isRead(c.Method())) {
 			return c.Next()
 		}
 

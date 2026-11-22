@@ -392,7 +392,7 @@ func (s *Server) sampleDBStats() {
 // healthHandler returns server health status.
 //
 // The "storage" field is served UNAUTHENTICATED by design, like the rest of
-// /health (see the PublicRoutes rationale in authPublicPaths): it
+// /health (a public route: probes and load balancers do not authenticate): it
 // contains no bucket/container names, endpoints, prefixes, paths, or key
 // material — only tier names, backend types, credential modes, sanitized
 // provider labels, expiry timestamps and error counts. That is what probes

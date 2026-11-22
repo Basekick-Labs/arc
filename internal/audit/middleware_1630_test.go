@@ -259,4 +259,15 @@ func TestMiddlewareSkipsTheMetricsFamily(t *testing.T) {
 	default:
 		t.Fatal("/api/v1/metricsfoo was skipped as a metrics path")
 	}
+	// A write to the family is audited: only polls are skipped.
+	app.Post("/api/v1/metrics/reset", ok)
+	ctx = &fasthttp.RequestCtx{}
+	ctx.Request.Header.SetMethod(fiber.MethodPost)
+	ctx.Request.SetRequestURI("/api/v1/metrics/reset")
+	app.Handler()(ctx)
+	select {
+	case <-logger.eventCh:
+	default:
+		t.Fatal("a write to the metrics family was not audited")
+	}
 }

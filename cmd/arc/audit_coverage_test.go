@@ -158,3 +158,26 @@ func TestAuditCoverageIgnoresEmptyPublicPrefix(t *testing.T) {
 		t.Error("an empty public prefix hid the routes ahead of audit")
 	}
 }
+
+// The secure-by-default switch main uses: with auth on the metrics need a
+// token and carry their guard; auth.metrics_public opens them; auth off
+// leaves nothing to guard. Never public and guarded at once.
+func TestMetricsAccess(t *testing.T) {
+	for _, c := range []struct {
+		authOn, key, public, guarded bool
+	}{
+		{true, false, false, true},
+		{true, true, true, false},
+		{false, false, true, false},
+		{false, true, true, false},
+	} {
+		public, guarded := metricsAccess(c.authOn, c.key)
+		if public != c.public || guarded != c.guarded {
+			t.Errorf("metricsAccess(auth %v, metrics_public %v) = public %v guarded %v, want %v %v",
+				c.authOn, c.key, public, guarded, c.public, c.guarded)
+		}
+		if public && guarded {
+			t.Errorf("auth %v, metrics_public %v: public and guarded at once", c.authOn, c.key)
+		}
+	}
+}

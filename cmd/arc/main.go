@@ -2877,12 +2877,13 @@ func main() {
 	// The paths the auth middleware lets through without a token. The audit
 	// coverage check (below, before the server starts) allows them ahead of
 	// the audit middleware: they are registered before it on purpose.
-	authPublicRoutes, authPublicPrefixes := authPublicPaths(authManager == nil || cfg.Auth.MetricsPublic)
+	metricsPublic, metricsGuarded := metricsAccess(authManager != nil, cfg.Auth.MetricsPublic)
+	authPublicRoutes, authPublicPrefixes := authPublicPaths(metricsPublic)
 	// The metrics routes' own guard (Server.RegisterMetricsRoutes): only
 	// when they need a token.
-	metricsGuard := authManager
-	if cfg.Auth.MetricsPublic {
-		metricsGuard = nil
+	var metricsGuard *auth.AuthManager
+	if metricsGuarded {
+		metricsGuard = authManager
 	}
 
 	// Apply auth middleware if enabled
@@ -4815,7 +4816,12 @@ func main() {
 		if n := cfg.Iceberg.ExportLagTableSeries; n > 0 {
 			icebergScheduler.EnableExportLagTables()
 			metrics.Get().SetIcebergTableLagSource(icebergScheduler, n)
-			log.Info().Int("tables", n).Msg("Iceberg export lag per table on /metrics: these series name databases and measurements, and /metrics is served without authentication")
+			ev := log.Info().Int("tables", n)
+			if authManager == nil || cfg.Auth.MetricsPublic {
+				ev.Msg("Iceberg export lag per table on /metrics: these series name databases and measurements, and /metrics is served without a token")
+			} else {
+				ev.Msg("Iceberg export lag per table on /metrics: these series name databases and measurements, readable by any valid token")
+			}
 		}
 		// Started after tiering is set up (below), so the first pass already sees the cold tier.
 		icebergStart = icebergScheduler.Start

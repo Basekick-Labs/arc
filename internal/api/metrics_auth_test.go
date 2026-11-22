@@ -58,8 +58,8 @@ func TestMetricsRoutesNeedAToken(t *testing.T) {
 			t.Errorf("GET %s without a token = %d, want 401", p, got)
 		}
 		for name, tok := range map[string]string{"read": read, "write-only": write} {
-			if got := metricsStatus(t, srv.app, p, tok); got == fiber.StatusUnauthorized || got == fiber.StatusForbidden {
-				t.Errorf("GET %s with a %s token = %d, want it served", p, name, got)
+			if got := metricsStatus(t, srv.app, p, tok); got != fiber.StatusOK {
+				t.Errorf("GET %s with a %s token = %d, want 200", p, name, got)
 			}
 		}
 	}
@@ -95,8 +95,8 @@ func TestMetricsRoutesPublic(t *testing.T) {
 	srv.app.Use(auth.NewMiddleware(mw))
 	srv.RegisterMetricsRoutes(nil)
 	for _, p := range metricsPaths {
-		if got := metricsStatus(t, srv.app, p, ""); got == fiber.StatusUnauthorized || got == fiber.StatusForbidden {
-			t.Errorf("GET %s public = %d, want it served", p, got)
+		if got := metricsStatus(t, srv.app, p, ""); got != fiber.StatusOK {
+			t.Errorf("GET %s public = %d, want 200", p, got)
 		}
 	}
 }

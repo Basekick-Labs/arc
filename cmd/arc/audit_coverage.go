@@ -14,15 +14,29 @@ import (
 // lets through without a token. main hands them to the auth middleware and to
 // checkAuditCoverage, so the two cannot drift apart.
 //
-// metricsPublic makes /metrics (Prometheus text) and /api/v1/metrics (the
-// JSON family) public: auth.metrics_public, or auth off (main passes
-// authManager == nil, so the audit coverage check, which runs with audit on
-// and auth off too, does not report them). Otherwise they need a valid
+// metricsPublic (metricsAccess) makes /metrics (Prometheus text) and
+// /api/v1/metrics (the JSON family) public. Otherwise they need a valid
 // token, read-only included: they carry operational counters, Go runtime
 // stats and host fingerprinting, and with iceberg.export_lag_table_series >
 // 0 the names of databases and measurements (#1772). They are registered
 // after the auth and audit middleware in every mode
 // (Server.RegisterMetricsRoutes), so this list is the only switch.
+// metricsAccess decides, in one place, whether the metrics routes are public
+// (listed in authPublicPaths) and whether they carry their own token guard
+// (Server.RegisterMetricsRoutes): secure by default while auth is on, open
+// with auth.metrics_public. The two are never both true: a public route
+// with a guard would refuse every caller without a token, and so every
+// scraper the key was set for.
+func metricsAccess(authOn, metricsPublicKey bool) (public, guarded bool) {
+	if !authOn {
+		return true, false // no auth middleware: nothing reads the list, nothing to guard with
+	}
+	if metricsPublicKey {
+		return true, false
+	}
+	return false, true
+}
+
 func authPublicPaths(metricsPublic bool) (routes, prefixes []string) {
 	cfg := auth.DefaultMiddlewareConfig()
 	// Add public routes that don't need auth
