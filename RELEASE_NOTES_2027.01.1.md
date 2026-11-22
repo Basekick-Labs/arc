@@ -15,10 +15,10 @@ Now:
 
 - **The aside records what it was.** A copy moved aside goes to `_stale_local/<id>.<inode>.<size>.<mtime>/<its path>`, so the name records what the stale copy was and where it came from.
 - **At start, Arc removes a file there only when it is provably the stale copy.** That means it matches the recorded identity, or it is the same file as what its path holds (a put-back that finished).
-- **Any other file there is kept for an operator,** under `_stale_local/keep-<id>/<its path>`, and logged as an error. It is not put back, because at start Arc does not yet know whether the manifest still lists the path. If it does, replication pulls the path again.
-- **A put-back is fsynced** before its aside name is removed.
-- **This also runs when the sweep is off,** so a file kept from an earlier crash is reported.
-- **Older versions' asides** are flat files in `_stale_local/`. They are removed at start as before.
+- **Any other file there is kept for an operator,** under `_stale_local/keep-<id>.<inode>.<size>.<mtime>/<its path>`, and logged as an error. Compare it with what its path holds and move it back by hand if it is wanted. It is not put back automatically, because at start Arc does not yet know whether the manifest still lists the path. Replication pulls a listed path again only while catch-up is on and another node holds the file.
+- **A put-back is fsynced** before its aside name is removed. If the fsync fails, the aside name stays, and the next start removes it once it finds the same file at the path.
+- **This also runs with replication catch-up off,** where the sweep itself does not run, so a file kept from an earlier crash is reported. With replication off it does not run.
+- **Older versions' asides** are flat files in `_stale_local/` and record nothing, so they are now kept as `keep-<name>`, with a warning, instead of being deleted.
 
 ## Fix: restoring a backup no longer leaves Iceberg tables stale or broken until the restart ([#1813](https://github.com/Basekick-Labs/arc/issues/1813))
 

@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -195,3 +196,103 @@ func TestStaleTagRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// seedStaleTag leaves, as a crash would, one stale copy (its tag's identity)
+// and one replacement under their tag directories.
+func seedStaleTag(t *testing.T, root string) (staleTag1, replTag string) {
+	t.Helper()
+	a := filepath.Join(root, staleLocalAsideDir)
+	tmp := filepath.Join(a, "tmp")
+	if err := os.MkdirAll(a, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tmp, []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	id, _ := localIdentity(tmp)
+	staleTag1 = staleTag(id)
+	dst := filepath.Join(a, staleTag1, filepath.FromSlash(staleHour+"s.parquet"))
+	_ = os.MkdirAll(filepath.Dir(dst), 0o700)
+	if err := os.Rename(tmp, dst); err != nil {
+		t.Fatal(err)
+	}
+	replTag = staleTag(seenRecord{ino: 1, size: 2, mtime: 3})
+	rp := filepath.Join(a, replTag, filepath.FromSlash(staleHour+"r.parquet"))
+	_ = os.MkdirAll(filepath.Dir(rp), 0o700)
+	if err := os.WriteFile(rp, []byte("replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return staleTag1, replTag
+}
+
+func assertRecovered(t *testing.T, root, staleTag1, replTag string) {
+	t.Helper()
+	a := filepath.Join(root, staleLocalAsideDir)
+	if _, err := os.Stat(filepath.Join(a, staleTag1)); err == nil {
+		t.Error("the stale copy's tag was not settled")
+	}
+	if _, err := os.Stat(filepath.Join(a, staleLocalKeepAside+replTag, filepath.FromSlash(staleHour+"r.parquet"))); err != nil {
+		t.Error("the replacement was not kept")
+	}
+}
+
+// The sweep's start settles the aside area before anything else (#1814).
+func TestStaleLocalRunRecoversAsides(t *testing.T) {
+	r := staleRig(t)
+	st, rt := seedStaleTag(t, r.root)
+	r.c.stale.seen.Store(nil)
+	file := filepath.Join(t.TempDir(), "not-a-dir")
+	_ = os.WriteFile(file, nil, 0o600)
+	r.c.cfg.RaftDataDir = file // the journal cannot open: the run ends after recovery
+	r.c.stale.wg.Add(1)
+	r.c.staleLocalRun(context.Background())
+	assertRecovered(t, r.root, st, rt)
+}
+
+// With catch-up off the sweep does not run, and the aside area is settled
+// all the same.
+func TestStaleAsideRecoveredWhenTheSweepIsOff(t *testing.T) {
+	r := staleRig(t)
+	st, rt := seedStaleTag(t, r.root)
+	r.c.cfg.ReplicationCatchUpEnabled = false
+	if r.c.staleLocalEnabled() {
+		t.Fatal("precondition: the sweep is still enabled")
+	}
+	r.c.startStaleLocalLocked()
+	r.c.stale.wg.Wait()
+	assertRecovered(t, r.root, st, rt)
+}
+
+// A put-back that cannot be made durable keeps its aside name: the next
+// start finds the same file at the path and removes only the aside.
+func TestStalePutBackFsyncFailureKeepsTheAside(t *testing.T) {
+	r := staleRig(t)
+	key := staleHour + "a.parquet"
+	full := filepath.Join(r.root, key)
+	staleReadyToUnlink(r, key, "rows a")
+	staleBeforeAside = func(p string) {
+		if p == full {
+			_ = os.Remove(p)
+			r.write(key, "rows A")
+		}
+	}
+	staleSyncDir = func(string) error { return errors.New("injected EIO") }
+	t.Cleanup(func() { staleBeforeAside, staleSyncDir = nil, storageSyncDir })
+	r.pass()
+	if got, _ := os.ReadFile(full); string(got) != "rows A" {
+		t.Fatalf("file at the path = %q, want the replacement put back", got)
+	}
+	if got := asideEntries(t, r.root); len(got) != 1 {
+		t.Fatalf("aside after a failed fsync = %v, want the aside name kept", got)
+	}
+	staleSyncDir = storageSyncDir
+	r.c.recoverStaleAsides(r.root)
+	if got := asideEntries(t, r.root); len(got) != 0 {
+		t.Fatalf("aside after recovery = %v", got)
+	}
+	if got, _ := os.ReadFile(full); string(got) != "rows A" {
+		t.Fatalf("file at the path after recovery = %q", got)
+	}
+}
+
+var storageSyncDir = staleSyncDir

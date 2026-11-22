@@ -535,20 +535,23 @@ func TestStaleLocalIgnoresReservedRoots(t *testing.T) {
 	}
 }
 
-// An older version's flat aside is removed at startup; a copy kept for an
-// operator is left.
+// An older version's flat aside records nothing, so startup keeps it for an
+// operator (#1814); a copy already kept is left.
 func TestRemoveStaleAsides(t *testing.T) {
 	r := staleRig(t)
 	dir := filepath.Join(r.root, staleLocalAsideDir)
 	_ = os.MkdirAll(dir, 0o700)
 	aside := filepath.Join(dir, "abc")
-	keep := filepath.Join(dir, staleLocalKeepAside+"abc")
+	keep := filepath.Join(dir, staleLocalKeepAside+"old")
 	_ = os.WriteFile(aside, []byte("x"), 0o600)
 	_ = os.WriteFile(keep, []byte("x"), 0o600)
 	r.write(staleHour+"x.parquet", "x")
 	r.c.recoverStaleAsides(r.root)
 	if _, err := os.Stat(aside); err == nil {
-		t.Fatal("aside copy left")
+		t.Fatal("flat aside left under its own name")
+	}
+	if _, err := os.Stat(filepath.Join(dir, staleLocalKeepAside+"abc")); err != nil {
+		t.Fatal("an older version's aside was not kept")
 	}
 	if _, err := os.Stat(keep); err != nil {
 		t.Fatal("a copy kept for an operator was removed")
