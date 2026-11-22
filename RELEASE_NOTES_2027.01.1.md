@@ -2,6 +2,20 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: in a cluster, compaction recovery no longer leaves the manifest listing an output it deleted ([#1811](https://github.com/Basekick-Labs/arc/issues/1811))
+
+**Who is affected:** clusters whose compaction does not use the staged commit, which today means a cluster with a node too old to support it, or leftovers from before it was turned on. A fully upgraded cluster's jobs do not take this path.
+
+When an interrupted compaction job is recovered and its output's stored size is not the size the job recorded, the output is deleted so the job is redone from its inputs. In a cluster that file may already be registered in the cluster manifest, and the node also keeps a record that registers it. The file was deleted from storage first and neither was touched: the manifest kept an entry no node could serve, and a restart registered the deleted file again.
+
+- **The output leaves the cluster manifest before it leaves storage.** Recovery removes the node's record for the job, then the manifest entry, and only then the file. The same when the output is already missing and the job is given up, provided its inputs are all still stored.
+- **If the cluster cannot be updated** (no quorum, or compaction is paused cluster-wide), nothing is deleted from storage. The recovery record stays under `_compaction_state/` and the next compaction cycle that covers that database tries again; nothing else does. Until then the job's inputs stay out of compaction.
+- **An output that is not in storage is not registered.** Before a node registers a finished output it now checks that the file is there, at the recorded size. If it is not, it logs `Compaction output is not in storage as its completion record describes` once and looks again about once a minute.
+- **Not changed:** a single node, and a node that could not join its cluster and runs standalone, recover as before.
+
+Not known to be reachable without outside help: the product writes the record only after the upload reports success, so the size has to change afterwards (the object replaced or damaged, or a storage fault).
+
+Checked on a two-node cluster (a writer and a compactor, local storage): an output was registered, its size changed on disk, and a compaction cycle run. Afterwards neither node's manifest listed it, the file, its recovery record and the node's record were gone, and the input was kept.
 ## Fix: on S3 and Azure, an object whose size the store does not report is no longer read as empty ([#1812](https://github.com/Basekick-Labs/arc/issues/1812))
 
 **Who is affected:** S3, S3-compatible and Azure storage, only with a store or proxy that answers an object's metadata request without a content length. AWS S3 and Azure send it, and so does SeaweedFS (tested). Local storage and GCS are unchanged.

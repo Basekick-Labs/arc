@@ -514,9 +514,9 @@ func (j *Job) Run(ctx context.Context) error {
 
 	// Phase 4 durability point: upload succeeded. In cluster mode, write the
 	// completion manifest in state output_written BEFORE we delete sources.
-	// From here on, the watcher will eventually register the compacted file
-	// in the Raft manifest even if the subprocess crashes before the delete
-	// phase.
+	// From here on, the watcher registers the compacted file in the Raft
+	// manifest even if the subprocess crashes before the delete phase, for
+	// as long as the file is in storage at the recorded size.
 	//
 	// Failing here does NOT unwind the upload, and it does not get retried
 	// into a good state either: next cycle recoverLoadedManifest finds the

@@ -326,6 +326,13 @@ type recoveryHooks struct {
 	// consumedInto runs after onConsumedInputs succeeded, with the output
 	// (#1683). Its error keeps the manifest, as onConsumedInputs's does.
 	consumedInto func(inputs []string, output string) error
+	// beforeOutputGone un-registers the output from the cluster before
+	// recovery removes it from storage (a mismatched output) or gives the
+	// job up with its output already missing (#1811): cluster manifest
+	// first, storage second. Its error keeps the output, the inputs and the
+	// recovery manifest; only a later cycle with this manifest in its scope
+	// tries again. Nil on a node with no completion watcher.
+	beforeOutputGone func(context.Context, *Manifest) error
 }
 
 func (m *ManifestManager) recoverOrphanedManifestsWithHooks(ctx context.Context, scope recoveryScope, onKeptOutput func(string), onConsumedInputs func([]string) error, hooks recoveryHooks) (recovered int, recoveryErr error) {
@@ -444,6 +451,44 @@ func (m *ManifestManager) recoverLoadedManifest(ctx context.Context, manifestPat
 	if !exists {
 		// Output file doesn't exist - compaction was interrupted before upload completed
 		// Delete manifest and let compaction retry
+		// The output may have been registered before it went missing, and
+		// a completion record may still be waiting to register it: it is
+		// un-registered first. Only when every input is known to be in
+		// storage, as for a mismatched output (discardPartialOutput). A
+		// manifest can outlive a job that finished, and then the inputs are
+		// gone and the output is the data: on a cluster with per-node
+		// storage this node's copy may be the only one missing, and
+		// un-registering would make every node that holds a good copy drop
+		// it. There the manifest goes, as it always did, and the cluster
+		// manifest is left alone.
+		if hooks.beforeOutputGone != nil {
+			missing, err := m.missingInputs(ctx, manifest)
+			if err != nil {
+				return fmt.Errorf("output %s is missing; could not confirm its inputs are still stored, manifest kept: %w", manifest.OutputPath, err)
+			}
+			if len(missing) > 0 || len(manifest.InputFiles) == 0 {
+				m.logger.Warn().
+					Str("manifest", manifestPath).
+					Str("output", manifest.OutputPath).
+					Strs("missing_inputs", missing).
+					Msg("Compaction output is missing from this node's storage and its inputs are not all stored either; removing the recovery manifest without un-registering the output from the cluster, since other nodes may hold it")
+			} else {
+				if err := hooks.beforeOutputGone(ctx, manifest); err != nil {
+					return fmt.Errorf("output %s is missing but could not be un-registered from the cluster; manifest kept: %w", manifest.OutputPath, err)
+				}
+				// The job may still be running on another node, and have
+				// uploaded and registered the output in the meantime. Then
+				// this is not an abandoned job: keep the manifest and let a
+				// later pass complete it normally.
+				appeared, err := m.backend.Exists(ctx, manifest.OutputPath)
+				if err != nil {
+					return fmt.Errorf("could not re-check output %s after un-registering it; manifest kept: %w", manifest.OutputPath, err)
+				}
+				if appeared {
+					return fmt.Errorf("output %s; manifest kept: %w", manifest.OutputPath, errOutputAppeared)
+				}
+			}
+		}
 		m.logger.Info().
 			Str("manifest", manifestPath).
 			Str("output", manifest.OutputPath).
@@ -475,7 +520,7 @@ func (m *ManifestManager) recoverLoadedManifest(ctx context.Context, manifestPat
 		return fmt.Errorf("output %s disappeared between the existence check and the size check; manifest and inputs kept", manifest.OutputPath)
 	}
 	if actualSize != manifest.OutputSize {
-		return m.discardPartialOutput(ctx, manifestPath, manifest, actualSize)
+		return m.discardPartialOutput(ctx, manifestPath, manifest, actualSize, hooks)
 	}
 
 	// Record the kept output for the cluster BEFORE deleting the inputs, so a
@@ -499,7 +544,7 @@ func (m *ManifestManager) recoverLoadedManifest(ctx context.Context, manifestPat
 			var short *shortOutputError
 			switch {
 			case errors.As(err, &short):
-				return m.discardPartialOutput(ctx, manifestPath, manifest, short.actual)
+				return m.discardPartialOutput(ctx, manifestPath, manifest, short.actual, hooks)
 			case errors.Is(err, errRecoveryPermanent):
 				return m.quarantineManifest(ctx, manifestPath, manifest.OutputPath, err)
 			default:
@@ -651,17 +696,11 @@ func quarantinePathFor(manifestPath string) (string, error) {
 //     while its output remains leaves the output and the inputs side by side
 //     with nothing keeping them out of the next compaction, which would
 //     merge them into duplicate rows.
-func (m *ManifestManager) discardPartialOutput(ctx context.Context, manifestPath string, manifest *Manifest, actualSize int64) error {
-	var missing []string
-	for _, inputFile := range manifest.InputFiles {
-		exists, err := m.backend.Exists(ctx, inputFile)
-		if err != nil {
-			return fmt.Errorf("output %s has size %d, manifest records %d; could not confirm input %s is still stored, nothing deleted: %w",
-				manifest.OutputPath, actualSize, manifest.OutputSize, inputFile, err)
-		}
-		if !exists {
-			missing = append(missing, inputFile)
-		}
+func (m *ManifestManager) discardPartialOutput(ctx context.Context, manifestPath string, manifest *Manifest, actualSize int64, hooks recoveryHooks) error {
+	missing, err := m.missingInputs(ctx, manifest)
+	if err != nil {
+		return fmt.Errorf("output %s has size %d, manifest records %d; nothing deleted: %w",
+			manifest.OutputPath, actualSize, manifest.OutputSize, err)
 	}
 	if len(missing) > 0 || len(manifest.InputFiles) == 0 {
 		m.logger.Error().
@@ -677,6 +716,16 @@ func (m *ManifestManager) discardPartialOutput(ctx context.Context, manifestPath
 			manifest.OutputPath, actualSize, manifest.OutputSize, len(missing), len(manifest.InputFiles))
 	}
 
+	// Cluster manifest before storage: an output the completion watcher
+	// registered must leave the cluster manifest before its file goes, or
+	// the manifest keeps an entry no node can serve (#1811).
+	if hooks.beforeOutputGone != nil {
+		if err := hooks.beforeOutputGone(ctx, manifest); err != nil {
+			return fmt.Errorf("output %s has size %d, manifest records %d, but it could not be un-registered from the cluster; nothing deleted: %w",
+				manifest.OutputPath, actualSize, manifest.OutputSize, err)
+		}
+	}
+
 	m.logger.Warn().
 		Str("manifest", manifestPath).
 		Int64("expected_size", manifest.OutputSize).
@@ -690,6 +739,33 @@ func (m *ManifestManager) discardPartialOutput(ctx context.Context, manifestPath
 		}
 	}
 	return m.DeleteManifest(ctx, manifestPath)
+}
+
+// errOutputAppeared marks a recovery pass that found the output missing and
+// then present: the job is still running on another node.
+var errOutputAppeared = errors.New("compaction output appeared during recovery")
+
+// missingInputs returns the manifest's inputs that are not known to be in
+// storage. An error means one of them could not be checked this time. An
+// input whose key no backend can address (storage.ErrInvalidPath, #747) can
+// never be checked, so it counts as not known to be stored rather than as an
+// error that would repeat on every cycle.
+func (m *ManifestManager) missingInputs(ctx context.Context, manifest *Manifest) ([]string, error) {
+	var missing []string
+	for _, inputFile := range manifest.InputFiles {
+		exists, err := m.backend.Exists(ctx, inputFile)
+		if errors.Is(err, storage.ErrInvalidPath) {
+			missing = append(missing, inputFile)
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("could not confirm input %s is still stored: %w", inputFile, err)
+		}
+		if !exists {
+			missing = append(missing, inputFile)
+		}
+	}
+	return missing, nil
 }
 
 func (m *ManifestManager) quarantineManifest(ctx context.Context, manifestPath, badKey string, cause error) error {
