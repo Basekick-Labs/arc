@@ -24,8 +24,12 @@ edge sync of a store that holds them, or from a file placed by hand.
   day.
 - **A job with such an input compacts nothing.** No output, no input removed. The file
   is remembered on local disk (`{compaction.temp_directory}/misfiled.json`), and the
-  partition's next job runs without it. So the first cycle after the upgrade may compact
-  nothing in an affected partition, and the cycle after compacts the rest.
+  partition is judged from then on as if the file were not there. So the first cycle
+  after the upgrade may compact nothing in an affected partition, and the cycle after
+  compacts the rest, if the rest is still enough files for a job: an hour left with
+  fewer than `hourly_min_files` waits for the daily tier, and a day older than
+  `daily_skip_file_age_check_days` left with fewer than `daily_min_files` gets its
+  daily file as a settled day (#1774).
 - **A file in the right day but the wrong hour is healed by the daily tier.** The hourly
   tier leaves it alone; the daily tier takes it, and the day's file is read by every
   query of that day.
@@ -34,8 +38,10 @@ edge sync of a store that holds them, or from a file placed by hand.
   filter by time do not read its rows and queries that do not filter do; that was
   already so before this release, and is unchanged. Moving such a file to the right
   directories is tracked in #1825.
-- **Outputs that already span two days are not undone.** They are refused as inputs of
-  any later job, and listed like any other file.
+- **Outputs that already span two days are not undone.** One that becomes an input of
+  a later job is refused and listed like any other file. A daily file of a day past
+  `daily_skip_file_age_check_days` is never an input again, so it is not listed; the
+  Iceberg export reports it (`arc_iceberg_files_left_out`).
 
 What to look at:
 
@@ -53,11 +59,17 @@ filed by ingestion time (written before 26.02.1) will see most of it listed: tha
 was merged into multi-day outputs by every earlier version.
 
 `compaction.refuse_misfiled_inputs = false` (`ARC_COMPACTION_REFUSE_MISFILED_INPUTS`)
-restores the previous behaviour.
+restores the previous behaviour: jobs do not check, and the list is neither read nor
+used, so files remembered earlier are compacted like any other. The list stays on disk
+for a later start with the check on.
+
+The list holds up to 100,000 entries. Past that, a job's files are not remembered and
+the job is refused again each time it runs, with a warning in the log.
 
 The compaction subprocess now sets its time zone to UTC for every connection of its
-DuckDB pool. Before, only the first connection was pinned; the compaction statement ran
-on that one, so outputs were not affected.
+DuckDB pool. Before, only the connection that ran the setting was pinned. A job runs its
+statements one after another and so reused that connection; this makes it hold whichever
+connection a statement gets.
 
 ## Fix: with `ingest.write_statistics = false`, Iceberg readers that filter by time no longer miss rows ([#1754](https://github.com/Basekick-Labs/arc/issues/1754))
 

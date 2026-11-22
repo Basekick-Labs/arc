@@ -333,9 +333,6 @@ func TestMisfiledMemo1825(t *testing.T) {
 	if kept, dropped := m.without("daily", files); dropped != 1 || len(kept) != 2 {
 		t.Fatalf("daily without = %v (%d dropped)", kept, dropped)
 	}
-	if !m.hasAny("hourly", files) || m.hasAny("hourly", files[1:2]) {
-		t.Fatal("hasAny")
-	}
 	if m.files() != 2 || len(m.list()) != 3 {
 		t.Fatalf("files %d, entries %d; want 2 and 3", m.files(), len(m.list()))
 	}
@@ -355,7 +352,7 @@ func TestMisfiledMemo1825(t *testing.T) {
 	}
 
 	var none *misfiledMemo
-	if none.has("hourly", "p") || none.hasAny("hourly", files) || none.files() != 0 || none.record("hourly", "p", []MisfiledInput{inDay}, now) != 0 {
+	if none.has("hourly", "p") || none.files() != 0 || none.forgetPaths(files) != 0 || none.record("hourly", "p", []MisfiledInput{inDay}, now) != 0 {
 		t.Fatal("nil memo")
 	}
 	if kept, dropped := none.without("hourly", files); dropped != 0 || len(kept) != 3 {
@@ -571,5 +568,285 @@ func TestRefusedSettledDaysTakeNoSlot1825(t *testing.T) {
 	_, _ = m.RunCompactionCycleForMeasurement(ctx, "db", "cpu", []string{"hourly"})
 	if len(*jobs) != 1 || (*jobs)[0][0] != real.Files[0] {
 		t.Fatalf("jobs = %d, want the one day that has a file to compact", len(*jobs))
+	}
+}
+
+// A column named "Time" is the time column to DuckDB, and the COPY merges its
+// rows: the check reads it too.
+func TestFileTimeRangeAnyCaseOfTheColumnName1825(t *testing.T) {
+	ctx := context.Background()
+	db := utcDB1825(t)
+	path := filepath.Join(t.TempDir(), "f.parquet")
+	q := fmt.Sprintf(`COPY (SELECT TIMESTAMPTZ '2030-01-01 00:00:00Z' AS "Time", 1 AS x) TO '%s' (FORMAT PARQUET)`, escapeSQLPath(filepath.ToSlash(path)))
+	if _, err := db.ExecContext(ctx, q); err != nil {
+		t.Fatal(err)
+	}
+	lo, _, found, err := fileTimeRange(ctx, db, path)
+	if err != nil || !found || !lo.Equal(ts1825("2030-01-01 00:00:00")) {
+		t.Fatalf("range starts %v (found %v, err %v), want the file's 2030 row", lo, found, err)
+	}
+}
+
+// A day is judged on the files a job could take. With eleven good hour files
+// and one refused, under daily_min_files = 12, the day is a settled day and
+// gets its daily file; judged with the refused file it was a regular
+// candidate that the filter turned down on every cycle, for good.
+func TestDayIsClassifiedWithoutRefusedFiles1825(t *testing.T) {
+	now := time.Now().UTC()
+	d := now.AddDate(0, 0, -30)
+	day := time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, time.UTC)
+	written := day.Add(36 * time.Hour)
+	var objects []string
+	for h := 0; h < 12; h++ {
+		objects = append(objects, hourFile("db", "cpu", day, h, written.Add(time.Duration(h)*time.Second)))
+	}
+	stray := objects[11]
+
+	m, _, cleanup := setupTestManager(t)
+	defer cleanup()
+	tier := settledTier(12, 7, 24)
+	m.Tiers = []Tier{tier}
+	m.misfiled.record("daily", "db/cpu", []MisfiledInput{{Path: stray, OutsideDay: true}}, now)
+
+	// As NewManager wires it.
+	tier.SetExclude(func(p string) bool { return m.misfiled.has("daily", p) })
+	got := tier.FindCandidatesFromListing("db", "cpu", objects)
+	if len(got) != 1 || !got[0].Settled || len(got[0].Files) != 11 {
+		t.Fatalf("candidates = %+v, want one settled day of the eleven other files", got)
+	}
+	for _, f := range got[0].Files {
+		if f == stray {
+			t.Fatal("the refused file is in the candidate")
+		}
+	}
+	if c, ok := m.filterMisfiled(got[0], tier); !ok || len(c.Files) != 11 {
+		t.Fatalf("the manager's filter turned the day down: %v", ok)
+	}
+	// The listing is not changed for its other readers.
+	if len(objects) != 12 || objects[11] != stray {
+		t.Fatal("the tier changed the caller's listing")
+	}
+	// Without the exclusion: a regular candidate of twelve, which the filter refuses.
+	tier.SetExclude(nil)
+	got = tier.FindCandidatesFromListing("db", "cpu", objects)
+	if len(got) != 1 || got[0].Settled || len(got[0].Files) != 12 {
+		t.Fatalf("without the exclusion: %+v", got)
+	}
+}
+
+// NewManager gives its tiers the exclusion.
+func TestNewManagerWiresTheTierExclusion1825(t *testing.T) {
+	backend := localBackend(t)
+	now := time.Now().UTC()
+	d := now.AddDate(0, 0, -30)
+	day := time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, time.UTC)
+	a, b, stray := hourFile("db", "cpu", day, 1, day.Add(30*time.Hour)), hourFile("db", "cpu", day, 2, day.Add(31*time.Hour)), hourFile("db", "cpu", day, 3, day.Add(32*time.Hour))
+	for _, on := range []bool{true, false} {
+		tier := settledTier(12, 7, 24)
+		m := NewManager(&ManagerConfig{StorageBackend: backend, LockManager: NewLockManager(), TempDirectory: t.TempDir(),
+			Logger: zerolog.Nop(), Tiers: []Tier{tier}, MergeMisfiledInputs: !on})
+		m.misfiled.record("daily", "p", []MisfiledInput{{Path: stray}}, now)
+		got := tier.FindCandidatesFromListing("db", "cpu", []string{a, b, stray})
+		want := 3
+		if on {
+			want = 2
+		}
+		if len(got) != 1 || len(got[0].Files) != want {
+			t.Fatalf("check on=%v: candidate files = %+v, want %d", on, got, want)
+		}
+	}
+}
+
+// With compaction.refuse_misfiled_inputs = false the list is neither read nor
+// used: files remembered by an earlier run are compacted like any other, the
+// job is not asked to check, and the list on disk is left as it was.
+func TestCheckOffIgnoresTheList1825(t *testing.T) {
+	backend := localBackend(t)
+	temp := t.TempDir()
+	part := "db/cpu/2026/01/01/03"
+	stray := part + "/stray.parquet"
+	earlier := newMisfiledMemo(temp, zerolog.Nop())
+	earlier.record("hourly", part, []MisfiledInput{{Path: stray, OutsideDay: true}}, time.Now())
+	saved, err := os.ReadFile(filepath.Join(temp, misfiledFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m := NewManager(&ManagerConfig{StorageBackend: backend, LockManager: NewLockManager(), TempDirectory: temp,
+		Logger: zerolog.Nop(), MergeMisfiledInputs: true, MaxFilesPerBatch: 10})
+	if len(m.MisfiledFiles()) != 0 || metrics.Get().Snapshot()["compaction_files_misfiled"].(int64) != 0 {
+		t.Fatalf("with the check off the list reads %+v", m.MisfiledFiles())
+	}
+	files := []string{part + "/a.parquet", part + "/b.parquet", stray}
+	m.Tiers = []Tier{cycleTierIssue915{find: func(context.Context, string, string) ([]Candidate, error) {
+		c := candidateIssue915(part)
+		c.Files, c.FileCount = files, len(files)
+		return []Candidate{c}, nil
+	}}}
+	old := runJobInSubprocess
+	t.Cleanup(func() { runJobInSubprocess = old })
+	var jobs []*SubprocessJobConfig
+	runJobInSubprocess = func(_ context.Context, cfg *SubprocessJobConfig, _ zerolog.Logger) (*SubprocessJobResult, error) {
+		jobs = append(jobs, cfg)
+		return &SubprocessJobResult{Success: true, FilesCompacted: len(cfg.Files), CompactedInputs: cfg.Files, SourcesDeleted: true}, nil
+	}
+	_, _ = m.RunCompactionCycleForMeasurement(context.Background(), "db", "cpu", []string{"hourly"})
+	if len(jobs) != 1 || len(jobs[0].Files) != 3 || jobs[0].CheckInputWindow {
+		t.Fatalf("jobs = %+v, want one job of all three files, not asked to check", jobs)
+	}
+	if now, _ := os.ReadFile(filepath.Join(temp, misfiledFile)); string(now) != string(saved) {
+		t.Fatal("the list on disk was changed with the check off")
+	}
+}
+
+// A job that refused its inputs is no evidence that its partition fits in a
+// job's memory: the too-wide strike the partition holds stays.
+func TestRefusedJobDoesNotClearATooWideStrike1825(t *testing.T) {
+	for _, refuse := range []bool{true, false} {
+		m, b, cleanup := setupTestManager(t)
+		ctx := context.Background()
+		part := "db/cpu/2026/01/01/03"
+		stray := part + "/stray.parquet"
+		files := []string{part + "/a.parquet", part + "/b.parquet", stray}
+		for _, f := range files {
+			if err := b.Write(ctx, f, []byte("x")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		m.Tiers = []Tier{cycleTierIssue915{
+			Tier: NewHourlyTier(&HourlyTierConfig{StorageBackend: b, MinAgeHours: 1, MinFiles: 2, Enabled: true, Logger: zerolog.Nop()}),
+			find: func(context.Context, string, string) ([]Candidate, error) {
+				c := candidateIssue915(part)
+				c.Files, c.FileCount = files, len(files)
+				return []Candidate{c}, nil
+			}}}
+		// One strike of a kind that needs two: the partition is still tried.
+		m.tooWide.strike("hourly", part, files, "killed", m.TooWideSettings())
+		target := ""
+		if refuse {
+			target = stray
+		}
+		refusingSubprocess1825(t, target, true)
+		_, _ = m.RunCompactionCycleForMeasurement(ctx, "db", "cpu", []string{"hourly"})
+		if kept := len(m.TooWidePartitions()) == 1; kept != refuse {
+			t.Fatalf("job refused=%v: the strike is kept=%v", refuse, kept)
+		}
+		cleanup()
+	}
+}
+
+// A staged job that refuses is remembered too: the staged path returns early
+// in compactPartition, after the refusal is recorded.
+func TestStagedJobRefusalIsRemembered1825(t *testing.T) {
+	backend := localBackend(t)
+	m := activeJobsRig(t, backend)
+	ctx := context.Background()
+	a := "db/cpu/2026/01/01/03/cpu_20260102_020000_000000001.parquet"
+	stray := "db/cpu/2026/01/01/03/cpu_20260102_020000_000000002.parquet"
+	for _, f := range []string{a, stray} {
+		if err := backend.Write(ctx, f, []byte("12345")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.SetStagedCommit(func() bool { return true },
+		func(string) (int64, string, bool) { return 5, "sha", true },
+		func(string) bool { return false })
+	refusingSubprocess1825(t, stray, true)
+	c := Candidate{Database: "db", Measurement: "cpu", PartitionPath: "cpu/2026/01/01/03", Tier: "hourly", BatchNumber: 1, Files: []string{a, stray}}
+	if err := m.compactPartition(ctx, c, jobAttribution{}); err != nil {
+		t.Fatal(err)
+	}
+	if !m.misfiled.has("hourly", stray) || !m.misfiled.has("daily", stray) {
+		t.Fatalf("a staged job's refusal was not remembered: %+v", m.MisfiledFiles())
+	}
+}
+
+// The list is checked against storage a window at a time, and every file gets
+// its turn: files past the first window are reached on a later cycle.
+func TestPruneMisfiledTakesEveryFileInTurn1825(t *testing.T) {
+	m, b, cleanup := setupTestManager(t)
+	defer cleanup()
+	ctx := context.Background()
+	const n = misfiledPrunePerCycle + 50
+	var in []MisfiledInput
+	for i := 0; i < n; i++ {
+		p := fmt.Sprintf("db/cpu/2026/01/01/03/f%04d.parquet", i)
+		in = append(in, MisfiledInput{Path: p})
+		if i < misfiledPrunePerCycle { // the first window's files are still in storage
+			if err := b.Write(ctx, p, []byte("x")); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	m.misfiled.record("hourly", "db/cpu/2026/01/01/03", in, time.Now())
+	m.pruneMisfiled(ctx)
+	if got := m.misfiled.files(); got != n {
+		t.Fatalf("after the first window the list holds %d files, want all %d (its files exist)", got, n)
+	}
+	m.pruneMisfiled(ctx)
+	if got := m.misfiled.files(); got != misfiledPrunePerCycle {
+		t.Fatalf("after the second window the list holds %d files, want the %d still in storage", got, misfiledPrunePerCycle)
+	}
+	// Round again: one of the first window's files goes, and is forgotten.
+	if err := b.Delete(ctx, in[3].Path); err != nil {
+		t.Fatal(err)
+	}
+	m.pruneMisfiled(ctx)
+	m.pruneMisfiled(ctx)
+	if m.misfiled.has("hourly", in[3].Path) {
+		t.Fatal("a file removed after its window was checked was never checked again")
+	}
+}
+
+// A full list: the files of a job it has no room for are not remembered, and
+// a settled day's job is then recorded like any job that ran, so it is not
+// refused again on every cycle.
+func TestFullListRecordsTheSettledJob1825(t *testing.T) {
+	m, b, cleanup := setupTestManager(t)
+	defer cleanup()
+	ctx := context.Background()
+	for i := 0; i < maxMisfiledEntries; i++ {
+		m.misfiled.entries[misfiledKey("hourly", fmt.Sprintf("x/%d", i))] = MisfiledEntry{Tier: "hourly", Path: fmt.Sprintf("x/%d", i)}
+	}
+	part := "db/cpu/2026/01/01"
+	stray := part + "/04/stray.parquet"
+	files := []string{part + "/03/a.parquet", stray}
+	for _, f := range files {
+		if err := b.Write(ctx, f, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.Tiers = []Tier{cycleTierIssue915{find: func(context.Context, string, string) ([]Candidate, error) {
+		c := candidateIssue915(part)
+		c.Settled, c.Files, c.FileCount = true, files, len(files)
+		return []Candidate{c}, nil
+	}}}
+	jobs := refusingSubprocess1825(t, stray, false)
+	for i := 0; i < 3; i++ {
+		_, _ = m.RunCompactionCycleForMeasurement(ctx, "db", "cpu", []string{"hourly"})
+	}
+	if m.misfiled.has("hourly", stray) {
+		t.Fatal("a full list took another file")
+	}
+	if len(*jobs) != 1 {
+		t.Fatalf("the settled day's job ran %d times over 3 cycles, want 1", len(*jobs))
+	}
+}
+
+// A large list is written once per cycle, not on every change.
+func TestLargeListIsWrittenOnFlush1825(t *testing.T) {
+	dir := t.TempDir()
+	m := newMisfiledMemo(dir, zerolog.Nop())
+	var in []MisfiledInput
+	for i := 0; i < misfiledSaveEachChange+10; i++ {
+		in = append(in, MisfiledInput{Path: fmt.Sprintf("p/%d", i)})
+	}
+	m.record("daily", "p", in, time.Now())
+	if _, err := os.Stat(filepath.Join(dir, misfiledFile)); err == nil {
+		t.Fatal("a list over the size written on each change was written at once")
+	}
+	m.flush()
+	if got := len(newMisfiledMemo(dir, zerolog.Nop()).list()); got != len(in) {
+		t.Fatalf("after flush a restart reads %d entries, want %d", got, len(in))
 	}
 }

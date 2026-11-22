@@ -100,7 +100,9 @@ func fileTimeRange(ctx context.Context, db *sql.DB, localPath string) (lo, hi ti
 	if err != nil {
 		return time.Time{}, time.Time{}, false, err
 	}
-	if !hasTimeColumn(cols) {
+	// Any case: DuckDB binds "time" to a column named "Time" too, and the
+	// compaction COPY would merge its rows.
+	if _, ok := cols["time"]; !ok {
 		return time.Time{}, time.Time{}, false, nil
 	}
 	var minUS, maxUS sql.NullInt64
@@ -172,8 +174,16 @@ type misfiledMemo struct {
 	mu      sync.Mutex
 	path    string // "" keeps the memo in memory only
 	entries map[string]MisfiledEntry
-	logger  zerolog.Logger
+	// dirty: a change to a large list not written yet (saveLocked).
+	dirty  bool
+	logger zerolog.Logger
 }
+
+// misfiledSaveEachChange is the list size up to which every change is
+// written at once. A larger list is written once per cycle (flush): the
+// whole file is rewritten each time, under the lock every candidate filter
+// takes. Entries not yet written when the process stops are found again.
+const misfiledSaveEachChange = 2000
 
 func misfiledKey(tier, path string) string { return tier + "\x00" + path }
 
@@ -239,23 +249,11 @@ func (m *misfiledMemo) has(tier, path string) bool {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	_, ok := m.entries[misfiledKey(tier, path)]
-	return ok
-}
-
-// hasAny reports whether tier leaves any of files alone.
-func (m *misfiledMemo) hasAny(tier string, files []string) bool {
-	if m == nil {
+	if len(m.entries) == 0 {
 		return false
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, f := range files {
-		if _, ok := m.entries[misfiledKey(tier, f)]; ok {
-			return true
-		}
-	}
-	return false
+	_, ok := m.entries[misfiledKey(tier, path)]
+	return ok
 }
 
 // without returns files less those tier leaves alone, and how many it dropped.
@@ -315,6 +313,43 @@ func (m *misfiledMemo) files() int {
 	return len(seen)
 }
 
+// forgetPaths drops every entry of the given files and returns how many it
+// dropped.
+func (m *misfiledMemo) forgetPaths(paths []string) int {
+	if m == nil || len(paths) == 0 {
+		return 0
+	}
+	drop := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		drop[p] = struct{}{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for k, e := range m.entries {
+		if _, ok := drop[e.Path]; ok {
+			delete(m.entries, k)
+			n++
+		}
+	}
+	if n > 0 {
+		m.saveLocked()
+	}
+	return n
+}
+
+// flush writes a change saveLocked put off.
+func (m *misfiledMemo) flush() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.dirty {
+		m.writeLocked()
+	}
+}
+
 // forget drops the entries of path (every path when it is empty), for tier
 // (every tier when it is empty), and returns how many it dropped.
 func (m *misfiledMemo) forget(tier, path string) int {
@@ -356,6 +391,15 @@ func (m *misfiledMemo) paths() []string {
 }
 
 func (m *misfiledMemo) saveLocked() {
+	if len(m.entries) > misfiledSaveEachChange {
+		m.dirty = true
+		return
+	}
+	m.writeLocked()
+}
+
+func (m *misfiledMemo) writeLocked() {
+	m.dirty = false
 	if m.path == "" {
 		return
 	}

@@ -308,13 +308,14 @@ daily_min_files = 12
 # store, or placed by hand. GET /api/v1/compaction/misfiled lists them.
 # false merges such a file with its neighbours, as before 27.01.1: the output
 # then holds rows of two days and the Iceberg export leaves it out of its table.
+# The list is then neither read nor used, so files remembered earlier are
+# compacted too; it is kept on disk for a later start with the check on.
 # Environment override: ARC_COMPACTION_REFUSE_MISFILED_INPUTS=false
 # refuse_misfiled_inputs = true
 
 # -----------------------------------------------------------------------------
 # Authentication
 # -----------------------------------------------------------------------------
-
 [auth]
 enabled = true
 # metrics_public = false             # true: /metrics and /api/v1/metrics without a

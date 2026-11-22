@@ -229,9 +229,11 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 	// under a host-zone session a non-UTC host would permanently rewrite
 	// those instants shifted by the UTC offset during compaction. Hard-fail:
 	// compacting with a wrong zone corrupts data, not just query results.
-	// GLOBAL: a plain SET pins the one pooled connection that ran it, and the
-	// job's later statements may run on another (the input check in
-	// misfiled.go reads times before the COPY takes its connection).
+	// GLOBAL: a plain SET pins the one pooled connection that ran it. The
+	// job runs its statements one after another, so in practice they reuse
+	// that connection; nothing guarantees it, and the input check in
+	// misfiled.go compares times before the COPY, so every connection of the
+	// pool is pinned.
 	if err := pinTimeZoneUTC(db); err != nil {
 		return nil, fmt.Errorf("failed to pin compaction DuckDB TimeZone to UTC: %w", err)
 	}

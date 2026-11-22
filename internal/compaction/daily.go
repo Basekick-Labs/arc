@@ -100,6 +100,7 @@ func (t *DailyTier) FindCandidatesFromListing(database, measurement string, obje
 	if !t.Enabled {
 		return nil
 	}
+	objects = t.withoutExcluded(objects)
 
 	var candidates []Candidate
 	cutoffTime := time.Now().UTC().Add(-time.Duration(t.MinAgeHours) * time.Hour)

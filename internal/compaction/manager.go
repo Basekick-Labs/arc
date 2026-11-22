@@ -283,6 +283,10 @@ type Manager struct {
 	// misfiledPruneFrom is where the next end-of-cycle check of the memo
 	// against storage starts (pruneMisfiled).
 	misfiledPruneFrom int
+	// refusedJobs holds tier+partition of a job that just refused its inputs
+	// as misfiled, from compactPartition to the batch loop that called it
+	// (a partition's batches run one after another in one goroutine).
+	refusedJobs sync.Map
 	// settled remembers settled-day jobs that ran and left their files
 	// (#1774), so a day the job cannot compact is not run every cycle.
 	settled    *settledMemo
@@ -541,8 +545,19 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		logger:           logger,
 	}
 	m.tooWide = newTooWideMemo(cfg.TempDirectory, logger)
-	m.misfiled = newMisfiledMemo(cfg.TempDirectory, logger)
 	m.mergeMisfiledInputs = cfg.MergeMisfiledInputs
+	if !m.mergeMisfiledInputs {
+		// With the check off the list is neither read nor used: files
+		// remembered earlier are compacted like any other, and the file on
+		// disk is left for a later start with the check on.
+		m.misfiled = newMisfiledMemo(cfg.TempDirectory, logger)
+		for _, tier := range m.Tiers {
+			if ex, ok := tier.(interface{ SetExclude(func(string) bool) }); ok {
+				name := tier.GetTierName()
+				ex.SetExclude(func(path string) bool { return m.misfiled.has(name, path) })
+			}
+		}
+	}
 	metrics.Get().SetCompactionFilesMisfiled(int64(m.misfiled.files()))
 	m.settled = newSettledMemo()
 	metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized(m.TooWideSettings())))
@@ -1433,12 +1448,16 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 	// files it refused are remembered below, and the day's next candidate is
 	// the rest of these same files, which the entry would match.
 	refused := result != nil && len(result.MisfiledInputs) > 0
-	if candidate.Settled && !jobInterrupted && !refused {
-		m.settled.record(candidate.Tier, candidate.PartitionPath, candidate.Files)
-	}
+	remembered := false
 	if refused {
 		// Before the staged path returns, below: a staged job refuses too.
-		m.rememberMisfiled(candidate, result.MisfiledInputs)
+		remembered = m.rememberMisfiled(candidate, result.MisfiledInputs)
+		m.refusedJobs.Store(refusedJobKey(candidate.Tier, candidate.PartitionPath), struct{}{})
+	}
+	// A refusal the list had no room for is recorded like any job that ran:
+	// the day's next candidate would be these same files, refused again.
+	if candidate.Settled && !jobInterrupted && (!refused || !remembered) {
+		m.settled.record(candidate.Tier, candidate.PartitionPath, candidate.Files)
 	}
 
 	// The job ran in the subprocess, whose metrics registry nothing scrapes:
@@ -2425,7 +2444,7 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 						// A job that refused its inputs as misfiled read
 						// their times and compacted nothing: no evidence
 						// that the partition fits.
-						if !m.misfiled.hasAny(tierName, batch.Files) {
+						if _, refused := m.refusedJobs.LoadAndDelete(refusedJobKey(tierName, partition)); !refused {
 							compacted = true
 						}
 					}
@@ -3477,10 +3496,27 @@ func (m *Manager) TooWideSkipped(e TooWideEntry) bool {
 	return e.Skips(m.TooWideSettings(), time.Now())
 }
 
+func refusedJobKey(tier, partition string) string { return tier + "\x00" + partition }
+
 // rememberMisfiled records the inputs a job refused, logs them, and counts
-// them.
-func (m *Manager) rememberMisfiled(candidate Candidate, files []MisfiledInput) {
+// them. It reports whether the tier now leaves every one of them alone:
+// false when the list is full.
+func (m *Manager) rememberMisfiled(candidate Candidate, files []MisfiledInput) bool {
 	added := m.misfiled.record(candidate.Tier, candidate.PartitionPath, files, time.Now())
+	remembered := true
+	for _, f := range files {
+		if !m.misfiled.has(candidate.Tier, f.Path) {
+			remembered = false
+			break
+		}
+	}
+	if !remembered {
+		m.logger.Warn().
+			Str("partition", candidate.PartitionPath).
+			Str("tier", candidate.Tier).
+			Int("limit", maxMisfiledEntries).
+			Msg("The list of files compaction leaves alone as misfiled is full: this job's files are not remembered, and a job that holds them is refused again each time it runs. Removing or moving the listed files makes room")
+	}
 	metrics.Get().AddCompactionInputsMisfiled(int64(len(files)))
 	metrics.Get().SetCompactionFilesMisfiled(int64(m.misfiled.files()))
 	sample := make([]string, 0, 3)
@@ -3498,7 +3534,8 @@ func (m *Manager) rememberMisfiled(candidate Candidate, files []MisfiledInput) {
 		Int("files", len(files)).
 		Int("newly_remembered", added).
 		Strs("sample", sample).
-		Msg("Compaction found files holding rows outside the partition they sit in and compacted nothing this time. They are left where they are and out of later jobs: nothing moves or compacts them, so they never reach a daily file or the cold tier, and queries that filter by time do not read their rows. GET /api/v1/compaction/misfiled lists them")
+		Msg("Compaction found files holding rows outside the partition they sit in and compacted nothing this time. They are left where they are and out of this tier's later jobs. A file whose rows are of another day is never compacted, so it never reaches a daily file or the cold tier, and queries that filter by time do not read its rows; one in the wrong hour of the right day is taken by the daily tier. GET /api/v1/compaction/misfiled lists them")
+	return remembered
 }
 
 // filterMisfiled drops the files the tier leaves alone as misfiled from a
@@ -3518,38 +3555,46 @@ func (m *Manager) filterMisfiled(candidate Candidate, tier Tier) (Candidate, boo
 }
 
 // misfiledPrunePerCycle bounds the files one cycle checks against storage.
-const misfiledPrunePerCycle = 1000
+const misfiledPrunePerCycle = 500
 
 // pruneMisfiled forgets remembered files that are gone from storage
-// (retention, a DELETE, an operator). It asks storage for each file, a
-// bounded number per cycle: a remembered file is in no candidate, and a
-// partition holding only remembered files and its own output is not listed
-// as one, so "not seen this cycle" says nothing about it.
+// (retention, a DELETE, an operator), and writes the list if it changed. It
+// asks storage for each file, a bounded number per cycle: a remembered file
+// is in no candidate, and a partition holding only remembered files and its
+// own output is not listed as one, so "not seen this cycle" says nothing
+// about it.
 func (m *Manager) pruneMisfiled(ctx context.Context) {
+	defer m.misfiled.flush()
 	paths := m.misfiled.paths()
 	if len(paths) == 0 {
 		return
 	}
 	m.mu.Lock()
 	from := m.misfiledPruneFrom
+	m.mu.Unlock()
 	if from >= len(paths) {
 		from = 0
 	}
-	to := min(from+misfiledPrunePerCycle, len(paths))
-	m.misfiledPruneFrom = to
-	m.mu.Unlock()
-	forgot := 0
-	for _, p := range paths[from:to] {
+	var gone []string
+	next := from
+	for _, p := range paths[from:min(from+misfiledPrunePerCycle, len(paths))] {
 		if ctx.Err() != nil {
 			break
 		}
-		// A missing file is size -1 with no error on some backends and a
-		// not-found error on others; any other error keeps the entry.
+		// StatFile reports a missing file as size -1 with no error; a backend
+		// that returns a not-found error means the same. Any other error
+		// keeps the entry.
 		if size, err := m.StorageBackend.StatFile(ctx, p); (err == nil && size < 0) || storage.IsNotFound(err) {
-			forgot += m.misfiled.forget("", p)
+			gone = append(gone, p)
 		}
+		next++
 	}
-	if forgot > 0 {
+	m.mu.Lock()
+	// The files forgotten leave the list, so the next window starts where
+	// this one would have ended in the shorter list.
+	m.misfiledPruneFrom = next - len(gone)
+	m.mu.Unlock()
+	if m.misfiled.forgetPaths(gone) > 0 {
 		metrics.Get().SetCompactionFilesMisfiled(int64(m.misfiled.files()))
 	}
 }
