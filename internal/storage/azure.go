@@ -533,9 +533,33 @@ func (b *AzureBlobBackend) StatFile(ctx context.Context, path string) (_ int64, 
 		return -1, fmt.Errorf("GetProperties %s: %w", path, err)
 	}
 	if resp.ContentLength == nil {
-		return -1, fmt.Errorf("GetProperties %s: %w", path, ErrNoContentLength)
+		return b.listedSize(ctx, path, key)
 	}
 	return *resp.ContentLength, nil
+}
+
+// listedSize is the size of the blob at key as a listing reports it, for a
+// response to GetProperties that carried no length (#1812); see
+// S3Backend.listedSize.
+func (b *AzureBlobBackend) listedSize(ctx context.Context, path, key string) (int64, error) {
+	one := int32(1)
+	pager := b.client.ServiceClient().NewContainerClient(b.containerName).NewListBlobsFlatPager(&container.ListBlobsFlatOptions{
+		Prefix:     &key,
+		MaxResults: &one,
+	})
+	if pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return -1, fmt.Errorf("GetProperties %s: %w (and the listing for its size failed: %w)", path, ErrNoContentLength, err)
+		}
+		if page.Segment != nil && len(page.Segment.BlobItems) > 0 {
+			item := page.Segment.BlobItems[0]
+			if item.Name != nil && *item.Name == key && item.Properties != nil && item.Properties.ContentLength != nil {
+				return *item.Properties.ContentLength, nil
+			}
+		}
+	}
+	return -1, fmt.Errorf("GetProperties %s: %w", path, ErrNoContentLength)
 }
 
 // List lists blobs with the given prefix

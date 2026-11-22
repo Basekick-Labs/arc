@@ -66,7 +66,11 @@ func (b *AzureBlobBackend) ObjectSHA(ctx context.Context, path string) (_ int64,
 		}
 	}
 	if resp.ContentLength == nil {
-		return -1, "", fmt.Errorf("GetProperties %s: %w", path, ErrNoContentLength)
+		size, err := b.listedSize(ctx, path, key)
+		if err != nil {
+			return -1, "", err
+		}
+		return size, objectSHA(meta), nil
 	}
 	return *resp.ContentLength, objectSHA(meta), nil
 }

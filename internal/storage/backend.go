@@ -59,10 +59,11 @@ func IsStoreNotFound(err error) bool {
 var ErrObjectNotFound = errors.New("file not found")
 
 // ErrNoContentLength is a StatFile or ObjectSHA failure on an object store
-// whose response for an existing object carried no length (#1812). It is an
-// error, not a size of 0: an empty object and an unknown size are different
-// answers, and a caller comparing sizes (compaction recovery, the object
-// finisher) would otherwise read the object as the wrong one.
+// whose response for an existing object carried no length, and whose listing
+// of that exact key reported no size either (#1812). It is an error, not a
+// size of 0: an empty object and an unknown size are different answers, and a
+// caller comparing sizes (compaction recovery, the object finisher) would
+// otherwise read the object as the wrong one.
 var ErrNoContentLength = errors.New("storage: the object store response carries no content length")
 
 // IsNotFound reports whether err is a backend saying the key names no object.
@@ -112,7 +113,9 @@ type Backend interface {
 	// StatFile returns the byte size of the committed file at path.
 	// Returns -1 (and nil error) if the committed file does not exist. Staged
 	// partials are exposed separately through StagingInspector.
-	// Returns a non-nil error only for unexpected backend failures.
+	// Returns a non-nil error only for unexpected backend failures, which
+	// include an object store that reports no size for an existing object
+	// (ErrNoContentLength): never a size of 0 for an unknown size.
 	StatFile(ctx context.Context, path string) (int64, error)
 
 	// List lists all objects with the given prefix

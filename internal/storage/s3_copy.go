@@ -42,7 +42,11 @@ func (b *S3Backend) ObjectSHA(ctx context.Context, path string) (int64, string, 
 		return -1, "", fmt.Errorf("HeadObject %s: %w", path, err)
 	}
 	if out.ContentLength == nil {
-		return -1, "", fmt.Errorf("HeadObject %s: %w", path, ErrNoContentLength)
+		size, err := b.listedSize(ctx, path, key)
+		if err != nil {
+			return -1, "", err
+		}
+		return size, objectSHA(out.Metadata), nil
 	}
 	return *out.ContentLength, objectSHA(out.Metadata), nil
 }
