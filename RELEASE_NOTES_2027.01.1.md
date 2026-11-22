@@ -8,7 +8,7 @@
 
 `/metrics` (Prometheus text) and `/api/v1/metrics` with its sub-paths (`/memory`, `/query-pool`, `/endpoints`, `/timeseries/:type`) were served without a token. They carry operational counters, Go runtime and host details, and, with `iceberg.export_lag_table_series` above 0, database and measurement names (#1772). They now need a valid token while auth is on. Any token works, including a read-only one, so give the scraper its own read-only token.
 
-**After upgrading,** a scraper without a token gets `401`. In Prometheus, `up` goes to 0 for Arc and Arc's auth-failure counters climb with every scrape, so an alert on them will fire. Add the token:
+**After upgrading,** a scraper without a token gets `401` on every scrape, so in Prometheus `up` goes to 0 for Arc and an `up == 0` alert fires. Add the token:
 
 ```yaml
 scrape_configs:
