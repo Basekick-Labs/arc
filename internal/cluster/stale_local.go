@@ -868,7 +868,7 @@ func (c *Coordinator) unlinkStale(ctx context.Context, path string) bool {
 	if !ok || moved.size != rec.size || moved.mtime != rec.mtime || moved.ino != rec.ino {
 		// Replaced between the check and the rename: put it back.
 		if err := putBackAside(aside, full, strings.Count(path, "/")+1); err != nil {
-			c.keepAside(tagDir, path, err)
+			c.keepAside(tagDir, path, err, false)
 			return false
 		}
 		// Durable before the aside goes: a crash now finds the same file at
@@ -924,15 +924,19 @@ func parseStaleTag(name string) (seenRecord, bool) {
 // keepAside renames a tag directory to a keep- name for an operator. Only a
 // successful rename is reported as kept: a tag directory left under its own
 // name is settled again (and kept again) by the next start.
-func (c *Coordinator) keepAside(tagDir, path string, cause error) {
+func (c *Coordinator) keepAside(tagDir, path string, cause error, atStart bool) {
 	keep := filepath.Join(filepath.Dir(tagDir), staleLocalKeepAside+filepath.Base(tagDir))
 	if err := staleKeepRename(tagDir, keep); err != nil {
 		c.logger.Error().Err(cause).AnErr("keep_error", err).Str("path", path).Str("left_at", filepath.Join(tagDir, filepath.FromSlash(path))).
 			Msg("A file written to a stale path while it was being removed could not be put back or kept aside; it stays where it is, and the next start keeps it for an operator")
 		return
 	}
-	c.logger.Error().Err(cause).Str("path", path).Str("kept_at", filepath.Join(keep, filepath.FromSlash(path))).
-		Msg("A file written to a stale path while it was being removed could not be put back; it is kept aside: compare it with what the path holds now, and move it back by hand if it is wanted")
+	ev := c.logger.Error().Err(cause).Str("path", path).Str("kept_at", filepath.Join(keep, filepath.FromSlash(path)))
+	if atStart {
+		ev.Msg("A file written to a stale path while its stale copy was being removed was left aside by a crash; it is kept, not put back, because the manifest is not known at start: if the manifest lists the path, replication pulls it again; otherwise compare it with what the path holds and move it back by hand if it is wanted")
+		return
+	}
+	ev.Msg("A file written to a stale path while it was being removed could not be put back; it is kept aside: compare it with what the path holds now, and move it back by hand if it is wanted")
 }
 
 // removeEmptyTree removes dir and the empty directories under it, bottom-up.
@@ -1035,6 +1039,6 @@ func (c *Coordinator) recoverStaleTag(base, tagDir string, rec seenRecord) {
 		return
 	}
 	for _, path := range kept {
-		c.keepAside(tagDir, path, keepErr)
+		c.keepAside(tagDir, path, keepErr, true)
 	}
 }
