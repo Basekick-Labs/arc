@@ -138,5 +138,6 @@ func (m *Metrics) appendIcebergExport(b []byte) []byte {
 	b = appendMetric(b, "arc_iceberg_ingest_append_files_total", float64(h.appendFiles.Load()))
 	b = append(b, "# HELP arc_iceberg_ingest_append_fallbacks_total Ingest-triggered Iceberg exports that had files to add and ran a full reconcile pass of the measurement instead; the log names the reason\n"...)
 	b = append(b, "# TYPE arc_iceberg_ingest_append_fallbacks_total counter\n"...)
-	return appendMetric(b, "arc_iceberg_ingest_append_fallbacks_total", float64(h.appendFallbacks.Load()))
+	b = appendMetric(b, "arc_iceberg_ingest_append_fallbacks_total", float64(h.appendFallbacks.Load()))
+	return m.appendIcebergExportTables(b)
 }

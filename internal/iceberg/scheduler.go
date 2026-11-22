@@ -840,6 +840,7 @@ func (s *Scheduler) pausedForRestore() bool {
 	}
 	s.dropIngest()
 	clear(s.busySince)
+	s.exporter.clearLastLag()
 	if !s.pauseWarned {
 		s.pauseWarned = true
 		s.logger.Warn().Msg("Iceberg export is paused until the server restarts: a restore staged a catalog that replaces this one at the next start, and nothing is exported or dropped until then")
@@ -865,6 +866,9 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 		}
 		s.logger.Debug().Msg("Iceberg reconcile skipped: node is not the active writer")
 		clear(s.busySince) // another node exports meanwhile; a later turn starts its own clock
+		if s.exporter != nil {
+			s.exporter.clearLastLag() // its publishes count now, not this node's (#1772)
+		}
 		return false
 	}
 	measurements, err := s.source.Measurements(ctx)

@@ -219,6 +219,10 @@ const minIcebergIngestExportInterval = 5
 // MiB at most) and a turn on the catalog's single SQLite connection.
 const maxIcebergIngestExportConcurrency = 32
 
+// maxIcebergExportLagTableSeries bounds iceberg.export_lag_table_series: each
+// table is two labelled series on /metrics.
+const maxIcebergExportLagTableSeries = 1000
+
 // maxIcebergReconcileConcurrency bounds iceberg.reconcile_concurrency. A
 // pass is heavier than an append: it lists the measurement, can read
 // thousands of footers, and prunes and sweeps. The passes that run at once
@@ -738,6 +742,11 @@ type IcebergConfig struct {
 	// storage the tables' appends overlap (reconcile passes have their own
 	// key, ReconcileConcurrency). 1 is one append at a time, as before.
 	IngestExportConcurrency int
+	// ExportLagTableSeries is how many tables get their own export lag series
+	// on /metrics (#1772): the ones whose files have waited longest, and the
+	// ones whose last export took longest. 0 (the default) writes none: the
+	// series carry database and measurement names.
+	ExportLagTableSeries int
 	// ReconcileConcurrency is how many tables' reconcile passes run at once
 	// (#1786): in the timed pass every reconcile_interval, and for the
 	// passes ingest requests need (a table's first export, a fallback) when
@@ -1580,6 +1589,7 @@ func Load() (*Config, error) {
 			MinVersionAge:            v.GetInt("iceberg.min_version_age"),
 			IngestAppendEnabled:      v.GetBool("iceberg.ingest_append_enabled"),
 			IngestExportConcurrency:  v.GetInt("iceberg.ingest_export_concurrency"),
+			ExportLagTableSeries:     v.GetInt("iceberg.export_lag_table_series"),
 			ReconcileConcurrency:     v.GetInt("iceberg.reconcile_concurrency"),
 			CatalogDBPath:            v.GetString("iceberg.catalog_db_path"),
 			RetainSnapshots:          v.GetInt("iceberg.retain_snapshots"),
@@ -2130,6 +2140,10 @@ func Load() (*Config, error) {
 		if n := cfg.Iceberg.IngestExportInterval; n < 0 || (n > 0 && n < minIcebergIngestExportInterval) {
 			return nil, fmt.Errorf("iceberg.ingest_export_interval must be 0 or at least %d (got %d): it is the least time, in seconds, "+
 				"between two exports of a table that ingest causes; 0 turns that trigger off", minIcebergIngestExportInterval, n)
+		}
+		if n := cfg.Iceberg.ExportLagTableSeries; n < 0 || n > maxIcebergExportLagTableSeries {
+			return nil, fmt.Errorf("iceberg.export_lag_table_series must be between 0 and %d, got %d: how many tables get their own "+
+				"export lag series on /metrics; 0 writes none", maxIcebergExportLagTableSeries, n)
 		}
 		if n := cfg.Iceberg.IngestExportConcurrency; n < 1 || n > maxIcebergIngestExportConcurrency {
 			return nil, fmt.Errorf("iceberg.ingest_export_concurrency must be between 1 and %d, got %d: how many tables' ingest "+
@@ -2797,6 +2811,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("iceberg.min_version_age", 300)             // seconds a published version outlives its successor (#1751)
 	v.SetDefault("iceberg.ingest_append_enabled", true)      // ingest exports add only the new files (#1751)
 	v.SetDefault("iceberg.ingest_export_concurrency", 8)     // tables whose ingest appends run at once (#1778)
+	v.SetDefault("iceberg.export_lag_table_series", 0)       // tables with their own lag series on /metrics; 0 = none (#1772)
 	v.SetDefault("iceberg.reconcile_concurrency", 0)         // tables whose reconcile passes run at once; 0 = 4 on object storage, 1 on local (#1786)
 	v.SetDefault("iceberg.catalog_db_path", "./data/arc.db") // shared SQLite DB with auth
 	v.SetDefault("iceberg.retain_snapshots", 10)
