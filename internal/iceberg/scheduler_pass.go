@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"path"
 	"runtime/debug"
 	"sync"
@@ -188,6 +189,19 @@ func (s *Scheduler) applyPassState(job *passJob) {
 	case stateDrop:
 		delete(s.state, job.key)
 	}
+	if job.op != stateKeep {
+		s.reportLeftOut()
+	}
+}
+
+// reportLeftOut sets arc_iceberg_files_left_out to the files left out of the tables whose
+// last reconcile settled. Loop goroutine only.
+func (s *Scheduler) reportLeftOut() {
+	n := 0
+	for _, st := range s.state {
+		n += st.leftOut
+	}
+	metrics.Get().SetIcebergFilesLeftOut(n)
 }
 
 // finishPass records a pass that ran on another goroutine: everything
@@ -504,6 +518,6 @@ func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter)
 	// pruneAt: published versions are waiting out iceberg.min_version_age, or
 	// the prune could not finish. The table's pass runs again then, whatever
 	// the listing is, and not before (measurementState.pruneAt).
-	job.setState(measurementState{fingerprint: fp, schema: res.schema, schemaFiles: schemaSet, pruneAt: res.pruneAgainAt})
+	job.setState(measurementState{fingerprint: fp, schema: res.schema, schemaFiles: schemaSet, pruneAt: res.pruneAgainAt, leftOut: res.leftOut})
 	return outcomeReconciled, nil
 }

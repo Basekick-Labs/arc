@@ -178,10 +178,10 @@ type IngestConfig struct {
 	Compression           string   // Parquet compression: snappy, gzip, zstd
 	UseDictionary         bool     // Dictionary-encode string/binary columns at ingest (default false: compaction re-encodes anyway; see setDefaults)
 	NumericDictionary     bool     // With UseDictionary, also dictionary-encode numeric/timestamp columns (pre-26.09.1 behavior; costs hashing+boxing per value)
-	WriteStatistics       bool     // Write Parquet statistics
+	WriteStatistics       bool     // Write Parquet statistics. The time column keeps its min/max when false (#1754)
 	DataPageVersion       string   // Parquet data page version: 1.0 or 2.0
 	MaxRowGroupRows       int      // Rows per Parquet row group at ingest (default 524288, free on the sustained benchmark; 0 = one row group per flush; 1..1023 and negatives rejected by Load)
-	WritePageIndex        bool     // Write the Parquet page index at ingest (default false: no reader yet, cost grows with row-group count). Offset index always; column index only where statistics exist (needs write_statistics) and fit the stats size cap
+	WritePageIndex        bool     // Write the Parquet page index at ingest (default false: no reader yet, cost grows with row-group count). Offset index always; column index only where statistics exist (every column with write_statistics, the time column alone without) and fit the stats size cap
 	FlushWorkers          int      // Number of workers for async flush (default: 2x CPU, min 8, max 64)
 	FlushQueueSize        int      // Capacity of flush task queue (default: 4x workers, min 100)
 	ShardCount            int      // Number of buffer shards for lock distribution (default: 32)
@@ -2650,7 +2650,8 @@ func setDefaults(v *viper.Viper) {
 	// Page index: nothing in Arc reads it yet and its write cost grows with the
 	// row-group count (−3.7 % at 41 groups per 5 M-row flush on the sustained
 	// benchmark), so it is off until a consumer exists. When on, the offset
-	// index is always written; the column index needs write_statistics and is
+	// index is always written; the column index needs statistics (all columns
+	// with write_statistics, the time column alone without it, #1754) and is
 	// dropped for a chunk whose page stats are missing or over the stats size
 	// cap (arrow-go discards, never errors). Compaction (DuckDB COPY) does not
 	// preserve it.

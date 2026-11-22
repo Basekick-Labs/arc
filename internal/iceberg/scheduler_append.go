@@ -510,14 +510,14 @@ func (s *Scheduler) runAppend(ctx context.Context, job *ingestJob, exp *Exporter
 	for _, p := range res.added {
 		job.done = append(job.done, keyOf[p])
 	}
-	for _, p := range res.skipped {
-		job.done = append(job.done, keyOf[p])
+	for _, f := range res.skipped {
+		job.done = append(job.done, keyOf[f.path])
 	}
 	job.added = len(res.added)
 	if len(res.skipped) > 0 {
 		s.logger.Warn().Str("database", m.Database).Str("measurement", m.Measurement).
-			Int("skipped", len(res.skipped)).Str("sample", strings.Join(res.skipped[:min(3, len(res.skipped))], ", ")).
-			Msg("Iceberg: ingest files left out of the table (their rows span more than one UTC day); the reconcile pass reports them")
+			Int("skipped", len(res.skipped)).Str("sample", strings.Join(leftOutLines(res.skipped[:min(3, len(res.skipped))]), ", ")).
+			Msg("Iceberg: ingest files left out of the table (no single UTC day could be given to them); the reconcile pass reports them")
 	}
 }
 

@@ -104,8 +104,8 @@ func (e *Exporter) appendMergeDue(ctx context.Context, tkey string, tbl *icetabl
 
 // appendResult is what appendFiles did with the files it was given.
 type appendResult struct {
-	added   []string // physical paths now in the table
-	skipped []string // physical paths left out: their rows straddle a UTC day
+	added   []string      // physical paths now in the table
+	skipped []leftOutFile // left out: no day could be given to them (file_day.go)
 }
 
 // appendFiles adds files to an existing table in one commit and publishes it.

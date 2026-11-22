@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"path/filepath"
 	"runtime/debug"
 	"sort"
@@ -37,6 +38,11 @@ type measurementState struct {
 	// changes of the table's lineage under it). A pass that finds another
 	// number starts from the table, not from this (#1789, #1801).
 	drops uint64
+	// leftOut is how many of the measurement's files that reconcile left out of the table
+	// because no day could be given to them (file_day.go). It lives here so that it goes when
+	// the state goes: a table that is dropped, or whose pass did not settle, is not counted
+	// (reportLeftOut).
+	leftOut int
 }
 
 // unchanged reports that a pass that listed fp has nothing to do: the
@@ -869,6 +875,7 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 		if s.exporter != nil {
 			s.exporter.clearLastLag() // its publishes count now, not this node's (#1772)
 		}
+		metrics.Get().SetIcebergFilesLeftOut(0) // the exporting node reports them
 		return false
 	}
 	measurements, err := s.source.Measurements(ctx)
@@ -1047,6 +1054,7 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 			delete(s.lastReconciled, k)
 		}
 	}
+	s.reportLeftOut()
 	event := s.logger.Info().Int("reconciled", ok).Int("unchanged", skipped).Int("failed", failed)
 	if awaitingMigration > 0 {
 		event = event.Int("awaiting_namespace_migration", awaitingMigration)

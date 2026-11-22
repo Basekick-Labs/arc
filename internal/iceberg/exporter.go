@@ -1084,20 +1084,26 @@ func (e *Exporter) addFilesMerging(ctx context.Context, txn *icetable.Transactio
 // the size with itself, and a replacement between that read and this build is seen by the next
 // pass's listing.
 //
-// A file whose day() partition cannot be inferred (its rows straddle a UTC day) is returned in
-// skipped instead of failing the pass, so one such file does not wedge the measurement. Any
-// other error fails the pass.
-func (e *Exporter) buildDataFiles(ctx context.Context, tbl *icetable.Table, paths []string, want map[string]int64) (built []iceberg.DataFile, skipped []string, err error) {
+// A file that cannot be given a day() partition value is returned in skipped, with the reason,
+// instead of failing the pass, so one such file does not wedge the measurement: its rows span
+// more than one UTC day, or its time column holds no value. Any other error fails the pass.
+//
+// A file whose footer has no min/max for the time column gets no partition value from
+// iceberg-go, and no error either. Its day is then read from its rows (file_day.go), so it is
+// registered under the day it belongs to and not under a null one (#1754).
+func (e *Exporter) buildDataFiles(ctx context.Context, tbl *icetable.Table, paths []string, want map[string]int64) (built []iceberg.DataFile, skipped []leftOutFile, err error) {
 	if len(paths) == 0 {
 		return nil, nil, nil
 	}
 	out := make([]iceberg.DataFile, len(paths))
-	errs := make([]error, len(paths))
+	reasons := make([]string, len(paths))
 	ios := make([]iceio.IO, len(paths))
+	under := make([]iceio.IO, len(paths))
 	for i, p := range paths {
 		if ios[i], err = e.fileIOFor(ctx, tbl, p); err != nil {
 			return nil, nil, err
 		}
+		under[i] = ios[i]
 		// The footer this export already read for the file's schema: iceberg-go
 		// reads the file from it, not from the store again (#1778).
 		if tail, ok := exportReadsFrom(ctx).takeTail(p); ok {
@@ -1113,13 +1119,27 @@ func (e *Exporter) buildDataFiles(ctx context.Context, tbl *icetable.Table, path
 			release()
 			if err != nil {
 				if isPartitionInferenceError(err) {
-					errs[i] = err
+					reasons[i] = leftOutSpansDays
 					return nil
 				}
 				return fmt.Errorf("build data file for %s: %w", paths[i], err)
 			}
 			if size, ok := want[paths[i]]; ok && df.FileSizeBytes() != size {
 				return fmt.Errorf("build data file for %s: %d bytes, listed as %d (the file changed since it was listed)", paths[i], df.FileSizeBytes(), size)
+			}
+			if missingPartitionValue(tbl.Spec(), df) {
+				// Read from the store, not from the remembered tail: the rows are before it.
+				release := acquireRead(gctx)
+				fixed, reason, err := withPartitionFromData(gctx, under[i], paths[i], tbl, df)
+				release()
+				if err != nil {
+					return fmt.Errorf("build data file for %s: %w", paths[i], err)
+				}
+				if reason != "" {
+					reasons[i] = reason
+					return nil
+				}
+				df = fixed
 			}
 			out[i] = df
 			return nil
@@ -1129,8 +1149,8 @@ func (e *Exporter) buildDataFiles(ctx context.Context, tbl *icetable.Table, path
 		return nil, nil, err
 	}
 	for i, p := range paths {
-		if errs[i] != nil {
-			skipped = append(skipped, p)
+		if reasons[i] != "" {
+			skipped = append(skipped, leftOutFile{path: p, reason: reasons[i]})
 			continue
 		}
 		built = append(built, out[i])

@@ -39,6 +39,15 @@ type icebergExport struct {
 	appends         atomic.Int64
 	appendFiles     atomic.Int64
 	appendFallbacks atomic.Int64
+	// leftOut is how many files are in no table because no day could be
+	// given to them, over the tables whose last reconcile settled (#1754).
+	leftOut atomic.Int64
+}
+
+// SetIcebergFilesLeftOut records how many files the Iceberg export holds
+// back from their tables because no single UTC day could be given to them.
+func (m *Metrics) SetIcebergFilesLeftOut(n int) {
+	m.icebergExport.leftOut.Store(int64(n))
 }
 
 // AddIcebergIngestAppend counts one ingest-triggered export that added only
@@ -139,5 +148,9 @@ func (m *Metrics) appendIcebergExport(b []byte) []byte {
 	b = append(b, "# HELP arc_iceberg_ingest_append_fallbacks_total Ingest-triggered Iceberg exports that had files to add and ran a full reconcile pass of the measurement instead; the log names the reason\n"...)
 	b = append(b, "# TYPE arc_iceberg_ingest_append_fallbacks_total counter\n"...)
 	b = appendMetric(b, "arc_iceberg_ingest_append_fallbacks_total", float64(h.appendFallbacks.Load()))
+
+	b = append(b, "# HELP arc_iceberg_files_left_out Files readable through Arc that are in no Iceberg table because no single UTC day could be given to them (rows spanning more than one day, or a time column with no value), over the tables whose last reconcile pass settled. The export's Error log names them. 0 on a node that does not export, and after a restart until each table's first pass.\n"...)
+	b = append(b, "# TYPE arc_iceberg_files_left_out gauge\n"...)
+	b = appendMetric(b, "arc_iceberg_files_left_out", float64(h.leftOut.Load()))
 	return m.appendIcebergExportTables(b)
 }
