@@ -8,12 +8,20 @@ import (
 
 type closedGate struct{}
 
+// lagRig is a pass rig with the per-table record on.
+func lagRig(t *testing.T) *passRig {
+	t.Helper()
+	r := newPassRig(t, 1, 1, 1)
+	r.sched.EnableExportLagTables()
+	return r
+}
+
 func (closedGate) CanRun() bool { return false }
 
 // A publish that covered ingest files records the table's last lag; one that
 // covered none leaves it as it was (#1772).
 func TestLastLagRecordedOnlyWithFiles(t *testing.T) {
-	e := newPassRig(t, 1, 1, 1).exp
+	e := lagRig(t).exp
 	ident := e.tableIdent("db", "cpu")
 	key := tableLagKey(ident)
 	e.lag.mu.Lock()
@@ -38,9 +46,9 @@ func TestLastLagRecordedOnlyWithFiles(t *testing.T) {
 }
 
 func TestLastLagForgottenWithItsNamespace(t *testing.T) {
-	e := newPassRig(t, 1, 1, 1).exp
+	e := lagRig(t).exp
 	ident := e.tableIdent("db", "cpu")
-	e.noteLastLag(tableLagKey(ident), ident, time.Minute, time.Now())
+	e.noteLastLag(tableLagKey(ident), ident, time.Minute, time.Now(), e.lag.gen)
 	e.forgetExportLagNamespace(ident[:len(ident)-1])
 	if len(e.lag.last) != 0 {
 		t.Fatalf("last lag after its namespace was forgotten: %v", e.lag.last)
@@ -50,7 +58,7 @@ func TestLastLagForgottenWithItsNamespace(t *testing.T) {
 // Old entries are not reported and are deleted; the rest come worst first,
 // ties by name, at most n.
 func TestLastLagTables(t *testing.T) {
-	r := newPassRig(t, 1, 1, 1)
+	r := lagRig(t)
 	e, s := r.exp, r.sched
 	s.interval = time.Minute // window = 1 h
 	now := time.Now()
@@ -65,7 +73,7 @@ func TestLastLagTables(t *testing.T) {
 		{"db", "slow", 5 * time.Minute, now},
 	} {
 		ident := e.tableIdent(c.db, c.m)
-		e.noteLastLag(tableLagKey(ident), ident, c.lag, c.at)
+		e.noteLastLag(tableLagKey(ident), ident, c.lag, c.at, e.lag.gen)
 	}
 	got := s.LastLagTables(2, now)
 	if len(got) != 2 || got[0].Measurement != "slow" || got[1].Measurement != "a" {
@@ -84,7 +92,7 @@ func TestLastLagTables(t *testing.T) {
 // Pending per table comes from the ingest reports and from committed files
 // not yet published; only tables past the floor count.
 func TestPendingTables(t *testing.T) {
-	r := newPassRig(t, 1, 1, 1)
+	r := lagRig(t)
 	e, s := r.exp, r.sched
 	s.ingestInterval = 30 * time.Second // floor 1 min
 	now := time.Now()
@@ -112,7 +120,7 @@ func TestPendingTables(t *testing.T) {
 
 // A dropped database's tables are not waiting.
 func TestForgetDatabaseClearsPending(t *testing.T) {
-	s := newPassRig(t, 1, 1, 1).sched
+	s := lagRig(t).sched
 	s.reqMu.Lock()
 	s.ingestPending["db\x00cpu"] = ingestReports{first: time.Now()}
 	s.ingestPending["other\x00cpu"] = ingestReports{first: time.Now()}
@@ -129,22 +137,95 @@ func TestForgetDatabaseClearsPending(t *testing.T) {
 // A node that stops exporting stops reporting last lags: another node's
 // publishes count now (#1772).
 func TestLastLagClearedWhenTheNodeStopsExporting(t *testing.T) {
-	r := newPassRig(t, 1, 1, 1)
+	r := lagRig(t)
 	e, s := r.exp, r.sched
 	ident := e.tableIdent("db", "cpu")
-	e.noteLastLag(tableLagKey(ident), ident, time.Minute, time.Now())
+	e.noteLastLag(tableLagKey(ident), ident, time.Minute, time.Now(), e.lag.gen)
 	s.gate = closedGate{}
 	s.runPass(context.Background())
 	if len(e.lag.last) != 0 {
 		t.Fatal("a gated node kept its last lags")
 	}
 	s.gate = nil
-	e.noteLastLag(tableLagKey(ident), ident, time.Minute, time.Now())
+	e.noteLastLag(tableLagKey(ident), ident, time.Minute, time.Now(), e.lag.gen)
 	if _, err := e.PauseExportForRestore(context.Background(), "restore b1"); err != nil {
 		t.Fatal(err)
 	}
 	s.pausedForRestore()
 	if len(e.lag.last) != 0 {
 		t.Fatal("a node paused for a restore kept its last lags")
+	}
+}
+
+// The same table in both sources counts from the earlier; with the ingest
+// trigger off the floor is twice the reconcile interval.
+func TestPendingTablesMergeAndTimerFloor(t *testing.T) {
+	r := lagRig(t)
+	e, s := r.exp, r.sched
+	now := time.Now()
+	s.ingestInterval = 0
+	s.interval = 5 * time.Minute // floor 10 min
+	cpu := e.tableIdent("db", "cpu")
+	s.reqMu.Lock()
+	s.ingestPending["db\x00cpu"] = ingestReports{first: now.Add(-12 * time.Minute)}
+	s.reqMu.Unlock()
+	e.lag.mu.Lock()
+	if e.lag.pending == nil {
+		e.lag.pending = map[string][]time.Time{}
+	}
+	e.lag.pending[tableLagKey(cpu)] = []time.Time{now.Add(-30 * time.Minute)}
+	e.lag.pending[tableLagKey(e.tableIdent("db", "young"))] = []time.Time{now.Add(-8 * time.Minute)}
+	e.lag.pending[tableLagKey(e.tableIdent("db", "past"))] = []time.Time{now.Add(-12 * time.Minute)}
+	e.lag.mu.Unlock()
+	top, total := s.PendingTables(5, now)
+	if total != 2 || len(top) != 2 || top[0].Measurement != "cpu" || top[0].Seconds < 1799 || top[1].Measurement != "past" {
+		t.Fatalf("PendingTables = %+v, %d; want cpu at 30 min, then past at 12 (young is under the 10 min floor)", top, total)
+	}
+}
+
+// A node that is not the exporter reports nothing, checked at the scrape;
+// and once its loop sees the gate closed, its committed, unpublished times
+// are forgotten too, so a later term as writer does not count from them.
+func TestNoTableSeriesFromANodeThatDoesNotExport(t *testing.T) {
+	r := lagRig(t)
+	e, s := r.exp, r.sched
+	now := time.Now()
+	cpu := e.tableIdent("db", "cpu")
+	e.lag.mu.Lock()
+	if e.lag.pending == nil {
+		e.lag.pending = map[string][]time.Time{}
+	}
+	e.lag.pending[tableLagKey(cpu)] = []time.Time{now.Add(-time.Hour)}
+	e.lag.mu.Unlock()
+	e.noteLastLag(tableLagKey(cpu), cpu, time.Minute, now, e.lag.gen)
+	s.gate = closedGate{}
+	if top, total := s.PendingTables(5, now); total != 0 || len(top) != 0 {
+		t.Fatalf("pending on a node that does not export: %+v %d", top, total)
+	}
+	if got := s.LastLagTables(5, now); len(got) != 0 {
+		t.Fatalf("last lag on a node that does not export: %+v", got)
+	}
+	s.runPass(context.Background())
+	if len(e.lag.pending) != 0 || len(e.lag.last) != 0 {
+		t.Fatalf("after the gated pass: pending %v last %v", e.lag.pending, e.lag.last)
+	}
+}
+
+// A clear between a publish reading its write times and recording its lag
+// wins; with the record off nothing is kept.
+func TestLastLagGenerationAndOff(t *testing.T) {
+	r := lagRig(t)
+	e := r.exp
+	cpu := e.tableIdent("db", "cpu")
+	gen := e.lag.gen
+	e.clearLastLag()
+	e.noteLastLag(tableLagKey(cpu), cpu, time.Minute, time.Now(), gen)
+	if len(e.lag.last) != 0 {
+		t.Fatal("a lag read before a clear was recorded after it")
+	}
+	off := newPassRig(t, 1, 1, 1).exp
+	off.noteLastLag(tableLagKey(cpu), cpu, time.Minute, time.Now(), off.lag.gen)
+	if len(off.lag.last) != 0 {
+		t.Fatal("recorded with the per-table series off")
 	}
 }

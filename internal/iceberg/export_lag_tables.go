@@ -12,15 +12,31 @@ import (
 // Iceberg export lag per table (#1772): the Scheduler is the metrics
 // package's IcebergTableLagSource, read at scrape time.
 
-// noteLastLag records a table's last publish that covered ingest files. An
+// EnableExportLagTables turns on the per-table record (the labelled series,
+// iceberg.export_lag_table_series > 0); off, nothing is kept for it.
+func (s *Scheduler) EnableExportLagTables() {
+	if s.exporter == nil {
+		return
+	}
+	s.exporter.lag.mu.Lock()
+	s.exporter.lag.tablesOn = true
+	s.exporter.lag.mu.Unlock()
+}
+
+// noteLastLag records a table's last publish that covered ingest files,
+// unless a forget or clear ran since its write times were read (gen). An
 // identifier this exporter did not build has no database to label it with
 // and is left out.
-func (e *Exporter) noteLastLag(key string, ident []string, lag time.Duration, at time.Time) {
+func (e *Exporter) noteLastLag(key string, ident []string, lag time.Duration, at time.Time, gen uint64) {
 	db := databaseOfIdent(e.nsPrefix, ident)
 	if db == "" {
 		return
 	}
 	e.lag.mu.Lock()
+	if !e.lag.tablesOn || e.lag.gen != gen {
+		e.lag.mu.Unlock()
+		return
+	}
 	if e.lag.last == nil {
 		e.lag.last = make(map[string]lastLag)
 	}
@@ -28,13 +44,23 @@ func (e *Exporter) noteLastLag(key string, ident []string, lag time.Duration, at
 	e.lag.mu.Unlock()
 }
 
-// clearLastLag forgets every table's last lag: this node stopped exporting
-// (the gate closed, a restore paused it), so another node's publishes are
-// the ones that count now, and two nodes must not report the same series.
+// clearLastLag forgets every table's last lag and its committed, unpublished
+// write times: this node stopped exporting (the gate closed, a restore
+// paused it), so another node publishes those tables now (forgetExportLag's
+// reason, for all of them), and two nodes must not report the same series.
 func (e *Exporter) clearLastLag() {
 	e.lag.mu.Lock()
 	clear(e.lag.last)
+	clear(e.lag.pending)
+	e.lag.gen++
 	e.lag.mu.Unlock()
+}
+
+// exportingNow reports whether this node exports now, without the side
+// effects of gateOpen: a scrape on a node that is not the writer reports no
+// table series, even before its loop notices.
+func (s *Scheduler) exportingNow() bool {
+	return s.gate == nil || s.gate.CanRun()
 }
 
 // lastLagWindow is how long a table's last lag is reported after its
@@ -61,6 +87,9 @@ func (s *Scheduler) pendingFloor() time.Duration {
 // trigger, standalone) and the write time of its oldest committed file not
 // yet published (every mode). Only tables past pendingFloor.
 func (s *Scheduler) PendingTables(n int, now time.Time) ([]metrics.IcebergTableLag, int) {
+	if !s.exportingNow() {
+		return nil, 0
+	}
 	since := map[string]time.Time{} // "<db>\x00<m>" -> oldest
 	s.reqMu.Lock()
 	for key, r := range s.ingestPending {
@@ -102,7 +131,7 @@ func (s *Scheduler) PendingTables(n int, now time.Time) ([]metrics.IcebergTableL
 // tables published recently.
 func (s *Scheduler) LastLagTables(n int, now time.Time) []metrics.IcebergTableLag {
 	e := s.exporter
-	if e == nil {
+	if e == nil || !s.exportingNow() {
 		return nil
 	}
 	window := s.lastLagWindow()

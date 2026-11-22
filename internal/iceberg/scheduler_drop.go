@@ -292,11 +292,6 @@ func (s *Scheduler) forgetDatabase(db string) {
 			dropped = true
 		}
 	}
-	for k := range s.ingestDue {
-		if match(k) {
-			delete(s.ingestDue, k)
-		}
-	}
 	if dropped {
 		s.publishIngestPendingLocked()
 	}

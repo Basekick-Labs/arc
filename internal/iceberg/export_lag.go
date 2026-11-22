@@ -32,8 +32,12 @@ type exportLag struct {
 	pending map[string][]time.Time // table identifier -> write times of committed, unpublished ingest files
 	started time.Time
 	// last is, per table, the largest lag of its last publish that covered
-	// ingest files (#1772, export_lag_tables.go).
-	last map[string]lastLag
+	// ingest files (#1772, export_lag_tables.go); kept only when tablesOn.
+	last     map[string]lastLag
+	tablesOn bool
+	// gen counts the forgets and clears, so a publish that read its write
+	// times before one does not record its lag after it.
+	gen uint64
 }
 
 // lastLag is a table's last publish: the largest lag among its files, and
@@ -92,6 +96,7 @@ func (e *Exporter) drainExportLag(ident []string) time.Duration {
 	e.lag.mu.Lock()
 	times := e.lag.pending[key]
 	delete(e.lag.pending, key)
+	gen := e.lag.gen
 	e.lag.mu.Unlock()
 	if len(times) == 0 {
 		// A publish that covered no ingest file (a pass that committed
@@ -109,7 +114,7 @@ func (e *Exporter) drainExportLag(ident []string) time.Duration {
 			oldest = d
 		}
 	}
-	e.noteLastLag(key, ident, oldest, now)
+	e.noteLastLag(key, ident, oldest, now, gen)
 	if oldest > e.passLag {
 		e.passLag = oldest
 	}
@@ -128,6 +133,7 @@ func (e *Exporter) forgetExportLag(ident []string) {
 	e.lag.mu.Lock()
 	delete(e.lag.pending, tableLagKey(ident))
 	delete(e.lag.last, tableLagKey(ident))
+	e.lag.gen++
 	e.lag.mu.Unlock()
 }
 
@@ -157,5 +163,6 @@ func (e *Exporter) forgetExportLagNamespace(namespace []string) {
 			delete(e.lag.last, key)
 		}
 	}
+	e.lag.gen++
 	e.lag.mu.Unlock()
 }

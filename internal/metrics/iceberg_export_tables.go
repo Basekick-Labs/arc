@@ -49,10 +49,10 @@ func (m *Metrics) appendIcebergExportTables(b []byte) []byte {
 	}
 	now := time.Now()
 	pending, total := s.src.PendingTables(s.n, now)
-	b = append(b, "# HELP arc_iceberg_export_tables_pending Tables whose oldest file waiting for an Iceberg export has waited past the floor (twice the export interval); the labelled series show at most iceberg.export_lag_table_series of them\n"...)
+	b = append(b, "# HELP arc_iceberg_export_tables_pending Tables whose oldest file waiting for an Iceberg export has waited past the floor (twice iceberg.ingest_export_interval, or twice iceberg.reconcile_interval where the ingest trigger is off, as on a cluster); the labelled series show at most iceberg.export_lag_table_series of them\n"...)
 	b = append(b, "# TYPE arc_iceberg_export_tables_pending gauge\n"...)
 	b = appendMetric(b, "arc_iceberg_export_tables_pending", float64(total))
-	b = append(b, "# HELP arc_iceberg_export_table_pending_seconds Per table, how long its oldest file waiting for an Iceberg export has waited: since it was reported (standalone, with the ingest trigger on) or written (committed but not yet published, every mode). Only the tables waiting longest\n"...)
+	b = append(b, "# HELP arc_iceberg_export_table_pending_seconds Per table, how long its oldest file waiting for an Iceberg export has waited: since it was reported (standalone, with the ingest trigger on) or written (committed but not yet published, files written after this process started). Only the tables waiting longest\n"...)
 	b = append(b, "# TYPE arc_iceberg_export_table_pending_seconds gauge\n"...)
 	for _, t := range pending {
 		b = appendTableMetric(b, "arc_iceberg_export_table_pending_seconds", t)

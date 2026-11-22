@@ -6,11 +6,11 @@
 
 The node-wide `arc_iceberg_export_lag_seconds` and `arc_iceberg_export_pending_seconds` (#1750) say how late the export is, not which table is late. With `iceberg.export_lag_table_series` set to a number N (`ARC_ICEBERG_EXPORT_LAG_TABLE_SERIES`, 0–1000, default 0 = off), `/metrics` also has, labelled `database` and `measurement`:
 
-- **`arc_iceberg_export_table_pending_seconds`:** per table, how long its oldest file waiting for an export has waited. Only the N tables waiting longest are shown, and only those past twice the export interval, so a healthy table between two exports is not listed. The wait is counted in one of two ways:
+- **`arc_iceberg_export_table_pending_seconds`:** per table, how long its oldest file waiting for an export has waited. Only the N tables waiting longest are shown, and only those past a floor, so a healthy table between two exports is not listed. The floor is twice `ingest_export_interval`, or twice `reconcile_interval` where the ingest trigger is off, as on every cluster node. The wait is counted in one of two ways:
   - from when the file was reported, on a standalone node with the ingest trigger on;
-  - from when it was written, for files a table has committed but not yet published, in every mode.
+  - from when it was written, for files a table has committed but not yet published, in every mode, counting files written after the process started.
 
-  So on a cluster, or with `ingest_export_interval = 0`, a table whose commits keep failing is not shown.
+  So on a cluster, or with `ingest_export_interval = 0`, a table whose commits keep failing is not shown, and after a restart neither is one whose publishes keep failing, until it commits again.
 - **`arc_iceberg_export_tables_pending`:** how many tables are past that floor, so falling out of the top N can be told from catching up.
 - **`arc_iceberg_export_table_last_lag_seconds`:** per table, the longest time from an ingest file being written to its table version being published, among the files its last publish covered.
   - Only files written after the process started count.
@@ -19,7 +19,7 @@ The node-wide `arc_iceberg_export_lag_seconds` and `arc_iceberg_export_pending_s
 
   A table missing from this series is not known to be healthy; it has only not been slow recently.
 
-**These series name databases and measurements, and `/metrics` is currently served without authentication.** That is why they are off by default. The JSON metrics endpoints never carry them. A node that stops exporting stops reporting them, so during a writer failover two nodes do not report the same table.
+**These series name databases and measurements, and `/metrics` is currently served without authentication.** That is why they are off by default. The JSON metrics endpoints never carry them. A node that is not the exporter reports none, checked at each scrape, so during a writer failover two nodes do not report the same table.
 
 ## Fix: in a cluster, compaction recovery no longer leaves the manifest listing an output it deleted ([#1811](https://github.com/Basekick-Labs/arc/issues/1811))
 

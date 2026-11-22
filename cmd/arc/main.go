@@ -4800,6 +4800,7 @@ func main() {
 		// Per-table export lag series on /metrics (#1772), opt-in: they carry
 		// database and measurement names.
 		if n := cfg.Iceberg.ExportLagTableSeries; n > 0 {
+			icebergScheduler.EnableExportLagTables()
 			metrics.Get().SetIcebergTableLagSource(icebergScheduler, n)
 			log.Info().Int("tables", n).Msg("Iceberg export lag per table on /metrics: these series name databases and measurements, and /metrics is served without authentication")
 		}
