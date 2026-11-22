@@ -114,6 +114,20 @@ type reconcileResult struct {
 	leftOut int
 }
 
+// withoutPaths is paths less those in drop.
+func withoutPaths(paths []string, drop map[string]struct{}) []string {
+	if len(drop) == 0 {
+		return paths
+	}
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if _, ok := drop[p]; !ok {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // maxRedatedPerPass bounds the entries with no day that one pass re-registers. Each costs a
 // read of the file's time column, inside the pass's first commit, which has no chunking and
 // runs under the pass's deadline.
@@ -335,8 +349,10 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 	// registered a file whose footer has no min/max for the time column under a null day, which
 	// readers prune for any time filter. Rebuilding it reads its day from its rows
 	// (buildDataFiles). They go in the pass's first commit, which is not chunked, so a pass
-	// takes maxRedatedPerPass of them and reports itself partial while more remain.
+	// takes maxRedatedPerPass of them and reports itself partial while more remain. An entry
+	// whose file turns out to have no single day is removed and not added again.
 	var toAdd, toRemove, rewritten []string
+	redatedPaths := map[string]struct{}{}
 	redated, redatedLeft := 0, 0
 	spec := tbl.Spec()
 	for p, size := range want {
@@ -354,6 +370,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 				continue
 			}
 			redated++
+			redatedPaths[p] = struct{}{}
 			rewritten = append(rewritten, p)
 			toRemove = append(toRemove, p)
 			toAdd = append(toAdd, p)
@@ -415,7 +432,20 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 	if err != nil {
 		return reconcileResult{}, err
 	}
-	anchored, free := splitAnchored(toBuild, toRemove, database, measurement)
+	// An entry given its day is replaced by itself: it commits with its own removal, and
+	// brings no other file of its day into the first commit, which a real removal does.
+	anchored, free := splitAnchored(toBuild, withoutPaths(toRemove, redatedPaths), database, measurement)
+	if len(redatedPaths) > 0 {
+		kept := free[:0]
+		for _, p := range free {
+			if _, ok := redatedPaths[p]; ok {
+				anchored = append(anchored, p)
+				continue
+			}
+			kept = append(kept, p)
+		}
+		free = kept
+	}
 	if len(leftBehind) > 0 {
 		// Left behind by the first read of a new table (above): only free adds exist then.
 		kept := free[:0]
@@ -538,8 +568,16 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 			// mid-pass never reaches, and the next writer, seeing nothing to remove, would never
 			// floor at all. finishPass retries a failed floor.
 			var floorOK bool
-			tbl, floorOK = e.expireSnapshots(ctx, tbl, database, measurement, expireModeFor(len(removes)))
-			if len(removes) > 0 {
+			// An entry given its day is the same file, still in storage: older snapshots that
+			// name it stay readable, so it does not count as a removal for the history floor.
+			gone := 0
+			for _, df := range removes {
+				if _, ok := redatedPaths[df.FilePath()]; !ok {
+					gone++
+				}
+			}
+			tbl, floorOK = e.expireSnapshots(ctx, tbl, database, measurement, expireModeFor(gone))
+			if gone > 0 {
 				e.setFloorOwed(tkey, !floorOK)
 			}
 			rewrote := make(map[string]struct{}, len(rewritten))
@@ -676,7 +714,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 	}
 	if stopReason == stopWriterLost && commits == 0 && len(removes)+len(cloned)+len(anchored) > 0 {
 		// The first commit itself was refused (writer role): nothing of this pass landed.
-		partial, remaining = true, newFiles
+		partial, remaining = true, newFiles+redatedLeft
 	}
 	if commits > 0 {
 		e.logger.Info().

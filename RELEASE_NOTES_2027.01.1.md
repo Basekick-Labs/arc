@@ -22,8 +22,11 @@ one day returned 0 where Arc returned 2. With the default (`true`) nothing was w
 - **Entries already registered without a day are corrected.** The first reconcile pass
   of each table after the upgrade re-registers them under their day, up to 256 files per
   pass; a table with more is finished over the following passes, on the short retry
-  interval. Nothing needs to be run. That pass removes and re-adds those entries, so the
-  table's snapshot history is cut to the current snapshot, as after a compaction.
+  interval. Nothing needs to be run, and the table's snapshot history is kept.
+- **An entry whose file has no single day leaves the table.** If the rows of such a
+  file span more than one UTC day, hold no time value, or cannot be read, the entry is
+  removed and the file is counted in the metric below. Before, an unfiltered Iceberg
+  read returned those rows and a read filtered by time did not.
 
 On the store from the measurement above, the first pass of the new binary changed the
 one-day reads from 0, 0 and 0 to 2, 2 and 1.
@@ -31,12 +34,14 @@ one-day reads from 0, 0 and 0 to 2, 2 and 1.
 ### New metric: `arc_iceberg_files_left_out`
 
 A file that cannot be given a single day is left out of its table: its rows span more
-than one UTC day, or its time column holds no value. Those rows are readable through
+than one UTC day, its time column holds no value, or (for a file whose footer has no
+time statistics) its time column cannot be decoded. Those rows are readable through
 Arc and missing from the Iceberg table, and until now the only sign was an Error log
 line. `arc_iceberg_files_left_out` (gauge; `iceberg_files_left_out` in the JSON
-metrics) is how many such files there are, over the tables whose last reconcile pass
-completed. It is 0 on a node that does not run the export, and after a restart until
-each table's first pass. The log line names each file and gives the reason.
+metrics) is how many such files there are, as of each table's last reconcile pass
+that went through all its new files. It is 0 on a node that does not run the export,
+and after a restart until each table's first pass. The log line names each file and
+gives the reason.
 
 Arc's own writers do not produce such a file: ingest splits every flush by the UTC
 hour of each row, and imports and continuous queries go through ingest. Compaction

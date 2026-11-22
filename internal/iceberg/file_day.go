@@ -2,7 +2,9 @@ package iceberg
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 
 	"github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/file"
@@ -15,22 +17,16 @@ import (
 // Why a file is left out of its table. A table is partitioned by day(time), and a file is
 // registered under one day; a file that cannot be given one is not registered (#1754).
 const (
-	leftOutSpansDays = "its rows span more than one UTC day"
-	leftOutNoTime    = "its time column holds no value to take a day from"
+	leftOutSpansDays  = "its rows span more than one UTC day"
+	leftOutNoTime     = "its time column holds no value to take a day from"
+	leftOutUnreadable = "its time column could not be read: the file is malformed"
+	leftOutOtherSpec  = "its footer has no statistics for the partition column, and the table is not partitioned by day(time)"
 )
 
 // leftOutFile is a file a pass did not register, and why.
 type leftOutFile struct {
 	path   string
 	reason string
-}
-
-func leftOutPaths(files []leftOutFile) []string {
-	out := make([]string, len(files))
-	for i, f := range files {
-		out[i] = f.path
-	}
-	return out
 }
 
 // leftOutLines is the files with their reasons, for a log line.
@@ -68,7 +64,7 @@ func missingPartitionValue(spec iceberg.PartitionSpec, df iceberg.DataFile) bool
 func withPartitionFromData(ctx context.Context, fio iceio.IO, path string, tbl *icetable.Table, df iceberg.DataFile) (fixed iceberg.DataFile, reason string, err error) {
 	spec := tbl.Spec()
 	if spec.NumFields() != 1 {
-		return nil, leftOutNoTime, nil
+		return nil, leftOutOtherSpec, nil
 	}
 	field := spec.Field(0)
 	src, ok := tbl.Schema().FindFieldByID(field.SourceID())
@@ -76,6 +72,9 @@ func withPartitionFromData(ctx context.Context, fio iceio.IO, path string, tbl *
 		return nil, "", fmt.Errorf("partition field %s: its source column is not in the table schema", field.Name)
 	}
 	lo, hi, found, err := columnMicrosRange(ctx, fio, path, src.Name)
+	if errors.Is(err, errMalformedColumn) {
+		return nil, leftOutUnreadable, nil
+	}
 	if err != nil {
 		return nil, "", err
 	}
@@ -84,7 +83,7 @@ func withPartitionFromData(ctx context.Context, fio iceio.IO, path string, tbl *
 	}
 	low, high := partitionOfMicros(field, src.Type, lo), partitionOfMicros(field, src.Type, hi)
 	if !low.Valid || !high.Valid {
-		return nil, leftOutNoTime, nil
+		return nil, leftOutOtherSpec, nil
 	}
 	if !low.Val.Equals(high.Val) {
 		return nil, leftOutSpansDays, nil
@@ -116,20 +115,81 @@ func partitionOfMicros(field iceberg.PartitionField, srcType iceberg.Type, micro
 	return field.Transform.Apply(iceberg.Optional[iceberg.Literal]{Valid: true, Val: lit})
 }
 
+// errMalformedColumn: the store returned the file's bytes and the Parquet library could not
+// decode the column from them.
+var errMalformedColumn = errors.New("malformed column")
+
+// ioTracker is an open file that remembers whether a read of it failed, so that a decode
+// failure can be told from a storage failure.
+type ioTracker struct {
+	iceio.File
+	failed error
+}
+
+func (t *ioTracker) note(err error) {
+	if err != nil && !errors.Is(err, io.EOF) && t.failed == nil {
+		t.failed = err
+	}
+}
+
+func (t *ioTracker) Read(p []byte) (int, error) {
+	n, err := t.File.Read(p)
+	t.note(err)
+	return n, err
+}
+
+func (t *ioTracker) ReadAt(p []byte, off int64) (int, error) {
+	n, err := t.File.ReadAt(p, off)
+	t.note(err)
+	return n, err
+}
+
+func (t *ioTracker) Seek(off int64, whence int) (int64, error) {
+	n, err := t.File.Seek(off, whence)
+	t.note(err)
+	return n, err
+}
+
 // columnMicrosRange reads a timestamp column of a Parquet file and returns its smallest and
 // largest value in microseconds. found is false when the column is absent, is not an int64
 // timestamp, or holds only nulls.
+//
+// The error is errMalformedColumn when every read of the store succeeded and the column still
+// could not be decoded, including when the Parquet library panicked on it: the files read here
+// include ones Arc did not write, this runs on a worker goroutine where a panic ends the
+// process, and the file stays in storage, so every restart would reach it again
+// (schemaFromReader, for a footer). A failed read of the store, or a cancelled ctx, is returned
+// as it is: the pass fails and the next one reads the file again.
 func columnMicrosRange(ctx context.Context, fio iceio.IO, path, column string) (lo, hi int64, found bool, err error) {
-	f, err := fio.Open(path)
+	opened, err := fio.Open(path)
 	if err != nil {
 		return 0, 0, false, fmt.Errorf("read the time column of %s: %w", path, err)
 	}
+	f := &ioTracker{File: opened}
 	defer f.Close()
-	rdr, err := file.NewParquetReader(f)
-	if err != nil {
-		return 0, 0, false, fmt.Errorf("read the time column of %s: %w", path, err)
+	lo, hi, found, err = decodeMicrosRange(ctx, f, column)
+	switch {
+	case err == nil:
+		return lo, hi, found, nil
+	case f.failed != nil:
+		return 0, 0, false, fmt.Errorf("read the time column of %s: %w", path, f.failed)
+	case ctx.Err() != nil:
+		return 0, 0, false, ctx.Err()
+	default:
+		return 0, 0, false, fmt.Errorf("%w: %s: %v", errMalformedColumn, path, err)
 	}
-	defer rdr.Close()
+}
+
+func decodeMicrosRange(ctx context.Context, f parquet.ReaderAtSeeker, column string) (lo, hi int64, found bool, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			lo, hi, found, err = 0, 0, false, fmt.Errorf("the Parquet reader panicked (%v)", r)
+		}
+	}()
+	rdr, err := newParquetReader(f)
+	if err != nil {
+		return 0, 0, false, err
+	}
 
 	sc := rdr.MetaData().Schema
 	idx := sc.ColumnIndexByName(column)
@@ -157,7 +217,7 @@ func columnMicrosRange(ctx context.Context, fio iceio.IO, path, column string) (
 		}
 		col, err := rdr.RowGroup(g).Column(idx)
 		if err != nil {
-			return 0, 0, false, fmt.Errorf("read the time column of %s: %w", path, err)
+			return 0, 0, false, err
 		}
 		cr, ok := col.(*file.Int64ColumnChunkReader)
 		if !ok {
@@ -166,7 +226,7 @@ func columnMicrosRange(ctx context.Context, fio iceio.IO, path, column string) (
 		for cr.HasNext() {
 			_, n, err := cr.ReadBatch(batch, vals, defs, nil)
 			if err != nil {
-				return 0, 0, false, fmt.Errorf("read the time column of %s: %w", path, err)
+				return 0, 0, false, err
 			}
 			for _, v := range vals[:n] {
 				m := toMicros(v)
@@ -176,6 +236,9 @@ func columnMicrosRange(ctx context.Context, fio iceio.IO, path, column string) (
 				}
 				lo, hi = min(lo, m), max(hi, m)
 			}
+		}
+		if err := cr.Err(); err != nil {
+			return 0, 0, false, err
 		}
 	}
 	return lo, hi, found, nil

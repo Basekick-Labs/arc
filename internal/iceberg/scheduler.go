@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/basekick-labs/arc/internal/metrics"
 	"path/filepath"
 	"runtime/debug"
 	"sort"
@@ -18,6 +17,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/basekick-labs/arc/internal/colname"
+	"github.com/basekick-labs/arc/internal/metrics"
 )
 
 // measurementState caches per-measurement work between passes so an unchanged measurement is
@@ -38,11 +38,6 @@ type measurementState struct {
 	// changes of the table's lineage under it). A pass that finds another
 	// number starts from the table, not from this (#1789, #1801).
 	drops uint64
-	// leftOut is how many of the measurement's files that reconcile left out of the table
-	// because no day could be given to them (file_day.go). It lives here so that it goes when
-	// the state goes: a table that is dropped, or whose pass did not settle, is not counted
-	// (reportLeftOut).
-	leftOut int
 }
 
 // unchanged reports that a pass that listed fp has nothing to do: the
@@ -114,6 +109,11 @@ type Scheduler struct {
 	// busySince is when each measurement last stopped making progress while busy: the first busy
 	// pass after one that committed or settled. Loop goroutine only, like state.
 	busySince map[string]time.Time
+	// leftOut is, per table, how many files its last pass that went through every new file
+	// left out because no day could be given to them (file_day.go); tables with none have no
+	// entry. Kept apart from state, which a pass that did not settle drops: the files are
+	// still left out then. Loop goroutine only (reportLeftOut).
+	leftOut map[string]int
 
 	// requested holds the measurements whose files a compaction just replaced
 	// (RequestReconcile), coalesced, until the loop goroutine reconciles
@@ -307,6 +307,7 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		gate:              cfg.Gate,
 		logger:            cfg.Logger.With().Str("component", "iceberg-scheduler").Logger(),
 		state:             make(map[string]measurementState),
+		leftOut:           make(map[string]int),
 		busySince:         make(map[string]time.Time),
 		requested:         make(map[string]Measurement),
 		requestedPaths:    make(map[string]struct{}),
@@ -1052,6 +1053,11 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 	for k := range s.lastReconciled {
 		if _, ok := seen[k]; !ok {
 			delete(s.lastReconciled, k)
+		}
+	}
+	for k := range s.leftOut {
+		if _, ok := seen[k]; !ok {
+			delete(s.leftOut, k)
 		}
 	}
 	s.reportLeftOut()

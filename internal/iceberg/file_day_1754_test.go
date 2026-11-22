@@ -3,6 +3,7 @@ package iceberg
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/apache/arrow-go/v18/parquet"
+	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/apache/iceberg-go"
 	iceio "github.com/apache/iceberg-go/io"
@@ -262,6 +264,9 @@ func TestEntryWithoutDayIsReRegistered(t *testing.T) {
 	if res.partial || !res.settled || res.leftOut != 0 {
 		t.Errorf("second pass: partial=%v settled=%v leftOut=%d, want false, true, 0", res.partial, res.settled, res.leftOut)
 	}
+	if res.commits != 1 {
+		t.Errorf("second pass: %d commits, want 1: an entry leaves and returns in the same commit, so no reader sees the table without it", res.commits)
+	}
 
 	res, err = exp.reconcile(ctx, reconcileRequest{database: "db", measurement: "cpu", schema: sc, current: current})
 	if err != nil || res.commits != 0 {
@@ -407,3 +412,206 @@ func TestFilesLeftOutGauge(t *testing.T) {
 type gate1754 func() bool
 
 func (g gate1754) CanRun() bool { return g() }
+
+// A file whose time column cannot be decoded is left out, and the pass goes on: the Parquet
+// library panics on some malformed pages, on a worker goroutine, where a panic ends the
+// process.
+func TestMalformedTimeColumnIsLeftOut(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	withStats := filepath.Join(dir, "stats.parquet")
+	bad := filepath.Join(dir, "nostats-bad-page.parquet")
+	writeArcStyleParquet(t, withStats, day1754, 10)
+	writeNoStatsParquet(t, bad, []int64{day1754, day1754 + 1}, nil)
+	raw, err := os.ReadFile(bad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 4; i < 24; i++ { // the first page header of the first column, time
+		raw[i] = 0
+	}
+	if err := os.WriteFile(bad, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := columnMicrosRange(ctx, iceio.LocalFS{}, bad, "time"); !errors.Is(err, errMalformedColumn) {
+		t.Fatalf("columnMicrosRange on a zeroed page header: err = %v, want errMalformedColumn", err)
+	}
+	// The library panics on some malformed pages; that is this file's error too.
+	open := newParquetReader
+	newParquetReader = func(parquet.ReaderAtSeeker, ...file.ReadOption) (*file.Reader, error) { panic("malformed page") }
+	_, _, _, err = columnMicrosRange(ctx, iceio.LocalFS{}, bad, "time")
+	newParquetReader = open
+	if !errors.Is(err, errMalformedColumn) {
+		t.Fatalf("columnMicrosRange when the Parquet reader panics: err = %v, want errMalformedColumn", err)
+	}
+	exp := exporter1754(t, dir)
+	sc, err := SchemaFromParquet(withStats)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerAsBefore1754(t, exp, sc, []string{withStats, bad})
+	res, err := exp.reconcile(ctx, reconcileRequest{database: "db", measurement: "cpu", schema: sc,
+		current: []FileRef{refOf(t, withStats), refOf(t, bad)}})
+	if err != nil {
+		t.Fatalf("reconcile: %v; one malformed file must not stop the table", err)
+	}
+	days := liveDays(t, exp, sc)
+	if _, ok := days[fileURI(bad)]; ok || len(days) != 1 {
+		t.Errorf("table = %v, want only the readable file", days)
+	}
+	if res.leftOut != 1 {
+		t.Errorf("leftOut = %d, want 1", res.leftOut)
+	}
+}
+
+// failingIO opens files whose reads fail.
+type failingIO struct{ iceio.LocalFS }
+
+type failingFile struct{ iceio.File }
+
+func (f failingFile) ReadAt([]byte, int64) (int, error) { return 0, errStore1754 }
+func (f failingFile) Read([]byte) (int, error)          { return 0, errStore1754 }
+
+var errStore1754 = errors.New("store unavailable")
+
+func (f failingIO) Open(name string) (iceio.File, error) {
+	under, err := f.LocalFS.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return failingFile{under}, nil
+}
+
+// A read the store fails is not a malformed file: it is returned, so the pass fails and the
+// next one reads the file again. Left out, it would stay out until the listing changed.
+func TestStoreFailureReadingTimeColumnIsNotMalformed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "f.parquet")
+	writeNoStatsParquet(t, path, []int64{day1754}, nil)
+	_, _, _, err := columnMicrosRange(context.Background(), failingIO{}, path, "time")
+	if err == nil || errors.Is(err, errMalformedColumn) || !errors.Is(err, errStore1754) {
+		t.Errorf("err = %v, want the store's error and not errMalformedColumn", err)
+	}
+}
+
+// An entry given its day is the same file: the commit does not cut the table's snapshot
+// history as a removal does, and does not pull the day's other new files into the pass's
+// first, unchunked commit.
+func TestGivingADayIsNotARemoval(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	hour := filepath.Join(root, "db/cpu/2023/11/14/22")
+	withStats := filepath.Join(hour, "stats.parquet")
+	noStats := filepath.Join(hour, "nostats.parquet")
+	fresh := filepath.Join(hour, "new.parquet")
+	writeArcStyleParquet(t, withStats, day1754, 10)
+	writeNoStatsParquet(t, noStats, []int64{day1754}, nil)
+	dbh, err := sql.Open("sqlite3", filepath.Join(root, "c.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { dbh.Close() })
+	exp, err := NewExporter(dbh, nil, "file://"+root+"/wh", "arc", 5, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc, err := SchemaFromParquet(withStats)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerAsBefore1754(t, exp, sc, []string{withStats, noStats})
+	writeArcStyleParquet(t, fresh, day1754+100, 5)
+	res, err := exp.reconcile(ctx, reconcileRequest{database: "db", measurement: "cpu", schema: sc,
+		current: []FileRef{refOf(t, withStats), refOf(t, noStats), refOf(t, fresh)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.commits != 2 {
+		t.Errorf("commits = %d, want 2: the entry given its day in the first, the new file of the same day in a chunk of its own", res.commits)
+	}
+	tbl, err := exp.EnsureTable(ctx, "db", "cpu", sc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(tbl.Metadata().Snapshots()); n < 3 {
+		t.Errorf("the table keeps %d snapshots, want the 3 made so far (retain_snapshots is 5): history was cut as if files had been deleted", n)
+	}
+	for p, d := range liveDays(t, exp, sc) {
+		if d == nil {
+			t.Errorf("%s has no day", filepath.Base(p))
+		}
+	}
+}
+
+// A table's count stays while a pass of it does not get through its new files, and goes with
+// the table.
+func TestFilesLeftOutCountOutlivesAnUnsettledPass(t *testing.T) {
+	s := &Scheduler{state: map[string]measurementState{}, leftOut: map[string]int{}}
+	gauge := func() int64 { return metrics.Get().Snapshot()["iceberg_files_left_out"].(int64) }
+	t.Cleanup(func() { metrics.Get().SetIcebergFilesLeftOut(0) })
+
+	done := &passJob{key: "db\x00cpu", leftOut: 2, leftOutKnown: true}
+	done.setState(measurementState{fingerprint: "a"})
+	s.applyPassState(done)
+	other := &passJob{key: "db\x00mem", leftOut: 1, leftOutKnown: true}
+	other.setState(measurementState{fingerprint: "b"})
+	s.applyPassState(other)
+	if got := gauge(); got != 3 {
+		t.Fatalf("gauge = %d, want 3", got)
+	}
+	unsettled := &passJob{key: "db\x00cpu"}
+	unsettled.dropState()
+	s.applyPassState(unsettled)
+	if got := gauge(); got != 3 {
+		t.Errorf("after a pass that did not get through its files the gauge is %d, want 3 still", got)
+	}
+	fixed := &passJob{key: "db\x00cpu", leftOutKnown: true}
+	fixed.setState(measurementState{fingerprint: "c"})
+	s.applyPassState(fixed)
+	if got := gauge(); got != 1 {
+		t.Errorf("after a pass that left nothing out the gauge is %d, want 1", got)
+	}
+	s.forgetDatabase("db")
+	s.reportLeftOut()
+	if got := gauge(); got != 0 {
+		t.Errorf("after the database is forgotten the gauge is %d, want 0", got)
+	}
+}
+
+// A tier move is registered by copying the table's entry to the new URI without opening the
+// file. An entry with no day is not copied: the file is built at its new place, which reads
+// its day.
+func TestTierMoveDoesNotCarryAMissingDay(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	withStats := filepath.Join(dir, "hot/db/cpu/2023/11/14/22/stats.parquet")
+	noStats := filepath.Join(dir, "hot/db/cpu/2023/11/14/22/nostats.parquet")
+	writeArcStyleParquet(t, withStats, day1754, 10)
+	writeNoStatsParquet(t, noStats, []int64{day1754}, nil)
+	exp := exporter1754(t, dir)
+	sc, err := SchemaFromParquet(withStats)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerAsBefore1754(t, exp, sc, []string{withStats, noStats})
+	tbl, err := exp.EnsureTable(ctx, "db", "cpu", sc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, err := exp.tableLiveFiles(ctx, tbl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	movedStats, movedNoStats := "s3://cold/db/cpu/2023/11/14/22/stats.parquet", "s3://cold/db/cpu/2023/11/14/22/nostats.parquet"
+	keyOf := map[string]string{movedStats: "db/cpu/2023/11/14/22/stats.parquet", movedNoStats: "db/cpu/2023/11/14/22/nostats.parquet"}
+	want := map[string]int64{movedStats: live[fileURI(withStats)].FileSizeBytes(), movedNoStats: live[fileURI(noStats)].FileSizeBytes()}
+	cloned, rest, err := cloneFromTable(tbl, live, []string{movedStats, movedNoStats}, keyOf, want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cloned) != 1 || cloned[0].FilePath() != movedStats {
+		t.Errorf("cloned = %v, want only the entry that has a day", dataFilePaths(cloned))
+	}
+	if len(rest) != 1 || rest[0] != movedNoStats {
+		t.Errorf("left to build = %v, want the entry without a day", rest)
+	}
+}
