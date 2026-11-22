@@ -41,7 +41,14 @@ func (b *S3Backend) ObjectSHA(ctx context.Context, path string) (int64, string, 
 		}
 		return -1, "", fmt.Errorf("HeadObject %s: %w", path, err)
 	}
-	return aws.ToInt64(out.ContentLength), objectSHA(out.Metadata), nil
+	if out.ContentLength == nil {
+		size, err := b.listedSize(ctx, path, key)
+		if err != nil {
+			return -1, "", err
+		}
+		return size, objectSHA(out.Metadata), nil
+	}
+	return *out.ContentLength, objectSHA(out.Metadata), nil
 }
 
 // CopyObject copies src to dst inside the bucket: one CopyObject up to 5 GiB,
