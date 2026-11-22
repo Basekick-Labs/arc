@@ -104,18 +104,30 @@ func TestUnknownDayWithoutItsDayGlobIsNotWidened(t *testing.T) {
 	}
 }
 
-// Off s3:// the recursive glob is not used: the hours are assumed and the day
-// glob is dropped, as before.
-func TestUnknownDayIsNotWidenedOffS3(t *testing.T) {
-	for _, scheme := range []string{"gs", "azure"} {
-		t.Run(scheme, func(t *testing.T) {
+// The schemes where the day-wide read was measured use it; elsewhere the
+// hours are assumed and the day glob is dropped, as before.
+func TestUnknownDayIsWidenedOnlyOnMeasuredSchemes(t *testing.T) {
+	for _, c := range []struct {
+		scheme string
+		widen  bool
+	}{
+		{"s3", true},
+		{"azure", true},
+		{"gs", false},
+		{"gcs", false},
+	} {
+		t.Run(c.scheme, func(t *testing.T) {
 			p, b := newLevelPruner(t, level{dirs: []string{"10"}, files: []string{"cpu_daily.parquet"}})
 			b.fail[lvlDay] = errListing
-			base := scheme + "://bucket"
+			base := c.scheme + "://bucket"
 			day := base + "/db/cpu/2025/01/15/*.parquet"
 			hour := base + "/db/cpu/2025/01/15/10/*.parquet"
+			want := []string{hour}
+			if c.widen {
+				want = []string{base + "/db/cpu/2025/01/15/**/*.parquet"}
+			}
 			got, verified, _ := p.filterExistingRemotePathsOpts(context.Background(), []string{day, hour}, base, 0)
-			if want := []string{hour}; !reflect.DeepEqual(got, want) || verified {
+			if !reflect.DeepEqual(got, want) || verified {
 				t.Errorf("paths = %v, verified = %v; want %v, false", got, verified, want)
 			}
 		})

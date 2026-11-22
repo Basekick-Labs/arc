@@ -22,15 +22,16 @@ Now:
 - **Trade-off:** a restore can no longer repair a damaged live `version-hint.text` or `v<N>.metadata.json`. Delete the damaged file first if you need the backup's copy.
 - **Left behind on a warehouse outside the storage root:** the metadata files of the versions exported after the backup stay there unreferenced. Nothing prunes a warehouse outside the root, restore or not.
 
-## Fix: on S3, a failed storage listing no longer leaves a day's daily files out of a query ([#1810](https://github.com/Basekick-Labs/arc/issues/1810))
+## Fix: on S3 and Azure, a failed storage listing no longer leaves a day's daily files out of a query ([#1810](https://github.com/Basekick-Labs/arc/issues/1810))
 
 For a time-ranged query on object storage, Arc lists each day's directory to learn which hours exist and whether the day holds daily files. When that listing failed, Arc guessed: it assumed every requested hour existed (a missing one then failed the query with a 503) and left the day's daily files out, so the query could answer 200 without them.
 
-- **On S3, a day that cannot be listed is now read whole.** Arc hands DuckDB one pattern for the day (`<day>/**/*.parquet`) in place of that day's hour and daily patterns. DuckDB lists the day itself and the query's time filter still decides which rows count, so the answer is complete, and a missing hour no longer fails the query.
+- **On S3 and Azure, a day that cannot be listed is now read whole.** Arc hands DuckDB one pattern for the day (`<day>/**/*.parquet`) in place of that day's hour and daily patterns. DuckDB lists the day itself and the query's time filter still decides which rows count, so the answer is complete, and a missing hour no longer fails the query.
 - **Cost, only when the listing fails:** a query over one hour opens every file of that day. Measured with the built binary on SeaweedFS S3, on a day of 3,004 files, with the day's listing failing: the same row counts as without the failure, in 0.6 to 4.3 s where the same queries took 0.14 to 0.63 s. That time includes the storage client's own retries of the failed listing, which were not measured separately. Such a result is never remembered, so the next query lists again.
 - **New metric `arc_query_days_read_unlisted_total`** (`query_days_read_unlisted_total` in the JSON metrics): days a query read this way. It staying above zero means listings of your bucket are failing.
 - **If the day holds nothing at all,** the query answers the retryable 503, with a warning in the log saying the day's listing failed, not an empty result.
-- **Azure and GCS are not changed:** there a day whose listing fails still loses its daily files from that query. Reading the day whole depends on a DuckDB pattern behaviour measured on S3 only.
+- **Azure** was measured the same way on Azurite, a day of 94 files with its listing failing: the same row counts as without the failure, each query waiting out the 5 second listing limit first.
+- **GCS is not changed:** there a day whose listing fails still loses its daily files from that query. Reading the day whole depends on DuckDB pattern behaviour that has been measured on S3 and Azure only.
 
 Also in this change, on every object store:
 
