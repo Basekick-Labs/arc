@@ -2,6 +2,26 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: restoring a backup no longer leaves Iceberg tables stale or broken until the restart ([#1813](https://github.com/Basekick-Labs/arc/issues/1813))
+
+**Who is affected:** anyone with Iceberg export on who restores a backup. On a cluster a restore never stages a catalog (`restore_metadata` is refused there), so only the fix to the version hint applies.
+
+A restore of metadata stages the SQLite database, including the Iceberg catalog, and applies it at the next start. Meanwhile it wrote the backup's Iceberg files live, and the export kept running on the old catalog. Two things went wrong between the restore and the restart:
+
+- **Warehouse outside the storage root (`iceberg.warehouse` elsewhere): a table could stop exporting for good.** Each export commit deletes metadata files older than its retention, and that could include the file the restored catalog row points at. After the restart, every pass of that table failed with `no such file or directory` until someone fixed it by hand. Reproduced with the backup one commit behind and three commits before the restart.
+- **Warehouse in the storage root (the default): directory readers saw the backup's table.** The restore wrote the backup's `version-hint.text` over the live one. DuckDB `iceberg_scan` on the table directory, Spark, and anything else that reads the hint then read the table as it was at the backup: 3 rows instead of 18 in the reproduction. On a table with no new data, that lasted until the restart. Arc's own queries were not affected.
+
+Now:
+
+- **The export pauses for the restore.** A restore that stages a catalog pauses the Iceberg export before it writes anything, waiting up to 150 s for exports already running, and keeps it paused until the restart. The restore status shows `"iceberg_export_pause": "paused_until_restart"`. If the restore fails before it stages the catalog, the pause is lifted (`"resumed"`). If an export is still running after the wait, the restore is refused and nothing is written.
+- **While paused:** no table is exported, and the log says so once (`Iceberg export is paused until the server restarts`). A `DELETE` of a database drops its data but not its Iceberg tables, and answers with `iceberg_cleanup: pending`, as when a drop cannot run. Repeat it after the restart. A second restore before the restart is not held up by the first one's pause; the last restore before the restart wins, as before.
+- **A restore no longer overwrites a table's live hint.** When a table's metadata directory already has a `version-hint.text`, the restore leaves the hint and every `v<N>.metadata.json` there as they are, and counts them as `iceberg_discovery_files_kept`. If the check for a hint fails, the restore logs it and leaves them out too.
+  - A directory with no hint gets the backup's discovery files, but none is written over a file that is already there.
+  - The rest of the table's metadata is restored as before.
+  - After the restart, the restored catalog row is moved onto the live published version, as since #1613.
+- **Trade-off:** a restore can no longer repair a damaged live `version-hint.text` or `v<N>.metadata.json`. Delete the damaged file first if you need the backup's copy.
+- **Left behind on a warehouse outside the storage root:** the metadata files of the versions exported after the backup stay there unreferenced. Nothing prunes a warehouse outside the root, restore or not.
+
 ## Fix: on S3, a failed storage listing no longer leaves a day's daily files out of a query ([#1810](https://github.com/Basekick-Labs/arc/issues/1810))
 
 For a time-ranged query on object storage, Arc lists each day's directory to learn which hours exist and whether the day holds daily files. When that listing failed, Arc guessed: it assumed every requested hour existed (a missing one then failed the query with a 503) and left the day's daily files out, so the query could answer 200 without them.

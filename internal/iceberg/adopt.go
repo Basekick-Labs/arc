@@ -125,10 +125,11 @@ func (e *Exporter) adoptPublished(ctx context.Context, ident icetable.Identifier
 	}
 	if rowExists && !e.isPublishedHere(ident, rowLoc) {
 		// The first check of this row in this process (a restart, a lease
-		// move, a restored catalog): the hint alone can be behind. A restore
-		// writes the backup's hint over a newer live one while the newer
-		// v<N> stay (#1613), and a writer can stop between v<N> and the
-		// hint. A v<N> above the hint is taken only when it is this table's
+		// move, a restored catalog): the hint alone can be behind. A writer
+		// can stop between v<N> and the hint, and a restore made before
+		// #1813 wrote the backup's hint over a newer live one while the
+		// newer v<N> stayed (#1613); a restore now leaves a live hint's
+		// directory as it is. A v<N> above the hint is taken only when it is this table's
 		// lineage (the same table-uuid as the row's metadata): a database
 		// DROP that failed part way can leave an older incarnation's v<N>
 		// behind a recreated table. One listing per table per process, until
