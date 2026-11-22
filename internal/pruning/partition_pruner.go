@@ -1320,10 +1320,18 @@ const dayWideSuffix = "/**/*.parquet"
 //   - azure:// on Azurite, with DuckDB's azure extension, which matches
 //     patterns itself rather than through httpfs: the same three checks, on
 //     a day of 94 files.
+//   - gs:// on Google Cloud Storage itself: the same three checks, on a day
+//     of 64 files.
 //
-// Elsewhere (gs://) the day glob is dropped, as before.
+// Those are the schemes Arc's backends build. Any other scheme keeps the
+// previous handling: the day glob is dropped.
 func canWidenDay(dayGlob string) bool {
-	return strings.HasPrefix(dayGlob, "s3://") || strings.HasPrefix(dayGlob, "azure://")
+	for _, scheme := range []string{"s3://", "azure://", "gs://"} {
+		if strings.HasPrefix(dayGlob, scheme) {
+			return true
+		}
+	}
+	return false
 }
 
 // widenUnknownDays rewrites the filtered paths for days whose level listing

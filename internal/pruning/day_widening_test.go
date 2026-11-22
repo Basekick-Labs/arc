@@ -65,13 +65,14 @@ func TestFailedDayListingIsNotRememberedAsEmpty(t *testing.T) {
 	}
 }
 
-// Off s3:// the day-level check still makes its own attempt after the hour
-// check's listing failed, as before: when it answers, the day glob is kept
-// on a verified answer (the hours stay assumed).
-func TestDayCheckStillRetriesOffS3(t *testing.T) {
+// On a scheme where the day is not read whole, the day-level check still
+// makes its own attempt after the hour check's listing failed, as before:
+// when it answers, the day glob is kept on a verified answer (the hours
+// stay assumed).
+func TestDayCheckStillRetriesOnAnUnmeasuredScheme(t *testing.T) {
 	p, b := newLevelPruner(t, level{dirs: []string{"10"}, files: []string{"cpu_daily.parquet"}})
 	b.failFirst[lvlDay] = 1
-	const base = "gs://bucket"
+	const base = "other://bucket"
 	day, hour := base+"/db/cpu/2025/01/15/*.parquet", base+"/db/cpu/2025/01/15/10/*.parquet"
 	got, _, _ := p.filterExistingRemotePathsOpts(context.Background(), []string{day, hour}, base, 0)
 	if want := []string{day, hour}; !reflect.DeepEqual(got, want) {
@@ -113,8 +114,9 @@ func TestUnknownDayIsWidenedOnlyOnMeasuredSchemes(t *testing.T) {
 	}{
 		{"s3", true},
 		{"azure", true},
-		{"gs", false},
-		{"gcs", false},
+		{"gs", true},
+		// Not a scheme Arc builds, and not measured.
+		{"other", false},
 	} {
 		t.Run(c.scheme, func(t *testing.T) {
 			p, b := newLevelPruner(t, level{dirs: []string{"10"}, files: []string{"cpu_daily.parquet"}})
