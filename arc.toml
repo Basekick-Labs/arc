@@ -299,10 +299,6 @@ daily_min_files = 12
 # 0 means the default, 7.
 # daily_skip_file_age_check_days = 7
 
-# -----------------------------------------------------------------------------
-# Authentication
-# -----------------------------------------------------------------------------
-
 # A compaction job reads each input file's time range before it merges
 # anything. If a file holds rows outside the hour (hourly tier) or UTC day
 # (daily tier) of the directory it sits in, the job compacts nothing, the file
@@ -314,6 +310,10 @@ daily_min_files = 12
 # then holds rows of two days and the Iceberg export leaves it out of its table.
 # Environment override: ARC_COMPACTION_REFUSE_MISFILED_INPUTS=false
 # refuse_misfiled_inputs = true
+
+# -----------------------------------------------------------------------------
+# Authentication
+# -----------------------------------------------------------------------------
 
 [auth]
 enabled = true
