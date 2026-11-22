@@ -32,8 +32,11 @@ func authPublicPaths() (routes, prefixes []string) {
 	// deliberately public, equivalent to the existing Prometheus /metrics
 	// surface: aggregate operational counters plus Go runtime/GC stats and
 	// host-arch fingerprinting (go_version/os/arch). They expose no queries,
-	// database/measurement names, file paths, or credentials, and monitoring
-	// dashboards poll them without a token. Whitelist them explicitly so
+	// file paths or credentials, and no database or measurement names: the
+	// one exception is opt-in, iceberg.export_lag_table_series > 0 (#1772),
+	// whose labelled series name databases and measurements on the
+	// Prometheus /metrics text only, never in these JSON endpoints.
+	// Monitoring dashboards poll them without a token. Whitelist them explicitly so
 	// their public status is an auditable decision, not an accident of
 	// registration order (they were previously reachable only because
 	// RegisterRoutes runs before this middleware; see GHSA-m3qr-fvp4-78xj).

@@ -282,6 +282,25 @@ func (s *Scheduler) forgetDatabase(db string) {
 	match := func(key string) bool {
 		return strings.HasPrefix(key, db+"\x00") || strings.HasPrefix(key, db+"/")
 	}
+	// Its tables' waiting reports too: a dropped table is not waiting for an
+	// export (the per-table pending series, #1772).
+	s.reqMu.Lock()
+	dropped := false
+	for k := range s.ingestPending {
+		if match(k) {
+			delete(s.ingestPending, k)
+			dropped = true
+		}
+	}
+	for k := range s.ingestDue {
+		if match(k) {
+			delete(s.ingestDue, k)
+		}
+	}
+	if dropped {
+		s.publishIngestPendingLocked()
+	}
+	s.reqMu.Unlock()
 	for k := range s.state {
 		if match(k) {
 			delete(s.state, k)

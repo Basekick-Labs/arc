@@ -103,9 +103,10 @@ type Metrics struct {
 	bufferFlushesTotal    atomic.Int64
 	bufferErrorsTotal     atomic.Int64
 	bufferFlushFailures   atomic.Int64
-	ingestPublishDelay    ingestPublishDelay // arc_ingest_publish_delay_seconds (ingest_publish_delay.go)
-	icebergExport         icebergExport      // arc_iceberg_export_* (iceberg_export.go)
-	flightSQLPrepare      flightSQLPrepare   // arc_flight_sql_prepare_* (flight_sql_prepare.go)
+	ingestPublishDelay    ingestPublishDelay                    // arc_ingest_publish_delay_seconds (ingest_publish_delay.go)
+	icebergExport         icebergExport                         // arc_iceberg_export_* (iceberg_export.go)
+	icebergTableLag       atomic.Pointer[icebergTableLagSource] // per-table lag series (iceberg_export_tables.go)
+	flightSQLPrepare      flightSQLPrepare                      // arc_flight_sql_prepare_* (flight_sql_prepare.go)
 	bufferQueueDepth      atomic.Int64
 	bufferRecordsQueued   atomic.Int64
 	bufferRecordsInflight atomic.Int64

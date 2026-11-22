@@ -4797,6 +4797,12 @@ func main() {
 			clusterCoordinator.SetIcebergDatabaseDropper(icebergScheduler.RequestDropDatabase)
 			log.Info().Msg("Iceberg export on node-local storage: this node drops its own Iceberg tables of a database deleted on the cluster")
 		}
+		// Per-table export lag series on /metrics (#1772), opt-in: they carry
+		// database and measurement names.
+		if n := cfg.Iceberg.ExportLagTableSeries; n > 0 {
+			metrics.Get().SetIcebergTableLagSource(icebergScheduler, n)
+			log.Info().Int("tables", n).Msg("Iceberg export lag per table on /metrics: these series name databases and measurements, and /metrics is served without authentication")
+		}
 		// Started after tiering is set up (below), so the first pass already sees the cold tier.
 		icebergStart = icebergScheduler.Start
 		icebergExporter, icebergWalk = exporter, icebergSource

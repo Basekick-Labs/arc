@@ -31,6 +31,17 @@ type exportLag struct {
 	mu      sync.Mutex
 	pending map[string][]time.Time // table identifier -> write times of committed, unpublished ingest files
 	started time.Time
+	// last is, per table, the largest lag of its last publish that covered
+	// ingest files (#1772, export_lag_tables.go).
+	last map[string]lastLag
+}
+
+// lastLag is a table's last publish: the largest lag among its files, and
+// when it was published.
+type lastLag struct {
+	database, measurement string
+	lag                   time.Duration
+	at                    time.Time
 }
 
 func tableLagKey(ident []string) string { return strings.Join(ident, "\x00") }
@@ -83,6 +94,9 @@ func (e *Exporter) drainExportLag(ident []string) time.Duration {
 	delete(e.lag.pending, key)
 	e.lag.mu.Unlock()
 	if len(times) == 0 {
+		// A publish that covered no ingest file (a pass that committed
+		// nothing new, a heal) says nothing of the table's lag and leaves
+		// its last one as it was.
 		return 0
 	}
 	now := time.Now()
@@ -95,6 +109,7 @@ func (e *Exporter) drainExportLag(ident []string) time.Duration {
 			oldest = d
 		}
 	}
+	e.noteLastLag(key, ident, oldest, now)
 	if oldest > e.passLag {
 		e.passLag = oldest
 	}
@@ -112,6 +127,7 @@ func (e *Exporter) forgetExportLag(ident []string) {
 	}
 	e.lag.mu.Lock()
 	delete(e.lag.pending, tableLagKey(ident))
+	delete(e.lag.last, tableLagKey(ident))
 	e.lag.mu.Unlock()
 }
 
@@ -134,6 +150,11 @@ func (e *Exporter) forgetExportLagNamespace(namespace []string) {
 	for key := range e.lag.pending {
 		if strings.HasPrefix(key, prefix) {
 			delete(e.lag.pending, key)
+		}
+	}
+	for key := range e.lag.last {
+		if strings.HasPrefix(key, prefix) {
+			delete(e.lag.last, key)
 		}
 	}
 	e.lag.mu.Unlock()
