@@ -65,13 +65,14 @@ func TestFailedDayListingIsNotRememberedAsEmpty(t *testing.T) {
 	}
 }
 
-// Off s3:// the day-level check still makes its own attempt after the hour
-// check's listing failed, as before: when it answers, the day glob is kept
-// on a verified answer (the hours stay assumed).
-func TestDayCheckStillRetriesOffS3(t *testing.T) {
+// On a scheme where the day is not read whole, the day-level check still
+// makes its own attempt after the hour check's listing failed, as before:
+// when it answers, the day glob is kept on a verified answer (the hours
+// stay assumed).
+func TestDayCheckStillRetriesOnAnUnmeasuredScheme(t *testing.T) {
 	p, b := newLevelPruner(t, level{dirs: []string{"10"}, files: []string{"cpu_daily.parquet"}})
 	b.failFirst[lvlDay] = 1
-	const base = "gs://bucket"
+	const base = "other://bucket"
 	day, hour := base+"/db/cpu/2025/01/15/*.parquet", base+"/db/cpu/2025/01/15/10/*.parquet"
 	got, _, _ := p.filterExistingRemotePathsOpts(context.Background(), []string{day, hour}, base, 0)
 	if want := []string{day, hour}; !reflect.DeepEqual(got, want) {
@@ -104,18 +105,31 @@ func TestUnknownDayWithoutItsDayGlobIsNotWidened(t *testing.T) {
 	}
 }
 
-// Off s3:// the recursive glob is not used: the hours are assumed and the day
-// glob is dropped, as before.
-func TestUnknownDayIsNotWidenedOffS3(t *testing.T) {
-	for _, scheme := range []string{"gs", "azure"} {
-		t.Run(scheme, func(t *testing.T) {
+// The schemes where the day-wide read was measured use it; elsewhere the
+// hours are assumed and the day glob is dropped, as before.
+func TestUnknownDayIsWidenedOnlyOnMeasuredSchemes(t *testing.T) {
+	for _, c := range []struct {
+		scheme string
+		widen  bool
+	}{
+		{"s3", true},
+		{"azure", true},
+		{"gs", true},
+		// Not a scheme Arc builds, and not measured.
+		{"other", false},
+	} {
+		t.Run(c.scheme, func(t *testing.T) {
 			p, b := newLevelPruner(t, level{dirs: []string{"10"}, files: []string{"cpu_daily.parquet"}})
 			b.fail[lvlDay] = errListing
-			base := scheme + "://bucket"
+			base := c.scheme + "://bucket"
 			day := base + "/db/cpu/2025/01/15/*.parquet"
 			hour := base + "/db/cpu/2025/01/15/10/*.parquet"
+			want := []string{hour}
+			if c.widen {
+				want = []string{base + "/db/cpu/2025/01/15/**/*.parquet"}
+			}
 			got, verified, _ := p.filterExistingRemotePathsOpts(context.Background(), []string{day, hour}, base, 0)
-			if want := []string{hour}; !reflect.DeepEqual(got, want) || verified {
+			if !reflect.DeepEqual(got, want) || verified {
 				t.Errorf("paths = %v, verified = %v; want %v, false", got, verified, want)
 			}
 		})
@@ -170,6 +184,29 @@ func TestDaysReadUnlistedCountsTheReturnedPlan(t *testing.T) {
 	after, _ := metrics.Get().Snapshot()["query_days_read_unlisted_total"].(int64)
 	if after-before != 1 {
 		t.Errorf("counter moved by %d, want 1", after-before)
+	}
+}
+
+// A plan that reads a day whole rests on a failed listing: it is volatile
+// and not remembered, so once storage answers the normal plan comes back.
+func TestAWidenedPlanIsNotCached(t *testing.T) {
+	p, b := newLevelPruner(t, level{dirs: []string{"10"}, files: []string{"cpu_daily.parquet"}})
+	b.fail[lvlDay] = errListing
+	const glob = "s3://bucket/db/cpu/**/*.parquet"
+	const sql = "SELECT * FROM cpu WHERE time >= '2025-01-15 10:00:00' AND time < '2025-01-15 11:00:00'"
+
+	ctx, vol := WithVolatileResult(context.Background())
+	if r, ok := p.OptimizeTablePath(ctx, glob, sql); !ok || !resultHasPath(r, lvlDayWide) {
+		t.Fatalf("got %v %v, want the day-wide glob", r, ok)
+	}
+	if !vol.Volatile {
+		t.Error("a plan that reads a day unlisted was not marked volatile")
+	}
+
+	delete(b.fail, lvlDay)
+	r, ok := p.OptimizeTablePath(context.Background(), glob, sql)
+	if !ok || resultHasPath(r, lvlDayWide) || !resultHasPath(r, lvlDayG) || !resultHasPath(r, lvlHourG) {
+		t.Errorf("after recovery got %v %v, want the day's own globs: the widened plan was served from cache", r, ok)
 	}
 }
 

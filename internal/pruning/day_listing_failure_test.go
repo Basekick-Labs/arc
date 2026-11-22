@@ -35,14 +35,15 @@ func (b *scriptedListBackend) List(_ context.Context, _ string) ([]string, error
 }
 
 const (
-	dayListGlob = "gs://bucket/db/cpu/**/*.parquet"
-	dayListDay  = "gs://bucket/db/cpu/2025/01/15/*.parquet"
+	dayListGlob = "other://bucket/db/cpu/**/*.parquet"
+	dayListDay  = "other://bucket/db/cpu/2025/01/15/*.parquet"
 	dayListSQL  = "SELECT * FROM cpu WHERE time >= '2025-01-15 10:00:00' AND time < '2025-01-15 11:00:00'"
 )
 
-// These run on gs://: there a day whose listing fails is still dropped (it is
-// read through one recursive glob on s3:// only, day_widening_test.go), which
-// is the state these tests need to show an unverified result is not kept.
+// These run on a scheme Arc does not build: there a day whose listing fails
+// is still dropped (on s3://, azure:// and gs:// it is read through one
+// recursive glob, day_widening_test.go), which is the state these tests need
+// to show an unverified result is not kept.
 var (
 	errListing   = errors.New("injected listing failure")
 	dayListDaily = []string{"db/cpu/2025/01/15/cpu_daily.parquet"}

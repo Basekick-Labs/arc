@@ -3014,7 +3014,9 @@ const vanishedPartitionMessage = "data read by this query was removed while it r
 // Measured through the built binary on SeaweedFS S3 (DuckDB 1.5.6,
 // 2026-11-21): DuckDB names that glob as Arc wrote it,
 // "s3://bucket/prefix/db/m/2026/11/17/**/*.parquet", and the query answers
-// 503 where it would have answered an empty result.
+// 503 where it would have answered an empty result. The same holds for
+// azure:// (DuckDB's azure extension, on the Azurite emulator) and gs://
+// (Google Cloud Storage); see pruning's canWidenDay for those runs.
 //
 // A "**" glob can still be one of several patterns a tiered read combines,
 // so an empty answer for it is only as right as it was before this check.
