@@ -2,6 +2,24 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: a crash while a stale local copy was being removed no longer deletes a newer file written to its path ([#1814](https://github.com/Basekick-Labs/arc/issues/1814))
+
+**Who is affected:** clusters with local storage and replication on, where the stale-copy sweep removes local copies whose delete the node missed. Object storage and single nodes are unchanged.
+
+To remove a stale copy, the sweep moves it into `_stale_local/` and checks it there. If a new file was written to the same path in that moment, for example by a pull, it is moved back. Two problems:
+
+- **A crash in that window deleted the new file at the next start.** The file existed only under a random name in `_stale_local/`, and startup deleted every such name.
+- **No fsync after the put-back.** A power loss soon after could lose the file at its path.
+
+Now:
+
+- **The aside records what it was.** A copy moved aside goes to `_stale_local/<id>.<inode>.<size>.<mtime>/<its path>`, so the name records what the stale copy was and where it came from.
+- **At start, Arc removes a file there only when it is provably the stale copy.** That means it matches the recorded identity, or it is the same file as what its path holds (a put-back that finished).
+- **Any other file there is kept for an operator,** under `_stale_local/keep-<id>.<inode>.<size>.<mtime>/<its path>`, and logged as an error. Compare it with what its path holds and move it back by hand if it is wanted. It is not put back automatically, because at start Arc does not yet know whether the manifest still lists the path. Replication pulls a listed path again only while catch-up is on and another node holds the file.
+- **A put-back is fsynced** before its aside name is removed. If the fsync fails, the aside name stays, and the next start removes it once it finds the same file at the path.
+- **This also runs with replication catch-up off,** where the sweep itself does not run, so a file kept from an earlier crash is reported. With replication off it does not run.
+- **Older versions' asides** are flat files in `_stale_local/` and record nothing, so they are now kept as `keep-<name>`, with a warning, instead of being deleted.
+
 ## Fix: restoring a backup no longer leaves Iceberg tables stale or broken until the restart ([#1813](https://github.com/Basekick-Labs/arc/issues/1813))
 
 **Who is affected:** anyone with Iceberg export on who restores a backup. On a cluster a restore never stages a catalog (`restore_metadata` is refused there), so only the fix to the version hint applies.

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -60,7 +61,9 @@ var staleLocalBreakerMin = 1000
 const (
 	staleLocalFeedQueue = 4096
 	// staleLocalAsideDir is the reserved root a copy is moved to before it is
-	// removed; startup empties it, except copies kept for an operator.
+	// removed, as <tag>/<its path> where the tag names the stale copy's
+	// identity (staleTag); startup settles what a crash left there
+	// (recoverStaleAsides), keeping what it cannot prove stale.
 	staleLocalAsideDir  = "_stale_local"
 	staleLocalKeepAside = "keep-"
 )
@@ -258,10 +261,22 @@ func (c *Coordinator) staleLocalEnabled() bool {
 // (c.mu held), before the FSM callbacks: no I/O here, the journal is opened
 // by the sweep goroutine.
 func (c *Coordinator) startStaleLocalLocked() {
+	bp, ok := c.storage.(interface{ GetBasePath() string })
 	if !c.staleLocalEnabled() {
+		// Replication on, catch-up off (or no Raft directory): what an
+		// earlier run with the sweep on left aside is settled even now, or
+		// a file kept from a crash would sit there unreported.
+		// Only the aside root is touched, so nothing orders it.
+		if ok && c.storage != nil && c.storage.Type() == "local" {
+			base := bp.GetBasePath()
+			c.stale.wg.Add(1)
+			go func() {
+				defer c.stale.wg.Done()
+				c.recoverStaleAsides(base)
+			}()
+		}
 		return
 	}
-	bp, ok := c.storage.(interface{ GetBasePath() string })
 	if !ok {
 		return
 	}
@@ -295,7 +310,7 @@ func (c *Coordinator) stopStaleLocal() {
 func (c *Coordinator) staleLocalRun(ctx context.Context) {
 	s := &c.stale
 	defer s.wg.Done()
-	c.removeStaleAsides()
+	c.recoverStaleAsides(s.base)
 	seen, err := openSeenLocal(c.cfg.RaftDataDir, c.cfg.ClusterName)
 	if err != nil {
 		s.markOpened()
@@ -754,6 +769,14 @@ func (c *Coordinator) staleCandidates(ctx context.Context, seen *seenLocal, now 
 var (
 	staleLinkFn      = os.Link
 	staleBeforeAside func(full string)
+	// staleAfterAside, when it returns true, ends unlinkStale right after the
+	// rename, leaving the disk as a crash there would (tests only).
+	staleAfterAside func(aside string) bool
+	// staleKeepRename is the rename that keeps a tag directory aside for an
+	// operator (a test seam for its failure).
+	staleKeepRename = os.Rename
+	// staleSyncDir makes a put-back durable (a test seam for its failure).
+	staleSyncDir = storage.SyncDirTolerant
 )
 
 // putBackAside links aside back at full. The rename emptied full's
@@ -815,43 +838,65 @@ func (c *Coordinator) unlinkStale(ctx context.Context, path string) bool {
 		return false
 	}
 	full := c.stalePath(path)
-	cur, ok := localIdentity(full)
-	if !ok {
-		seen.remove(path)
-		return false
-	}
-	if cur.size != rec.size || cur.mtime != rec.mtime || cur.ino != rec.ino {
-		seen.remove(path) // another file now: never this sweep's to remove
-		return false
-	}
-	asideDir := filepath.Join(s.base, staleLocalAsideDir)
-	if err := os.MkdirAll(asideDir, 0o700); err != nil {
+	// The aside is <tag>/<path>: where the copy came from and what it was,
+	// so a crash between the rename and the put-back below leaves what the
+	// next start needs to tell a replacement from the stale copy (#1814).
+	// Made before the identity check, to keep the check-to-rename window as
+	// short as it was.
+	asideRoot := filepath.Join(s.base, staleLocalAsideDir)
+	tagDir := filepath.Join(asideRoot, staleTag(rec))
+	aside := filepath.Join(tagDir, filepath.FromSlash(path))
+	if err := os.MkdirAll(filepath.Dir(aside), 0o700); err != nil {
+		removeEmptyTree(tagDir)
 		c.logger.Warn().Err(err).Str("path", path).Msg("Could not remove a stale local copy; the next pass retries")
 		return false
 	}
-	aside := filepath.Join(asideDir, randomSuffix())
+	cur, ok := localIdentity(full)
+	if !ok {
+		removeEmptyTree(tagDir)
+		seen.remove(path)
+		return false
+	}
+	if !sameFile(cur, rec) {
+		removeEmptyTree(tagDir)
+		seen.remove(path) // another file now: never this sweep's to remove
+		return false
+	}
 	if staleBeforeAside != nil {
 		staleBeforeAside(full)
 	}
 	if err := os.Rename(full, aside); err != nil {
+		removeEmptyTree(tagDir)
 		c.logger.Warn().Err(err).Str("path", path).Msg("Could not remove a stale local copy; the next pass retries")
 		return false
 	}
+	if staleAfterAside != nil && staleAfterAside(aside) {
+		return false // a test's crash right after the rename
+	}
 	moved, ok := localIdentity(aside)
-	if !ok || moved.size != rec.size || moved.mtime != rec.mtime || moved.ino != rec.ino {
+	if !ok || !sameFile(moved, rec) {
 		// Replaced between the check and the rename: put it back.
 		if err := putBackAside(aside, full, strings.Count(path, "/")+1); err != nil {
-			keep := filepath.Join(asideDir, staleLocalKeepAside+randomSuffix())
-			_ = os.Rename(aside, keep)
-			c.logger.Error().Err(err).Str("path", path).Str("kept_at", keep).
-				Msg("A file written to a stale path while it was being removed could not be put back; it is kept aside, move it back by hand")
+			c.keepAside(tagDir, []string{path}, err, false)
+			return false
+		}
+		// Durable before the aside goes: a crash now finds the same file at
+		// the path and in the aside, and removes only the aside.
+		if err := syncUpTo(filepath.Dir(full), s.base); err != nil {
+			// The aside name stays: the next start finds the same file at
+			// the path and removes only the aside, or keeps it if a power
+			// loss took the path's name.
+			c.logger.Warn().Err(err).Str("path", path).Msg("A file put back at a stale path could not be made durable; its aside name is kept until the next start")
+			seen.remove(path)
 			return false
 		}
 		_ = os.Remove(aside)
+		removeEmptyTree(tagDir)
 		seen.remove(path)
 		return false
 	}
 	removeErr := os.Remove(aside)
+	removeEmptyTree(tagDir)
 	s.endUnlink(path)
 	unlinking = false
 	if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
@@ -869,17 +914,150 @@ func randomSuffix() string {
 	return hex.EncodeToString(b[:])
 }
 
-// removeStaleAsides removes copies a crash left moved aside, keeping the ones
-// set aside for an operator.
-func (c *Coordinator) removeStaleAsides() {
-	dir := filepath.Join(c.stale.base, staleLocalAsideDir)
+// staleTag names an aside directory: a random part, then the stale copy's
+// inode, size and mtime (UnixNano), dot-separated.
+func staleTag(rec seenRecord) string {
+	return fmt.Sprintf("%s.%d.%d.%d", randomSuffix(), rec.ino, rec.size, rec.mtime)
+}
+
+// parseStaleTag reads the identity back from a tag directory's name.
+func parseStaleTag(name string) (seenRecord, bool) {
+	parts := strings.Split(name, ".")
+	if len(parts) != 4 || len(parts[0]) != 16 {
+		return seenRecord{}, false
+	}
+	ino, err1 := strconv.ParseUint(parts[1], 10, 64)
+	size, err2 := strconv.ParseInt(parts[2], 10, 64)
+	mtime, err3 := strconv.ParseInt(parts[3], 10, 64)
+	if err1 != nil || err2 != nil || err3 != nil {
+		return seenRecord{}, false
+	}
+	return seenRecord{ino: ino, size: size, mtime: mtime}, true
+}
+
+// keepAside renames a tag directory to a keep- name for an operator. Only a
+// successful rename is reported as kept: a tag directory left under its own
+// name is settled again (and kept again) by the next start.
+func (c *Coordinator) keepAside(tagDir string, paths []string, cause error, atStart bool) {
+	keep := filepath.Join(filepath.Dir(tagDir), staleLocalKeepAside+filepath.Base(tagDir))
+	if err := staleKeepRename(tagDir, keep); err != nil {
+		c.logger.Error().Err(cause).AnErr("keep_error", err).Strs("paths", paths).Str("left_in", tagDir).
+			Msg("A file written to a stale path while it was being removed could not be put back or kept aside; it stays where it is, and the next start keeps it for an operator")
+		return
+	}
+	ev := c.logger.Error().Err(cause).Strs("paths", paths).Str("kept_in", keep)
+	if atStart {
+		ev.Msg("A file left aside by a crash while a stale local copy was being removed is not provably that stale copy; it is kept, not put back, because the manifest is not known at start. Compare it with what its path holds, and move it back by hand if it is wanted (replication pulls a listed path again only while catch-up is on and another node holds it)")
+		return
+	}
+	ev.Msg("A file written to a stale path while it was being removed could not be put back; it is kept aside: compare it with what the path holds now, and move it back by hand if it is wanted")
+}
+
+// removeEmptyTree removes dir and the empty directories under it, bottom-up.
+// It never removes a file: a directory that still holds one stays.
+func removeEmptyTree(dir string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
 	for _, e := range entries {
-		if !strings.HasPrefix(e.Name(), staleLocalKeepAside) {
-			_ = os.Remove(filepath.Join(dir, e.Name()))
+		if e.IsDir() {
+			removeEmptyTree(filepath.Join(dir, e.Name()))
 		}
 	}
+	_ = os.Remove(dir)
+}
+
+// syncUpTo fsyncs dir and each parent up to and including root, tolerating a
+// volume that cannot fsync directories: a put-back may have created levels.
+func syncUpTo(dir, root string) error {
+	root = filepath.Clean(root)
+	for d := filepath.Clean(dir); ; d = filepath.Dir(d) {
+		if err := staleSyncDir(d); err != nil {
+			return err
+		}
+		if d == root || len(d) <= len(root) || filepath.Dir(d) == d {
+			return nil
+		}
+	}
+}
+
+// recoverStaleAsides settles what a crash left under staleLocalAsideDir
+// (#1814). It runs at start, before the manifest is known, so it only removes
+// what it can prove is the stale copy, and never writes to a data path:
+//
+//   - a file whose identity is its tag's: the stale copy, removed;
+//   - a file that is the same file as what its path holds: a put-back that
+//     finished, the aside name removed;
+//   - any other file: written to the path while the stale copy was being
+//     removed. Kept aside for an operator, not put back: the manifest may
+//     have deleted the path since, and a file put back unlisted is read by
+//     queries and tracked by nothing. A listed path is pulled again only
+//     while catch-up is on and another node holds it;
+//   - a tag directory with no file (the rename did not survive) is removed;
+//   - a flat entry is an older version's aside, which records nothing: kept.
+//
+// keep- entries are left. A file is only ever removed inside the aside root.
+func (c *Coordinator) recoverStaleAsides(base string) {
+	root := filepath.Join(base, staleLocalAsideDir)
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, staleLocalKeepAside) {
+			continue
+		}
+		if !e.IsDir() {
+			// An older version's aside: a stale copy, or a file written to
+			// its path in the window; nothing tells which, so it is kept.
+			keep := filepath.Join(root, staleLocalKeepAside+name)
+			if err := staleKeepRename(filepath.Join(root, name), keep); err != nil {
+				c.logger.Warn().Err(err).Str("file", filepath.Join(root, name)).Msg("Could not keep a stale local copy an older version left aside; the next start tries again")
+				continue
+			}
+			c.logger.Warn().Str("kept_at", keep).
+				Msg("An older version left a file aside while removing a stale local copy, and nothing records which path it came from or whether it was the stale copy; it is kept for an operator. Remove it once you are sure it is not wanted")
+			continue
+		}
+		rec, ok := parseStaleTag(name)
+		if !ok {
+			c.logger.Warn().Str("dir", filepath.Join(root, name)).Msg("Unrecognised directory under the stale local copy area; left as it is")
+			continue
+		}
+		c.recoverStaleTag(base, filepath.Join(root, name), rec)
+	}
+}
+
+func (c *Coordinator) recoverStaleTag(base, tagDir string, rec seenRecord) {
+	var kept []string
+	_ = filepath.WalkDir(tagDir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		rel, rerr := filepath.Rel(tagDir, p)
+		path := filepath.ToSlash(rel)
+		if rerr != nil || !sweepablePath(path) {
+			kept = append(kept, path) // not a data path: never compared, never removed
+			return nil
+		}
+		if id, ok := localIdentity(p); ok && sameFile(id, rec) {
+			_ = os.Remove(p) // the stale copy
+			return nil
+		}
+		if a, aerr := os.Lstat(p); aerr == nil {
+			if f, ferr := os.Lstat(filepath.Join(base, filepath.FromSlash(path))); ferr == nil && os.SameFile(a, f) {
+				_ = os.Remove(p) // put back already
+				return nil
+			}
+		}
+		kept = append(kept, path)
+		return nil
+	})
+	if len(kept) == 0 {
+		removeEmptyTree(tagDir)
+		return
+	}
+	c.keepAside(tagDir, kept, fmt.Errorf("not the stale copy its tag names"), true)
 }
