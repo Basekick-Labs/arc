@@ -2,6 +2,63 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: compaction no longer merges a file whose rows belong to another hour or day ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
+
+A partition is a directory, and a compaction job merged every file of it without
+looking at their times. A file sitting in the wrong directory was merged with its
+neighbours into an output holding rows of two days. The Iceberg export cannot give such
+a file a day and leaves it out (#1754), so rows that were in the Iceberg table left it:
+in the reproduction the table went from 5 rows to 1 while Arc still returned 5.
+
+Arc's own writers do not put a file in the wrong directory: ingest files every row
+under the UTC hour of its time, and imports and continuous queries go through ingest. A
+normal workload (three days, rows on hour and day boundaries, one request spanning
+midnight, late rows) went through hourly and daily compaction with nothing refused and
+the same rows. Such files come from data written by old versions (directories by
+ingestion time before 26.02.1; times before 1970 before 26.06.2), from a restore or an
+edge sync of a store that holds them, or from a file placed by hand.
+
+- **A job reads each input's time range first.** The range is the file's times as the
+  compaction would write them, read from the rows, not from footer statistics. The
+  hourly tier requires them inside the directory's hour, the daily tier inside its UTC
+  day.
+- **A job with such an input compacts nothing.** No output, no input removed. The file
+  is remembered on local disk (`{compaction.temp_directory}/misfiled.json`), and the
+  partition's next job runs without it. So the first cycle after the upgrade may compact
+  nothing in an affected partition, and the cycle after compacts the rest.
+- **A file in the right day but the wrong hour is healed by the daily tier.** The hourly
+  tier leaves it alone; the daily tier takes it, and the day's file is read by every
+  query of that day.
+- **A file whose rows are of another day stays where it is.** It is never compacted, so
+  it never becomes part of a daily file and never moves to the cold tier. Queries that
+  filter by time do not read its rows and queries that do not filter do; that was
+  already so before this release, and is unchanged. Moving such a file to the right
+  directories is tracked in #1825.
+- **Outputs that already span two days are not undone.** They are refused as inputs of
+  any later job, and listed like any other file.
+
+What to look at:
+
+- `arc_compaction_files_misfiled` (gauge): files compaction leaves alone on this node.
+- `arc_compaction_inputs_misfiled_total` (counter): inputs refused by jobs.
+- `GET /api/v1/compaction/misfiled` (admin): each file, its tier, its time range.
+  `DELETE /api/v1/compaction/misfiled` (optionally `?tier=` and `?path=`) forgets
+  them, so the next cycle reads them again.
+- One Error log line per refused job, with up to three files and their ranges.
+
+The list is per node, like the list of partitions too wide to compact: on a cluster the
+compactor's list is the one in use, and a node that takes over compaction finds the
+files again with one job per affected partition. A deployment that still holds data
+filed by ingestion time (written before 26.02.1) will see most of it listed: that data
+was merged into multi-day outputs by every earlier version.
+
+`compaction.refuse_misfiled_inputs = false` (`ARC_COMPACTION_REFUSE_MISFILED_INPUTS`)
+restores the previous behaviour.
+
+The compaction subprocess now sets its time zone to UTC for every connection of its
+DuckDB pool. Before, only the first connection was pinned; the compaction statement ran
+on that one, so outputs were not affected.
+
 ## Fix: with `ingest.write_statistics = false`, Iceberg readers that filter by time no longer miss rows ([#1754](https://github.com/Basekick-Labs/arc/issues/1754))
 
 An Iceberg table is partitioned by day, and the export takes a file's day from the

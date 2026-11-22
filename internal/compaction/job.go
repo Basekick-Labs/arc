@@ -234,6 +234,12 @@ type Job struct {
 	compactedFiles  []string // Files that were actually compacted (valid files only)
 	manifestManager *ManifestManager
 	manifestPath    string // Path to the manifest file for this job
+
+	// checkInputWindow: read each input's time range and refuse the job when
+	// one holds a row outside the partition (misfiled.go).
+	checkInputWindow bool
+	// misfiled is what that check found; the job then compacted nothing.
+	misfiled []MisfiledInput
 }
 
 // JobConfig holds configuration for creating a compaction job
@@ -258,6 +264,9 @@ type JobConfig struct {
 	// state transition. Empty means OSS / standalone — no completion manifest
 	// is written and the job is byte-compatible with pre-Phase-4 behavior.
 	CompletionDir string
+
+	// CheckInputWindow — see Job.checkInputWindow (#1825).
+	CheckInputWindow bool
 
 	// ParentFinalizesManifest — see Job.ParentFinalizesManifest (#619).
 	ParentFinalizesManifest bool
@@ -331,6 +340,7 @@ func NewJob(cfg *JobConfig) *Job {
 		db:                      cfg.DB,
 		manifestManager:         cfg.ManifestManager,
 		outputName:              cfg.OutputName,
+		checkInputWindow:        cfg.CheckInputWindow,
 	}
 }
 
@@ -428,6 +438,22 @@ func (j *Job) Run(ctx context.Context) error {
 		// Zero the download-phase byte count: nothing was compacted, and a
 		// non-zero BytesBefore with BytesAfter 0 would log as a 100%
 		// compression ratio and count toward the manager's total_bytes_saved.
+		j.BytesBefore = 0
+		j.discardCompletionManifest()
+		return j.complete()
+	}
+	var refused *errMisfiledInputs
+	if errors.As(err, &refused) {
+		// An input holds rows of another hour or day (misfiled.go). The job
+		// merges nothing: the parent remembers the files and forms the
+		// partition's next candidate without them. Zero work, as above:
+		// nothing uploaded, nothing deleted, no manifest.
+		j.misfiled = refused.files
+		j.logger.Warn().
+			Str("database", j.Database).
+			Str("partition", j.PartitionPath).
+			Int("misfiled", len(refused.files)).
+			Msg("Skipping compaction: an input file holds rows outside this partition; compacting nothing, the parent leaves those files out of the next job")
 		j.BytesBefore = 0
 		j.discardCompletionManifest()
 		return j.complete()
@@ -879,6 +905,16 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 		columns = nil
 	} else if !hasTimeColumn(columns) {
 		return "", errNoTimeColumn
+	}
+
+	// A file that holds a row outside this partition is not merged, and
+	// neither is anything else of the job (misfiled.go, #1825).
+	misfiled, err := j.misfiledInputs(ctx, db, validLocalPaths, validStorageKeys)
+	if err != nil {
+		return "", fmt.Errorf("check that the inputs belong to the partition: %w", err)
+	}
+	if len(misfiled) > 0 {
+		return "", &errMisfiledInputs{files: misfiled}
 	}
 
 	// Build ORDER BY clause from sort keys: the ingest order (keys, then time)
@@ -1470,6 +1506,12 @@ func (j *Job) removeDirectoryTree(ctx context.Context, remover storage.Directory
 // has run.
 func (j *Job) CompactedInputKeys() []string {
 	return j.compactedFiles
+}
+
+// MisfiledInputs returns the inputs the job refused because they hold rows
+// outside its partition; when there are any, the job compacted nothing.
+func (j *Job) MisfiledInputs() []MisfiledInput {
+	return j.misfiled
 }
 
 // RetainedManifestPath returns the crash-recovery manifest path the job

@@ -1995,7 +1995,9 @@ func main() {
 			MaxConcurrent:    cfg.Compaction.MaxConcurrent,
 			CycleTimeout:     cfg.Compaction.CycleTimeout,
 			MaxFilesPerBatch: cfg.Compaction.MaxFilesPerBatch,
-			ExcludeDatabases: cfg.Compaction.ExcludeDatabases,
+			// compaction.refuse_misfiled_inputs (#1825), default true.
+			MergeMisfiledInputs: !cfg.Compaction.RefuseMisfiledInputs,
+			ExcludeDatabases:    cfg.Compaction.ExcludeDatabases,
 			// Per-subprocess DuckDB bounds. Config resolves the "auto"
 			// sentinels at load time. memory_limit: when
 			// database.memory_limit is set explicitly it is that

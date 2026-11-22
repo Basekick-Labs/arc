@@ -273,6 +273,16 @@ type Manager struct {
 	// tooWide remembers partitions too wide to compact in a job's memory
 	// (too_wide.go). Persisted under TempDirectory; per node.
 	tooWide *tooWideMemo
+	// misfiled is the files compaction leaves alone because a job found rows
+	// in them outside the partition they sit in (misfiled.go). Persisted
+	// under TempDirectory; per node.
+	misfiled *misfiledMemo
+	// mergeMisfiledInputs turns that check off
+	// (compaction.refuse_misfiled_inputs = false).
+	mergeMisfiledInputs bool
+	// misfiledPruneFrom is where the next end-of-cycle check of the memo
+	// against storage starts (pruneMisfiled).
+	misfiledPruneFrom int
 	// settled remembers settled-day jobs that ran and left their files
 	// (#1774), so a day the job cannot compact is not run every cycle.
 	settled    *settledMemo
@@ -452,14 +462,18 @@ type ManagerConfig struct {
 	// scheduled (unscoped) cycles skip during candidate discovery.
 	// Database-scoped cycles bypass it. Normalized by NewManager.
 	ExcludeDatabases []string
-	TempDirectory    string              // Temp directory for compaction files
-	MemoryLimit      string              // DuckDB memory limit for EACH subprocess (e.g., "8GB")
-	Threads          int                 // DuckDB thread count for EACH subprocess (0 = DuckDB decides: the container CPU quota, or all cores when unlimited)
-	CompletionDir    string              // Phase 4: local-disk completion-manifest dir (empty = OSS mode)
-	SortKeysConfig   map[string][]string // Per-measurement sort keys from ingest config
-	DefaultSortKeys  []string            // Default sort keys from ingest config
-	Tiers            []Tier
-	Logger           zerolog.Logger
+	TempDirectory    string // Temp directory for compaction files
+	// MergeMisfiledInputs turns off the check that an input's rows belong to
+	// the partition it sits in (compaction.refuse_misfiled_inputs = false):
+	// such a file is then merged with its neighbours, as before #1825.
+	MergeMisfiledInputs bool
+	MemoryLimit         string              // DuckDB memory limit for EACH subprocess (e.g., "8GB")
+	Threads             int                 // DuckDB thread count for EACH subprocess (0 = DuckDB decides: the container CPU quota, or all cores when unlimited)
+	CompletionDir       string              // Phase 4: local-disk completion-manifest dir (empty = OSS mode)
+	SortKeysConfig      map[string][]string // Per-measurement sort keys from ingest config
+	DefaultSortKeys     []string            // Default sort keys from ingest config
+	Tiers               []Tier
+	Logger              zerolog.Logger
 }
 
 // NewManager creates a new compaction manager
@@ -527,6 +541,9 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		logger:           logger,
 	}
 	m.tooWide = newTooWideMemo(cfg.TempDirectory, logger)
+	m.misfiled = newMisfiledMemo(cfg.TempDirectory, logger)
+	m.mergeMisfiledInputs = cfg.MergeMisfiledInputs
+	metrics.Get().SetCompactionFilesMisfiled(int64(m.misfiled.files()))
 	m.settled = newSettledMemo()
 	metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized(m.TooWideSettings())))
 
@@ -1265,6 +1282,8 @@ func (m *Manager) subprocessJob(candidate Candidate, jobID string) *SubprocessJo
 		JobID:         jobID,
 		CompletionDir: m.CompletionDir,
 		PartitionTime: candidate.PartitionTime,
+		// A job checks that its inputs belong to the partition (#1825).
+		CheckInputWindow: !m.mergeMisfiledInputs,
 	}
 	// When the hub observes consumed inputs (#619), the subprocess leaves
 	// the crash-recovery manifest in place and THIS process deletes it after
@@ -1409,8 +1428,17 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 	// already held or a staged filter that left too few files returns nil
 	// without running one, and that day must be tried again next cycle. On
 	// success the files are gone, so the entry never matches again.
-	if candidate.Settled && !jobInterrupted {
+	//
+	// Not a job that refused its inputs as misfiled: it compacted nothing, the
+	// files it refused are remembered below, and the day's next candidate is
+	// the rest of these same files, which the entry would match.
+	refused := result != nil && len(result.MisfiledInputs) > 0
+	if candidate.Settled && !jobInterrupted && !refused {
 		m.settled.record(candidate.Tier, candidate.PartitionPath, candidate.Files)
+	}
+	if refused {
+		// Before the staged path returns, below: a staged job refuses too.
+		m.rememberMisfiled(candidate, result.MisfiledInputs)
 	}
 
 	// The job ran in the subprocess, whose metrics registry nothing scrapes:
@@ -1448,6 +1476,9 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 		}
 		if result.Error != "" {
 			jobStats["error"] = result.Error
+		}
+		if len(result.MisfiledInputs) > 0 {
+			jobStats["misfiled_inputs"] = len(result.MisfiledInputs)
 		}
 	}
 	if err != nil {
@@ -2230,6 +2261,13 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 				return nil
 			}
 
+			// A file an earlier job found rows of another hour or day in
+			// is left alone (misfiled.go); the rest compacts without it.
+			filteredCandidate, shouldProcess = m.filterMisfiled(filteredCandidate, tier)
+			if !shouldProcess {
+				return nil
+			}
+
 			// Files still pending cluster registration wait a cycle
 			// (#1212); minFilesFor is re-checked on the rest.
 			filteredCandidate, shouldProcess = m.filterPending(filteredCandidate, tier)
@@ -2384,7 +2422,12 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 						// per-partition batch behavior.
 					} else {
 						succeeded.Add(1)
-						compacted = true
+						// A job that refused its inputs as misfiled read
+						// their times and compacted nothing: no evidence
+						// that the partition fits.
+						if !m.misfiled.hasAny(tierName, batch.Files) {
+							compacted = true
+						}
 					}
 				}
 			}(batches, candidate.PartitionPath, filteredCandidate.Files)
@@ -2444,6 +2487,16 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 				for _, candidate := range candidates {
 					if candidate.Settled {
 						tooWideSeen[tooWideKey(tierName, candidate.PartitionPath)] = true
+						// Before the skip and the collection: a day whose
+						// hour-level files are all left alone as misfiled
+						// must not take a slot of the cycle's settled days,
+						// every cycle.
+						if kept, dropped := m.misfiled.without(tierName, candidate.Files); dropped > 0 {
+							if len(kept) == 0 {
+								continue
+							}
+							candidate.Files, candidate.FileCount = kept, len(kept)
+						}
 						if m.settled.skip(candidate.Tier, candidate.PartitionPath, candidate.Files) {
 							continue
 						}
@@ -2528,6 +2581,7 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 		m.tooWide.prune(tooWideTiers, tooWideSeen)
 		metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized(m.TooWideSettings())))
 	}
+	m.pruneMisfiled(ctx)
 
 	// The finalizer records the terminal outcome and complete counters.
 	return nil
@@ -3421,6 +3475,97 @@ func (m *Manager) TooWideSettings() string {
 // too wide (files aside: a new input file would still retry it).
 func (m *Manager) TooWideSkipped(e TooWideEntry) bool {
 	return e.Skips(m.TooWideSettings(), time.Now())
+}
+
+// rememberMisfiled records the inputs a job refused, logs them, and counts
+// them.
+func (m *Manager) rememberMisfiled(candidate Candidate, files []MisfiledInput) {
+	added := m.misfiled.record(candidate.Tier, candidate.PartitionPath, files, time.Now())
+	metrics.Get().AddCompactionInputsMisfiled(int64(len(files)))
+	metrics.Get().SetCompactionFilesMisfiled(int64(m.misfiled.files()))
+	sample := make([]string, 0, 3)
+	for _, f := range files[:min(3, len(files))] {
+		sample = append(sample, fmt.Sprintf("%s (%s to %s)", f.Path, f.MinTime.Format(time.RFC3339), f.MaxTime.Format(time.RFC3339)))
+	}
+	start, end, _ := partitionWindow(candidate.Tier, candidate.PartitionTime)
+	m.logger.Error().
+		Str("database", candidate.Database).
+		Str("measurement", candidate.Measurement).
+		Str("partition", candidate.PartitionPath).
+		Str("tier", candidate.Tier).
+		Time("partition_start", start).
+		Time("partition_end", end).
+		Int("files", len(files)).
+		Int("newly_remembered", added).
+		Strs("sample", sample).
+		Msg("Compaction found files holding rows outside the partition they sit in and compacted nothing this time. They are left where they are and out of later jobs: nothing moves or compacts them, so they never reach a daily file or the cold tier, and queries that filter by time do not read their rows. GET /api/v1/compaction/misfiled lists them")
+}
+
+// filterMisfiled drops the files the tier leaves alone as misfiled from a
+// candidate. What is left must still be a job: minFilesFor, and the
+// two-file floor of a job that is not a settled day's single file.
+func (m *Manager) filterMisfiled(candidate Candidate, tier Tier) (Candidate, bool) {
+	kept, dropped := m.misfiled.without(candidate.Tier, candidate.Files)
+	if dropped == 0 {
+		return candidate, true
+	}
+	if len(kept) < minFilesFor(candidate, tier) || (len(kept) < MinFilesPerBatch && !singleFileJob(candidate, kept)) {
+		return candidate, false
+	}
+	candidate.Files = kept
+	candidate.FileCount = len(kept)
+	return candidate, true
+}
+
+// misfiledPrunePerCycle bounds the files one cycle checks against storage.
+const misfiledPrunePerCycle = 1000
+
+// pruneMisfiled forgets remembered files that are gone from storage
+// (retention, a DELETE, an operator). It asks storage for each file, a
+// bounded number per cycle: a remembered file is in no candidate, and a
+// partition holding only remembered files and its own output is not listed
+// as one, so "not seen this cycle" says nothing about it.
+func (m *Manager) pruneMisfiled(ctx context.Context) {
+	paths := m.misfiled.paths()
+	if len(paths) == 0 {
+		return
+	}
+	m.mu.Lock()
+	from := m.misfiledPruneFrom
+	if from >= len(paths) {
+		from = 0
+	}
+	to := min(from+misfiledPrunePerCycle, len(paths))
+	m.misfiledPruneFrom = to
+	m.mu.Unlock()
+	forgot := 0
+	for _, p := range paths[from:to] {
+		if ctx.Err() != nil {
+			break
+		}
+		// A missing file is size -1 with no error on some backends and a
+		// not-found error on others; any other error keeps the entry.
+		if size, err := m.StorageBackend.StatFile(ctx, p); (err == nil && size < 0) || storage.IsNotFound(err) {
+			forgot += m.misfiled.forget("", p)
+		}
+	}
+	if forgot > 0 {
+		metrics.Get().SetCompactionFilesMisfiled(int64(m.misfiled.files()))
+	}
+}
+
+// MisfiledFiles lists the files compaction leaves alone because a job found
+// rows in them outside the partition they sit in.
+func (m *Manager) MisfiledFiles() []MisfiledEntry {
+	return m.misfiled.list()
+}
+
+// ClearMisfiled forgets remembered files (all, or one tier and/or path), so
+// the next cycle reads them again; it returns how many entries it removed.
+func (m *Manager) ClearMisfiled(tier, path string) int {
+	n := m.misfiled.forget(tier, path)
+	metrics.Get().SetCompactionFilesMisfiled(int64(m.misfiled.files()))
+	return n
 }
 
 // TooWidePartitions lists the partitions remembered as too wide to compact,

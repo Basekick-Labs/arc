@@ -302,6 +302,19 @@ daily_min_files = 12
 # -----------------------------------------------------------------------------
 # Authentication
 # -----------------------------------------------------------------------------
+
+# A compaction job reads each input file's time range before it merges
+# anything. If a file holds rows outside the hour (hourly tier) or UTC day
+# (daily tier) of the directory it sits in, the job compacts nothing, the file
+# is remembered ({temp_directory}/misfiled.json) and later jobs of that
+# partition run without it. Arc's own writers never produce such a file; it
+# comes from data written by old versions, restored or synced from such a
+# store, or placed by hand. GET /api/v1/compaction/misfiled lists them.
+# false merges such a file with its neighbours, as before 27.01.1: the output
+# then holds rows of two days and the Iceberg export leaves it out of its table.
+# Environment override: ARC_COMPACTION_REFUSE_MISFILED_INPUTS=false
+# refuse_misfiled_inputs = true
+
 [auth]
 enabled = true
 # metrics_public = false             # true: /metrics and /api/v1/metrics without a
