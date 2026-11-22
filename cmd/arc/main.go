@@ -2370,6 +2370,9 @@ func main() {
 								watcher.SetStagedSettled(compactionManager.MeasurementCompacted)
 								compactionManager.SetStagedCommit(clusterCoordinator.StagedCompactionMode,
 									clusterCoordinator.CompactionInputLookup, watcher.LocallyStagedInput)
+								// Crash recovery un-registers an output before
+								// it removes it from storage (#1811).
+								compactionManager.SetOutputRetractor(watcher.RetractOutput)
 							}
 							// A typed nil would be a non-nil interface.
 							var holder cluster.StagedRegistrationHolder
@@ -2436,6 +2439,12 @@ func main() {
 					if err := clusterCoordinator.Start(); err != nil {
 						log.Error().Err(err).Msg("Failed to start cluster coordinator - running in standalone mode")
 						arrowBuffer.SetIngestGate(nil)
+						// No cluster manifest to keep in step after all: crash
+						// recovery must not wait on a coordinator that never
+						// ran before it removes an output (#1811).
+						if compactionManager != nil {
+							compactionManager.SetOutputRetractor(nil)
+						}
 						clusterCoordinator = nil
 					} else {
 						// The coordinator is a COMPONENT: it owns Raft and must

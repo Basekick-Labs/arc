@@ -385,6 +385,11 @@ type Manager struct {
 	inputLookup   InputLookup
 	locallyStaged func(path string) bool
 
+	// outputRetractor un-registers a legacy job's output from the cluster
+	// before crash recovery removes it (#1811); CompletionWatcher.RetractOutput.
+	// Guarded by mu.
+	outputRetractor func(ctx context.Context, jobID, outputPath string) error
+
 	// Nil in production. Deterministic cycle tests may inject a batch
 	// runner without starting an external compaction subprocess.
 	compactBatchForTest func(context.Context, Candidate) error
@@ -1145,6 +1150,19 @@ func (m *Manager) recoverOrphanedManifests(ctx context.Context, scope recoverySc
 		hooks.afterInputDelete = m.writeRecoveredSourcesDeletedManifest
 	}
 	hooks.consumedInto = m.notifyConsumedInto
+	// Copied under the lock: main.go wires it after the schedulers start,
+	// and clears it again if the cluster coordinator then fails to start.
+	// Nil when this node has no completion watcher (OSS, or a node that
+	// fell back to standalone): there is no cluster manifest to keep in
+	// step, and recovery deletes as it always did.
+	m.mu.Lock()
+	retract := m.outputRetractor
+	m.mu.Unlock()
+	if retract != nil {
+		hooks.beforeOutputGone = func(ctx context.Context, manifest *Manifest) error {
+			return retract(ctx, manifest.JobID, manifest.OutputPath)
+		}
+	}
 	return m.ManifestManager.recoverOrphanedManifestsWithHooks(ctx, scope, m.notifyCompactedOutput, m.notifyConsumedInputs, hooks)
 }
 
