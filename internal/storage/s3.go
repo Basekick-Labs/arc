@@ -646,9 +646,30 @@ func (b *S3Backend) StatFile(ctx context.Context, path string) (int64, error) {
 		return -1, fmt.Errorf("HeadObject %s: %w", path, err)
 	}
 	if result.ContentLength == nil {
-		return 0, nil
+		return b.listedSize(ctx, path, key)
 	}
 	return *result.ContentLength, nil
+}
+
+// listedSize is the size of the object at key as a listing reports it, for a
+// store whose HEAD response carried no length (#1812). A listing's schema
+// requires a size, so this is what the store itself records. The exact key
+// sorts before any key it is a prefix of, so the first listed key is it if it
+// exists. No size there either is ErrNoContentLength, never 0: an empty
+// object and an unknown size are different answers.
+func (b *S3Backend) listedSize(ctx context.Context, path, key string) (int64, error) {
+	out, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(b.bucket),
+		Prefix:  aws.String(key),
+		MaxKeys: aws.Int32(1),
+	})
+	if err != nil {
+		return -1, fmt.Errorf("HeadObject %s: %w (and the listing for its size failed: %w)", path, ErrNoContentLength, err)
+	}
+	if len(out.Contents) == 1 && aws.ToString(out.Contents[0].Key) == key && out.Contents[0].Size != nil {
+		return *out.Contents[0].Size, nil
+	}
+	return -1, fmt.Errorf("HeadObject %s: %w", path, ErrNoContentLength)
 }
 
 // List lists objects with the given prefix
