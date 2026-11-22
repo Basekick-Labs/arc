@@ -624,15 +624,12 @@ func TestDefaultMiddlewareConfig(t *testing.T) {
 		}
 	}
 
-	// Check default public prefixes
-	foundMetrics := false
+	// /metrics is public only with auth.metrics_public, which main adds
+	// (authPublicPaths): not a default.
 	for _, prefix := range config.PublicPrefixes {
 		if prefix == "/metrics" {
-			foundMetrics = true
+			t.Error("/metrics is a default public prefix; it needs a token unless auth.metrics_public is on")
 		}
-	}
-	if !foundMetrics {
-		t.Error("Expected /metrics in default public prefixes")
 	}
 }
 

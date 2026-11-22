@@ -13,7 +13,31 @@ import (
 // authPublicPaths returns the routes and path prefixes the auth middleware
 // lets through without a token. main hands them to the auth middleware and to
 // checkAuditCoverage, so the two cannot drift apart.
-func authPublicPaths() (routes, prefixes []string) {
+//
+// metricsPublic (metricsAccess) makes /metrics (Prometheus text) and
+// /api/v1/metrics (the JSON family) public. Otherwise they need a valid
+// token, read-only included: they carry operational counters, Go runtime
+// stats and host fingerprinting, and with iceberg.export_lag_table_series >
+// 0 the names of databases and measurements (#1772). They are registered
+// after the auth and audit middleware in every mode
+// (Server.RegisterMetricsRoutes), so this list is the only switch.
+// metricsAccess decides, in one place, whether the metrics routes are public
+// (listed in authPublicPaths) and whether they carry their own token guard
+// (Server.RegisterMetricsRoutes): secure by default while auth is on, open
+// with auth.metrics_public. The two are never both true: a public route
+// with a guard would refuse every caller without a token, and so every
+// scraper the key was set for.
+func metricsAccess(authOn, metricsPublicKey bool) (public, guarded bool) {
+	if !authOn {
+		return true, false // no auth middleware: nothing reads the list, nothing to guard with
+	}
+	if metricsPublicKey {
+		return true, false
+	}
+	return false, true
+}
+
+func authPublicPaths(metricsPublic bool) (routes, prefixes []string) {
 	cfg := auth.DefaultMiddlewareConfig()
 	// Add public routes that don't need auth
 	// Note: /api/v1/internal/cache/invalidate is public because cluster peers
@@ -21,28 +45,15 @@ func authPublicPaths() (routes, prefixes []string) {
 	// HMAC-SHA256 validation in the handler (see handleCacheInvalidate); the
 	// receiver refuses every request when cluster.shared_secret is empty.
 	routes = append(cfg.PublicRoutes, "/health", "/ready", "/ready/write", "/api/v1/auth/verify", api.CacheInvalidatePath)
-	// /metrics stays public — Prometheus scrapers expect it. It is
-	// already in auth.DefaultMiddlewareConfig().PublicPrefixes, so no
-	// further append is needed here. /debug/pprof is intentionally NOT
-	// here: pprof is no longer mounted on the public Fiber app
-	// (internal/api/server.go). The opt-in localhost pprof listener
-	// runs on a separate port; see startDebugPprofIfEnabled.
-	//
-	// The JSON metrics endpoints (/api/v1/metrics and its sub-paths) are
-	// deliberately public, equivalent to the existing Prometheus /metrics
-	// surface: aggregate operational counters plus Go runtime/GC stats and
-	// host-arch fingerprinting (go_version/os/arch). They expose no queries,
-	// file paths or credentials, and no database or measurement names: the
-	// one exception is opt-in, iceberg.export_lag_table_series > 0 (#1772),
-	// whose labelled series name databases and measurements on the
-	// Prometheus /metrics text only, never in these JSON endpoints.
-	// Monitoring dashboards poll them without a token. Whitelist them explicitly so
-	// their public status is an auditable decision, not an accident of
-	// registration order (they were previously reachable only because
-	// RegisterRoutes runs before this middleware; see GHSA-m3qr-fvp4-78xj).
-	// /api/v1/logs, by contrast, is NOT public — it is registered with admin
-	// auth after the auth middleware.
-	prefixes = append(cfg.PublicPrefixes, "/api/v1/metrics")
+	// /debug/pprof is intentionally NOT here: pprof is no longer mounted on
+	// the public Fiber app (internal/api/server.go). The opt-in localhost
+	// pprof listener runs on a separate port; see startDebugPprofIfEnabled.
+	// /api/v1/logs is NOT public either — it is registered with admin auth
+	// after the auth middleware (GHSA-m3qr-fvp4-78xj).
+	prefixes = append([]string{}, cfg.PublicPrefixes...)
+	if metricsPublic {
+		prefixes = append(prefixes, "/metrics", "/api/v1/metrics")
+	}
 	return routes, prefixes
 }
 

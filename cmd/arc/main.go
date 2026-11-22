@@ -2877,7 +2877,14 @@ func main() {
 	// The paths the auth middleware lets through without a token. The audit
 	// coverage check (below, before the server starts) allows them ahead of
 	// the audit middleware: they are registered before it on purpose.
-	authPublicRoutes, authPublicPrefixes := authPublicPaths()
+	metricsPublic, metricsGuarded := metricsAccess(authManager != nil, cfg.Auth.MetricsPublic)
+	authPublicRoutes, authPublicPrefixes := authPublicPaths(metricsPublic)
+	// The metrics routes' own guard (Server.RegisterMetricsRoutes): only
+	// when they need a token.
+	var metricsGuard *auth.AuthManager
+	if metricsGuarded {
+		metricsGuard = authManager
+	}
 
 	// Apply auth middleware if enabled
 	var rbacManager *auth.RBACManager
@@ -2905,6 +2912,12 @@ func main() {
 		// middleware so it sits later in the Fiber stack and is actually
 		// gated (GHSA-m3qr-fvp4-78xj).
 		server.RegisterLogsRoute(authManager)
+		// Metrics after auth and audit too: public only with
+		// auth.metrics_public (authPublicPaths).
+		server.RegisterMetricsRoutes(metricsGuard)
+		if cfg.Auth.MetricsPublic {
+			log.Warn().Msg("auth.metrics_public is on: /metrics and /api/v1/metrics are served without a token")
+		}
 
 		// Initialize RBAC Manager (Enterprise feature)
 		rbacManager = auth.NewRBACManager(&auth.RBACManagerConfig{
@@ -3100,6 +3113,7 @@ func main() {
 			server.GetApp().Use(auditMiddleware)
 		}
 		server.RegisterLogsRoute(nil)
+		server.RegisterMetricsRoutes(nil)
 	}
 
 	// Register MessagePack handler with Arrow buffer
@@ -4802,7 +4816,12 @@ func main() {
 		if n := cfg.Iceberg.ExportLagTableSeries; n > 0 {
 			icebergScheduler.EnableExportLagTables()
 			metrics.Get().SetIcebergTableLagSource(icebergScheduler, n)
-			log.Info().Int("tables", n).Msg("Iceberg export lag per table on /metrics: these series name databases and measurements, and /metrics is served without authentication")
+			ev := log.Info().Int("tables", n)
+			if authManager == nil || cfg.Auth.MetricsPublic {
+				ev.Msg("Iceberg export lag per table on /metrics: these series name databases and measurements, and /metrics is served without a token")
+			} else {
+				ev.Msg("Iceberg export lag per table on /metrics: these series name databases and measurements, readable by any valid token")
+			}
 		}
 		// Started after tiering is set up (below), so the first pass already sees the cold tier.
 		icebergStart = icebergScheduler.Start

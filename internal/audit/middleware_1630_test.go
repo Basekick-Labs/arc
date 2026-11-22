@@ -227,3 +227,47 @@ func TestMiddlewareStatusOfAWrappedFiberError(t *testing.T) {
 		t.Errorf("recorded %d, client got %d, want both 500", event.StatusCode, ctx.Response.StatusCode())
 	}
 }
+
+// The JSON metrics family is never recorded, like /metrics: dashboards poll
+// it every few seconds, and include_reads would record every poll. A path
+// that only starts with the same letters is not part of it.
+func TestMiddlewareSkipsTheMetricsFamily(t *testing.T) {
+	ok := func(c *fiber.Ctx) error { return c.SendStatus(fiber.StatusOK) }
+	logger := &Logger{eventCh: make(chan *AuditEvent, 8)}
+	app := fiber.New()
+	app.Use(Middleware(logger, true))
+	for _, p := range []string{"/metrics", "/api/v1/metrics", "/api/v1/metrics/memory", "/api/v1/metrics/timeseries/system", "/api/v1/metricsfoo"} {
+		app.Get(p, ok)
+	}
+	for _, p := range []string{"/metrics", "/api/v1/metrics", "/api/v1/metrics/", "/api/v1/metrics/memory", "/api/v1/metrics/timeseries/system"} {
+		ctx := &fasthttp.RequestCtx{}
+		ctx.Request.Header.SetMethod(fiber.MethodGet)
+		ctx.Request.SetRequestURI(p)
+		app.Handler()(ctx)
+	}
+	select {
+	case event := <-logger.eventCh:
+		t.Fatalf("a metrics poll was recorded: %s %s", event.Method, event.Path)
+	default:
+	}
+	ctx := &fasthttp.RequestCtx{}
+	ctx.Request.Header.SetMethod(fiber.MethodGet)
+	ctx.Request.SetRequestURI("/api/v1/metricsfoo")
+	app.Handler()(ctx)
+	select {
+	case <-logger.eventCh:
+	default:
+		t.Fatal("/api/v1/metricsfoo was skipped as a metrics path")
+	}
+	// A write to the family is audited: only polls are skipped.
+	app.Post("/api/v1/metrics/reset", ok)
+	ctx = &fasthttp.RequestCtx{}
+	ctx.Request.Header.SetMethod(fiber.MethodPost)
+	ctx.Request.SetRequestURI("/api/v1/metrics/reset")
+	app.Handler()(ctx)
+	select {
+	case <-logger.eventCh:
+	default:
+		t.Fatal("a write to the metrics family was not audited")
+	}
+}

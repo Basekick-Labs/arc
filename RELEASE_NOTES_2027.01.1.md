@@ -2,6 +2,29 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Breaking: `/metrics` and `/api/v1/metrics` need a token while auth is on
+
+**Who is affected:** anyone scraping or polling Arc's metrics with authentication on, which is the default. That means Prometheus, Grafana panels, Telegraf, scripts, or a dashboard reading `/api/v1/metrics`. `/health`, `/ready` and `/ready/write` stay public for load balancers and probes. With auth off nothing changes.
+
+`/metrics` (Prometheus text) and `/api/v1/metrics` with its sub-paths (`/memory`, `/query-pool`, `/endpoints`, `/timeseries/:type`) were served without a token. They carry operational counters, Go runtime and host details, and, with `iceberg.export_lag_table_series` above 0, database and measurement names (#1772). They now need a valid token while auth is on. Any token works, including a read-only one, so give the scraper its own read-only token.
+
+**After upgrading,** a scraper without a token gets `401` on every scrape, so in Prometheus `up` goes to 0 for Arc and an `up == 0` alert fires. Add the token:
+
+```yaml
+scrape_configs:
+  - job_name: arc
+    authorization:
+      credentials: <a read-only Arc token>   # sent as "Authorization: Bearer ..."
+    static_configs:
+      - targets: ["arc:8000"]
+```
+
+Use `authorization`, not `basic_auth`: Arc does not accept basic auth. For other clients, send `Authorization: Bearer <token>` or `x-api-key: <token>`.
+
+**To keep them public,** set `auth.metrics_public = true` (`ARC_AUTH_METRICS_PUBLIC=true`). With auth on, Arc then logs a warning at start; with auth off the key changes nothing.
+
+Reads of the JSON metrics family are no longer audited, whatever `include_reads` says, as `/metrics` already was not: dashboards poll it every few seconds.
+
 ## New: Iceberg export lag per table on /metrics ([#1772](https://github.com/Basekick-Labs/arc/issues/1772))
 
 The node-wide `arc_iceberg_export_lag_seconds` and `arc_iceberg_export_pending_seconds` (#1750) say how late the export is, not which table is late. With `iceberg.export_lag_table_series` set to a number N (`ARC_ICEBERG_EXPORT_LAG_TABLE_SERIES`, 0–1000, default 0 = off), `/metrics` also has, labelled `database` and `measurement`:
@@ -19,7 +42,7 @@ The node-wide `arc_iceberg_export_lag_seconds` and `arc_iceberg_export_pending_s
 
   A table missing from this series is not known to be healthy; it has only not been slow recently.
 
-**These series name databases and measurements, and `/metrics` is currently served without authentication.** That is why they are off by default. The JSON metrics endpoints never carry them. A node that is not the exporter reports none, checked at each scrape, so during a writer failover two nodes do not report the same table.
+**These series name databases and measurements.** That is why they are off by default. Since this release `/metrics` needs a token while auth is on, unless `auth.metrics_public` is set (see above). Any valid token can read them, including a token scoped to one database, which then sees the names of every exported table. The JSON metrics endpoints never carry them. A node that is not the exporter reports none, checked at each scrape, so during a writer failover two nodes do not report the same table.
 
 ## Fix: in a cluster, compaction recovery no longer leaves the manifest listing an output it deleted ([#1811](https://github.com/Basekick-Labs/arc/issues/1811))
 
@@ -878,8 +901,8 @@ Audit logging (Enterprise) has never recorded a change made through `/api/v1/aut
 
 - **Now recorded:** creating, updating, rotating, revoking and deleting a token, adding a token to a team or removing it, and every change to an organization, team, role or measurement permission. The actor is the token name.
 - **Refusals:** a request whose token is valid but lacks the permission (403) is recorded as `auth.failed`, with the token name as actor. A request to an authenticated route with no token or an invalid one is refused by authentication **before** the audit log and is **not** recorded, as before.
-- **Requests without a token that are recorded:** a public route sits ahead of authentication, so a write (POST, PUT, PATCH, DELETE) to one is recorded with actor `anonymous`, as before this release. In practice: `POST /api/v1/internal/cache/invalidate`, the HMAC-signed cache invalidation cluster peers send after a compaction (one row per call, a refused signature included), and a write to a path under `/metrics` or `/api/v1/metrics`, which has no write route and is answered 404 or 405.
-- **Never recorded:** `/health`, `/healthz`, `/metrics`, `/api/v1/ready`, `/api/v1/logs`, and now `/api/v1/auth/verify`, in any method.
+- **Requests without a token that are recorded:** a public route sits ahead of authentication, so a write (POST, PUT, PATCH, DELETE) to one is recorded with actor `anonymous`, as before this release. In practice: `POST /api/v1/internal/cache/invalidate`, the HMAC-signed cache invalidation cluster peers send after a compaction (one row per call, a refused signature included), and, only with `auth.metrics_public` on, a write to `/api/v1/metrics` or a path under it or under `/metrics/`, which has no write route and is answered 404 or 405.
+- **Never recorded:** `/health`, `/healthz`, `/metrics`, `/api/v1/ready`, `/api/v1/logs`, and now `/api/v1/auth/verify`, in any method; and reads of the `/api/v1/metrics` family.
 - **Event names:**
   - RBAC events are now named after the resource the route changes, not the first segment of its path.
   - A team created under an organization is `rbac.team.created` (it would have been `rbac.org.created`).
