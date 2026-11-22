@@ -2,6 +2,14 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: on S3 and Azure, an object whose size the store does not report is no longer read as empty ([#1812](https://github.com/Basekick-Labs/arc/issues/1812))
+
+**Who is affected:** S3, S3-compatible and Azure storage, only with a store or proxy that answers an object's metadata request without a content length. AWS S3, Azure, MinIO and SeaweedFS always send it. Local storage and GCS are unchanged.
+
+Arc read a missing length as a size of 0. Compaction recovery compares an output's size with the size its manifest recorded (#1809), so a good output was taken for a partial upload: it was discarded and the job redone, or, with an input missing, the manifest was kept and reported every cycle under the wrong cause. The object-storage compaction finisher compares sizes the same way. No data was lost.
+
+**Now:** a missing length is an error naming the object (`the object store's response carries no content length`), handled as any other failed size check. Compaction recovery keeps the manifest and the inputs, says it could not read the output's size, and retries next cycle.
+
 ## Fix: a crash while a stale local copy was being removed no longer deletes a newer file written to its path ([#1814](https://github.com/Basekick-Labs/arc/issues/1814))
 
 **Who is affected:** clusters with local storage and replication on, where the stale-copy sweep removes local copies whose delete the node missed. Object storage and single nodes are unchanged.

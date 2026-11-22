@@ -533,7 +533,7 @@ func (b *AzureBlobBackend) StatFile(ctx context.Context, path string) (_ int64, 
 		return -1, fmt.Errorf("GetProperties %s: %w", path, err)
 	}
 	if resp.ContentLength == nil {
-		return 0, nil
+		return -1, fmt.Errorf("GetProperties %s: %w", path, ErrNoContentLength)
 	}
 	return *resp.ContentLength, nil
 }

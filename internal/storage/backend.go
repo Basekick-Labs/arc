@@ -58,6 +58,13 @@ func IsStoreNotFound(err error) bool {
 // BlobNotFound ResponseError on Azure).
 var ErrObjectNotFound = errors.New("file not found")
 
+// ErrNoContentLength is a StatFile or ObjectSHA failure on an object store
+// whose response for an existing object carried no length (#1812). It is an
+// error, not a size of 0: an empty object and an unknown size are different
+// answers, and a caller comparing sizes (compaction recovery, the object
+// finisher) would otherwise read the object as the wrong one.
+var ErrNoContentLength = errors.New("storage: the object store's response carries no content length")
+
 // IsNotFound reports whether err is a backend saying the key names no object.
 //
 // It accepts the wrapped sentinel, a wrapped fs not-exist, and the typed

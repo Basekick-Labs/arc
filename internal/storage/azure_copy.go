@@ -65,11 +65,10 @@ func (b *AzureBlobBackend) ObjectSHA(ctx context.Context, path string) (_ int64,
 			meta[k] = *v
 		}
 	}
-	var size int64
-	if resp.ContentLength != nil {
-		size = *resp.ContentLength
+	if resp.ContentLength == nil {
+		return -1, "", fmt.Errorf("GetProperties %s: %w", path, ErrNoContentLength)
 	}
-	return size, objectSHA(meta), nil
+	return *resp.ContentLength, objectSHA(meta), nil
 }
 
 // CopyObject copies src to dst inside the container, synchronously: one Put

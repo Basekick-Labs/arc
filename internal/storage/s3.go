@@ -646,7 +646,7 @@ func (b *S3Backend) StatFile(ctx context.Context, path string) (int64, error) {
 		return -1, fmt.Errorf("HeadObject %s: %w", path, err)
 	}
 	if result.ContentLength == nil {
-		return 0, nil
+		return -1, fmt.Errorf("HeadObject %s: %w", path, ErrNoContentLength)
 	}
 	return *result.ContentLength, nil
 }
