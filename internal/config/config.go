@@ -271,6 +271,10 @@ type AuthConfig struct {
 	MaxCacheSize   int    // Maximum number of cached tokens
 	BootstrapToken string // Pre-set admin token value (env: ARC_AUTH_BOOTSTRAP_TOKEN). Used on first run instead of generating a random token.
 	ForceBootstrap bool   // Add a recovery admin token without removing existing tokens (env: ARC_AUTH_FORCE_BOOTSTRAP). Recovery path when locked out.
+	// MetricsPublic serves /metrics and /api/v1/metrics without a token
+	// while auth is on (env: ARC_AUTH_METRICS_PUBLIC). Off by default: they
+	// then need a valid token, read-only included.
+	MetricsPublic bool
 }
 
 type CompactionConfig struct {
@@ -1480,6 +1484,7 @@ func Load() (*Config, error) {
 			DBPath:         v.GetString("auth.db_path"),
 			CacheTTL:       v.GetInt("auth.cache_ttl"),
 			MaxCacheSize:   v.GetInt("auth.max_cache_size"),
+			MetricsPublic:  v.GetBool("auth.metrics_public"),
 			BootstrapToken: v.GetString("auth.bootstrap_token"),
 			ForceBootstrap: v.GetBool("auth.force_bootstrap"),
 		},
@@ -2677,6 +2682,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("auth.db_path", "./data/arc.db") // Shared SQLite DB (same as Python)
 	v.SetDefault("auth.cache_ttl", 300)           // 5 minutes
 	v.SetDefault("auth.max_cache_size", 1000)     // Max cached tokens
+	v.SetDefault("auth.metrics_public", false)    // /metrics and /api/v1/metrics need a token while auth is on
 	v.SetDefault("auth.bootstrap_token", "")      // Empty = generate one on first start
 	v.SetDefault("auth.force_bootstrap", false)
 

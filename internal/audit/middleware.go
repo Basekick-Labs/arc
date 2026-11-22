@@ -35,6 +35,13 @@ var excludedPaths = map[string]bool{
 	"/api/v1/auth/verify": true,
 }
 
+// isMetricsPath reports the JSON metrics family, which monitoring dashboards
+// poll every few seconds: its reads are never audited, or include_reads
+// would record every poll. A write to it (none exists today) is audited.
+func isMetricsPath(p string) bool {
+	return p == "/api/v1/metrics" || strings.HasPrefix(p, "/api/v1/metrics/")
+}
+
 // isRead reports the methods include_reads governs. HEAD is a GET without a
 // body (Fiber registers it beside every GET) and OPTIONS a CORS preflight;
 // neither changes anything, so both are reads (#1630 review).
@@ -54,7 +61,8 @@ func Middleware(logger *Logger, includeReads bool) fiber.Handler {
 		// Skip excluded paths, matched on the cleaned path as the auth
 		// middleware matches public routes, so /api/v1/auth/verify/ is
 		// excluded too.
-		if excludedPaths[pathpkg.Clean(path)] {
+		clean := pathpkg.Clean(path)
+		if excludedPaths[clean] || (isMetricsPath(clean) && isRead(c.Method())) {
 			return c.Next()
 		}
 

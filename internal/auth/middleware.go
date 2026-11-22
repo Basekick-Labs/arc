@@ -45,10 +45,10 @@ func DefaultMiddlewareConfig() MiddlewareConfig {
 			"/ready/write",
 			"/api/v1/auth/verify",
 		},
-		PublicPrefixes: []string{
-			"/metrics",
-		},
-		Skip: false,
+		// /metrics is public only with auth.metrics_public (authPublicPaths,
+		// cmd/arc/audit_coverage.go).
+		PublicPrefixes: []string{},
+		Skip:           false,
 	}
 }
 

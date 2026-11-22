@@ -86,7 +86,9 @@ func clientIdentity(rec ClientRecorder, authRequired bool) fiber.Handler {
 
 // isUnauthenticatedRoute mirrors the auth middleware's default public
 // routes (internal/auth/middleware.go DefaultMiddlewareConfig) plus the
-// metrics route main.go adds, normalised the way Fiber matches them.
+// metrics routes, normalised the way Fiber matches them. The metrics routes
+// need a token unless auth.metrics_public is on; listing them here in both
+// cases only means no client is recorded from a metrics poll.
 func isUnauthenticatedRoute(p string) bool {
 	p = strings.ToLower(path.Clean("/" + p))
 	switch p {

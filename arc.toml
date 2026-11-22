@@ -304,6 +304,9 @@ daily_min_files = 12
 # -----------------------------------------------------------------------------
 [auth]
 enabled = true
+# metrics_public = false             # true: /metrics and /api/v1/metrics without a
+#                                    # token. false (default): any valid token, a
+#                                    # read-only one included; give scrapers their own.
 
 # -----------------------------------------------------------------------------
 # Delete
@@ -405,7 +408,9 @@ s3_cache_ttl_seconds = 3600
 # export_lag_table_series = 0        # tables with their own export lag series on
 #                                    # /metrics (0-1000): the ones waiting longest and
 #                                    # the ones whose last export took longest. 0 = none.
-#                                    # The series carry database and measurement names.
+#                                    # The series carry database and measurement names,
+#                                    # visible to any valid token (and to anyone, with
+#                                    # auth.metrics_public = true).
 # ingest_append_enabled = true       # those exports add only the new files, without
 #                                    # listing the measurement. false = a full pass
 #                                    # of the measurement each time.
