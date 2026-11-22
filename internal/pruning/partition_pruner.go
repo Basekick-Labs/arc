@@ -1308,7 +1308,7 @@ const dayWideSuffix = "/**/*.parquet"
 
 // canWidenDay reports whether a day glob may be replaced by the day-wide
 // recursive glob. Only on schemes where two DuckDB behaviours it relies on
-// were measured through the built binary with the DuckDB Arc ships (1.5.6,
+// were measured through the built binary (on macOS) with the DuckDB Arc ships (1.5.6,
 // 2026-11-21): "**" matches zero directories, so files directly in the day
 // are read, and a "No files found" names the pattern as Arc wrote it, so
 // classifyNoFiles can tell it from an empty measurement.
@@ -1317,9 +1317,10 @@ const dayWideSuffix = "/**/*.parquet"
 //     its directory is read through its "**/*.parquet" glob; a day of 3,004
 //     files returned the same counts through the day-wide glob as through
 //     its partition globs; an empty day-wide glob answered 503.
-//   - azure:// on Azurite, with DuckDB's azure extension, which matches
-//     patterns itself rather than through httpfs: the same three checks, on
-//     a day of 94 files.
+//   - azure:// on Azurite, the Azure Storage EMULATOR, with DuckDB's azure
+//     extension, which matches patterns itself rather than through httpfs:
+//     the same three checks, on a day of 94 files. Not run against Azure
+//     itself; the matching is done by the extension, not the service.
 //   - gs:// on Google Cloud Storage itself: the same three checks, on a day
 //     of 64 files.
 //

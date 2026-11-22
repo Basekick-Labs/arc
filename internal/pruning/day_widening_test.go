@@ -187,6 +187,29 @@ func TestDaysReadUnlistedCountsTheReturnedPlan(t *testing.T) {
 	}
 }
 
+// A plan that reads a day whole rests on a failed listing: it is volatile
+// and not remembered, so once storage answers the normal plan comes back.
+func TestAWidenedPlanIsNotCached(t *testing.T) {
+	p, b := newLevelPruner(t, level{dirs: []string{"10"}, files: []string{"cpu_daily.parquet"}})
+	b.fail[lvlDay] = errListing
+	const glob = "s3://bucket/db/cpu/**/*.parquet"
+	const sql = "SELECT * FROM cpu WHERE time >= '2025-01-15 10:00:00' AND time < '2025-01-15 11:00:00'"
+
+	ctx, vol := WithVolatileResult(context.Background())
+	if r, ok := p.OptimizeTablePath(ctx, glob, sql); !ok || !resultHasPath(r, lvlDayWide) {
+		t.Fatalf("got %v %v, want the day-wide glob", r, ok)
+	}
+	if !vol.Volatile {
+		t.Error("a plan that reads a day unlisted was not marked volatile")
+	}
+
+	delete(b.fail, lvlDay)
+	r, ok := p.OptimizeTablePath(context.Background(), glob, sql)
+	if !ok || resultHasPath(r, lvlDayWide) || !resultHasPath(r, lvlDayG) || !resultHasPath(r, lvlHourG) {
+		t.Errorf("after recovery got %v %v, want the day's own globs: the widened plan was served from cache", r, ok)
+	}
+}
+
 // The newest-partition shortcut reads its glob alone. When that glob is a
 // day whose listing fails, the answer is a day-wide glob, not the glob asked
 // about: the unpruned fallback answers, as it did when the glob was dropped.

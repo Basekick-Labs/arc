@@ -30,7 +30,7 @@ For a time-ranged query on object storage, Arc lists each day's directory to lea
 - **Cost, only when the listing fails:** a query over one hour opens every file of that day. Measured with the built binary on SeaweedFS S3, on a day of 3,004 files, with the day's listing failing: the same row counts as without the failure, in 0.6 to 4.3 s where the same queries took 0.14 to 0.63 s. That time includes the storage client's own retries of the failed listing, which were not measured separately. Such a result is never remembered, so the next query lists again.
 - **New metric `arc_query_days_read_unlisted_total`** (`query_days_read_unlisted_total` in the JSON metrics): days a query read this way. It staying above zero means listings of your bucket are failing.
 - **If the day holds nothing at all,** the query answers the retryable 503, with a warning in the log saying the day's listing failed, not an empty result.
-- **Azure** was measured the same way on Azurite, a day of 94 files with its listing failing: the same row counts as without the failure, each query waiting out the 5 second listing limit first.
+- **Azure** was measured the same way on Azurite, the Azure Storage emulator (not against Azure itself), a day of 94 files with its listing failing: the same row counts as without the failure, each query waiting out the 5 second listing limit first.
 - **GCS** was measured on Google Cloud Storage itself, a day of 64 files with its listing made to fail in a test build: the same row counts as without the failure.
 
 Also in this change, on every object store:
