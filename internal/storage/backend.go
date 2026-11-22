@@ -63,7 +63,7 @@ var ErrObjectNotFound = errors.New("file not found")
 // error, not a size of 0: an empty object and an unknown size are different
 // answers, and a caller comparing sizes (compaction recovery, the object
 // finisher) would otherwise read the object as the wrong one.
-var ErrNoContentLength = errors.New("storage: the object store's response carries no content length")
+var ErrNoContentLength = errors.New("storage: the object store response carries no content length")
 
 // IsNotFound reports whether err is a backend saying the key names no object.
 //
