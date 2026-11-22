@@ -535,8 +535,8 @@ func TestStaleLocalIgnoresReservedRoots(t *testing.T) {
 	}
 }
 
-// Copies a crash left moved aside are removed at startup, except those kept
-// for an operator.
+// An older version's flat aside is removed at startup; a copy kept for an
+// operator is left.
 func TestRemoveStaleAsides(t *testing.T) {
 	r := staleRig(t)
 	dir := filepath.Join(r.root, staleLocalAsideDir)
@@ -546,7 +546,7 @@ func TestRemoveStaleAsides(t *testing.T) {
 	_ = os.WriteFile(aside, []byte("x"), 0o600)
 	_ = os.WriteFile(keep, []byte("x"), 0o600)
 	r.write(staleHour+"x.parquet", "x")
-	r.c.removeStaleAsides()
+	r.c.recoverStaleAsides(r.root)
 	if _, err := os.Stat(aside); err == nil {
 		t.Fatal("aside copy left")
 	}

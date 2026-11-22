@@ -65,6 +65,17 @@ func dirSyncUnsupported(err error) bool {
 	return errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.ENOSYS)
 }
 
+// SyncDirTolerant makes the entries in dir durable, treating a volume that
+// cannot fsync directories at all (dirSyncUnsupported) as done. For code
+// outside the package that creates names under the storage root directly
+// (internal/cluster/stale_local.go).
+func SyncDirTolerant(dir string) error {
+	if err := syncDirFn(dir); err != nil && !dirSyncUnsupported(err) {
+		return fmt.Errorf("failed to sync directory %s: %w", dir, err)
+	}
+	return nil
+}
+
 // syncDir makes the entries in dir durable.
 func (b *LocalBackend) syncDir(dir string) error {
 	err := syncDirFn(dir)
