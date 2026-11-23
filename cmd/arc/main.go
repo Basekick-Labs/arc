@@ -4460,6 +4460,14 @@ func main() {
 	}
 	spokeDeleteInvalidate.Store(&invalidateQueryCaches)
 
+	// Re-homing a misfiled file (#1825): the dry run. Its own routes, not
+	// compaction's: it reads storage and needs no compaction manager, so it
+	// works with compaction off. Admin only when auth is on.
+	rehomeHandler := api.NewRehomeHandler(storageBackend, authManager, dbConfig.UploadDir, logger.Get("rehome"))
+	rehomeHandler.RegisterRoutes(server.GetApp())
+	// Before storage closes: a running job reads from it.
+	shutdownCoordinator.RegisterHook("rehome-jobs", rehomeHandler.Shutdown, shutdown.PriorityCompaction)
+
 	// Register Compaction handler (if compaction is enabled)
 	if compactionManager != nil {
 		// compactionAPIGate wraps the same gate value the schedulers consult,
