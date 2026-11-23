@@ -373,8 +373,191 @@ func TestFlightSQLShutdownOfAnIdleServerIsClean(t *testing.T) {
 	start := time.Now()
 	require.NoError(t, s.Shutdown(ctx))
 	// Nothing is in flight, so no stage is waited out: the grace alone is
-	// 2.7 s here. The stop takes about 100 ms, the bridge's drain tick.
+	// 2.7 s here.
 	require.Less(t, time.Since(start), 2*time.Second, "an idle server must not wait out its stages")
+}
+
+// setFlightSQLShutdownStages sets the shutdown stages for one test.
+func setFlightSQLShutdownStages(t *testing.T, grace, force, drain time.Duration) {
+	t.Helper()
+	prevGrace, prevForce, prevDrain := flightSQLShutdownGrace, flightSQLShutdownForce, flightSQLBridgeDrain
+	flightSQLShutdownGrace, flightSQLShutdownForce, flightSQLBridgeDrain = grace, force, drain
+	t.Cleanup(func() {
+		flightSQLShutdownGrace, flightSQLShutdownForce, flightSQLBridgeDrain = prevGrace, prevForce, prevDrain
+	})
+}
+
+// shutdownFlightSQLTestServer stops s under a context long enough that the
+// stages are not scaled and Shutdown's own deadline cannot be what ends it.
+func shutdownFlightSQLTestServer(s *FlightSQLServer) (time.Duration, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	start := time.Now()
+	err := s.Shutdown(ctx)
+	return time.Since(start), err
+}
+
+// The bridge drain waits for requests, not for connections (#1834). A
+// connection without a request is closed, whatever the drain: fasthttp's own
+// shutdown waits for every connection to be gone and looks again only every
+// 100 ms, so it timed out on a drain shorter than that, and at any drain on a
+// connection that was opened and never used.
+func TestFlightSQLBridgeDrainDoesNotWaitOnConnectionsWithoutARequest(t *testing.T) {
+	answer := func(c *fiber.Ctx) error {
+		return c.Status(fiber.StatusServiceUnavailable).SendString(`{"error":"test"}`)
+	}
+
+	// The drain of server.shutdown_timeout = 2 is 73 ms; 30 ms is well under
+	// fasthttp's 100 ms.
+	t.Run("a kept-alive connection, drain under 100 ms", func(t *testing.T) {
+		setFlightSQLShutdownStages(t, flightSQLShutdownGrace, flightSQLShutdownForce, 30*time.Millisecond)
+		s := newBridgeTestServer(t, nil, answer)
+		startBridgeTestServer(t, s)
+		client, err := flightsql.NewClient(s.flightLn.Addr().String(), nil, nil, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		require.NoError(t, err)
+		defer client.Close()
+		runFlightTestStatement(client)
+		require.GreaterOrEqual(t, s.bridgeConns.open(), 1, "the statement must have left a bridge connection open")
+		// The server marks the connection idle after the client has its answer.
+		require.Eventually(t, func() bool { return s.bridgeConns.active() == 0 }, 5*time.Second, time.Millisecond)
+
+		_, err = shutdownFlightSQLTestServer(s)
+		require.NoError(t, err)
+		requireNoBridgeConns(t, s)
+	})
+
+	// The stages as shipped: a 2 s drain. fasthttp does not count a new
+	// connection as idle for 5 s, so this one used to fail the stop after
+	// the whole drain. The bridge's HTTP client leaves such connections
+	// behind after concurrent queries.
+	t.Run("a connection never used, default drain", func(t *testing.T) {
+		s := newBridgeTestServer(t, nil, answer)
+		startBridgeTestServer(t, s)
+		conn, err := net.Dial("tcp", s.bridgeLn.Addr().String())
+		require.NoError(t, err)
+		defer conn.Close()
+		require.Eventually(t, func() bool { return s.bridgeConns.open() == 1 }, 5*time.Second, 5*time.Millisecond)
+
+		took, err := shutdownFlightSQLTestServer(s)
+		require.NoError(t, err)
+		require.Less(t, took, time.Second, "an unused connection must not be waited on")
+		requireNoBridgeConns(t, s)
+		requireConnClosedByPeer(t, conn)
+	})
+
+	t.Run("no connection at all, drain under 100 ms", func(t *testing.T) {
+		setFlightSQLShutdownStages(t, flightSQLShutdownGrace, flightSQLShutdownForce, 30*time.Millisecond)
+		s := newBridgeTestServer(t, nil, answer)
+		startBridgeTestServer(t, s)
+		_, err := shutdownFlightSQLTestServer(s)
+		require.NoError(t, err)
+	})
+}
+
+// requireNoBridgeConns waits for the bridge's serve loops to notice that
+// their connections were closed: the drain closes the sockets, and each
+// connection leaves the count when its loop ends.
+func requireNoBridgeConns(t *testing.T, s *FlightSQLServer) {
+	t.Helper()
+	require.Eventually(t, func() bool { return s.bridgeConns.open() == 0 }, 5*time.Second, time.Millisecond,
+		"the drain closes the connections it does not wait on")
+}
+
+// requireConnClosedByPeer reads conn to its end: the server must have closed
+// it, so the read ends before the deadline.
+func requireConnClosedByPeer(t *testing.T, conn net.Conn) {
+	t.Helper()
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	_, err := io.Copy(io.Discard, conn)
+	var ne net.Error
+	require.False(t, errors.As(err, &ne) && ne.Timeout(), "the connection must have been closed, got a read timeout")
+}
+
+// A shutdown that comes before Serve has started is a stop, not a failure:
+// gRPC's Serve then returns ErrServerStopped.
+func TestFlightSQLShutdownBeforeServeHasStartedIsClean(t *testing.T) {
+	s := newBridgeTestServer(t, nil)
+	require.NoError(t, s.Listen())
+	// What Shutdown does first, done before Serve can start: the order a
+	// SIGTERM right after startup can produce.
+	s.flight.Shutdown()
+	require.NoError(t, s.Serve())
+	_, err := shutdownFlightSQLTestServer(s)
+	require.NoError(t, err)
+}
+
+// blockingBody is a response body whose first read answers and whose second
+// waits: a response still being streamed after its handler returned.
+type blockingBody struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+	sent    bool
+}
+
+func (b *blockingBody) Read(p []byte) (int, error) {
+	if !b.sent {
+		b.sent = true
+		b.once.Do(func() { close(b.started) })
+		return copy(p, "x"), nil
+	}
+	<-b.release
+	return 0, io.EOF
+}
+
+// A request still running when the drain ends fails the stop, as before: a
+// handler that has not returned, and a response still being streamed (the
+// Arrow path streams after its handler returns, so a count of handlers would
+// miss it). Their connections are closed.
+func TestFlightSQLBridgeDrainReportsARequestStillRunning(t *testing.T) {
+	for name, route := range map[string]func(started, release chan struct{}) fiber.Handler{
+		"a handler that has not returned": func(started, release chan struct{}) fiber.Handler {
+			return func(c *fiber.Ctx) error {
+				close(started)
+				<-release
+				return c.SendString("{}")
+			}
+		},
+		"a response still streaming": func(started, release chan struct{}) fiber.Handler {
+			return func(c *fiber.Ctx) error {
+				return c.SendStream(&blockingBody{started: started, release: release})
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			setFlightSQLShutdownStages(t, 50*time.Millisecond, 50*time.Millisecond, 50*time.Millisecond)
+			started := make(chan struct{})
+			release := make(chan struct{})
+			s := newBridgeTestServer(t, nil)
+			s.bridge.Post("/test/running", route(started, release))
+			startBridgeTestServer(t, s)
+			// Registered after the server's cleanup, so it runs first: the
+			// request ends before the cleanup's Shutdown.
+			t.Cleanup(func() { close(release) })
+			// A raw connection, so the test sees what the server does to it:
+			// the bridge's own client would close its end when shutdown
+			// cancels its request.
+			conn, err := net.Dial("tcp", s.bridgeLn.Addr().String())
+			require.NoError(t, err)
+			defer conn.Close()
+			_, err = conn.Write([]byte("POST /test/running HTTP/1.1\r\nHost: bridge\r\n" +
+				flightSQLInternalKeyHeader + ": " + s.service.internalKey + "\r\nContent-Length: 0\r\n\r\n"))
+			require.NoError(t, err)
+			select {
+			case <-started:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the request did not start")
+			}
+			require.Equal(t, 1, s.bridgeConns.active())
+
+			took, err := shutdownFlightSQLTestServer(s)
+			require.ErrorContains(t, err, "shutdown internal Flight SQL query bridge: requests still running after the 50ms drain: 1")
+			require.Less(t, took, 5*time.Second)
+			// The request is still running (release is not closed yet), so
+			// only the drain can have closed its connection.
+			requireConnClosedByPeer(t, conn)
+		})
+	}
 }
 
 // With a short context, a stalled connection and a hung bridge handler,

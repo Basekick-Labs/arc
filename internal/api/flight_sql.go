@@ -33,6 +33,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/rs/zerolog"
+	"github.com/valyala/fasthttp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -93,15 +94,18 @@ var (
 )
 
 type FlightSQLServer struct {
-	bridge     *fiber.App
-	bridgeLn   net.Listener
-	flight     flight.Server
-	flightLn   *flightSQLConnTracker
-	service    *flightSQLService
-	config     FlightSQLServerConfig
-	logger     zerolog.Logger
-	serveDone  chan error
-	cancelBase context.CancelFunc
+	bridge   *fiber.App
+	bridgeLn net.Listener
+	// bridgeConns follows the bridge's connections, so the drain knows
+	// which still carry a request (see drainBridge).
+	bridgeConns *flightSQLBridgeConns
+	flight      flight.Server
+	flightLn    *flightSQLConnTracker
+	service     *flightSQLService
+	config      FlightSQLServerConfig
+	logger      zerolog.Logger
+	serveDone   chan error
+	cancelBase  context.CancelFunc
 
 	startMu           sync.Mutex
 	listening         bool
@@ -244,14 +248,20 @@ func NewFlightSQLServer(queryHandler *QueryHandler, config FlightSQLServerConfig
 	flightServer := flight.NewServerWithMiddleware(middleware, options...)
 	flightServer.RegisterFlightService(flightsql.NewFlightServer(newFlightSQLMetadataModeService(service, logger)))
 
+	// Fiber never sets ConnState, and bridge.Server() is the server its
+	// Listener serves.
+	bridgeConns := newFlightSQLBridgeConns()
+	bridge.Server().ConnState = bridgeConns.connState
+
 	return &FlightSQLServer{
-		bridge:     bridge,
-		flight:     flightServer,
-		service:    service,
-		config:     config,
-		logger:     logger,
-		serveDone:  make(chan error, 1),
-		cancelBase: cancelBase,
+		bridge:      bridge,
+		bridgeConns: bridgeConns,
+		flight:      flightServer,
+		service:     service,
+		config:      config,
+		logger:      logger,
+		serveDone:   make(chan error, 1),
+		cancelBase:  cancelBase,
 	}, nil
 }
 
@@ -444,7 +454,7 @@ func (s *FlightSQLServer) finishShutdown(serving bool, st flightSQLShutdownStage
 		_ = s.flightLn.Close()
 	}
 	s.cancelBase()
-	if err := s.bridge.ShutdownWithTimeout(st.drain); err != nil {
+	if err := s.drainBridge(st.drain); err != nil {
 		shutdownErr = errors.Join(shutdownErr, fmt.Errorf("shutdown internal Flight SQL query bridge: %w", err))
 	}
 	if s.bridgeLn != nil {
@@ -454,7 +464,9 @@ func (s *FlightSQLServer) finishShutdown(serving bool, st flightSQLShutdownStage
 		transport.CloseIdleConnections()
 	}
 	if serving && shutdownErr == nil {
-		if err := <-s.serveDone; err != nil {
+		// ErrServerStopped is Serve finding the server already stopped: a
+		// shutdown that came before Serve had started. That is a stop.
+		if err := <-s.serveDone; err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("Flight SQL server stopped: %w", err))
 		}
 	}
@@ -463,6 +475,132 @@ func (s *FlightSQLServer) finishShutdown(serving bool, st flightSQLShutdownStage
 	s.shutdownErr = shutdownErr
 	close(s.shutdownDone)
 	s.shutdownMu.Unlock()
+}
+
+// flightSQLBridgeDrainPoll is how often drainBridge looks for requests still
+// in flight.
+const flightSQLBridgeDrainPoll = 2 * time.Millisecond
+
+// drainBridge stops the bridge and waits up to drain for the requests still
+// in flight on it. It fails only when a request is still running at the end:
+// a handler that did not return, or a response still being streamed. Their
+// queries were cancelled before this is called.
+//
+// The wait is on Arc's own count of requests in flight, not on the result of
+// fasthttp's shutdown. That shutdown waits for every connection to be gone
+// and looks again only every 100 ms, so it timed out with nothing running:
+// whenever the drain was shorter than that (#1834), and at any drain when a
+// connection had been opened and not yet used, which it does not treat as
+// idle for 5 s. A connection without a request is closed here, not waited on.
+func (s *FlightSQLServer) drainBridge(drain time.Duration) error {
+	// The bridge's only client: its idle connections first, so their server
+	// ends are closing before the wait starts.
+	if transport, ok := s.service.client.Transport.(*http.Transport); ok {
+		transport.CloseIdleConnections()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), drain)
+	defer cancel()
+	// fasthttp's shutdown runs for the whole wait: it closes the listener,
+	// and while it runs a connection closes once its request is answered.
+	done := make(chan error, 1)
+	go func() { done <- s.bridge.ShutdownWithContext(ctx) }()
+	tick := time.NewTicker(flightSQLBridgeDrainPoll)
+	defer tick.Stop()
+	var err error
+	running := -1
+wait:
+	for {
+		select {
+		case err = <-done:
+			break wait
+		case <-tick.C:
+			if s.bridgeConns.active() == 0 {
+				// Nothing in flight: that is the result. It is not read
+				// again after the join below, where a request that was
+				// sent before the queries were cancelled could still
+				// show up, and be reported as outliving a drain that
+				// never ran its length.
+				running = 0
+				cancel()
+				err = <-done
+				break wait
+			}
+		}
+	}
+	if running < 0 {
+		running = s.bridgeConns.active()
+	}
+	// Whatever is left is closed: fasthttp's shutdown has returned and no
+	// longer closes a connection when its request ends.
+	s.bridgeConns.closeAll()
+	if running > 0 {
+		s.logger.Warn().Int("requests", running).Dur("drain", drain).Msg("Flight SQL shutdown: requests still running on the bridge after its drain, their connections were closed")
+		return fmt.Errorf("requests still running after the %s drain: %d", drain, running)
+	}
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		return err
+	}
+	return nil
+}
+
+// flightSQLBridgeConns follows the bridge's connections through fasthttp's
+// ConnState hook: which are open, and which carry a request. A connection is
+// active from the first byte of a request until its response is written in
+// full, a streamed body included.
+type flightSQLBridgeConns struct {
+	mu    sync.Mutex
+	conns map[net.Conn]bool // true while a request is in flight on it
+}
+
+func newFlightSQLBridgeConns() *flightSQLBridgeConns {
+	return &flightSQLBridgeConns{conns: map[net.Conn]bool{}}
+}
+
+func (t *flightSQLBridgeConns) connState(c net.Conn, state fasthttp.ConnState) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	switch state {
+	case fasthttp.StateNew, fasthttp.StateIdle:
+		t.conns[c] = false
+	case fasthttp.StateActive:
+		t.conns[c] = true
+	case fasthttp.StateClosed, fasthttp.StateHijacked:
+		delete(t.conns, c)
+	}
+}
+
+// active is the number of connections with a request in flight.
+func (t *flightSQLBridgeConns) active() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	n := 0
+	for _, busy := range t.conns {
+		if busy {
+			n++
+		}
+	}
+	return n
+}
+
+// open is the number of connections, with or without a request.
+func (t *flightSQLBridgeConns) open() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.conns)
+}
+
+// closeAll closes every connection still open. fasthttp closes them again
+// when their serve loops end; a second Close is harmless.
+func (t *flightSQLBridgeConns) closeAll() {
+	t.mu.Lock()
+	conns := make([]net.Conn, 0, len(t.conns))
+	for c := range t.conns {
+		conns = append(conns, c)
+	}
+	t.mu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
 }
 
 // flightSQLConnTracker records the connections it accepts, so shutdown can

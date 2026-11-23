@@ -2,6 +2,16 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: with Flight SQL on, a stop with no Flight query running no longer exits 1 on a short shutdown timeout or an unused internal connection ([#1834](https://github.com/Basekick-Labs/arc/issues/1834))
+
+**Who is affected:** builds of `main` with `flight_sql.enabled = true`. Flight SQL is new in this release, so no released version has this.
+
+Flight SQL runs its statements over an internal loopback HTTP listener, which is drained last when the Flight SQL listener stops. The drain waited for every connection on it to be gone, checking only every 100 ms, and reported a timeout as a failed stop: `shutdown internal Flight SQL query bridge: context deadline exceeded`, exit code 1, after an otherwise clean shutdown.
+
+- **Short timeouts:** with `server.shutdown_timeout` of 2 or less on a standalone node, and 5 or less in a cluster, the drain gets less than 100 ms. A node that had served a Flight statement then exited 1 on every stop, because the connection kept open for the next statement was still closing when the drain ended.
+- **Any timeout, the default included:** a connection to the internal listener that was opened and not yet used was not closed for 5 s, so it failed the stop after the whole drain (2 s at most). The internal HTTP client leaves such connections behind after concurrent Flight statements: at the default `server.shutdown_timeout`, a node stopped after a burst of 80 concurrent statements exited 1 on every stop.
+- **Now** the drain waits for requests, not connections. A connection with no request in flight is closed, and a stop with nothing running takes a few milliseconds instead of 100. The stop still fails, as before, when a request is still running at the end of the drain (a handler that has not returned, or a result still being streamed): the error now says how many, and their connections are closed.
+- **Also fixed:** a stop that arrives in the instant before the Flight SQL listener starts serving no longer reports `grpc: the server has been stopped` as a failure.
 ## Fix: a replicated compaction output is always recorded in the receiving node's tiering index ([#1831](https://github.com/Basekick-Labs/arc/issues/1831))
 
 On a node-local-storage cluster, each node moves its staged copy of a committed compaction output into place and records the file in its tiering index as hot. When the pull the commit queued was still waiting (a backlogged pull queue), the 30-second staged sweep moved the copy into place itself, without recording it. The queued pull then found the file present and skipped it without recording it either.
@@ -128,7 +138,7 @@ At shutdown the Flight SQL listener scales its waits (5 s for in-flight queries,
 - **In-flight Flight queries** were cancelled the moment shutdown began, and their connections closed, instead of getting the grace period. In a cluster at the default the grace was negative too.
 - **Now** each wait is its share of the budget, never negative and never more than the unscaled value: at the default 30 s, in-flight queries get about 2.7 s on a standalone node and about 1.4 s in a cluster, and an idle listener stops at once with exit code 0.
 - **What this changes for the rest of shutdown:** the Flight SQL listener stops before the HTTP server, and its waits were never taken before. A Flight client that stalls now uses up to half of the hooks' time (6 s at the default, standalone), and the HTTP drain gets what is left. The time kept for the buffer flush, the WAL and the database is not touched. `docs/operations/flight-sql.md` has the numbers.
-- **Not changed:** with `server.shutdown_timeout` of 2 or less (5 or less in a cluster), a node that has served a Flight query can still exit 1 on a clean stop, because the internal drain then gets less than 100 ms ([#1834](https://github.com/Basekick-Labs/arc/issues/1834)).
+- **Fixed separately:** a clean stop could still exit 1 with `server.shutdown_timeout` of 2 or less (5 or less in a cluster), where the internal drain gets less than 100 ms. See the #1834 entry above.
 
 Reported, with the cause and a patch, by Grump.
 ## Fix: a continuous query's read of its source runs under the run's timeout ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
