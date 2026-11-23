@@ -25,14 +25,15 @@ place queries keep reading the original; once all are in place queries read the 
 files; the original is removed after every query planned before that switch has
 finished. A query in flight at the moment the original is removed can get the existing
 "data read by this query was removed while it ran; retry the query" answer (503). With
-eight clients querying in a loop through 20 jobs, 3,979 answers were right, 40 were that
+eight clients querying in a loop through 19 jobs, 5,114 answers were right, 27 were that
 retry answer, and none was wrong.
 
 **What happens on a stop.** Each step is recorded in a journal file under `_rehome/` in
 the storage root. At the next start a job that had begun to switch queries over is
 finished, and one that had only staged its files is dropped (the file is as it was;
-send the request again). The process was killed a few milliseconds into a job twelve
-times; every restart ended with the right rows and nothing left behind.
+send the request again). The process was killed a few milliseconds into a job sixteen
+times, four of them part way through the move; every restart ended with the right rows
+and nothing left behind.
 
 - **A job that stops part way in a running process** (a storage error) keeps its record
   and its files stay owned. `POST /api/v1/rehome/<id>/resume` takes it up again, and so
