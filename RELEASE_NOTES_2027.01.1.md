@@ -2,7 +2,7 @@
 
 > **Status:** Planned — January 2027 release.
 
-## Fix: with Flight SQL on, a normal stop no longer exits 1 and in-flight Flight queries get their grace period (PRLINK)
+## Fix: with Flight SQL on, a normal stop no longer exits 1 and in-flight Flight queries get their grace period ([#1835](https://github.com/Basekick-Labs/arc/pull/1835))
 
 **Who is affected:** builds of `main` with `flight_sql.enabled = true`. Flight SQL is new in this release, so no released version has this.
 
