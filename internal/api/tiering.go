@@ -5,7 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/auth"
@@ -162,11 +165,15 @@ func (h *TieringHandler) TriggerMigration(c *fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(c.Context(), h.manager.MigrationBudget())
 	defer cancel()
 
-	var req TriggerMigrationRequest
-	if err := c.BodyParser(&req); err != nil {
-		// Empty body is OK: migrate every database. This is a migration,
-		// not the scheduled cycle — no pre-migration scan and no
-		// reconciliation (POST /api/v1/tiering/reconcile runs that).
+	// An empty body migrates every database. This is a migration, not the
+	// scheduled cycle: no pre-migration scan and no reconciliation
+	// (POST /api/v1/tiering/reconcile runs that).
+	req, err := parseMigrationRequest(c)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error":   "invalid request body: " + err.Error(),
+			"message": `Send JSON such as {"database": "telemetry"}, or an empty body to migrate every database. Nothing was migrated.`,
+		})
 	}
 
 	fromTier := tiering.TierHot
@@ -355,6 +362,71 @@ func (h *TieringHandler) Reconcile(c *fiber.Ctx) error {
 		"manifest_entries_removed": res.ManifestEntriesRemoved,
 		"errors":                   res.Errors,
 	})
+}
+
+// migrationRequestFields are the fields TriggerMigrationRequest reads.
+var migrationRequestFields = map[string]bool{
+	"from_tier": true, "to_tier": true, "database": true, "measurement": true, "dry_run": true,
+}
+
+// parseMigrationRequest reads the migrate body (#1841). A body it cannot
+// read used to be ignored like an empty one, and an empty body migrates
+// every database: a scoped request sent as JSON with curl's default form
+// Content-Type, malformed, or with a misspelt field ran an unscoped
+// migration of everything and answered as if it had done what was asked.
+//   - empty: migrate every database, as always;
+//   - starting with '{': JSON, whatever the Content-Type, with unknown
+//     fields and trailing data refused;
+//   - application/x-www-form-urlencoded: form fields (dry_run read as a
+//     boolean), unknown or repeated keys refused;
+//   - anything else: refused.
+func parseMigrationRequest(c *fiber.Ctx) (TriggerMigrationRequest, error) {
+	var req TriggerMigrationRequest
+	body := bytes.TrimSpace(c.Body())
+	if len(body) == 0 {
+		return req, nil
+	}
+	if body[0] == '{' {
+		dec := json.NewDecoder(bytes.NewReader(body))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil {
+			return req, err
+		}
+		if dec.More() {
+			return req, errors.New("unexpected data after the JSON object")
+		}
+		return req, nil
+	}
+	if strings.HasPrefix(strings.ToLower(string(c.Request().Header.ContentType())), fiber.MIMEApplicationForm) {
+		vals, err := url.ParseQuery(string(body))
+		if err != nil {
+			return req, err
+		}
+		for k, v := range vals {
+			if !migrationRequestFields[k] {
+				return req, fmt.Errorf("unknown field %q", k)
+			}
+			if len(v) != 1 {
+				return req, fmt.Errorf("field %q given %d times", k, len(v))
+			}
+		}
+		// Decoded here, not by BodyParser: its form decoder does not read
+		// the json tags, so dry_run=true was dropped and a dry run asked
+		// for as form fields ran a real migration.
+		req.FromTier = vals.Get("from_tier")
+		req.ToTier = vals.Get("to_tier")
+		req.Database = vals.Get("database")
+		req.Measurement = vals.Get("measurement")
+		if v := vals.Get("dry_run"); v != "" {
+			dry, err := strconv.ParseBool(v)
+			if err != nil {
+				return req, fmt.Errorf("dry_run %q is not a boolean", v)
+			}
+			req.DryRun = dry
+		}
+		return req, nil
+	}
+	return req, errors.New("the body is neither JSON nor form fields")
 }
 
 // migrationRoleGatedResponse is the answer to a manual migration on a node

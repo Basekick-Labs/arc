@@ -579,10 +579,11 @@ migration_history_retention_days = 90
 # Environment override: ARC_TIERED_STORAGE_SCAN_TIMEOUT=4h
 #
 # The scan is what puts a file in the tier metadata the query path routes reads
-# from. It runs on four paths and this one number now bounds all of them: the
-# startup scan, POST /api/v1/tiering/scan, and the pre-migration scan inside a
-# scheduled cycle or POST /api/v1/tiering/migrate. Before 27.01.1 the first two
-# were capped at 30 minutes with no way to change it (#1154).
+# from. It runs on four paths and this one number bounds all of them: the
+# startup scan, POST /api/v1/tiering/scan, the pre-migration scan inside a
+# scheduled cycle, and the scan POST /api/v1/tiering/reconcile runs first.
+# POST /api/v1/tiering/migrate does not scan. Before 27.01.1 the first two were
+# capped at 30 minutes with no way to change it (#1154).
 #
 # Inside a migration cycle the scan runs on a budget derived from the cycle's,
 # so it gets whichever is shorter. At this default the two are equal (the cycle
@@ -606,9 +607,12 @@ migration_history_retention_days = 90
 # it.
 # scan_timeout = "2h"
 #
-# How long one migration cycle may run, scheduled or POST /api/v1/tiering/migrate.
-# Go duration; must be positive. The scan at the start of a cycle runs inside
-# this bound, so keep it above scan_timeout (Arc warns at startup if not).
+# How long one migration run may take: a scheduled cycle,
+# POST /api/v1/tiering/migrate or POST /api/v1/tiering/reconcile. Go duration;
+# must be positive. The scan at the start of a cycle or a reconcile runs inside
+# this bound, so keep it no shorter than scan_timeout (Arc warns at startup if
+# it is shorter). Files a run already moved to cold are still released for up
+# to 2 minutes after it (#1830).
 # migration_timeout = "2h"
 
 [tiered_storage.cold]

@@ -2,6 +2,26 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: `POST /api/v1/tiering/migrate` refuses a body it cannot read instead of migrating every database ([#1841](https://github.com/Basekick-Labs/arc/issues/1841))
+
+The migrate endpoint ignored a body it could not parse, and treated it as an empty body, which migrates every database. In each of these cases a request meant for one database migrated all of them, and the answer looked like the scoped run that was asked for:
+
+- `{"database": "x"}` sent with `curl -d`, which sends a form Content-Type;
+- the same body sent with `text/plain` or no Content-Type;
+- malformed JSON;
+- a misspelt field such as `databse`.
+
+Worse, `dry_run=true` sent as a form field was dropped, so a dry run asked for that way ran a real migration.
+
+Now:
+
+- An empty body migrates every database, as before.
+- A body starting with `{` is read as JSON whatever its Content-Type. Unknown fields and anything after the object are refused.
+- Form fields (`application/x-www-form-urlencoded`) keep working, and `dry_run` is now read. Unknown or repeated keys, and a `dry_run` that is not a boolean, are refused.
+- Anything else is refused. A refused body answers `400` and nothing is migrated.
+
+A client that sent extra fields in the JSON body now gets `400` and must drop them.
+
 ## Fix: with Flight SQL on, a stop with no Flight query running no longer exits 1 on a short shutdown timeout or an unused internal connection ([#1834](https://github.com/Basekick-Labs/arc/issues/1834))
 
 **Who is affected:** builds of `main` with `flight_sql.enabled = true`. Flight SQL is new in this release, so no released version has this.
