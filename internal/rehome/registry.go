@@ -539,6 +539,33 @@ func (r *Registry) ExcludedFor(_ context.Context, prefix string) []string {
 	return out
 }
 
+// Replaced returns, for the jobs under prefix whose reads already use the new
+// files (latched), the key of the file each is replacing with the keys of the
+// files that hold its rows now. The Iceberg export commits such a file's
+// removal together with those files.
+func (r *Registry) Replaced(prefix string) map[string][]string {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out map[string][]string
+	for _, j := range r.jobs {
+		if j.Prefix() != prefix || j.State != StateLatched {
+			continue
+		}
+		if out == nil {
+			out = map[string][]string{}
+		}
+		keys := make([]string, len(j.Outputs))
+		for i, o := range j.Outputs {
+			keys[i] = o.Key
+		}
+		out[j.Source.Key] = keys
+	}
+	return out
+}
+
 // ExcludedForStrict is ExcludedFor for a reader that must not go on without
 // the journal: the Iceberg export.
 func (r *Registry) ExcludedForStrict(ctx context.Context, prefix string) ([]string, error) {

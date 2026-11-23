@@ -4565,6 +4565,10 @@ func main() {
 	rehomeHandler.SetSwap(&api.RehomeSwap{
 		Registry: rehomeRegistry,
 		Reads:    queryHandler.Reads(),
+		// The export itself is bound once its scheduler exists (SetExport,
+		// below); from the configuration alone a job found at start knows
+		// to wait for it.
+		ExportExpected: cfg.Iceberg.Enabled,
 		Refusal: func() string {
 			switch {
 			case cfg.Cluster.Enabled:
@@ -4573,8 +4577,6 @@ func main() {
 				return "moving a file's rows is not available with tiered storage in this version"
 			case cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Active() || cfg.EdgeSync.Spoke.Active():
 				return "moving a file's rows is not available with edge sync in this version"
-			case cfg.Iceberg.Enabled:
-				return "moving a file's rows is not available with the Iceberg export in this version"
 			}
 			return ""
 		},
@@ -4900,6 +4902,20 @@ func main() {
 			// How many tables' reconcile passes run at once (#1786): one on a
 			// cluster node.
 			ReconcileConcurrency: icebergPassesAtOnce,
+		})
+		// #1825: a re-home job keeps the file it replaces until the published
+		// table does not name it, and the export commits that file's removal
+		// with the files that replace it.
+		exporter.SetReplaced(func(database, measurement string) map[string][]string {
+			return rehomeRegistry.Replaced(database + "/" + measurement + "/")
+		})
+		rehomeHandler.SetExport(func(ctx context.Context, database, measurement, fileKey string) (api.RehomeExportAnswer, error) {
+			a, err := icebergScheduler.ReconcileAndConfirm(ctx, database, measurement, fileKey)
+			if err != nil {
+				return api.RehomeExportAnswer{}, err
+			}
+			clear, why := a.Verdict(fileKey != "")
+			return api.RehomeExportAnswer{Clear: clear, Why: why}, nil
 		})
 		// #1731: with node-local warehouses (not icebergTopo.barrier, which is a shared bucket or
 		// shared_storage_mode), a database DELETE on the writer drops only the writer's tables.

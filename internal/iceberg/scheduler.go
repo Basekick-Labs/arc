@@ -124,6 +124,12 @@ type Scheduler struct {
 	// per-pass version claims assume one reconcile at a time.
 	reqMu     sync.Mutex
 	requested map[string]Measurement
+	// confirms are the questions of re-home jobs waiting for a pass
+	// (scheduler_confirm.go), under reqMu.
+	confirms []*confirmWaiter
+	// confirmWake: a wake-up for a question held back by requestSpacing is
+	// pending. Under reqMu.
+	confirmWake bool
 	// requestedPaths holds storage keys or directory prefixes another Arc
 	// path removed, moved or rewrote (RequestReconcilePaths, #1727). The loop
 	// maps them onto measurements the last pass listed: callers name data the
@@ -672,6 +678,7 @@ func (s *Scheduler) takeRequests() []Measurement {
 // escalated one is left to them. The gate is checked once per batch; the
 // reconcile's own commit fence (canCommit) covers a lease lost meanwhile.
 func (s *Scheduler) serviceRequests(ctx context.Context) {
+	s.serviceConfirms(ctx)
 	reqs := s.takeRequests()
 	byPath := s.measurementsFor(s.takePathRequests())
 	hotOnly := s.measurementsFor(s.takeHotPathRequests())
@@ -846,6 +853,7 @@ func (s *Scheduler) pausedForRestore() bool {
 		return false
 	}
 	s.dropIngest()
+	s.blockConfirms("the Iceberg export is paused until the server restarts (a restore staged a catalog)")
 	clear(s.busySince)
 	s.exporter.clearLastLag()
 	if !s.pauseWarned {

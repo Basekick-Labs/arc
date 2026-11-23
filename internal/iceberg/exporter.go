@@ -168,6 +168,8 @@ type exporterShared struct {
 	// onPublished, when set, is told of every successful publish (Glue sync,
 	// #1690). Set during wiring, before the scheduler starts.
 	onPublished func(database, measurement string)
+	// replaced: the files re-home jobs are replacing (SetReplaced).
+	replaced func(database, measurement string) map[string][]string
 
 	// servedLayoutOnce caches the warehouse layout the published-state reads
 	// (published.go) check names against.

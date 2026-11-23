@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -75,6 +76,15 @@ type RehomeHandler struct {
 	swap *RehomeSwap
 	// afterStep is a test seam: called after each step of a swap.
 	afterStep func(step string)
+
+	// export asks the Iceberg export about a table (SetExport); exportBound
+	// is closed once it is set. waitingExport is the id of the job waiting
+	// for the export, skipExport that its wait was waived, skipCh wakes it.
+	export        RehomeExportFunc
+	exportBound   chan struct{}
+	waitingExport string
+	skipExport    bool
+	skipCh        chan struct{}
 }
 
 // rehomeJob is one request and its report.
@@ -86,8 +96,11 @@ type rehomeJob struct {
 	StartedAt  time.Time  `json:"started_at"`
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
 	// Reason: why a job was refused or failed.
-	Reason string        `json:"reason,omitempty"`
-	Report *rehomeReport `json:"report,omitempty"`
+	Reason string `json:"reason,omitempty"`
+	// WaitingFor: what a running job is waiting on, when it is not Arc's
+	// own work: the Iceberg export.
+	WaitingFor string        `json:"waiting_for,omitempty"`
+	Report     *rehomeReport `json:"report,omitempty"`
 }
 
 // rehomeReport is what a dry run found.
@@ -138,6 +151,8 @@ func NewRehomeHandler(backend storage.Backend, authManager *auth.AuthManager, sc
 		ctx:         ctx,
 		stop:        stop,
 		jobs:        map[string]*rehomeJob{},
+		exportBound: make(chan struct{}),
+		skipCh:      make(chan struct{}, 1),
 	}
 	h.run = h.dryRun
 	h.removeScratch()
@@ -356,6 +371,33 @@ func (h *RehomeHandler) resumeJob(c *fiber.Ctx) error {
 	rec, ok := h.swap.Registry.Get(id)
 	if !ok {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "no job with that id is recorded on this node; a job that ended has no record"})
+	}
+	var body struct {
+		SkipExportWait bool `json:"skip_export_wait"`
+	}
+	if len(c.Body()) > 0 {
+		// Parsed as JSON whatever the Content-Type: a form-encoded reading
+		// of the same bytes would leave the flag unset and take the request
+		// for a plain resume.
+		if err := json.Unmarshal(c.Body(), &body); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "the body is not JSON"})
+		}
+	}
+	if body.SkipExportWait {
+		// A word to the running job, not a second run of it.
+		if !h.waiveExportWait(id) {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "that job is not waiting for the Iceberg export"})
+		}
+		h.logger.Warn().Str("job", id).Msg("Re-home: asked to end a job's wait for the Iceberg export")
+		// The waiting job is the running one, which the job list does not
+		// drop while it runs.
+		h.mu.Lock()
+		job := h.jobs[id]
+		h.mu.Unlock()
+		if job == nil {
+			return c.Status(fiber.StatusAccepted).JSON(fiber.Map{"id": id, "state": "running"})
+		}
+		return c.Status(fiber.StatusAccepted).JSON(h.view(job))
 	}
 	h.mu.Lock()
 	if h.running {

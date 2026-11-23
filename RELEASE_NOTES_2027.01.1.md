@@ -80,9 +80,9 @@ On a file holding rows of two days, a query for the second day returned 1 of 2 r
 before and 2 of 2 after; unfiltered queries returned the same rows throughout.
 
 **Where it runs in this release.** A standalone node with local storage. It is refused,
-with the reason, on a cluster, with tiered storage, with edge sync, with the Iceberg
-export enabled, and on storage that is not local. Those come in later releases; the dry
-run works everywhere.
+with the reason, on a cluster, with tiered storage, with edge sync, and on storage that
+is not local; those come in later releases. With the Iceberg export enabled it runs as
+described in the next section. The dry run works everywhere, one job at a time.
 
 **What a query sees while a job runs.** Every row, once. While the new files are put in
 place queries keep reading the original; once all are in place queries read the new
@@ -108,7 +108,7 @@ and nothing left behind.
   read it, an output after queries were switched to the outputs, or another file sitting
   at an output's name. Until it is put right, queries may be missing that file's rows.
 - **A journal from a run under another configuration.** If the node has since become a
-  cluster member, or tiering, edge sync or the Iceberg export was turned on, a job that
+  cluster member, or tiering or edge sync was turned on, a job that
   had not switched queries over is undone, and one that had is kept as recorded with an
   Error line saying how to finish it.
 - **Queries that do not end.** If queries in flight when the job starts have not ended
@@ -137,6 +137,74 @@ storage: one listing of a prefix that is empty unless a job was left. A record t
 that cannot be read stops the start and names the file.
 
 **Not in this release:** undoing a job by request, and metrics for jobs.
+
+## New: moving a misfiled file's rows with the Iceberg export on ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
+
+`POST /api/v1/rehome` now runs with `iceberg.enabled = true` on a standalone node with
+local storage. A file spanning more than one day, which the export leaves out of the
+table (#1754), is in the table once it is moved: on such a file the table went from 1 of
+4 rows to 4 of 4, and `arc_iceberg_files_left_out` returned to 0.
+
+**The table never loses the rows on the way.** The file being moved stays in storage,
+left out of Arc's queries, until the export has published a version of the table that
+does not name it; and the export commits that file's removal together with the files
+that replace it, in one snapshot, whatever days they are in. Other new files of the
+measurement are not pulled into that commit: they are registered in chunks as before.
+
+With a reader counting the table's rows in a loop through 14 jobs, compaction on, 259
+reads were right, none was wrong and none failed. The process was killed a few tens of
+milliseconds into a job 24 times, 11 of them while the job waited for the export; every
+restart ended with Arc and the table holding the same rows.
+
+**What a job does differently with the export on.**
+
+- **Before it changes anything**, it asks the export for a pass of the measurement's
+  table. If that pass fails, or the export is paused or does not export the table yet
+  (a namespace awaiting migration), the job is refused with the export's reason and the
+  file is as it was.
+- **After queries use the new files**, it asks for a pass again and removes the old file
+  only when the published table does not name it. `GET /api/v1/rehome/<id>` shows
+  `waiting_for` while it waits.
+- **That wait has no time limit.** If the export cannot commit (a full or read-only
+  warehouse, a schema conflict that appeared since the job started), the old file is
+  kept and the job stays `running`, with a Warn line every five minutes carrying the
+  export's error. Arc's queries are right all the while. Until the job ends, backup,
+  restore, a delete of that database and other re-home jobs (dry runs included: one job
+  runs at a time) are refused, and a row DELETE or retention leaves the job's files for
+  a retry.
+- **Ending the wait by hand.** Repair the export and the job ends by itself. Or
+  `POST /api/v1/rehome/<id>/resume` with `{"skip_export_wait": true}` removes the old
+  file without the export's commit: the table then names a file that is gone, and
+  readers of the table fail on it, until the export next commits. That later commit is
+  an ordinary one, no longer tied to the job: if it stops part way, the table can be
+  published for a while without some of the file's rows. The request is honoured once
+  the export has answered the job at least once.
+
+**What is refused with the export on.** A file holding rows with a NULL or infinite
+time: the export cannot give a file of only such rows a day, so splitting them off
+would take them out of the table. The dry run reports them as `remainder_rows`.
+
+**Things to know.**
+
+- The check before the job cannot see a fault that only shows when the export writes.
+  With the table's metadata directory made read-only, the check passed (the table needed
+  no change), and the job waited after switching queries until the directory was writable
+  again.
+- A job found at start past its commit is left as recorded until the export exists,
+  and taken up then, not inline during startup. One whose old file is already gone ends
+  without asking the export.
+- The export turned off and on again across a job is an export-off period like any
+  other: with it off the job ends without asking, and a table left from before names
+  the old file until the export is on again and reconciles.
+- Each job adds two passes of one table to the export's work. At
+  `iceberg.retain_snapshots` 1 or 2 passes of a table are spaced two seconds apart, so a
+  job takes that much longer.
+
+Run with these `iceberg.` settings at non-default values, four jobs each, Arc and the
+table agreeing after every one: `ingest_append_enabled = false`, `warehouse` set to a
+subdirectory of the storage root, `layout = "colocated"`, `retain_snapshots = 1`,
+`ingest_export_interval = 0`, `reconcile_concurrency = 1`.
+
 ## Fix: a migrate cut off by its time budget no longer leaves files read twice ([#1830](https://github.com/Basekick-Labs/arc/issues/1830))
 
 `POST /api/v1/tiering/migrate` ran everything on one context bounded by `tiered_storage.migration_timeout`, including releasing the hot copies of the files it had just moved. When the budget ran out, the files copied in the last second or so were already marked cold, but their manifest update was refused on the expired context. They were left in cold, still hot on every node, and still in the cluster manifest.
