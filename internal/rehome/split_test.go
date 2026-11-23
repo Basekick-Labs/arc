@@ -366,6 +366,19 @@ func TestCheckCatchesABadSplit(t *testing.T) {
 	if err := Check(ctx, db, more, clone()); err == nil {
 		t.Error("a split one row short passed")
 	}
+	// The remainder holding two rows that have times, with every count right.
+	timed := clone()
+	timed[4].LocalPath = timed[3].LocalPath
+	if err := Check(ctx, db, p, timed); err == nil {
+		t.Error("a remainder of rows that have times passed, with the right row count")
+	}
+	// A plan that counted the same total, differently per directory.
+	shifted := p
+	shifted.Destinations = append([]Destination(nil), p.Destinations...)
+	shifted.Destinations[1].Rows, shifted.Destinations[2].Rows = 1, 2
+	if err := Check(ctx, db, shifted, clone()); err == nil {
+		t.Error("outputs whose rows per directory differ from the plan passed")
+	}
 	if err := Check(ctx, db, p, clone()); err != nil {
 		t.Errorf("the good split failed its check: %v", err)
 	}
