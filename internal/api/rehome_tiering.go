@@ -1,0 +1,152 @@
+package api
+
+import (
+	"context"
+	"errors"
+
+	"github.com/basekick-labs/arc/internal/rehome"
+	"github.com/basekick-labs/arc/internal/tiering"
+)
+
+// With tiered storage on, a job's files must stay on the hot tier while it
+// runs, and the files it puts in place need tier rows: reads take the tiers
+// of a measurement from its rows, and a measurement whose rows are all cold
+// is not read from hot at all (#1825).
+//
+//   - tiering leaves alone every file the registry owns
+//     (tiering.Manager.SetOwnedFilter, wired in main);
+//   - once a job owns its file it asks tiering about it, and is refused a
+//     file that is being moved, or that cold storage holds or holds a copy
+//     of, or any file while cold storage cannot be asked;
+//   - before reads are sent to the new files, the job records them as hot;
+//     after the old file is removed, it forgets that file's row.
+//
+// A file on the cold tier is not moved in this version.
+
+// RehomeTiering is what a job needs of the tiering manager.
+type RehomeTiering interface {
+	CheckRehomeSource(ctx context.Context, path string) error
+	CanRecord(path string) error
+	RecordRehomedFiles(ctx context.Context, files []tiering.RehomedFile) error
+	ForgetRehomedFiles(ctx context.Context, paths []string) error
+}
+
+// SetTiering binds the tiering manager, or records that none runs (nil: off,
+// no licence, or it failed to start). Call it before Wired.
+func (h *RehomeHandler) SetTiering(t RehomeTiering) {
+	h.mu.Lock()
+	h.tiering = t
+	h.mu.Unlock()
+}
+
+// SetExportNotStarted records that the Iceberg export is bound and will not
+// run in this process (its cold tier is unavailable), with the reason. A job
+// then gets that as the export's answer at once, instead of waiting on a
+// scheduler that never serves it.
+func (h *RehomeHandler) SetExportNotStarted(why string) {
+	h.mu.Lock()
+	h.exportDown = why
+	h.mu.Unlock()
+}
+
+func (h *RehomeHandler) exportNotStarted() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.exportDown
+}
+
+// Wired tells the handler that everything a job may need has been bound or
+// found absent: the Iceberg export (SetExport, SetExportNotStarted) and
+// tiering (SetTiering). Jobs found at start are taken up from here, and new
+// ones accepted.
+func (h *RehomeHandler) Wired() {
+	h.wiredOnce.Do(func() { close(h.wired) })
+}
+
+func (h *RehomeHandler) isWired() bool {
+	select {
+	case <-h.wired:
+		return true
+	default:
+		return false
+	}
+}
+
+// lateBound reports that this deployment has something a job needs that is
+// bound after Recover runs.
+func (h *RehomeHandler) lateBound() bool {
+	return h.swap != nil && (h.swap.ExportExpected || h.swap.TieringExpected)
+}
+
+func (h *RehomeHandler) tieringManager() RehomeTiering {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.tiering
+}
+
+// checkTieringSource is why tiering keeps a job off the file at key, as a
+// refusal, or nil.
+func (h *RehomeHandler) checkTieringSource(ctx context.Context, key string) error {
+	err, _ := h.tieringSource(ctx, key)
+	return err
+}
+
+// tieringSource is checkTieringSource, and whether the refusal is something
+// tiering knows (the file is moving, or cold storage holds it or a copy)
+// rather than something it could not find out.
+func (h *RehomeHandler) tieringSource(ctx context.Context, key string) (refusal error, known bool) {
+	if h.swap == nil || !h.swap.TieringExpected {
+		return nil, false
+	}
+	t := h.tieringManager()
+	if t == nil {
+		if h.swap.ColdConfigured {
+			return rehome.Refusef("tiered storage with a cold tier is configured and is not running on this node (no licence, or it failed to start), so cold storage cannot be asked whether it holds a copy of %s; moving the file's rows could leave them twice", key), false
+		}
+		return nil, false
+	}
+	err := t.CheckRehomeSource(ctx, key)
+	switch {
+	case err == nil:
+		return nil, false
+	case errors.Is(err, tiering.ErrFileMoving):
+		return rehome.Refusef("%s is being moved to cold storage; a file on the cold tier is not supported in this version", key), true
+	case errors.Is(err, tiering.ErrRehomeColdCopy):
+		return rehome.Refusef("%s is in cold storage, or a copy of it is; a file on the cold tier is not supported in this version", key), true
+	}
+	return rehome.Refusef("cold storage could not be asked whether it holds a copy of %s (%v); retry once it can", key, err), false
+}
+
+// canRecordTier reports whether tiering can record a file at key.
+func (h *RehomeHandler) canRecordTier(key string) error {
+	if t := h.tieringManager(); t != nil {
+		return t.CanRecord(key)
+	}
+	return nil
+}
+
+// recordTierRows records the job's outputs as hot files. Safe to repeat.
+func (h *RehomeHandler) recordTierRows(ctx context.Context, job *rehome.Job) error {
+	t := h.tieringManager()
+	if t == nil {
+		return nil
+	}
+	files := make([]tiering.RehomedFile, len(job.Outputs))
+	for i, o := range job.Outputs {
+		files[i] = tiering.RehomedFile{Path: o.Key, SizeBytes: o.Size}
+	}
+	return t.RecordRehomedFiles(ctx, files)
+}
+
+// forgetTierRows removes the hot rows of files the job removed. A failure is
+// logged: a tiering scan retires the row of a hot file that is gone, once
+// the row is older than its margin (a few minutes).
+func (h *RehomeHandler) forgetTierRows(ctx context.Context, id string, keys []string) {
+	t := h.tieringManager()
+	if t == nil {
+		return
+	}
+	if err := t.ForgetRehomedFiles(ctx, keys); err != nil {
+		h.logger.Warn().Err(err).Str("job", id).Msg("Re-home: could not remove the tier rows of files the job removed; a later tiering scan retires them")
+	}
+}

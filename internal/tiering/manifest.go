@@ -36,11 +36,20 @@ type compactionOwner interface {
 	CompactionOwns(path string) bool
 }
 
-// heldByCompaction reports a hot file a staged compaction owns: an input or
-// output of a job not yet ended (an input of a committed job is unregistered
-// and still in the bucket until its finisher deletes it). Moving it to the
-// cold tier would leave its rows there next to the compaction's output.
-func (m *Manager) heldByCompaction(path string) bool {
+// heldElsewhere reports a hot file another operation owns, which must stay on
+// the hot tier until that operation ends:
+//
+//   - a staged compaction's input or output, while the job has not ended (an
+//     input of a committed job is unregistered and still in the bucket until
+//     its finisher deletes it). Moving it to the cold tier would leave its
+//     rows there next to the compaction's output;
+//   - the file a re-home job is replacing, or one of the files replacing it
+//     (SetOwnedFilter, #1825). A copy in cold storage would be read beside
+//     the other side of the job.
+func (m *Manager) heldElsewhere(path string) bool {
+	if m.owned != nil && m.owned(path) {
+		return true
+	}
 	if m.manifest == nil {
 		return false
 	}

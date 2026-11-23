@@ -80,9 +80,9 @@ On a file holding rows of two days, a query for the second day returned 1 of 2 r
 before and 2 of 2 after; unfiltered queries returned the same rows throughout.
 
 **Where it runs in this release.** A standalone node with local storage. It is refused,
-with the reason, on a cluster, with tiered storage, with edge sync, and on storage that
-is not local; those come in later releases. With the Iceberg export enabled it runs as
-described in the next section. The dry run works everywhere, one job at a time.
+with the reason, on a cluster, with edge sync, and on storage that is not local; those
+come in later releases. With the Iceberg export or tiered storage enabled it runs as
+described in the next two sections. The dry run works everywhere, one job at a time.
 
 **What a query sees while a job runs.** Every row, once. While the new files are put in
 place queries keep reading the original; once all are in place queries read the new
@@ -204,6 +204,67 @@ Run with these `iceberg.` settings at non-default values, four jobs each, Arc an
 table agreeing after every one: `ingest_append_enabled = false`, `warehouse` set to a
 subdirectory of the storage root, `layout = "colocated"`, `retain_snapshots = 1`,
 `ingest_export_interval = 0`, `reconcile_concurrency = 1`.
+
+
+## New: moving a misfiled file's rows with tiered storage on, for a file on the hot tier ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
+
+`POST /api/v1/rehome` now runs with `tiered_storage.enabled = true` on a standalone node
+whose hot tier is local storage, for a file that is on the hot tier. On a measurement
+with files on both tiers, a query for the misfiled rows' day went from 1 of 13 rows to
+13 of 13 across 12 jobs. A daily file spanning three days was split into three day
+files, and the next `POST /api/v1/tiering/migrate` moved them to cold storage with no
+scan in between.
+
+**A file on the cold tier is not moved in this release.** It is refused, as is a hot file
+that cold storage holds a copy of (a migration that kept its hot copy, a file restored
+to hot from a backup), whatever the file's name: splitting the hot copy would leave the
+cold one to be read beside the new files.
+
+**What changes with tiering on.**
+
+- **Tiering leaves a job's files on the hot tier.** The file being moved and the files
+  replacing it are not migration candidates while the job runs; a migration that had
+  already picked one stops before its copy, or removes its copy before the tier row
+  changes. `POST /api/v1/tiering/migrate` during a job reported no candidates for them
+  and moved them after it.
+- **The job writes the tier rows.** The new files are recorded as hot before queries are
+  sent to them, and the old file's row is removed with it. A measurement whose other
+  files are all on the cold tier is read from hot only when it has a hot row, so without
+  this the new files would not be read until the next tiering scan.
+- **Queries across both tiers are right throughout.** With eight clients querying a
+  measurement that has cold files through 12 jobs, 6,291 answers were right, 6 were the
+  "retry the query" 503, none was wrong. The process was killed part way 20 times; every
+  restart ended with the right rows, and with hot files and hot tier rows agreeing.
+- **With the Iceberg export on too**, Arc and the table agreed after each job and after
+  the new day files were migrated to an S3 cold tier.
+
+**What is refused, with the reason.**
+
+- A file being moved to cold storage, in cold storage, or with a copy there.
+- Any file while cold storage cannot be asked: `tiered_storage.cold.enabled = true` and
+  the cold tier could not be reached at start, or tiering is not running at all (no
+  licence). With no cold tier configured there is nothing to ask and the job runs.
+- A file with rows before 1970: tiering records no file in such a directory, so the new
+  files there would not be read.
+
+**Things to know.**
+
+- A job found at start past its commit, with tiered storage or the Iceberg export
+  configured, is taken up once startup has wired them, not inline. If tiered storage now
+  holds a copy of its file (the job was recorded under another configuration), a job
+  that had not switched queries is undone; one that had is finished, with an Error line
+  saying the cold copy must be removed by hand. If tiered storage cannot be asked at
+  that moment, a job that had not switched queries is kept as recorded for
+  `POST /api/v1/rehome/<id>/resume`.
+- `tiered_storage.cold.enabled = true` with the Iceberg export on and no usable cold tier
+  leaves the export unstarted (as before). A job then gets "the Iceberg export is not
+  started" as the export's answer at once instead of waiting for it.
+- A migration that meets a file a job owns before copying it skips it: it is not an
+  error and not "not attempted". One that had already copied the file when the job took
+  it removes the copy, logs a Warn, and counts that file as failed for the cycle.
+
+Run with `tiered_storage.default_hot_max_age_days = 1`, `migration_batch_size = 1` and
+`migration_max_concurrent = 1` (non-default) together with the Iceberg export.
 
 ## Fix: a migrate cut off by its time budget no longer leaves files read twice ([#1830](https://github.com/Basekick-Labs/arc/issues/1830))
 
