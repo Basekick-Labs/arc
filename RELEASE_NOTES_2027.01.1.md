@@ -2,6 +2,34 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: a continuous query's read of its source runs under the run's timeout ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
+
+A continuous query ran its aggregation statement without the run's context. The run's
+10-minute timeout therefore never reached DuckDB: the statement could wait for a pooled
+connection, and then run, with no bound at all. The statement now runs under the run's
+context, for scheduled and manual runs alike.
+
+What changes for a running system: a run that reaches its 10 minutes now fails instead
+of running on, and so does a run in flight when its continuous query is updated or
+deleted or the scheduler is reloaded. A failed run is recorded as failed, its window is
+not marked done, and the next run covers it.
+
+Found while preparing the move of misfiled files (#1825), which needs to know that no
+read planned before a file swap is still on its way to the files. For that:
+
+- **Reads in flight are counted.** Every query route, Flight SQL (which goes through
+  them) and every continuous query run is counted from before its SQL is built until its
+  statement has run. Nothing uses the count yet. The file move will wait on it, together
+  with separate handling for the readers it does not cover (the Iceberg export, DELETE,
+  retention, compaction, other nodes of a cluster).
+- **A query reads what it must leave out before it lists directories, not after.** The
+  list of files a compaction or a DELETE is replacing was read after the query had
+  worked out which hour and day directories exist, so a read could pair an older view of
+  the directories with a newer list of files to leave out, and miss rows. With the new
+  order the opposite pairing is possible: a replacement that lands in between is read
+  beside the file it replaces, and its rows count twice in that one read. That window
+  already existed during a compaction; it is slightly longer now. It was chosen because
+  a double count is visible and gone on the next read, where missing rows are silent.
 ## Fix: a leader elected late keeps its node record current ([#1829](https://github.com/Basekick-Labs/arc/issues/1829))
 
 A node writes its own record in cluster state (its addresses, version and role) only while it is the Raft leader; a follower's record is written by the leader when the follower joins. The leader used to write its record once, and only if it won an election within 30 seconds of starting. A writer elected later kept the record of its previous process. That happens after a full cold start where peers are not yet resolvable, and after a failover hours in.

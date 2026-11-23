@@ -31,6 +31,7 @@ import (
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/pruning"
 	"github.com/basekick-labs/arc/internal/queryregistry"
+	"github.com/basekick-labs/arc/internal/readgate"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
@@ -843,6 +844,10 @@ type QueryHandler struct {
 	// openCompactions lists compaction jobs whose output and inputs can both
 	// be in storage (compaction.OpenJobs); nil without a compaction manager.
 	openCompactions OpenCompactions
+	// reads counts the reads in flight on this handler's routes, on Flight
+	// SQL (which goes through them) and on the continuous queries that share
+	// it (Reads). Never nil after NewQueryHandler.
+	reads *readgate.Gate
 	// vanishedInvalidatedAt rate-limits the cache wipe after a partition
 	// removed mid-query (UnixNano; see invalidateAfterVanished).
 	vanishedInvalidatedAt atomic.Int64
@@ -1184,6 +1189,7 @@ func NewQueryHandler(db *database.DuckDB, storage storage.Backend, logger zerolo
 	}
 
 	return &QueryHandler{
+		reads:              &readgate.Gate{},
 		db:                 db,
 		storage:            storage,
 		pruner:             pruner,
@@ -1689,6 +1695,12 @@ type OpenCompactions interface {
 // SetOpenCompactions wires the compaction jobs a read must account for.
 func (h *QueryHandler) SetOpenCompactions(oc OpenCompactions) { h.openCompactions = oc }
 
+// Reads is the count of reads in flight: every query this handler serves
+// enters it before its SQL is built and leaves when the handler returns,
+// which is after its statement has run (internal/readgate).
+// Other readers of data files (continuous queries) share it.
+func (h *QueryHandler) Reads() *readgate.Gate { return h.reads }
+
 func (h *QueryHandler) openCompactionsGeneration() uint64 {
 	if h.openCompactions == nil {
 		return 0
@@ -1699,12 +1711,6 @@ func (h *QueryHandler) openCompactionsGeneration() uint64 {
 // openCompactionFileColumn names the file column the exclusion reads. Not
 // "filename": DuckDB refuses that option on a file that has such a column.
 const openCompactionFileColumn = "__arc_file"
-
-// excludeOpenCompactions is wrapOpenCompactions with this handler's
-// registry and storage.
-func (h *QueryHandler) excludeOpenCompactions(ctx context.Context, expr, database, measurement string) string {
-	return wrapOpenCompactions(ctx, h.openCompactions, h.storage, expr, database, measurement)
-}
 
 // openCompactionExclusions is the storage keys a read of database.measurement
 // must leave out (wrapOpenCompactions), for readers that list files
@@ -1726,22 +1732,41 @@ func (h *QueryHandler) openCompactionExclusions(ctx context.Context, prefix stri
 // The excluded files are still opened: DuckDB does not skip a file by its
 // name column. The result is volatile.
 func wrapOpenCompactions(ctx context.Context, oc OpenCompactions, backend storage.Backend, expr, database, measurement string) string {
-	if oc == nil || backend == nil || database == "" || measurement == "" {
+	if backend == nil {
 		return expr
+	}
+	return snapshotOpenCompactions(ctx, oc, database, measurement).apply(backend, expr)
+}
+
+// readExclusions is what a read of one measurement must leave out,
+// as the registry had it at one instant.
+type readExclusions struct {
+	keys []string
+}
+
+// snapshotOpenCompactions reads the registry for a measurement. It marks the
+// transform volatile when a job is open on it: whatever this read leaves out
+// now, the job's files can change before the next one, so it is never cached.
+func snapshotOpenCompactions(ctx context.Context, oc OpenCompactions, database, measurement string) readExclusions {
+	if oc == nil || database == "" || measurement == "" {
+		return readExclusions{}
 	}
 	prefix := database + "/" + measurement + "/"
 	if !oc.Open(prefix) {
-		return expr
+		return readExclusions{}
 	}
-	// An open job on this measurement: whatever this read leaves out now,
-	// its output can appear before the next one, so it is never cached.
 	pruning.MarkVolatile(ctx)
-	keys := oc.ExcludedFor(ctx, prefix)
-	if len(keys) == 0 {
+	return readExclusions{keys: oc.ExcludedFor(ctx, prefix)}
+}
+
+// apply filters expr, which contains one read_parquet(...) call and ends with
+// it, by file name.
+func (e readExclusions) apply(backend storage.Backend, expr string) string {
+	if backend == nil || len(e.keys) == 0 {
 		return expr
 	}
-	quoted := make([]string, 0, len(keys))
-	for _, k := range keys {
+	quoted := make([]string, 0, len(e.keys))
+	for _, k := range e.keys {
 		uri, err := storage.ObjectURI(backend, k)
 		if err != nil {
 			continue
@@ -2552,6 +2577,9 @@ localProcessing:
 	}
 	deadline := requestDeadline(effectiveTimeout)
 
+	// A read in flight, from before its SQL is built until its statement is
+	// bound (internal/readgate): a job that swaps files waits for it.
+	defer h.reads.Enter()()
 	// Convert SQL to storage paths
 	transformCtx, cancelTransform := transformContext(c.Context(), deadline)
 	convertedSQL, cached, emittedRefs, err := h.getTransformedSQLForQueryWithRefs(transformCtx, req.SQL, headerDB)
@@ -4561,7 +4589,21 @@ func joinKeyword(prefix string) string {
 // If tiering is enabled and cold tier has data, builds a UNION ALL query across tiers.
 func (h *QueryHandler) buildReadParquetExpr(ctx context.Context, path, originalSQL, keyword string) string {
 	db, meas := h.extractDBMeasurementFromPath(path)
-	return h.excludeOpenCompactions(ctx, h.buildReadParquetExprRaw(ctx, path, originalSQL, keyword), db, meas)
+	// The exclusions are read before the path list is built, not after: a
+	// list built first could miss a directory that did not exist yet, and
+	// then be paired with exclusions read after a job put files there and
+	// switched reads to them, leaving out both sides (#1825).
+	//
+	// The price is the other pairing: a replacement that lands after the
+	// snapshot, while the file it replaces is still there when the statement
+	// binds, is read beside it, and its rows count twice. Every source
+	// excludes a file only once its replacement is in storage, so this order
+	// can count twice and never zero; the window existed before
+	// (compaction/open_jobs.go) and now also spans the build of the path
+	// list. Twice is the side to err on: it is visible, and the next read is
+	// right.
+	excl := snapshotOpenCompactions(ctx, h.openCompactions, db, meas)
+	return excl.apply(h.storage, h.buildReadParquetExprRaw(ctx, path, originalSQL, keyword))
 }
 
 // buildReadParquetExprRaw is buildReadParquetExpr without the open
@@ -4627,7 +4669,9 @@ func (h *QueryHandler) buildReadParquetExprRaw(ctx context.Context, path, origin
 // This is the tiering-aware version used by the fast path that takes database and measurement
 // separately instead of a pre-constructed path, allowing proper tiering metadata lookup.
 func (h *QueryHandler) buildReadParquetExprForMeasurement(ctx context.Context, database, measurement, originalSQL, keyword string) string {
-	return h.excludeOpenCompactions(ctx, h.buildReadParquetExprForMeasurementRaw(ctx, database, measurement, originalSQL, keyword), database, measurement)
+	// Exclusions first, then the path list: see buildReadParquetExpr.
+	excl := snapshotOpenCompactions(ctx, h.openCompactions, database, measurement)
+	return excl.apply(h.storage, h.buildReadParquetExprForMeasurementRaw(ctx, database, measurement, originalSQL, keyword))
 }
 
 // buildReadParquetExprForMeasurementRaw is buildReadParquetExprForMeasurement
@@ -6023,6 +6067,9 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	}
 	deadline := requestDeadline(effectiveTimeout)
 
+	// A read in flight, from before its SQL is built until its statement is
+	// bound (internal/readgate): a job that swaps files waits for it.
+	defer h.reads.Enter()()
 	// Convert SQL to storage paths (with caching)
 	transformCtx, cancelTransform := transformContext(c.Context(), deadline)
 	convertedSQL, _, emittedRefs, err := h.getTransformedSQLWithRefs(transformCtx, req.SQL, headerDB)
@@ -6627,6 +6674,9 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	}
 	deadline := requestDeadline(effectiveTimeout)
 
+	// A read in flight, from before its SQL is built until its statement is
+	// bound (internal/readgate): a job that swaps files waits for it.
+	defer h.reads.Enter()()
 	// Convert SQL to storage paths (with caching)
 	// Note: This endpoint builds its own db.measurement SQL, so no header optimization
 	transformCtx, cancelTransform := transformContext(c.Context(), deadline)

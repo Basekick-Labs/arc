@@ -18,6 +18,7 @@ import (
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/fieldschema"
 	"github.com/basekick-labs/arc/internal/ingest"
+	"github.com/basekick-labs/arc/internal/readgate"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/pkg/models"
@@ -58,8 +59,11 @@ type ContinuousQueryHandler struct {
 	// openCompactions: compaction jobs whose output and inputs can both be in
 	// storage (optional; see wrapOpenCompactions).
 	openCompactions OpenCompactions
-	config          *config.ContinuousQueryConfig
-	sqliteDB        *sql.DB
+	// reads is the query handler's count of reads in flight (SetReads); nil
+	// counts nothing.
+	reads    *readgate.Gate
+	config   *config.ContinuousQueryConfig
+	sqliteDB *sql.DB
 	// ownsDB records whether this handler opened sqliteDB itself. When CQ
 	// shares the auth database (the default), the handle is borrowed and Close
 	// must leave it to its owner.
@@ -226,6 +230,10 @@ func (h *ContinuousQueryHandler) sourceRead(ctx context.Context, cq *ContinuousQ
 
 // SetOpenCompactions wires the compaction jobs a source read must account for.
 func (h *ContinuousQueryHandler) SetOpenCompactions(oc OpenCompactions) { h.openCompactions = oc }
+
+// SetReads shares the query handler's count of reads in flight, so a job that
+// swaps files waits for a running continuous query too.
+func (h *ContinuousQueryHandler) SetReads(g *readgate.Gate) { h.reads = g }
 
 func NewContinuousQueryHandler(db *database.DuckDB, storage storage.Backend, arrowBuffer *ingest.ArrowBuffer, cfg *config.ContinuousQueryConfig, authManager *auth.AuthManager, logger zerolog.Logger) (*ContinuousQueryHandler, error) {
 	// continuous_query.db_path defaults to the auth database. When it resolves
@@ -1533,12 +1541,23 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	// MaskStringLiterals, which ends a comment at its first `*/`, so it reads a
 	// nested comment as DuckDB does only because the validator never lets one
 	// through.
+	// A read in flight, from before its exclusions are read until its rows
+	// are in memory (internal/readgate). A job that swaps files waits for
+	// it: a run that bound after the swap with the exclusions from before it
+	// would aggregate without the swapped rows and write that back for good.
+	leaveRead := h.reads.Enter()
+	defer leaveRead()
 	wrappedQuery := wrapSourceMeasurement(query, cq.Database, cq.SourceMeasurement, h.sourceRead(ctx, cq, measurementPath))
 
 	h.logger.Debug().Str("query", sqlutil.ForLog(wrappedQuery)).Msg("Executing wrapped query")
 
 	// Execute query using DuckDB
-	rows, err := h.db.Query(wrappedQuery)
+	// With the run's context: without it the statement waited for a pooled
+	// connection, and ran, with no bound at all, past the run's own timeout.
+	// The same context ends when the scheduler stops this query's job (the
+	// query was updated or deleted, or the scheduler reloaded): the run then
+	// fails, its window is not marked done, and the next run covers it.
+	rows, err := h.db.QueryContext(ctx, wrappedQuery)
 	if err != nil {
 		return 0, fmt.Errorf("query execution failed: %w", err)
 	}
@@ -1548,6 +1567,7 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	if err != nil {
 		return 0, err
 	}
+	leaveRead() // the rows are read; what follows writes them
 
 	h.logger.Info().Int("record_count", len(records)).Msg("Aggregation query returned records")
 

@@ -697,6 +697,8 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	}
 	deadline := requestDeadline(effectiveTimeout)
 	transformCtx, cancelTransform := transformContext(c.Context(), deadline)
+	// A read in flight until its statement is bound (internal/readgate).
+	defer h.reads.Enter()()
 	convertedSQL, _, emittedRefs, err := h.getTransformedSQLWithRefs(transformCtx, req.SQL, headerDB)
 	cancelTransform()
 	if err != nil {
