@@ -367,6 +367,15 @@ func stageFile(ctx context.Context, store rehomeStore, stagedKey, localPath stri
 	return store.Sync(ctx, stagedKey)
 }
 
+// errJobKept: a job that has not switched reads cannot go on now, for a
+// reason that may pass (tiered storage could not be asked about its file).
+// It is kept as recorded.
+type errJobKept struct{ why string }
+
+func (e errJobKept) Error() string {
+	return "the job is kept as recorded and can be resumed later: " + e.why
+}
+
 // errUndone: the job was undone before anything changed for readers.
 var errUndone = errors.New("the job was undone: reads in flight did not end in time, and nothing had been moved")
 
@@ -748,6 +757,21 @@ func (h *RehomeHandler) recoverJob(ctx context.Context, store rehomeStore, job *
 	case rehome.StateCommitted:
 		if err := sourceWhole(ctx, store, job); err != nil {
 			return err
+		}
+		// Tiering is asked about the file again before the job goes on: it
+		// may have been recorded under another configuration, or kept at
+		// start because tiering could not be asked. Reads still use the
+		// source here, so both answers are safe to act on.
+		if cerr, known := h.tieringSource(ctx, job.Source.Key); cerr != nil {
+			if !known {
+				return errJobKept{cerr.Error()}
+			}
+			// Cold storage holds the file or a copy: going on would leave
+			// it read beside the new files.
+			if uerr := h.undo(ctx, job); uerr != nil {
+				return fmt.Errorf("%v; undoing the job: %w", cerr, uerr)
+			}
+			return cerr
 		}
 		for _, o := range job.Outputs {
 			moved, err := h.outputInPlace(ctx, store, o)

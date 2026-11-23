@@ -256,29 +256,13 @@ func (h *RehomeHandler) recoverLater(jobs []*rehome.Job) {
 			h.mu.Unlock()
 			log := h.logger.With().Str("job", rec.ID).Str("path", rec.Source.Key).Str("state", string(rec.State)).Logger()
 			state, reason, _ := h.runGuarded(h.ctx, job, func(ctx context.Context, _ *rehomeJob) (string, string, *rehomeReport) {
-				// The file as tiering has it now: the job may have been
-				// recorded under another configuration.
-				if cerr, known := h.tieringSource(ctx, rec.Source.Key); cerr != nil {
-					switch {
-					case rec.State == rehome.StateCommitted && known:
-						// Cold storage holds the file or a copy: going on
-						// would leave it read beside the new files.
-						store, _ := h.mover()
-						if uerr := h.undoIfSourceWhole(ctx, store, rec); uerr != nil {
-							log.Error().Err(uerr).Str("why", cerr.Error()).Msg("Re-home: a job found at start cannot go on with what tiered storage holds of its file, and could not be undone; it is kept as recorded. Check by hand")
-							return "stopped", "the job cannot go on and could not be undone; the server log has the error under this job's id", nil
-						}
-						log.Warn().Str("why", cerr.Error()).Msg("Re-home: a job found at start was undone, because of what tiered storage holds of its file now; the file is as it was")
-						return "refused", cerr.Error(), nil
-					case rec.State == rehome.StateCommitted:
-						// Could not be asked (cold storage unreachable just
-						// now, tiering not running): nothing is known to be
-						// wrong. Kept as recorded, for a resume.
-						log.Warn().Str("why", cerr.Error()).Msg("Re-home: a job found at start is kept as recorded, because tiered storage could not be asked about its file. POST /api/v1/rehome/<id>/resume takes it up once it can")
-						return "stopped", "tiered storage could not be asked about the job's file; the job is kept as recorded. POST /api/v1/rehome/" + rec.ID + "/resume takes it up again: " + cerr.Error(), nil
-					case known:
+				// A latched job is finished whatever tiering holds of its
+				// old file: reads already use the new files. Say what that
+				// leaves. (A committed job is asked about in recoverJob.)
+				if rec.State == rehome.StateLatched {
+					if cerr, known := h.tieringSource(ctx, rec.Source.Key); cerr != nil && known {
 						log.Error().Str("why", cerr.Error()).Msg("Re-home: a job found at start had switched reads to its new files, and tiered storage now holds its old file or a copy of it. The job is finished; the copy in cold storage holds the same rows as the new files and must be removed by hand, or they are read twice")
-					default:
+					} else if cerr != nil {
 						log.Warn().Str("why", cerr.Error()).Msg("Re-home: a job found at start had switched reads to its new files, and tiered storage could not be asked about its old file. The job is finished; if cold storage holds a copy of that file, its rows are read twice until the copy is removed")
 					}
 				}
@@ -289,6 +273,15 @@ func (h *RehomeHandler) recoverLater(jobs []*rehome.Job) {
 					return "done", "", nil
 				case errors.Is(err, context.Canceled):
 					return "stopped", "the server stopped while the job waited; its record is kept and the next start takes it up", nil
+				}
+				var kept errJobKept
+				if errors.As(err, &kept) {
+					log.Warn().Str("why", kept.why).Msg("Re-home: a job found at start is kept as recorded, because tiered storage could not be asked about its file. POST /api/v1/rehome/<id>/resume takes it up once it can")
+					return "stopped", kept.Error(), nil
+				}
+				if why, refused := rehome.IsRefused(err); refused {
+					log.Warn().Str("why", why).Msg("Re-home: a job found at start was undone, because of what tiered storage holds of its file now; the file is as it was")
+					return "refused", why, nil
 				}
 				log.Error().Err(err).Msg("Re-home: a job found at start could not be taken up. It is kept as recorded: its files stay out of compaction, DELETE and retention. The error says which file is not as the job recorded it; until that is put right by hand, reads may be missing that file's rows")
 				return "stopped", "the job could not be taken up and its record is kept; the server log has the error under this job's id", nil

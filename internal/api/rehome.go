@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -434,6 +435,10 @@ func (h *RehomeHandler) resumeJob(c *fiber.Ctx) error {
 			if err := h.resume(ctx, job.ID); err != nil {
 				if why, refused := rehome.IsRefused(err); refused {
 					return "refused", why, nil
+				}
+				var kept errJobKept
+				if errors.As(err, &kept) {
+					return "stopped", kept.Error(), nil
 				}
 				h.logger.Error().Err(err).Str("job", job.ID).Msg("Re-home: a job could not be taken up again; its record is kept")
 				return "stopped", "the job could not be taken up again and its record is kept; the server log has the error under this job's id", nil

@@ -255,7 +255,9 @@ cold one to be read beside the new files.
   that had not switched queries is undone; one that had is finished, with an Error line
   saying the cold copy must be removed by hand. If tiered storage cannot be asked at
   that moment, a job that had not switched queries is kept as recorded for
-  `POST /api/v1/rehome/<id>/resume`.
+  `POST /api/v1/rehome/<id>/resume`. The resume asks tiered storage again before it
+  goes on: the job stays as recorded while the answer cannot be had, and is undone if
+  cold storage turns out to hold its file.
 - `tiered_storage.cold.enabled = true` with the Iceberg export on and no usable cold tier
   leaves the export unstarted (as before). A job then gets "the Iceberg export is not
   started" as the export's answer at once instead of waiting for it.
