@@ -127,6 +127,9 @@ type Scheduler struct {
 	// confirms are the questions of re-home jobs waiting for a pass
 	// (scheduler_confirm.go), under reqMu.
 	confirms []*confirmWaiter
+	// confirmWake: a wake-up for a question held back by requestSpacing is
+	// pending. Under reqMu.
+	confirmWake bool
 	// requestedPaths holds storage keys or directory prefixes another Arc
 	// path removed, moved or rewrote (RequestReconcilePaths, #1727). The loop
 	// maps them onto measurements the last pass listed: callers name data the

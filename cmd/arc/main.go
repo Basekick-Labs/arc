@@ -4914,22 +4914,8 @@ func main() {
 			if err != nil {
 				return api.RehomeExportAnswer{}, err
 			}
-			// Asked before a job starts (no file): the pass itself must
-			// have gone through, not only an earlier one's publish.
-			if a.Clear() && (fileKey != "" || a.NotExported || a.Err == nil) {
-				return api.RehomeExportAnswer{Clear: true}, nil
-			}
-			why := a.Blocked
-			switch {
-			case why != "":
-			case a.Err != nil:
-				why = "the last pass of the table failed: " + a.Err.Error()
-			case !a.Published:
-				why = "the last pass of the table (" + a.Outcome + ") did not publish its version"
-			default:
-				why = "the published table still names the file (last pass: " + a.Outcome + ")"
-			}
-			return api.RehomeExportAnswer{Why: why}, nil
+			clear, why := a.Verdict(fileKey != "")
+			return api.RehomeExportAnswer{Clear: clear, Why: why}, nil
 		})
 		// #1731: with node-local warehouses (not icebergTopo.barrier, which is a shared bucket or
 		// shared_storage_mode), a database DELETE on the writer drops only the writer's tables.

@@ -3,6 +3,7 @@ package iceberg
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -386,5 +387,35 @@ func TestReconcileAndConfirm1825_SpacedPassesStillAnswer(t *testing.T) {
 	}
 	if time.Since(start) < 100*time.Millisecond {
 		t.Fatalf("answered after %s: the spacing was not kept", time.Since(start))
+	}
+}
+
+func TestPassAnswerVerdict1825(t *testing.T) {
+	failed := errors.New("schema conflict")
+	for _, tc := range []struct {
+		name  string
+		a     PassAnswer
+		asked bool
+		clear bool
+		why   string
+	}{
+		{"published without the file", PassAnswer{Published: true}, true, true, ""},
+		{"published, still naming the file", PassAnswer{Published: true, Named: true, Outcome: "unchanged"}, true, false, "still names the file"},
+		{"not published", PassAnswer{Outcome: "reconciled"}, true, false, "did not publish"},
+		{"blocked", PassAnswer{Blocked: "paused"}, true, false, "paused"},
+		{"not exported", PassAnswer{NotExported: true}, false, true, ""},
+		// The file is out of the published table and the pass failed on
+		// something else: the old file can go.
+		{"clear with a failed pass, about a file", PassAnswer{Published: true, Err: failed}, true, true, ""},
+		// Before the job: a table published by an earlier pass is not
+		// enough when this one failed.
+		{"before the job, the pass failed", PassAnswer{Published: true, Err: failed}, false, false, "schema conflict"},
+		{"before the job, the pass went through", PassAnswer{Published: true}, false, true, ""},
+		{"a failed pass that did not publish", PassAnswer{Err: failed}, true, false, "schema conflict"},
+	} {
+		clear, why := tc.a.Verdict(tc.asked)
+		if clear != tc.clear || !strings.Contains(why, tc.why) || (clear && why != "") {
+			t.Errorf("%s: clear %v, why %q", tc.name, clear, why)
+		}
 	}
 }

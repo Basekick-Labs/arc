@@ -45,6 +45,26 @@ func (a PassAnswer) Clear() bool {
 	return a.NotExported || (a.Blocked == "" && a.Published && !a.Named)
 }
 
+// Verdict is the answer as a re-home job uses it: whether it may go on, and
+// if not, what is in the way. asked is false for the question a job puts
+// before it changes anything, which names no file: there the pass itself
+// must have gone through, not only an earlier one's publish, since the job
+// is about to depend on the next one.
+func (a PassAnswer) Verdict(asked bool) (clear bool, why string) {
+	if a.Clear() && (asked || a.NotExported || a.Err == nil) {
+		return true, ""
+	}
+	switch {
+	case a.Blocked != "":
+		return false, a.Blocked
+	case a.Err != nil:
+		return false, "the last pass of the table failed: " + a.Err.Error()
+	case !a.Published:
+		return false, "the last pass of the table (" + a.Outcome + ") did not publish its version"
+	}
+	return false, "the published table still names the file (last pass: " + a.Outcome + ")"
+}
+
 type confirmWaiter struct {
 	m   Measurement
 	key string // the storage key asked about; "" asks only for a pass
@@ -139,15 +159,24 @@ func (s *Scheduler) serviceConfirms(ctx context.Context) {
 			if since := time.Since(s.lastReconciled[key]); since < spacing {
 				// Not now (requestSpacing): ask again when the spacing has
 				// passed, without holding the loop.
+				// One wake-up at a time, however often the loop comes by
+				// here before it fires.
 				s.reqMu.Lock()
 				s.confirms = append(s.confirms, w)
+				arm := !s.confirmWake
+				s.confirmWake = true
 				s.reqMu.Unlock()
-				time.AfterFunc(spacing-since, func() {
-					select {
-					case s.wake <- struct{}{}:
-					default:
-					}
-				})
+				if arm {
+					time.AfterFunc(spacing-since, func() {
+						s.reqMu.Lock()
+						s.confirmWake = false
+						s.reqMu.Unlock()
+						select {
+						case s.wake <- struct{}{}:
+						default:
+						}
+					})
+				}
 				continue
 			}
 		}
