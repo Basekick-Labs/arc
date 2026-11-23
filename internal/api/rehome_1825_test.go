@@ -124,14 +124,14 @@ func TestRehomeDryRun1825(t *testing.T) {
 		body string
 		code int
 	}{
-		"not a dry run":      {fmt.Sprintf(`{"path":%q}`, key), 400},
-		"path traversal":     {`{"path":"db/cpu/2026/11/18/23/../../../../../etc/passwd","dry_run":true}`, 400},
-		"absolute path":      {`{"path":"/etc/passwd","dry_run":true}`, 400},
-		"reserved directory": {`{"path":"_schema/cpu/2026/11/18/23/f.parquet","dry_run":true}`, 400},
-		"not a data shape":   {`{"path":"db/cpu/f.parquet","dry_run":true}`, 400},
-		"not parquet":        {`{"path":"db/cpu/2026/11/18/23/f.json","dry_run":true}`, 400},
-		"missing file":       {`{"path":"db/cpu/2026/11/18/23/nope.parquet","dry_run":true}`, 404},
-		"not JSON":           {`path=x`, 400},
+		"not a dry run, no swap wired": {fmt.Sprintf(`{"path":%q}`, key), 409},
+		"path traversal":               {`{"path":"db/cpu/2026/11/18/23/../../../../../etc/passwd","dry_run":true}`, 400},
+		"absolute path":                {`{"path":"/etc/passwd","dry_run":true}`, 400},
+		"reserved directory":           {`{"path":"_schema/cpu/2026/11/18/23/f.parquet","dry_run":true}`, 400},
+		"not a data shape":             {`{"path":"db/cpu/f.parquet","dry_run":true}`, 400},
+		"not parquet":                  {`{"path":"db/cpu/2026/11/18/23/f.json","dry_run":true}`, 400},
+		"missing file":                 {`{"path":"db/cpu/2026/11/18/23/nope.parquet","dry_run":true}`, 404},
+		"not JSON":                     {`path=x`, 400},
 	} {
 		if code, out := rehomeDo(t, app, "POST", "/api/v1/rehome", admin, c.body); code != c.code || out["error"] == nil {
 			t.Errorf("%s: %d %v, want %d with a reason", name, code, out, c.code)
