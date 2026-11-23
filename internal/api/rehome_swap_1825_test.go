@@ -297,9 +297,19 @@ func TestSwapWaitsForReadsInFlight1825(t *testing.T) {
 	var at atomic.Value
 	at.Store("")
 	r.h.afterStep = func(s string) { at.Store(s) }
+	// reaches waits for the job to get to a step, then gives it time to go
+	// past it: a job that does not wait would.
+	reaches := func(step string) {
+		t.Helper()
+		deadline := time.Now().Add(30 * time.Second)
+		for at.Load() != step && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
 	leave := r.gate.Enter() // a query from before the job, still on its way
 	id, _, _ := r.start()
-	time.Sleep(400 * time.Millisecond)
+	reaches("committed")
 	if got := at.Load(); got != "committed" {
 		t.Fatalf("with a read from before the job in flight the job is at %q, want it waiting after committed", got)
 	}
@@ -309,7 +319,7 @@ func TestSwapWaitsForReadsInFlight1825(t *testing.T) {
 	// A read that enters now, and stays: it is from before the latch.
 	second := r.gate.Enter()
 	leave()
-	time.Sleep(400 * time.Millisecond)
+	reaches("latched")
 	if got := at.Load(); got != "latched" {
 		t.Fatalf("with a read from before the latch in flight the job is at %q, want it waiting after latched", got)
 	}
