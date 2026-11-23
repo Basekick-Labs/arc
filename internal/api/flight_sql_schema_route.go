@@ -127,6 +127,8 @@ func (h *QueryHandler) describeFlightSQLSchema(c *fiber.Ctx, binds chan struct{}
 	waited := time.Since(waitStart)
 	start := time.Now()
 
+	// A read in flight until its statement is bound (internal/readgate).
+	defer h.reads.Enter()()
 	convertedSQL, _, emittedRefs, err := h.getTransformedSQLWithRefs(ctx, req.SQL, headerDB)
 	if err != nil {
 		if errors.Is(err, errQueryTimedOut) {

@@ -2,6 +2,26 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: a continuous query's read of its source runs under the run's timeout ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
+
+A continuous query ran its aggregation statement without the run's context. The run's
+10-minute timeout therefore never reached DuckDB: the statement could wait for a pooled
+connection, and then run, with no bound at all, while the scheduler had already given
+the run up. The statement now runs under the run's context, so a run that times out or
+is cancelled stops its statement.
+
+Found while preparing the move of misfiled files (#1825), which needs to know that no
+read planned before a file swap is still on its way to the files. For that:
+
+- **Reads in flight are counted.** Every query route, Flight SQL (which goes through
+  them) and every continuous query run is counted from before its SQL is built until its
+  statement is bound. Nothing uses the count yet; the file move will wait on it.
+- **A query reads what it must leave out before it lists directories, not after.** The
+  list of files a compaction or a DELETE is replacing was read after the query had
+  worked out which hour and day directories exist. A read could pair an older view of
+  the directories with a newer list of files to leave out. No wrong result from this was
+  observed; the order is fixed because the file move would make it reachable.
+
 ## New: a dry run that shows where a misfiled file's rows belong ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
 
 A file is misfiled when it holds rows whose time is outside the hour or day of the

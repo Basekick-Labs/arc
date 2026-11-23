@@ -4924,6 +4924,8 @@ func main() {
 		if err == nil {
 			cqHandler.SetFieldSchema(fieldSchemaRegistry)
 			cqHandler.SetOpenCompactions(openCompactions)
+			// The same count of reads in flight as queries (#1825).
+			cqHandler.SetReads(queryHandler.Reads())
 		}
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize continuous query handler")
