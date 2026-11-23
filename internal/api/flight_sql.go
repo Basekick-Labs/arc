@@ -507,6 +507,7 @@ func (s *FlightSQLServer) drainBridge(drain time.Duration) error {
 	tick := time.NewTicker(flightSQLBridgeDrainPoll)
 	defer tick.Stop()
 	var err error
+	running := -1
 wait:
 	for {
 		select {
@@ -514,19 +515,27 @@ wait:
 			break wait
 		case <-tick.C:
 			if s.bridgeConns.active() == 0 {
+				// Nothing in flight: that is the result. It is not read
+				// again after the join below, where a request that was
+				// sent before the queries were cancelled could still
+				// show up, and be reported as outliving a drain that
+				// never ran its length.
+				running = 0
 				cancel()
 				err = <-done
 				break wait
 			}
 		}
 	}
-	running := s.bridgeConns.active()
+	if running < 0 {
+		running = s.bridgeConns.active()
+	}
 	// Whatever is left is closed: fasthttp's shutdown has returned and no
 	// longer closes a connection when its request ends.
 	s.bridgeConns.closeAll()
 	if running > 0 {
-		s.logger.Warn().Int("requests", running).Dur("drain", drain).Msg("Flight SQL shutdown: closed bridge connections whose requests were still running")
-		return fmt.Errorf("%d requests still running after %s", running, drain)
+		s.logger.Warn().Int("requests", running).Dur("drain", drain).Msg("Flight SQL shutdown: requests still running on the bridge after its drain, their connections were closed")
+		return fmt.Errorf("requests still running after the %s drain: %d", drain, running)
 	}
 	if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
 		return err
