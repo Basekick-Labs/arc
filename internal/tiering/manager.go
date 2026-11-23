@@ -123,7 +123,9 @@ type Manager struct {
 	// manifest, when non-nil, is told about every hot copy tiering removes,
 	// before it is removed. See ManagerConfig. manifestMu serializes
 	// proposals and guards lastManifestProposal, which paces them.
-	manifest             ManifestCoordinator
+	manifest ManifestCoordinator
+	// owned reports a file a re-home job owns (SetOwnedFilter); nil: none.
+	owned                func(path string) bool
 	manifestMu           sync.Mutex
 	lastManifestProposal time.Time
 
@@ -1804,7 +1806,7 @@ func (m *Manager) cleanupHotOnlyColdCopies(ctx context.Context, objects []storag
 			m.logger.Warn().Err(err).Str("path", object.Path).Msg("Could not inspect hot-only migration copy; preserving it")
 			continue
 		}
-		if file == nil || file.Tier != TierHot || file.Database != info.Database || file.QuarantinedAt != nil || file.SizeBytes != object.Size || m.heldByCompaction(file.Path) {
+		if file == nil || file.Tier != TierHot || file.Database != info.Database || file.QuarantinedAt != nil || file.SizeBytes != object.Size || m.heldElsewhere(file.Path) {
 			continue
 		}
 		if m.manifest != nil {
@@ -1817,7 +1819,7 @@ func (m *Manager) cleanupHotOnlyColdCopies(ctx context.Context, objects []storag
 			m.logger.Warn().Err(err).Str("path", file.Path).Msg("Could not verify hot copy for hot-only cold object; preserving it")
 			continue
 		}
-		if !hotExists || !m.IsHotOnly(ctx, info.Database) || m.roleGated() || m.heldByCompaction(file.Path) {
+		if !hotExists || !m.IsHotOnly(ctx, info.Database) || m.roleGated() || m.heldElsewhere(file.Path) {
 			continue
 		}
 		// runCycle holds cycleRunning across this pass, so migration cannot

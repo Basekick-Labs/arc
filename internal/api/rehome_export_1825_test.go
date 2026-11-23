@@ -49,6 +49,7 @@ func withExport1825(t *testing.T, r *swapRig, answer func(n int, fileKey string)
 	f := &fakeExport1825{answer: answer}
 	r.swap.ExportExpected = true
 	r.h.SetExport(f.ask)
+	r.h.Wired()
 	return f
 }
 
@@ -166,6 +167,7 @@ func TestSwapRefusedWhenTheExportCannotPublish1825(t *testing.T) {
 func TestSwapRefusedWhenTheExportIsNotRunning1825(t *testing.T) {
 	r := newSwapRig(t)
 	r.swap.ExportExpected = true
+	r.h.Wired()
 	id, _, _ := r.start()
 	if job := r.wait(id); job["state"] != "refused" || !strings.Contains(fmt.Sprint(job["reason"]), "not running on this node") {
 		t.Fatalf("job: %v", job)
@@ -283,6 +285,7 @@ func TestRecoveryWaitsForTheExport1825(t *testing.T) {
 			}
 			f := &fakeExport1825{answer: func(int, string) (RehomeExportAnswer, error) { return RehomeExportAnswer{Clear: true}, nil }}
 			r.h.SetExport(f.ask)
+			r.h.Wired()
 			id := r.reg.Jobs()[0].ID
 			if job := r.wait(id); job["state"] != "done" {
 				t.Fatalf("job: %v", job)

@@ -70,6 +70,11 @@ type RehomeSwap struct {
 	// the file a job moves (rehome_export.go). The export itself is bound
 	// later, with SetExport.
 	ExportExpected bool
+	// TieringExpected: tiered storage is enabled in the configuration
+	// (rehome_tiering.go). Whether a manager runs is known later
+	// (SetTiering). ColdConfigured: a cold tier is enabled too.
+	TieringExpected bool
+	ColdConfigured  bool
 }
 
 const (
@@ -107,6 +112,9 @@ func (h *RehomeHandler) swapRefusal() string {
 		if why := h.swap.Refusal(); why != "" {
 			return why
 		}
+	}
+	if h.lateBound() && !h.isWired() {
+		return "the server is still starting; retry in a moment"
 	}
 	if h.swap.BackupRunning != nil && h.swap.BackupRunning() {
 		return "a backup or a restore is running; retry once it has ended"
@@ -237,6 +245,11 @@ func (h *RehomeHandler) runSwap(ctx context.Context, job *rehomeJob) (state, rea
 	} else {
 		check()
 	}
+	// The job owns the file now, so tiering leaves it where it is: what
+	// tiering says about it here holds for the job's life.
+	if checkErr == nil {
+		checkErr = h.checkTieringSource(ctx, src.Key)
+	}
 	if checkErr != nil {
 		return fail("checking the file", checkErr)
 	}
@@ -275,6 +288,11 @@ func (h *RehomeHandler) runSwap(ctx context.Context, job *rehomeJob) (state, rea
 
 	// 3. Stage.
 	refs := make([]rehome.FileRef, len(outs))
+	for _, o := range outs {
+		if err := h.canRecordTier(o.Dir + "/x.parquet"); err != nil {
+			return refuse(fmt.Sprintf("%s holds rows that belong in %s, which tiered storage cannot record (%v): with tiered storage on, the files there would not be read. Not supported in this version", src.Key, o.Dir, err))
+		}
+	}
 	for i, o := range outs {
 		sum, err := fileSHA256(o.LocalPath)
 		if err != nil {
@@ -431,6 +449,11 @@ func (h *RehomeHandler) finishSwap(ctx context.Context, id string) error {
 		if h.swap.InvalidateCaches != nil {
 			h.swap.InvalidateCaches()
 		}
+		// With tiered storage, reads take a measurement's tiers from its
+		// tier rows: the outputs have theirs before reads are sent to them.
+		if err := h.recordTierRows(ctx, job); err != nil {
+			return err
+		}
 		// 6. Reads start leaving the source out.
 		if err := reg.Advance(ctx, id, rehome.StateLatched); err != nil {
 			return err
@@ -439,7 +462,13 @@ func (h *RehomeHandler) finishSwap(ctx context.Context, id string) error {
 		job.State = rehome.StateLatched
 	}
 
-	// Latched. Every output must be there before the source goes.
+	// Latched. A job latched while no tiering manager ran, and taken up
+	// with one, has no rows for its outputs yet; recording them is safe to
+	// repeat.
+	if err := h.recordTierRows(ctx, job); err != nil {
+		return err
+	}
+	// Every output must be there before the source goes.
 	for _, o := range job.Outputs {
 		if n, err := store.StatFile(bg, o.Key); err != nil || n != o.Size {
 			return fmt.Errorf("output %s is not in place at its size (%d, want %d, err %v); the source is kept and left out of reads: restore the output or the source by hand", o.Key, n, o.Size, err)
@@ -492,6 +521,7 @@ func (h *RehomeHandler) finishSwap(ctx context.Context, id string) error {
 		}
 	}
 	h.hook("removed")
+	h.forgetTierRows(bg, id, []string{job.Source.Key})
 	if err := reg.End(bg, id); err != nil {
 		return err
 	}
@@ -548,6 +578,12 @@ func (h *RehomeHandler) undo(ctx context.Context, job *rehome.Job) error {
 			}
 		}
 	}
+	// Their rows too, if the job had got as far as writing them.
+	outs := make([]string, len(job.Outputs))
+	for i, o := range job.Outputs {
+		outs[i] = o.Key
+	}
+	h.forgetTierRows(ctx, job.ID, outs)
 	if err := h.swap.Registry.End(ctx, job.ID); err != nil {
 		return err
 	}
@@ -564,11 +600,11 @@ func (h *RehomeHandler) undo(ctx context.Context, job *rehome.Job) error {
 // removed without waiting for reads, because no read from before the stop is
 // alive.
 //
-// With the Iceberg export enabled, a job found past its commit is not
-// finished here: it needs the export, which is built later. Recover hands
-// those to a goroutine that holds the job slot and does nothing to them
-// until SetExport is called (recoverLater); until then each is as recorded,
-// which reads see as every row once.
+// With the Iceberg export or tiered storage enabled, a job found past its
+// commit is not finished here: it needs them, and they are built later.
+// Recover hands those to a goroutine that holds the job slot and does
+// nothing to them until Wired is called (recoverLater); until then each is
+// as recorded, which reads see as every row once.
 func (h *RehomeHandler) Recover(ctx context.Context) error {
 	if h.swap == nil || h.swap.Registry == nil {
 		return nil
@@ -580,9 +616,13 @@ func (h *RehomeHandler) Recover(ctx context.Context) error {
 		return fmt.Errorf("%d re-home job(s) are recorded under %s/ and this node's storage is not local: they cannot be taken up", len(jobs), rehome.JournalRoot)
 	}
 	// A journal from a run under another configuration: this deployment is
-	// one a swap is refused on (it became a cluster node, or tiering or edge
-	// sync was turned on). Finishing a job would put files in place that the
-	// cluster manifest or the tier rows know nothing of.
+	// one a swap is refused on (it became a cluster node, or edge sync was
+	// turned on). Finishing a job would put files in place that the cluster
+	// manifest or the spokes know nothing of.
+	//
+	// Tiered storage turned on across the restart is not such a case: the
+	// job is taken up once tiering is known (recoverLater), which asks
+	// tiering about the job's file first.
 	//
 	// The Iceberg export turned on or off across the restart is not such a
 	// case. Turned on: the job is finished as any job is with the export on
@@ -596,12 +636,12 @@ func (h *RehomeHandler) Recover(ctx context.Context) error {
 	var later []*rehome.Job
 	for _, job := range jobs {
 		log := h.logger.With().Str("job", job.ID).Str("path", job.Source.Key).Str("state", string(job.State)).Logger()
-		if refused == "" && h.exportExpected() && job.State != rehome.StateStaged {
-			// Past its commit, with the Iceberg export on: the job needs
-			// the export, which does not exist yet. Reads are right in
-			// either state meanwhile.
+		if refused == "" && h.lateBound() && job.State != rehome.StateStaged {
+			// Past its commit, with the Iceberg export or tiered storage
+			// on: the job needs them, and neither exists yet. Reads are
+			// right in either state meanwhile.
 			later = append(later, job)
-			log.Info().Msg("Re-home: a job found at start is taken up once the Iceberg export is running")
+			log.Info().Msg("Re-home: a job found at start is taken up once the Iceberg export and tiered storage are running")
 			continue
 		}
 		if refused != "" {

@@ -4569,12 +4569,14 @@ func main() {
 		// below); from the configuration alone a job found at start knows
 		// to wait for it.
 		ExportExpected: cfg.Iceberg.Enabled,
+		// Tiered storage is built further down too (SetTiering), and may
+		// turn out not to run (no licence).
+		TieringExpected: cfg.TieredStorage.Enabled,
+		ColdConfigured:  cfg.TieredStorage.Enabled && cfg.TieredStorage.Cold.Enabled,
 		Refusal: func() string {
 			switch {
 			case cfg.Cluster.Enabled:
 				return "moving a file's rows is not available on a cluster in this version"
-			case cfg.TieredStorage.Enabled:
-				return "moving a file's rows is not available with tiered storage in this version"
 			case cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Active() || cfg.EdgeSync.Spoke.Active():
 				return "moving a file's rows is not available with edge sync in this version"
 			}
@@ -5488,6 +5490,10 @@ func main() {
 						tieringDB.Close()
 					}
 				} else {
+					// #1825: a re-home job's files stay on the hot tier while
+					// it runs. Before Start, so the startup scan and the first
+					// cycle already see a job found at start.
+					tieringManager.SetOwnedFilter(rehomeRegistry.Owns)
 					// /health "tiering": cold rows whose object is gone (#1551).
 					// ColdMissingObjects is nil until a cold sync has checked.
 					server.SetColdMissingObjects(tieringManager.ColdMissingObjects)
@@ -5857,8 +5863,17 @@ func main() {
 		}
 		if startExport {
 			icebergStart()
+		} else {
+			rehomeHandler.SetExportNotStarted("the Iceberg export is not started on this node: tiered_storage.cold is enabled and the export cannot track the cold tier (the server log has the reason)")
 		}
 	}
+	// #1825: everything a re-home job may need is bound now, or known absent:
+	// the Iceberg export above, tiering here. Jobs found at start past their
+	// commit are taken up from this point, and new ones accepted.
+	if tieringManager != nil {
+		rehomeHandler.SetTiering(tieringManager)
+	}
+	rehomeHandler.Wired()
 
 	// Initialize Backup/Restore (OSS feature — no license required)
 	if cfg.Backup.Enabled {

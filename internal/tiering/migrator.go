@@ -255,7 +255,9 @@ func (m *Migrator) FindCandidatesFiltered(ctx context.Context, fromTier, toTier 
 			continue
 		}
 
-		if m.manager.heldByCompaction(file.Path) {
+		if m.manager.heldElsewhere(file.Path) {
+			m.logger.Debug().Str("path", file.Path).
+				Msg("Skipping a file a compaction or a re-home job owns for cold migration")
 			continue
 		}
 		if m.supersededByDelete(file.Path, retired[file.Path]) {
@@ -279,15 +281,23 @@ func (m *Migrator) FindCandidatesFiltered(ctx context.Context, fromTier, toTier 
 	return candidates, nil
 }
 
-// dropTakenOver removes from files those a compaction committed over since
-// their copy (#1207 d2a2b): their rows are in the compaction's output, so the
-// cold copy goes and the hot copy is the finisher's to delete.
+// dropTakenOver removes from files those another operation took over since
+// their copy, and makes them hot again: the cold copy goes and the row is set
+// back.
+//
+//   - A compaction that committed over the file (#1207 d2a2b): its rows are
+//     in the compaction's output, and the hot copy is the finisher's to
+//     delete.
+//   - A re-home job that owns the file (#1825). This is reached only for a
+//     file the job does not end up taking: the job's check of its source
+//     (CheckRehomeSource) is refused while the move claim is held, which is
+//     until after this. The hot copy stays, as a hot file.
 func (m *Migrator) dropTakenOver(ctx context.Context, files []MigrationCandidate) []MigrationCandidate {
 	kept := files[:0:0]
 	var removed []string
 	defer func() { m.manager.reportColdRemoved(removed) }() // once for the chunk
 	for _, c := range files {
-		if !m.manager.heldByCompaction(c.Path) {
+		if !m.manager.heldElsewhere(c.Path) {
 			kept = append(kept, c)
 			continue
 		}
@@ -296,22 +306,27 @@ func (m *Migrator) dropTakenOver(ctx context.Context, files []MigrationCandidate
 		m.manager.BeginColdRemoval()
 		if dst := m.manager.GetBackendForTier(c.TargetTier); dst != nil {
 			if err := dst.Delete(ctx, c.Path); err != nil && !storage.IsNotFound(err) {
-				m.logger.Warn().Err(err).Str("path", c.Path).Msg("Could not remove the cold copy of a file a compaction took over")
+				m.logger.Warn().Err(err).Str("path", c.Path).Msg("Could not remove the cold copy of a file a compaction or a re-home job took over")
 			} else {
 				removed = append(removed, c.Path)
 			}
 		}
 		if err := m.manager.metadata.UpdateTier(ctx, c.Path, c.CurrentTier); err != nil {
-			m.logger.Warn().Err(err).Str("path", c.Path).Msg("Could not record a file a compaction took over as hot again")
+			m.logger.Warn().Err(err).Str("path", c.Path).Msg("Could not record a file a compaction or a re-home job took over as hot again")
 		}
 		m.manager.EndColdRemoval()
-		m.logger.Info().Str("path", c.Path).Msg("A compaction took over a file during its migration; its cold copy was removed")
+		m.logger.Info().Str("path", c.Path).Msg("A compaction or a re-home job took over a file during its migration; it stays on the hot tier")
 	}
 	return kept
 }
 
-// errHeldByCompaction: a compaction took the file over during its migration.
-var errHeldByCompaction = errors.New("a compaction took the file over during its migration")
+// errHeldByCompaction: a compaction or a re-home job took the file over
+// during its migration.
+var errHeldByCompaction = errors.New("a compaction or a re-home job took the file over during its migration")
+
+// errHeldBeforeCopy: a compaction or a re-home job owns the file; nothing was
+// copied, and it migrates on a later cycle.
+var errHeldBeforeCopy = errors.New("a compaction or a re-home job owns the file; it migrates on a later cycle")
 
 // dropSupersededCopy deletes the cold copy of a file whose rows a DELETE took
 // out. If it stays, the next cold sync records it as a cold file and the
@@ -541,6 +556,16 @@ func (m *Migrator) migrateBatch(ctx context.Context, candidates []MigrationCandi
 			defer sem.Release(1)
 
 			if err := m.copyAndFlip(ctx, c); err != nil {
+				if errors.Is(err, errHeldBeforeCopy) {
+					// Not a failure, and not a file the run's budget left
+					// behind (which is what not-attempted reports): another
+					// operation owns it. Its claim goes now, not with the
+					// batch's: the owner may be about to ask about this very
+					// file (CheckRehomeSource), and nothing of it is moving.
+					m.manager.claims.releaseMove(c.Path)
+					m.logger.Debug().Str("path", c.Path).Msg("A compaction or a re-home job owns the file; it stays hot this cycle")
+					return
+				}
 				if errors.Is(err, errCopyCutOff) {
 					// Not a failure of the file: the run ran out of time
 					// while copying it. It stays hot, with no cold row.
@@ -557,7 +582,7 @@ func (m *Migrator) migrateBatch(ctx context.Context, candidates []MigrationCandi
 				// say so the one time it happens.
 				// Not-primary, replaced and changed-row outcomes logged their
 				// own Warn; they are not failures of the copy.
-				if errors.Is(err, errNotPrimary) || errors.Is(err, errReplacedByDelete) || errors.Is(err, errTierChanged) {
+				if errors.Is(err, errNotPrimary) || errors.Is(err, errReplacedByDelete) || errors.Is(err, errTierChanged) || errors.Is(err, errHeldByCompaction) {
 					mu.Lock()
 					failed++
 					mu.Unlock()
@@ -770,8 +795,8 @@ func (m *Migrator) copyAndFlip(ctx context.Context, candidate MigrationCandidate
 	if dstBackend == nil {
 		return fmt.Errorf("destination backend not available for tier: %s", candidate.TargetTier)
 	}
-	if m.manager.heldByCompaction(candidate.Path) {
-		return fmt.Errorf("%s is being compacted; it migrates on a later cycle", candidate.Path)
+	if m.manager.heldElsewhere(candidate.Path) {
+		return fmt.Errorf("%s: %w", candidate.Path, errHeldBeforeCopy)
 	}
 
 	// The row's size is what the last scan recorded; a file rewritten at
@@ -851,16 +876,17 @@ func (m *Migrator) copyAndFlip(ctx context.Context, candidate MigrationCandidate
 	// A compaction may have committed over the file during the copy: its
 	// rows are in the compaction's output now, and a cold copy would hold
 	// them twice (#1207 d2a2b).
-	if m.manager.heldByCompaction(candidate.Path) {
+	if m.manager.heldElsewhere(candidate.Path) {
 		if migrationID > 0 {
 			m.manager.metadata.CompleteMigration(ctx, migrationID, errHeldByCompaction)
 		}
 		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer dcancel()
 		if err := dstBackend.Delete(dctx, candidate.Path); err != nil && !storage.IsNotFound(err) {
-			m.logger.Warn().Err(err).Str("path", candidate.Path).Msg("Could not remove the cold copy of a file a compaction took over")
+			m.logger.Warn().Err(err).Str("path", candidate.Path).Msg("Could not remove the cold copy of a file a compaction or a re-home job took over")
 		} else {
 			m.manager.reportColdRemoved([]string{candidate.Path})
+			m.logger.Warn().Str("path", candidate.Path).Msg("A compaction or a re-home job took over a file while it was copied to cold storage; the copy was removed and the file stays hot")
 		}
 		return fmt.Errorf("%s: %w", candidate.Path, errHeldByCompaction)
 	}
@@ -892,9 +918,11 @@ func (m *Migrator) copyAndFlip(ctx context.Context, candidate MigrationCandidate
 		return fail(fmt.Errorf("%s: %w", candidate.Path, errReplacedByDelete))
 	}
 	// Standalone, nothing but this node's DELETE (or its retention) removes
-	// a hot file, so a source gone during the copy means its rows were
+	// a hot file during its copy, so a source gone then means its rows were
 	// deleted: a leftover whose journal record was cleared mid-copy, or a
-	// file retention removed. Clusters cannot tell that from another node's
+	// file retention removed. (A re-home job removes hot files too, but not
+	// one being copied: it checks its source against the move claim held
+	// here, CheckRehomeSource.) Clusters cannot tell that from another node's
 	// move, so there only the evidence above counts.
 	if m.manager.manifest == nil && m.manager.clusterGate == nil {
 		size, err := m.manager.hotBackend.StatFile(bctx, candidate.Path)

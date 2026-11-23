@@ -58,7 +58,7 @@ var (
 )
 
 // SetExport binds the Iceberg export. Call it once the export's scheduler
-// exists; jobs found at start with the export expected wait for it.
+// exists, and before Wired, which is what jobs found at start wait for.
 func (h *RehomeHandler) SetExport(f RehomeExportFunc) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -91,6 +91,9 @@ func (h *RehomeHandler) exportReady(ctx context.Context, job *rehome.Job) string
 	export := h.exportFunc()
 	if export == nil {
 		return "the Iceberg export is enabled and is not running on this node"
+	}
+	if why := h.exportNotStarted(); why != "" {
+		return why
 	}
 	actx, cancel := context.WithTimeout(ctx, rehomeExportAsk)
 	defer cancel()
@@ -145,9 +148,17 @@ func (h *RehomeHandler) waitExport(ctx context.Context, job *rehome.Job) error {
 		pause    = rehomeExportRetry
 	)
 	for {
-		actx, cancel := context.WithTimeout(ctx, rehomeExportAsk)
-		ans, err := export(actx, job.Database, job.Measurement, job.Source.Key)
-		cancel()
+		var ans RehomeExportAnswer
+		var err error
+		if why := h.exportNotStarted(); why != "" {
+			// Nothing runs passes: that is an answer, and no listing of
+			// the measurement is in flight.
+			ans = RehomeExportAnswer{Why: why}
+		} else {
+			actx, cancel := context.WithTimeout(ctx, rehomeExportAsk)
+			ans, err = export(actx, job.Database, job.Measurement, job.Source.Key)
+			cancel()
+		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -201,9 +212,10 @@ func (h *RehomeHandler) waiveExportWait(id string) bool {
 	return true
 }
 
-// recoverLater takes up, once the export is bound, the jobs found at start
-// that need it: recovery runs before the export's scheduler exists, and a
-// job past its commit must not remove its old file without asking.
+// recoverLater takes up, once startup has bound the Iceberg export and
+// tiering or found them absent (Wired), the jobs found at start that need
+// them: recovery runs before either exists, and a job past its commit must
+// not remove its old file, or send reads to new ones, without asking.
 func (h *RehomeHandler) recoverLater(jobs []*rehome.Job) {
 	h.mu.Lock()
 	h.running = true
@@ -216,7 +228,7 @@ func (h *RehomeHandler) recoverLater(jobs []*rehome.Job) {
 	h.mu.Unlock()
 	h.mu.Lock()
 	for _, rec := range jobs {
-		h.jobs[rec.ID].WaitingFor = "the Iceberg export, to start"
+		h.jobs[rec.ID].WaitingFor = "the server, to finish starting"
 	}
 	h.mu.Unlock()
 	h.done.Add(1)
@@ -227,10 +239,11 @@ func (h *RehomeHandler) recoverLater(jobs []*rehome.Job) {
 			h.running = false
 			h.mu.Unlock()
 		}()
-		// Nothing is done to a job before the export exists: not its moves,
-		// not its latch. The rest of the process is still being wired.
+		// Nothing is done to a job before the export and tiering exist or
+		// are known absent: not its moves, not its latch. The rest of the
+		// process is still being wired.
 		select {
-		case <-h.exportBound:
+		case <-h.wired:
 		case <-h.ctx.Done():
 			return
 		}
@@ -243,6 +256,32 @@ func (h *RehomeHandler) recoverLater(jobs []*rehome.Job) {
 			h.mu.Unlock()
 			log := h.logger.With().Str("job", rec.ID).Str("path", rec.Source.Key).Str("state", string(rec.State)).Logger()
 			state, reason, _ := h.runGuarded(h.ctx, job, func(ctx context.Context, _ *rehomeJob) (string, string, *rehomeReport) {
+				// The file as tiering has it now: the job may have been
+				// recorded under another configuration.
+				if cerr, known := h.tieringSource(ctx, rec.Source.Key); cerr != nil {
+					switch {
+					case rec.State == rehome.StateCommitted && known:
+						// Cold storage holds the file or a copy: going on
+						// would leave it read beside the new files.
+						store, _ := h.mover()
+						if uerr := h.undoIfSourceWhole(ctx, store, rec); uerr != nil {
+							log.Error().Err(uerr).Str("why", cerr.Error()).Msg("Re-home: a job found at start cannot go on with what tiered storage holds of its file, and could not be undone; it is kept as recorded. Check by hand")
+							return "stopped", "the job cannot go on and could not be undone; the server log has the error under this job's id", nil
+						}
+						log.Warn().Str("why", cerr.Error()).Msg("Re-home: a job found at start was undone, because of what tiered storage holds of its file now; the file is as it was")
+						return "refused", cerr.Error(), nil
+					case rec.State == rehome.StateCommitted:
+						// Could not be asked (cold storage unreachable just
+						// now, tiering not running): nothing is known to be
+						// wrong. Kept as recorded, for a resume.
+						log.Warn().Str("why", cerr.Error()).Msg("Re-home: a job found at start is kept as recorded, because tiered storage could not be asked about its file. POST /api/v1/rehome/<id>/resume takes it up once it can")
+						return "stopped", "tiered storage could not be asked about the job's file; the job is kept as recorded. POST /api/v1/rehome/" + rec.ID + "/resume takes it up again: " + cerr.Error(), nil
+					case known:
+						log.Error().Str("why", cerr.Error()).Msg("Re-home: a job found at start had switched reads to its new files, and tiered storage now holds its old file or a copy of it. The job is finished; the copy in cold storage holds the same rows as the new files and must be removed by hand, or they are read twice")
+					default:
+						log.Warn().Str("why", cerr.Error()).Msg("Re-home: a job found at start had switched reads to its new files, and tiered storage could not be asked about its old file. The job is finished; if cold storage holds a copy of that file, its rows are read twice until the copy is removed")
+					}
+				}
 				err := h.resume(ctx, rec.ID)
 				switch {
 				case err == nil:

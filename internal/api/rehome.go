@@ -85,6 +85,16 @@ type RehomeHandler struct {
 	waitingExport string
 	skipExport    bool
 	skipCh        chan struct{}
+	// exportDown is why the export is bound and will not run ("" when it
+	// runs): SetExportNotStarted.
+	exportDown string
+
+	// tiering is the tiering manager (SetTiering), nil when none runs.
+	// wired is closed by Wired, once everything a job found at start may
+	// need has been bound or found absent.
+	tiering   RehomeTiering
+	wired     chan struct{}
+	wiredOnce sync.Once
 }
 
 // rehomeJob is one request and its report.
@@ -152,6 +162,7 @@ func NewRehomeHandler(backend storage.Backend, authManager *auth.AuthManager, sc
 		stop:        stop,
 		jobs:        map[string]*rehomeJob{},
 		exportBound: make(chan struct{}),
+		wired:       make(chan struct{}),
 		skipCh:      make(chan struct{}, 1),
 	}
 	h.run = h.dryRun
