@@ -200,6 +200,9 @@ func TestSwapMovesTheRows1825(t *testing.T) {
 	if left, _ := os.ReadDir(r.scratch); len(left) != 0 {
 		t.Fatalf("scratch left: %v", left)
 	}
+	if _, err := os.Stat(filepath.Join(r.root, rehome.StagedDir(id))); !os.IsNotExist(err) {
+		t.Fatalf("the job's staging directory is still there (%v)", err)
+	}
 	want := "staged committed moved moved moved latched drained removed"
 	if got := strings.Join(steps, " "); got != want {
 		t.Fatalf("steps = %q, want %q", got, want)
