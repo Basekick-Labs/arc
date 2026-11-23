@@ -2,6 +2,58 @@
 
 > **Status:** Planned — January 2027 release.
 
+## New: moving a misfiled file's rows to the directories they belong to, on a standalone node ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
+
+A file is misfiled when it holds rows whose time is outside the hour or day of the
+directory it sits in. Queries that filter by time do not read those rows, compaction
+leaves the file alone and lists it, and a file spanning more than one day is left out of
+its Iceberg table. `POST /api/v1/rehome` with `{"path": "<storage key>"}` now moves the
+rows: it writes one file per UTC hour (or per UTC day, for a file in a day directory) in
+the directory each belongs to, and removes the file. `"dry_run": true` still only
+reports.
+
+On a file holding rows of two days, a query for the second day returned 1 of 2 rows
+before and 2 of 2 after; unfiltered queries returned the same rows throughout.
+
+**Where it runs in this release.** A standalone node with local storage. It is refused,
+with the reason, on a cluster, with tiered storage, with edge sync, with the Iceberg
+export enabled, and on storage that is not local. Those come in later releases; the dry
+run works everywhere.
+
+**What a query sees while a job runs.** Every row, once. While the new files are put in
+place queries keep reading the original; once all are in place queries read the new
+files; the original is removed after every query planned before that switch has
+finished. A query in flight at the moment the original is removed can get the existing
+"data read by this query was removed while it ran; retry the query" answer (503). With
+eight clients querying in a loop through 20 jobs, 3,979 answers were right, 40 were that
+retry answer, and none was wrong.
+
+**What happens on a stop.** Each step is recorded in a journal file under `_rehome/` in
+the storage root. At the next start a job found part way is finished, or, if it had not
+started moving files, dropped (the file is as it was; send the request again). The
+process was killed a few milliseconds into a job twelve times; every restart ended with
+the right rows and nothing left behind. A job that cannot be taken up is kept as
+recorded, logged at Error, and listed by `GET /api/v1/rehome` as `stuck`; reads still
+see every row once.
+
+**What leaves a job's files alone while it runs.** Compaction, DELETE (the response is
+207 naming the files left for a retry), retention (it takes the file on its next run),
+and a database delete (409). A backup or a restore and a job refuse each other (409).
+
+**What is refused, with the reason.** Besides the deployments above and what the dry run
+refuses: a file whose rows all belong where it sits; a file another operation already
+leaves out of reads (a DELETE that could not remove it, a compaction that merged it); a
+measurement with a compaction job open; a file another job owns.
+
+**Output files.** Named like ingest files (hour) or `..._daily.parquet` (day), ZSTD,
+with Arc's dedup metadata carried over. Rows whose time is NULL or infinite stay in the
+original's directory, in a file of their own. The staging directory `_rehome_staged/`
+holds a job's files before they are moved into place; backup skips it.
+
+**Audit.** A job start is recorded as `rehome.started`.
+
+**Not in this release:** undoing a job by request, and metrics for jobs.
+
 ## Fix: with Flight SQL on, a normal stop no longer exits 1 and in-flight Flight queries get their grace period ([#1835](https://github.com/Basekick-Labs/arc/pull/1835))
 
 **Who is affected:** builds of `main` with `flight_sql.enabled = true`. Flight SQL is new in this release, so no released version has this.
