@@ -283,6 +283,19 @@ func (r *Registry) SetOutputs(id string, outputs []FileRef) error {
 	return nil
 }
 
+// SetSource records a preparing job's source size and hash, read while it
+// was copied.
+func (r *Registry) SetSource(id string, src FileRef) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	j, ok := r.jobs[id]
+	if !ok || j.State != StatePreparing || j.Source.Key != src.Key {
+		return fmt.Errorf("job %s is not preparing %s", id, src.Key)
+	}
+	j.Source = src
+	return nil
+}
+
 // next is the one state a job may move to from each.
 var next = map[State]State{StatePreparing: StateStaged, StateStaged: StateCommitted, StateCommitted: StateLatched}
 
