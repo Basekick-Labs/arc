@@ -2,6 +2,29 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: a migrate cut off by its time budget no longer leaves files read twice ([#1830](https://github.com/Basekick-Labs/arc/issues/1830))
+
+`POST /api/v1/tiering/migrate` ran everything on one context bounded by `tiered_storage.migration_timeout`, including releasing the hot copies of the files it had just moved. When the budget ran out, the files copied in the last second or so were already marked cold, but their manifest update was refused on the expired context. They were left in cold, still hot on every node, and still in the cluster manifest.
+
+Queries read both copies, so their rows were counted twice. A reproduction on a 3-node cluster read 750 rows out of 600. Nothing cleaned them up unless the scheduled migration cycle ran, and the call still answered `200 "Migration completed successfully"`.
+
+Now:
+
+- **Files already moved are always released.** Their hot copies are released on a context of their own, which runs up to 2 minutes past the budget and ends when tiering stops. A copy cut off by the budget leaves its file hot, with nothing written in cold. Once the budget has ended, no new copy or batch starts. This applies to the scheduled cycle too.
+- **The answer says what happened.** `status` is `completed` or `incomplete`, and the body now includes `candidates`, `not_attempted`, `kept_hot_copies` and `timed_out` alongside `migrated` and `errors`.
+  - A run cut off by the budget answers 200 `incomplete` with the count not attempted. Run it again to move them.
+  - Files left both cold and hot (a manifest update or hot delete that genuinely failed) make it answer **500** `incomplete` with `kept_hot_copies`.
+  - A copy cut off by the budget counts as not attempted, not as an error.
+- **New: `POST /api/v1/tiering/reconcile`** (admin, tiering licence, primary writer only). It runs on demand what the scheduled cycle runs after migrating:
+  1. the cold metadata sync and hot scan;
+  2. the orphan sweep: files whose row says cold but whose hot copy is still there are removed from the manifest, then from hot storage, after the cold copy is verified;
+  3. the manifest sweep.
+
+  This is how an API-driven deployment cleans up files left both cold and hot, without enabling the schedule or restarting. The orphan sweep looks back 48 hours by default; `{"window_hours": N}` (up to 8760) reaches older files. It answers 503 when the cold tier cannot be listed, and 409 on a non-primary node or while a migration runs.
+- The log line for kept files now says that they are read twice and what finishes them. Before, it said reconciliation would.
+
+**Rebuilding a node from the cold tier on fresh volumes:** each node rebuilds its cold rows from the cold listing at startup. That listing must fit in `tiered_storage.scan_timeout`; check `last_scan` in `GET /api/v1/tiering/status`. Fresh volumes also wipe what the data directory holds besides hot data: by default the Raft state (`raft/`), `arc.db` (API tokens, tier rows, retention policies, continuous queries) and the WAL. A writer whose Raft state is empty bootstraps a new cluster, so rebuild every node together, never one node's Raft state alone.
+
 ## Fix: a continuous query's read of its source runs under the run's timeout ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
 
 A continuous query ran its aggregation statement without the run's context. The run's
@@ -48,6 +71,7 @@ Now:
 - **Peers' versions are no longer blank after a join.** The join response carries no version, so a node that had just joined showed an empty `version` for its peers in `GET /api/v1/cluster`. It now keeps the version it already knows from cluster state.
 
 Restarting the leader after a cold start is no longer needed.
+
 
 ## New: a dry run that shows where a misfiled file's rows belong ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
 
