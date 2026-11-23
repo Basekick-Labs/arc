@@ -95,6 +95,9 @@ func TestJobStates(t *testing.T) {
 	if r.Open("db/mem/") || len(r.ExcludedFor(ctx, "db/mem/")) != 0 {
 		t.Fatal("another measurement is not affected")
 	}
+	if got := r.Replaced(prefix); got != nil {
+		t.Fatalf("committed: reads still use the source, so nothing is replaced yet: %v", got)
+	}
 
 	if err := r.Advance(ctx, id, StateLatched); err != nil {
 		t.Fatal(err)
@@ -104,6 +107,12 @@ func TestJobStates(t *testing.T) {
 	}
 	if strict, err := r.ExcludedForStrict(ctx, prefix); err != nil || len(strict) != 1 {
 		t.Fatalf("strict: %v %v", strict, err)
+	}
+	if got := r.Replaced(prefix); len(got) != 1 || len(got[srcKey]) != 2 || got[srcKey][0] != outA || got[srcKey][1] != outB {
+		t.Fatalf("latched: the source is replaced by the outputs: %v", got)
+	}
+	if got := r.Replaced("db/mem/"); got != nil {
+		t.Fatalf("another measurement: %v", got)
 	}
 
 	// A state cannot be skipped or repeated.

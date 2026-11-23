@@ -66,6 +66,10 @@ type RehomeSwap struct {
 	// ClearMisfiled forgets the source in compaction's list of misfiled
 	// files once it is gone.
 	ClearMisfiled func(path string)
+	// ExportExpected: the Iceberg export is enabled, so a table may name
+	// the file a job moves (rehome_export.go). The export itself is bound
+	// later, with SetExport.
+	ExportExpected bool
 }
 
 const (
@@ -257,6 +261,12 @@ func (h *RehomeHandler) runSwap(ctx context.Context, job *rehomeJob) (state, rea
 	if !plan.Misfiled() {
 		return "refused", fmt.Sprintf("every row of %s belongs in the directory it sits in; there is nothing to move", src.Key), report
 	}
+	if plan.RemainderRows > 0 && h.exportExpected() {
+		// The export registers a file under the day of its rows, and leaves
+		// out one whose rows have none. In the file as it is those rows may
+		// be in the table; split off, they would leave it.
+		return "refused", fmt.Sprintf("%s holds %d row(s) with a NULL or infinite time, which the Iceberg export cannot place in a file of their own: moving the others would take these out of the table. Not supported with the Iceberg export in this version", src.Key, plan.RemainderRows), report
+	}
 	outs, err := rehome.Split(ctx, prep.db, plan, prep.local, prep.outDir)
 	if err != nil {
 		return fail("splitting the file and checking the split", err)
@@ -298,6 +308,10 @@ func (h *RehomeHandler) runSwap(ctx context.Context, job *rehomeJob) (state, rea
 	// From here the job is on disk: what follows is the same code a restart
 	// runs, and a failure leaves the record for it.
 	if err := h.finishSwap(ctx, job.ID); err != nil {
+		var refused errExportRefused
+		if errors.As(err, &refused) {
+			return "refused", fmt.Sprintf("the Iceberg export cannot publish %s.%s now (%s), so the job was undone before it moved anything; the file is as it was. Send the request again once the export is publishing that table", src.Database, src.Measurement, refused.why), report
+		}
 		if errors.Is(err, errUndone) {
 			h.logger.Warn().Str("job", job.ID).Str("path", src.Key).Msg("Re-home job undone: reads in flight did not end in time; nothing was moved")
 			return "failed", fmt.Sprintf("queries in flight did not end within %s, so the job was undone before it moved anything; the file is as it was. Send the request again", rehomeReadWait), report
@@ -355,6 +369,17 @@ func (h *RehomeHandler) finishSwap(ctx context.Context, id string) error {
 	bg := context.WithoutCancel(ctx)
 
 	if job.State == rehome.StateStaged {
+		// With the Iceberg export on: it must be publishing this table,
+		// asked while undoing the job costs nothing.
+		if h.exportExpected() {
+			if why := h.exportReady(ctx, job); why != "" {
+				if uerr := h.undo(bg, job); uerr != nil {
+					return fmt.Errorf("the Iceberg export cannot publish the table (%s); undoing the job: %v", why, uerr)
+				}
+				return errExportRefused{why}
+			}
+			h.hook("export-ready")
+		}
 		// 4. Reads start leaving the outputs out.
 		if err := reg.Advance(ctx, id, rehome.StateCommitted); err != nil {
 			return err
@@ -436,6 +461,23 @@ func (h *RehomeHandler) finishSwap(ctx context.Context, id string) error {
 		}
 	}
 	h.hook("drained")
+
+	// With the Iceberg export on, the source stays until the published
+	// table does not name it.
+	// A source already gone (a stop between its removal and the record's)
+	// has nothing left to keep for the table's sake.
+	if h.exportExpected() {
+		n, err := store.StatFile(bg, job.Source.Key)
+		if err != nil && !storage.IsNotFound(err) {
+			return fmt.Errorf("stat %s: %w", job.Source.Key, err)
+		}
+		if err == nil && n >= 0 {
+			if err := h.waitExport(ctx, job); err != nil {
+				return err
+			}
+			h.hook("exported")
+		}
+	}
 
 	// 7. The source goes. A file that is already gone was removed before a
 	// restart.
@@ -521,6 +563,12 @@ func (h *RehomeHandler) undo(ctx context.Context, job *rehome.Job) error {
 // schedule or over the network starts: a job found latched has its source
 // removed without waiting for reads, because no read from before the stop is
 // alive.
+//
+// With the Iceberg export enabled, a job found past its commit is not
+// finished here: it needs the export, which is built later. Recover hands
+// those to a goroutine that holds the job slot and does nothing to them
+// until SetExport is called (recoverLater); until then each is as recorded,
+// which reads see as every row once.
 func (h *RehomeHandler) Recover(ctx context.Context) error {
 	if h.swap == nil || h.swap.Registry == nil {
 		return nil
@@ -532,16 +580,30 @@ func (h *RehomeHandler) Recover(ctx context.Context) error {
 		return fmt.Errorf("%d re-home job(s) are recorded under %s/ and this node's storage is not local: they cannot be taken up", len(jobs), rehome.JournalRoot)
 	}
 	// A journal from a run under another configuration: this deployment is
-	// one a swap is refused on (it became a cluster node, or tiering or the
-	// Iceberg export was turned on). Finishing a job would put files in
-	// place that the cluster manifest, the tier rows or the table know
-	// nothing of.
+	// one a swap is refused on (it became a cluster node, or tiering or edge
+	// sync was turned on). Finishing a job would put files in place that the
+	// cluster manifest or the tier rows know nothing of.
+	//
+	// The Iceberg export turned on or off across the restart is not such a
+	// case. Turned on: the job is finished as any job is with the export on
+	// (below). Turned off: nothing maintains a table, and the job finishes
+	// without asking; a table left from before names the old file until the
+	// export is turned on again, as after any change made with it off.
 	refused := ""
 	if h.swap.Refusal != nil {
 		refused = h.swap.Refusal()
 	}
+	var later []*rehome.Job
 	for _, job := range jobs {
 		log := h.logger.With().Str("job", job.ID).Str("path", job.Source.Key).Str("state", string(job.State)).Logger()
+		if refused == "" && h.exportExpected() && job.State != rehome.StateStaged {
+			// Past its commit, with the Iceberg export on: the job needs
+			// the export, which does not exist yet. Reads are right in
+			// either state meanwhile.
+			later = append(later, job)
+			log.Info().Msg("Re-home: a job found at start is taken up once the Iceberg export is running")
+			continue
+		}
 		if refused != "" {
 			if job.State == rehome.StateLatched {
 				log.Error().Str("why", refused).Msg("Re-home: a job found at start had switched reads to its new files, and this deployment no longer runs such jobs. It is kept as recorded: reads leave the old file out and read the new ones. Finish it under the configuration it was started with, or remove the old file and the record by hand")
@@ -563,6 +625,9 @@ func (h *RehomeHandler) Recover(ctx context.Context) error {
 			continue
 		}
 		log.Info().Msg("Re-home: a job found at start was taken up")
+	}
+	if len(later) > 0 {
+		h.recoverLater(later)
 	}
 	// Staging directories with no record: a job that stopped before it was
 	// journaled.

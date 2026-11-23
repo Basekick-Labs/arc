@@ -435,6 +435,24 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 	// An entry given its day is replaced by itself: it commits with its own removal, and
 	// brings no other file of its day into the first commit, which a real removal does.
 	anchored, free := splitAnchored(toBuild, withoutPaths(toRemove, redatedPaths), database, measurement)
+	// A re-home job's old file is among the removals (#1825): its rows are in
+	// new files in other directories, often other days. Those files go in the
+	// first commit with the removal, so no published version has the removal
+	// without them, and that commit is all or nothing below. Only those: the
+	// first commit is not chunked or time-budgeted, and a backlog of other
+	// new files folded into it could keep it from ever fitting in a pass.
+	swapOutputs, swap := e.replacedOutputs(database, measurement, toRemove)
+	if swap {
+		kept := free[:0]
+		for _, p := range free {
+			if isOneOf(p, keyOf[p], swapOutputs) {
+				anchored = append(anchored, p)
+				continue
+			}
+			kept = append(kept, p)
+		}
+		free = kept
+	}
 	if len(redatedPaths) > 0 {
 		kept := free[:0]
 		for _, p := range free {
@@ -526,7 +544,9 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 			moved = true
 			days, byDay := daysOfPaths(ve.paths, database, measurement)
 			if !byDay || round >= maxVanishRounds || anyUnknownDay(toRemove, database, measurement) ||
-				anyUnknownDay(anchored, database, measurement) || anyUnknownDay(dataFilePaths(cloned), database, measurement) {
+				anyUnknownDay(anchored, database, measurement) || anyUnknownDay(dataFilePaths(cloned), database, measurement) || swap {
+				// swap: a re-home job's files span days, and deferring one
+				// of them would commit the old file's removal without it.
 				days = nil
 			}
 			leave(ve.paths) // only for the cold-listing flag: commit 0 is already split from the free set
@@ -550,11 +570,17 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 			}
 			return reconcileResult{}, err
 		}
+		for _, f := range skipped {
+			if isOneOf(f.path, keyOf[f.path], swapOutputs) {
+				return reconcileResult{}, fmt.Errorf("a re-home job's new file %s cannot be registered (%s); the file it replaces stays in the table until it can", f.path, f.reason)
+			}
+		}
 		skippedAll = append(skippedAll, skipped...)
 		adds := append(cloned, built...)
-		// An anchored add or a clone exists only beside a removal in its day, and deferDays takes a
-		// day whole (everything, when any path's day is unreadable), so a non-empty commit always
-		// has a removal.
+		// An anchored add or a clone exists only beside a removal: in its day, or, for the new
+		// files of a re-home job whose old file this pass removes (swap), that old file's.
+		// deferDays takes a day whole, and everything when any path's day is unreadable or the
+		// pass is such a swap, so a non-empty commit always has a removal.
 		if len(adds)+len(removes) == 0 {
 			// Every day of this commit was deferred: nothing to commit.
 		} else if !canCommit() {
