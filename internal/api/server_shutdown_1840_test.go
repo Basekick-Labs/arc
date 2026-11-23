@@ -131,13 +131,9 @@ func TestShutdownClosesAConnectionThatNeverSentARequest(t *testing.T) {
 	}
 }
 
-// With TLS, a connection that never finishes its handshake is closed the
-// same way. fasthttp starts its own 5 s only after the handshake, so it
-// never closed this one and the drain ran its whole grace, then reported
-// queries cancelled and connections closed.
-func TestShutdownClosesAConnectionThatNeverHandshakes(t *testing.T) {
-	setShutdownNewConnAllowance(t, 300*time.Millisecond)
-	s, logs := newLoggedShutdownTestServer(t)
+// serveTLS1840 starts s behind a TLS listener and returns its address.
+func serveTLS1840(t *testing.T, s *Server) string {
+	t.Helper()
 	certFile, keyFile, _ := createFlightSQLTestTLS(t)
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
@@ -150,19 +146,43 @@ func TestShutdownClosesAConnectionThatNeverHandshakes(t *testing.T) {
 	go func() {
 		_ = s.app.Listener(tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}))
 	}()
-	conn := dialTracked(t, s, ln.Addr().String()) // plain TCP: no ClientHello
+	return ln.Addr().String()
+}
 
-	err, took := shutdownWithin(s, 10*time.Second)
-	if err != nil {
-		t.Fatalf("shutdown error: %v", err)
+// With TLS, a connection that sends no request is closed the same way,
+// whether or not it finished its handshake. fasthttp starts its own 5 s only
+// after the handshake, so one that never handshakes was left to its read
+// timeout: the drain ran its whole grace, then reported queries cancelled
+// and connections closed.
+func TestShutdownClosesAnUnusedTLSConnection(t *testing.T) {
+	for name, handshake := range map[string]bool{"no handshake": false, "handshake, then nothing": true} {
+		t.Run(name, func(t *testing.T) {
+			setShutdownNewConnAllowance(t, 300*time.Millisecond)
+			s, logs := newLoggedShutdownTestServer(t)
+			conn := dialTracked(t, s, serveTLS1840(t, s)) // plain TCP: no ClientHello yet
+			if handshake {
+				tc := tls.Client(conn, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // test certificate
+				if err := tc.Handshake(); err != nil {
+					t.Fatalf("handshake: %v", err)
+				}
+			}
+
+			err, took := shutdownWithin(s, 10*time.Second)
+			if err != nil {
+				t.Fatalf("shutdown error: %v", err)
+			}
+			if took > 2*time.Second {
+				t.Fatalf("drain took %v, want about the 300ms allowance", took)
+			}
+			if !closedByServer(conn, 2*time.Second) {
+				t.Fatal("the connection was not closed")
+			}
+			requireNoLog(t, logs, logCancelledQueries, logClosedStillOpen)
+			if !strings.Contains(logs.String(), logClosedUnused) {
+				t.Fatalf("no log of the closed connection:\n%s", logs.String())
+			}
+		})
 	}
-	if took > 2*time.Second {
-		t.Fatalf("drain took %v, want about the 300ms allowance", took)
-	}
-	if !closedByServer(conn, 2*time.Second) {
-		t.Fatal("the connection was not closed")
-	}
-	requireNoLog(t, logs, logCancelledQueries, logClosedStillOpen)
 }
 
 // The allowance protects a client whose first request is still on its way:
@@ -268,8 +288,13 @@ func TestConnTrackerUnusedConnections(t *testing.T) {
 	if n := tr.closeUnused(time.Hour); n != 0 {
 		t.Fatalf("closed %d connections younger than the allowance", n)
 	}
-	if n := tr.usedOpen(); n != 1 {
-		t.Fatalf("usedOpen = %d, want 1", n)
+	// b is between requests: used, so not swept, and not in a request.
+	if n := tr.inRequest(); n != 0 {
+		t.Fatalf("inRequest = %d with b idle, want 0", n)
+	}
+	tr.connState(b, fasthttp.StateActive)
+	if n := tr.inRequest(); n != 1 {
+		t.Fatalf("inRequest = %d with b in a request, want 1", n)
 	}
 	if n := tr.closeUnused(0); n != 1 {
 		t.Fatalf("closeUnused = %d, want 1 (a only)", n)
@@ -281,8 +306,8 @@ func TestConnTrackerUnusedConnections(t *testing.T) {
 	if n := tr.closeAll(); n != 1 {
 		t.Fatalf("closeAll = %d, want 1", n)
 	}
-	if n := tr.usedOpen(); n != 0 {
-		t.Fatalf("usedOpen = %d after closeAll, want 0", n)
+	if n := tr.inRequest(); n != 0 {
+		t.Fatalf("inRequest = %d after closeAll, want 0", n)
 	}
 	tr.connState(a, fasthttp.StateClosed)
 	tr.connState(b, fasthttp.StateClosed)
@@ -290,7 +315,41 @@ func TestConnTrackerUnusedConnections(t *testing.T) {
 		t.Fatalf("%d connections left after their close was reported", len(tr.conns))
 	}
 	var nilTracker *connTracker
-	if nilTracker.closeAll() != 0 || nilTracker.closeUnused(0) != 0 || nilTracker.usedOpen() != 0 {
+	if nilTracker.closeAll() != 0 || nilTracker.closeUnused(0) != 0 || nilTracker.inRequest() != 0 {
 		t.Fatal("a nil tracker must report nothing")
 	}
+}
+
+// A keep-alive connection between requests is not a query: with a spent
+// budget, where the grace ends before fasthttp has closed it, the drain does
+// not report queries cancelled on it.
+func TestShutdownWithASpentBudgetAndAnIdleKeepAliveConnection(t *testing.T) {
+	s, logs := newLoggedShutdownTestServer(t)
+	s.app.Get("/ok", func(c *fiber.Ctx) error { return c.SendString("ok") })
+	addr := serve1644(t, s)
+	conn := dialTracked(t, s, addr)
+	if _, err := conn.Write([]byte("GET /ok HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	// The server marks the connection idle after the client has its answer.
+	deadline := time.Now().Add(5 * time.Second)
+	for s.conns.inRequest() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the connection did not go idle")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	err, _ = shutdownWithin(s, -time.Second)
+	if err != nil {
+		t.Fatalf("shutdown error: %v", err)
+	}
+	requireNoLog(t, logs, logCancelledQueries)
 }

@@ -50,16 +50,16 @@ func httpShutdownStagesFor(budget time.Duration) httpShutdownStages {
 // shutdownNewConnAllowance is how long a drain waits on a connection that has
 // never sent a request, counted from when it was accepted: its first request,
 // or its TLS handshake, may still be on the way, and closing it would reset a
-// write its client cannot safely repeat. 5 s is the rule net/http uses.
-// fasthttp has it too, but counts from after the TLS handshake, so with TLS
-// it never closed a connection that did not handshake (#1840).
-//
+// write its client cannot safely repeat. 5 s from accept is the allowance
+// net/http gives a new connection at shutdown. fasthttp gives 5 s too, but
+// counts from after the TLS handshake, so a connection that did not finish
+// one was left to its read timeout (30 s here), longer than any drain at the
+// default server.shutdown_timeout (#1840).
+// A variable so a test can shorten it.
+var shutdownNewConnAllowance = 5 * time.Second
+
 // shutdownSweepInterval is how often the drain looks for such connections.
-// Variables so a test can shorten them.
-var (
-	shutdownNewConnAllowance = 5 * time.Second
-	shutdownSweepInterval    = 50 * time.Millisecond
-)
+const shutdownSweepInterval = 50 * time.Millisecond
 
 // connTracker records the server's open connections through fasthttp's
 // ConnState hook, so shutdown can close the ones a graceful drain would wait
@@ -73,7 +73,8 @@ type connTracker struct {
 
 type trackedConn struct {
 	accepted time.Time
-	used     bool // a request has started on it
+	used     bool // a request has started on it, now or earlier
+	busy     bool // a request is in flight on it: first byte in, response not yet written in full
 	closing  bool // shutdown has closed it; fasthttp has not reported it yet
 }
 
@@ -90,7 +91,12 @@ func (t *connTracker) connState(c net.Conn, state fasthttp.ConnState) {
 	case fasthttp.StateActive:
 		// The first byte of a request has arrived.
 		if tc := t.conns[c]; tc != nil {
-			tc.used = true
+			tc.used, tc.busy = true, true
+		}
+	case fasthttp.StateIdle:
+		// Its response is written in full, a streamed body included.
+		if tc := t.conns[c]; tc != nil {
+			tc.busy = false
 		}
 	case fasthttp.StateClosed, fasthttp.StateHijacked:
 		delete(t.conns, c)
@@ -138,9 +144,10 @@ func (t *connTracker) closeWhere(match func(*trackedConn) bool) int {
 	return len(conns)
 }
 
-// usedOpen is the number of connections a request has started on that
-// shutdown has not closed: the ones a query can still be running on.
-func (t *connTracker) usedOpen() int {
+// inRequest is the number of connections with a request in flight that
+// shutdown has not closed: the ones a query can still be running on. A
+// keep-alive connection between requests is not one.
+func (t *connTracker) inRequest() int {
 	if t == nil {
 		return 0
 	}
@@ -148,7 +155,7 @@ func (t *connTracker) usedOpen() int {
 	defer t.mu.Unlock()
 	n := 0
 	for _, tc := range t.conns {
-		if tc.used && !tc.closing {
+		if tc.busy && !tc.closing {
 			n++
 		}
 	}
@@ -244,8 +251,8 @@ graceStage:
 			break graceStage
 		case <-sweep.C:
 			// A connection that has sent nothing since it was accepted:
-			// fasthttp's drain waits on it, without limit when it has not
-			// finished a TLS handshake.
+			// fasthttp's drain waits on it, until its read timeout when
+			// it has not finished a TLS handshake.
 			closedUnused(s.conns.closeUnused(shutdownNewConnAllowance))
 		}
 	}
@@ -254,7 +261,7 @@ graceStage:
 	// the time there is; no query runs on it.
 	closedUnused(s.conns.closeUnused(0))
 	s.endQueries()
-	if n := s.conns.usedOpen(); n > 0 {
+	if n := s.conns.inRequest(); n > 0 {
 		s.logger.Warn().Dur("grace", st.grace).Int("connections", n).Msg("HTTP shutdown: cancelled the queries still running after the grace period")
 	}
 	force := time.NewTimer(st.force)
