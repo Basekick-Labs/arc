@@ -312,8 +312,10 @@ func (h *TieringHandler) Reconcile(c *fiber.Ctx) error {
 	// JSON whatever the Content-Type: curl -d sends a form type, and the
 	// form decoder would drop window_hours without a word.
 	if body := c.Body(); len(bytes.TrimSpace(body)) > 0 {
-		if err := json.Unmarshal(body, &req); err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body: expected JSON such as {\"window_hours\": 72}"})
+		dec := json.NewDecoder(bytes.NewReader(body))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body: expected JSON such as {\"window_hours\": 72}: " + err.Error()})
 		}
 	}
 	if req.WindowHours < 0 || req.WindowHours > 8760 {
@@ -380,6 +382,10 @@ var migrationRequestFields = map[string]bool{
 //   - application/x-www-form-urlencoded: form fields (dry_run read as a
 //     boolean), unknown or repeated keys refused;
 //   - anything else: refused.
+//
+// In both forms a filter that is present but empty, and a dry_run that is
+// not a boolean, are refused: either would otherwise widen the request to a
+// real migration of everything.
 func parseMigrationRequest(c *fiber.Ctx) (TriggerMigrationRequest, error) {
 	var req TriggerMigrationRequest
 	body := bytes.TrimSpace(c.Body())
@@ -387,13 +393,52 @@ func parseMigrationRequest(c *fiber.Ctx) (TriggerMigrationRequest, error) {
 		return req, nil
 	}
 	if body[0] == '{' {
+		// Pointers, so a field that is present but null or empty is told
+		// apart from an absent one.
+		var raw struct {
+			FromTier    *string `json:"from_tier"`
+			ToTier      *string `json:"to_tier"`
+			Database    *string `json:"database"`
+			Measurement *string `json:"measurement"`
+			DryRun      *bool   `json:"dry_run"`
+		}
 		dec := json.NewDecoder(bytes.NewReader(body))
 		dec.DisallowUnknownFields()
-		if err := dec.Decode(&req); err != nil {
+		if err := dec.Decode(&raw); err != nil {
 			return req, err
 		}
-		if dec.More() {
-			return req, errors.New("unexpected data after the JSON object")
+		// json.Unmarshal of the whole body also refuses anything after the
+		// object, which the streaming decoder above does not. And a null
+		// decodes like an absent field, and an absent filter means every
+		// database: refuse it. A null dry_run would mean a real run.
+		var keys map[string]json.RawMessage
+		if err := json.Unmarshal(body, &keys); err != nil {
+			return req, err
+		}
+		for k, v := range keys {
+			if string(bytes.TrimSpace(v)) == "null" {
+				return req, fmt.Errorf("field %q is null", k)
+			}
+		}
+		for name, v := range map[string]*string{"from_tier": raw.FromTier, "to_tier": raw.ToTier, "database": raw.Database, "measurement": raw.Measurement} {
+			if v != nil && strings.TrimSpace(*v) == "" {
+				return req, fmt.Errorf("field %q is empty; leave it out to mean every one", name)
+			}
+		}
+		if raw.FromTier != nil {
+			req.FromTier = *raw.FromTier
+		}
+		if raw.ToTier != nil {
+			req.ToTier = *raw.ToTier
+		}
+		if raw.Database != nil {
+			req.Database = *raw.Database
+		}
+		if raw.Measurement != nil {
+			req.Measurement = *raw.Measurement
+		}
+		if raw.DryRun != nil {
+			req.DryRun = *raw.DryRun
 		}
 		return req, nil
 	}
@@ -409,24 +454,29 @@ func parseMigrationRequest(c *fiber.Ctx) (TriggerMigrationRequest, error) {
 			if len(v) != 1 {
 				return req, fmt.Errorf("field %q given %d times", k, len(v))
 			}
+			if k != "dry_run" && strings.TrimSpace(v[0]) == "" {
+				return req, fmt.Errorf("field %q is empty; leave it out to mean every one", k)
+			}
 		}
-		// Decoded here, not by BodyParser: its form decoder does not read
-		// the json tags, so dry_run=true was dropped and a dry run asked
-		// for as form fields ran a real migration.
+		// Decoded here, not by BodyParser: its form decoder matches Go field
+		// names rather than the json tags, so dry_run=true was dropped and a
+		// dry run asked for as form fields ran a real migration.
 		req.FromTier = vals.Get("from_tier")
 		req.ToTier = vals.Get("to_tier")
 		req.Database = vals.Get("database")
 		req.Measurement = vals.Get("measurement")
-		if v := vals.Get("dry_run"); v != "" {
-			dry, err := strconv.ParseBool(v)
+		if v, ok := vals["dry_run"]; ok {
+			// Present means it must parse: a bare "dry_run" or "dry_run="
+			// is not a request for a real migration.
+			dry, err := strconv.ParseBool(v[0])
 			if err != nil {
-				return req, fmt.Errorf("dry_run %q is not a boolean", v)
+				return req, fmt.Errorf("dry_run %q is not true or false", v[0])
 			}
 			req.DryRun = dry
 		}
 		return req, nil
 	}
-	return req, errors.New("the body is neither JSON nor form fields")
+	return req, errors.New("expected a JSON object or form fields")
 }
 
 // migrationRoleGatedResponse is the answer to a manual migration on a node

@@ -17,10 +17,17 @@ Now:
 
 - An empty body migrates every database, as before.
 - A body starting with `{` is read as JSON whatever its Content-Type. Unknown fields and anything after the object are refused.
-- Form fields (`application/x-www-form-urlencoded`) keep working, and `dry_run` is now read. Unknown or repeated keys, and a `dry_run` that is not a boolean, are refused.
-- Anything else is refused. A refused body answers `400` and nothing is migrated.
+- Form fields (`application/x-www-form-urlencoded`) are read by their documented names (`database`, `measurement`, `from_tier`, `to_tier`, `dry_run`), and `dry_run` now works. Unknown or repeated keys are refused, and so is a `dry_run` that is not `true` or `false`, including a bare `dry_run` or an empty `dry_run=`.
+- In either form, a filter that is present but empty or `null` (`database=` from an unset shell variable, `{"database": ""}`, `{"database": null}`) is refused rather than meaning every database. To migrate every database, leave the field out.
+- Anything else is refused, including a multipart body. A refused body answers `400` and nothing is migrated.
 
-A client that sent extra fields in the JSON body now gets `400` and must drop them.
+What may now get `400`:
+
+- a client that sent extra fields in the JSON body;
+- a form that used the Go field names the old decoder also matched (`dryrun`, `Database`, `fromtier`);
+- `curl -F` (multipart).
+
+Each must switch to the documented names or to JSON. `POST /api/v1/tiering/reconcile` likewise refuses an unknown field instead of running its default 48-hour window.
 
 ## Fix: with Flight SQL on, a stop with no Flight query running no longer exits 1 on a short shutdown timeout or an unused internal connection ([#1834](https://github.com/Basekick-Labs/arc/issues/1834))
 
@@ -1696,7 +1703,7 @@ Four long-running operations had a hardcoded time limit. Each now has a setting.
 
 | Setting | Bounds | Default |
 |---|---|---|
-| `tiered_storage.migration_timeout` | one migration cycle, scheduled or `POST /api/v1/tiering/migrate` | `2h` |
+| `tiered_storage.migration_timeout` | one migration cycle, scheduled or `POST /api/v1/tiering/migrate` (and, since #1830, `POST /api/v1/tiering/reconcile`) | `2h` |
 | `edge_sync.spoke.sync_timeout` | one manual sync pass, `POST /api/v1/spoke-sync/run` | `2h` |
 | `edge_sync.spoke.bundle.timeout` | one air-gap export, `POST /api/v1/spoke-sync/export` | `2h` |
 | `edge_sync.import.timeout` | one air-gap import on the hub, `POST /api/v1/bundle-import` | `4h` |
