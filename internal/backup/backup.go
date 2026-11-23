@@ -656,6 +656,12 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		case isStagedCompaction(obj.Path):
 			// A compaction output waiting for its commit is not data; a
 			// committed one is backed up at its own path (see stagedSource).
+		case strings.HasPrefix(obj.Path, rehomeStagedRoot+"/"):
+			// A re-home job's outputs before they are moved into place
+			// (internal/rehome) are not data: the file they replace is. The
+			// API refuses a backup while such a job is in flight, which is
+			// what keeps a backup from holding both a file and the outputs
+			// already moved into place; this only keeps staged files out.
 		case isCompactionState(obj.Path):
 			stateFiles = append(stateFiles, obj)
 		case strings.HasSuffix(obj.Path, ".parquet"):
@@ -2622,6 +2628,10 @@ func isStagedCompaction(path string) bool {
 }
 
 const stagedCompactionRoot = "_compaction_staged"
+
+// rehomeStagedRoot is rehome.StagedRoot, repeated here so that this package
+// does not import the DuckDB-backed one; a test holds the two together.
+const rehomeStagedRoot = "_rehome_staged"
 
 // StagedOutputs is a ClusterManifest that knows committed object-store
 // compactions (#1207 d2a2b): the key an output waits at until its finisher

@@ -39,6 +39,29 @@ type BackupHandler struct {
 	operationTimeout time.Duration
 	logger           zerolog.Logger
 	activeOperation  atomic.Pointer[string]
+	// rehomeBlock keeps re-home jobs and a backup or restore apart
+	// (SetRehomeBlock, #1825); rehomeRelease is the block the running
+	// operation holds.
+	rehomeBlock   func(prefix string) (release func(), ok bool)
+	rehomeRelease atomic.Pointer[func()]
+}
+
+// SetRehomeBlock gives the handler the block a backup or a restore takes over
+// every data file while it runs: it is refused while a re-home job is in
+// flight, and no job begins while it is held. A backup taken mid-job would
+// copy the job's staged files as data and miss either the file being moved
+// or the files replacing it. nil: no such jobs.
+func (h *BackupHandler) SetRehomeBlock(fn func(prefix string) (release func(), ok bool)) {
+	h.rehomeBlock = fn
+}
+
+// releaseOperation frees the backup/restore slot and the block on re-home
+// jobs taken with it.
+func (h *BackupHandler) releaseOperation() {
+	if rel := h.rehomeRelease.Swap(nil); rel != nil {
+		(*rel)()
+	}
+	h.activeOperation.Store(nil)
 }
 
 // NewBackupHandler creates a new backup handler.
@@ -314,7 +337,7 @@ func (h *BackupHandler) CreateBackup(c *fiber.Ctx) error {
 	// Run backup asynchronously — Fiber recycles c.Context() after the handler
 	// returns, so we must use a detached context.
 	go func() {
-		defer h.activeOperation.Store(nil)
+		defer h.releaseOperation()
 		ctx, cancel := context.WithTimeout(context.Background(), h.operationTimeout)
 		defer cancel()
 		if _, err := h.manager.CreateBackup(ctx, opts); err != nil {
@@ -492,7 +515,7 @@ func (h *BackupHandler) DeleteBackup(c *fiber.Ctx) error {
 	if !acquired {
 		return err
 	}
-	defer h.activeOperation.Store(nil)
+	defer h.releaseOperation()
 
 	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Second)
 	defer cancel()
@@ -716,7 +739,7 @@ func (h *BackupHandler) RestoreBackup(c *fiber.Ctx) error {
 
 	// Run restore asynchronously — detached context (Fiber recycles c.Context()).
 	go func() {
-		defer h.activeOperation.Store(nil)
+		defer h.releaseOperation()
 		ctx, cancel := context.WithTimeout(context.Background(), h.operationTimeout)
 		defer cancel()
 		if _, err := h.manager.RestoreBackup(ctx, opts); err != nil {
@@ -762,6 +785,17 @@ func (h *BackupHandler) acquireOperation(c *fiber.Ctx, operation string) (bool, 
 			held = *active
 		}
 		return false, h.operationConflict(c, held)
+	}
+	if h.rehomeBlock != nil {
+		release, ok := h.rehomeBlock("")
+		if !ok {
+			h.activeOperation.Store(nil)
+			return false, c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"error":  "A re-home job is in flight (GET /api/v1/rehome); a backup or restore started now could copy a file and the files replacing it, or neither. Retry once the job has ended",
+				"status": "refused",
+			})
+		}
+		h.rehomeRelease.Store(&release)
 	}
 	return true, nil
 }
