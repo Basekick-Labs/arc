@@ -26,6 +26,9 @@ import (
 
 // DatabasesHandler handles database management API endpoints
 type DatabasesHandler struct {
+	// rehomeBlock keeps a database delete and the re-home jobs on its files
+	// apart (SetRehomeBlock).
+	rehomeBlock func(prefix string) (release func(), ok bool)
 	// onFilesRemoved invalidates the query caches (and the cluster's) after
 	// a database's files were removed: see SetOnFilesRemoved.
 	onFilesRemoved func()
@@ -763,6 +766,12 @@ func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
 }
 
 // handleDelete handles DELETE /api/v1/databases/:name
+// SetRehomeBlock gives the handler the block a database delete takes over the
+// database's files against re-home jobs (#1825). nil: no such jobs.
+func (h *DatabasesHandler) SetRehomeBlock(fn func(prefix string) (release func(), ok bool)) {
+	h.rehomeBlock = fn
+}
+
 func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	// Check if delete is enabled
 	if h.deleteConfig == nil || !h.deleteConfig.Enabled {
@@ -807,6 +816,18 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 			"error": "Cannot delete reserved database '" + name + "'",
 		})
+	}
+	// Kept apart from a re-home job on a file of this database (#1825): the
+	// delete would remove the file the job is moving, or the files it writes,
+	// under it. Held for the whole delete, so no job begins meanwhile.
+	if h.rehomeBlock != nil {
+		release, ok := h.rehomeBlock(name + "/")
+		if !ok {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"error": "A re-home job is in flight on a file of database '" + name + "' (GET /api/v1/rehome); retry once it has ended",
+			})
+		}
+		defer release()
 	}
 	// A database holding a nested Iceberg warehouse ("<root>/db/m/…") is
 	// refused whole: its delete lists and removes every file under it, the

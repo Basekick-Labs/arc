@@ -295,6 +295,47 @@ func TestSeedRefusesABadRecord(t *testing.T) {
 	}
 }
 
+// An operation over a whole prefix (a database delete, a backup) and a job
+// keep each other out, whichever registers first.
+func TestBlock(t *testing.T) {
+	r := seeded(t, testStore(t))
+	release, ok := r.Block("db/")
+	if !ok {
+		t.Fatal("a block with no job in flight was refused")
+	}
+	if err := r.Begin(testJob("aa")); err == nil {
+		t.Fatal("a job began under a blocked prefix")
+	}
+	other := testJob("bb")
+	other.Database, other.Source.Key = "db2", "db2/cpu/2026/11/18/23/x.parquet"
+	if err := r.Begin(other); err != nil {
+		t.Fatalf("a job outside the blocked prefix: %v", err)
+	}
+	if _, ok := r.Block(""); ok {
+		t.Fatal("a block over everything was granted with a job in flight")
+	}
+	if _, ok := r.Block("db2/"); ok {
+		t.Fatal("a block over a database a job owns a file in was granted")
+	}
+	release()
+	release()
+	if err := r.Begin(testJob("aa")); err != nil {
+		t.Fatalf("after the block was released: %v", err)
+	}
+	// An output key under a blocked prefix is refused too.
+	r.Drop("aa")
+	r.Drop("bb")
+	rel, _ := r.Block("db/cpu/2026/11/19/")
+	_ = r.Begin(testJob("cc"))
+	if err := r.SetOutputs("cc", testOutputs("cc")); err == nil {
+		t.Fatal("an output key under a blocked prefix was taken")
+	}
+	rel()
+	if _, ok := NewRegistry(testStore(t)).Block(""); ok {
+		t.Fatal("an unseeded registry granted a block")
+	}
+}
+
 func TestNilRegistry(t *testing.T) {
 	var r *Registry
 	if r.Owns("x") || r.OwnsUnder("x") || r.Open("x") || r.Active() || r.Generation() != 0 || r.ExcludedFor(context.Background(), "x") != nil {
@@ -302,6 +343,11 @@ func TestNilRegistry(t *testing.T) {
 	}
 	if release, ok := r.Claim("x"); !ok {
 		t.Fatal("a nil registry refused a claim")
+	} else {
+		release()
+	}
+	if release, ok := r.Block(""); !ok {
+		t.Fatal("a nil registry refused a block")
 	} else {
 		release()
 	}

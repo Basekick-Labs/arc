@@ -165,6 +165,7 @@ type Registry struct {
 	jobs   map[string]*Job
 	owned  map[string]string // storage key -> job id
 	claims map[string]int    // storage key -> holders (Claim)
+	blocks map[string]int    // key prefix -> holders (Block)
 
 	// gen moves when a job starts leaving files out of reads (committed):
 	// it is part of the query transform cache's key.
@@ -178,7 +179,7 @@ type Registry struct {
 // NewRegistry creates a registry over the storage root. Call Seed before
 // anything lists data files.
 func NewRegistry(store storage.Backend) *Registry {
-	return &Registry{store: store, jobs: map[string]*Job{}, owned: map[string]string{}, claims: map[string]int{}}
+	return &Registry{store: store, jobs: map[string]*Job{}, owned: map[string]string{}, claims: map[string]int{}, blocks: map[string]int{}}
 }
 
 // Seed reads every record under JournalRoot. A record that cannot be read or
@@ -249,8 +250,8 @@ func (r *Registry) Begin(j *Job) error {
 	if _, ok := r.owned[j.Source.Key]; ok {
 		return fmt.Errorf("%s: %w", j.Source.Key, ErrOwned)
 	}
-	if r.claims[j.Source.Key] > 0 {
-		return fmt.Errorf("%s is being deleted or rewritten by another operation", j.Source.Key)
+	if r.claims[j.Source.Key] > 0 || r.blockedLocked(j.Source.Key) {
+		return fmt.Errorf("%s is being deleted, rewritten or backed up by another operation", j.Source.Key)
 	}
 	j.State = StatePreparing
 	r.jobs[j.ID] = j.clone()
@@ -271,8 +272,8 @@ func (r *Registry) SetOutputs(id string, outputs []FileRef) error {
 		if owner, ok := r.owned[o.Key]; ok && owner != id {
 			return fmt.Errorf("%s: %w", o.Key, ErrOwned)
 		}
-		if r.claims[o.Key] > 0 {
-			return fmt.Errorf("%s is being deleted or rewritten by another operation", o.Key)
+		if r.claims[o.Key] > 0 || r.blockedLocked(o.Key) {
+			return fmt.Errorf("%s is being deleted, rewritten or backed up by another operation", o.Key)
 		}
 	}
 	j.Outputs = append([]FileRef(nil), outputs...)
@@ -449,6 +450,48 @@ func (r *Registry) Claim(key string) (release func(), ok bool) {
 			r.mu.Unlock()
 		})
 	}, true
+}
+
+// Block is taken by an operation that acts on everything under a key prefix
+// outside any job: a database delete ("db/"), a backup or a restore (""). ok
+// is false when a job in flight owns a file under the prefix: the operation
+// must not start. While the block is held no job can begin on, or write to,
+// a file under the prefix. Each side registers first and then looks for the
+// other, so one of the two always sees the other.
+func (r *Registry) Block(prefix string) (release func(), ok bool) {
+	if r == nil {
+		return func() {}, true
+	}
+	if !r.seeded.Load() {
+		return func() {}, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for k := range r.owned {
+		if strings.HasPrefix(k, prefix) {
+			return func() {}, false
+		}
+	}
+	r.blocks[prefix]++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			r.mu.Lock()
+			if r.blocks[prefix]--; r.blocks[prefix] <= 0 {
+				delete(r.blocks, prefix)
+			}
+			r.mu.Unlock()
+		})
+	}, true
+}
+
+func (r *Registry) blockedLocked(key string) bool {
+	for p := range r.blocks {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // Open reports whether a job is leaving files out of reads of the

@@ -135,6 +135,13 @@ func sharedManifest(coord any) bool {
 // apostrophe because the log masker truncates a line at the first quote.
 var errSourceRetired = errors.New("source file was retired by a concurrent delete, retry the request")
 
+// errFileBeingRehomed reports a file a re-home job in flight owns (#1825):
+// the file being moved, or one its rows are moved into. A rewrite here would
+// publish a replacement the job knows nothing of, beside the files the job
+// writes. The file is left as it is and the response says so; the DELETE can
+// be sent again once the job has ended.
+var errFileBeingRehomed = errors.New("the file is being re-homed; retry once that job has ended")
+
 // parquetRowGroupSize is the row group size used for Parquet rewrites during delete operations.
 // Matches compaction's row group size to limit DuckDB's internal write buffer per group.
 const parquetRowGroupSize = 122880
@@ -193,6 +200,8 @@ type DeleteHandler struct {
 	// moveClaims keeps the tiering migrator off a file this DELETE rewrites
 	// (the tiering manager, when tiering is on).
 	moveClaims moveClaimer
+	// rehomeOwns reports a file a re-home job in flight owns (SetRehomeOwns).
+	rehomeOwns func(path string) bool
 	// tempDir is the absolute, sandbox-allowlisted directory used by
 	// rewriteS3File to stage the COPY-rewritten parquet locally before
 	// uploading. MUST match one of the prefixes added to DuckDB's
@@ -374,6 +383,20 @@ func (h *DeleteHandler) SetPendingRegistrations(p PendingRegistrations) {
 }
 
 // SetTieringManager wires rewrite/delete metadata updates into tiering.
+// SetRehomeOwns gives the handler the test for a file a re-home job in
+// flight owns (#1825). nil: no such jobs.
+func (h *DeleteHandler) SetRehomeOwns(fn func(path string) bool) { h.rehomeOwns = fn }
+
+// WithRewriteLock runs fn while no DELETE rewrites a file: under the mutex
+// the whole rewrite phase of a DELETE, the removal of leftovers and the
+// drainer hold. A re-home job switches reads from its source to its outputs
+// inside it, after re-checking its source.
+func (h *DeleteHandler) WithRewriteLock(fn func()) {
+	h.rewriteMu.Lock()
+	defer h.rewriteMu.Unlock()
+	fn()
+}
+
 func (h *DeleteHandler) SetTieringManager(tm *tiering.Manager) {
 	h.tieringManager = tm
 	h.coldTier = nil
@@ -757,6 +780,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	// retryable, so the answer is 503 rather than 207.
 	var notRegistered []string
 	var moving []string
+	rehoming := 0 // files a re-home job in flight owns, left as they are
 	var coldUnchecked []string
 
 	for round := 0; ; round++ {
@@ -782,6 +806,8 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 				if errors.Is(err, tiering.ErrFileMoving) || errors.Is(err, tiering.ErrColdCheckFailed) {
 					// Expected while a migration runs; the response says so.
 					h.logger.Warn().Err(err).Str("file", f.path).Msg("File left as it is: it is being moved to cold storage")
+				} else if errors.Is(err, errFileBeingRehomed) {
+					h.logger.Warn().Str("file", f.path).Msg("File left as it is: a re-home job in flight owns it")
 				} else {
 					h.logger.Error().Err(err).Str("file", f.path).Msg("Failed to rewrite file")
 				}
@@ -810,6 +836,9 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 				}
 				if errors.Is(err, tiering.ErrFileMoving) {
 					moving = append(moving, f.relativePath)
+				}
+				if errors.Is(err, errFileBeingRehomed) {
+					rehoming++
 				}
 				if errors.Is(err, tiering.ErrColdCheckFailed) {
 					coldUnchecked = append(coldUnchecked, f.relativePath)
@@ -929,6 +958,9 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		}
 		if len(moving) > 0 {
 			resp.Error += fmt.Sprintf(" (%d of them %s)", len(moving), movingWhy)
+		}
+		if rehoming > 0 {
+			resp.Error += fmt.Sprintf(" (%d of them are being re-homed and were left as they are; retry for those once the job has ended, GET /api/v1/rehome)", rehoming)
 		}
 		if len(coldUnchecked) > 0 {
 			resp.Error += fmt.Sprintf(" (%d of them %s; retry for those)", len(coldUnchecked), coldUncheckedWhy)
@@ -1320,6 +1352,12 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 	// rewrite phase, so nothing can retire the file between this check and the read below.
 	if size, statErr := h.storage.StatFile(ctx, relativePath); statErr == nil && size < 0 {
 		return 0, fmt.Errorf("%w: %s", errSourceRetired, filepath.Base(relativePath))
+	}
+	// Under the rewrite mutex, which a re-home job holds while it switches
+	// reads from its source to its outputs: either the job owns the file
+	// here, or it will see this rewrite's result when it re-checks its source.
+	if h.rehomeOwns != nil && h.rehomeOwns(relativePath) {
+		return 0, fmt.Errorf("%w: %s", errFileBeingRehomed, filepath.Base(relativePath))
 	}
 	// Kept off a file the tiering migrator is copying, or one with a cold
 	// copy already: a rewrite here would leave that copy holding the rows
