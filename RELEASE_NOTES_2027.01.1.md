@@ -2,6 +2,33 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: `POST /api/v1/tiering/migrate` refuses a body it cannot read instead of migrating every database ([#1841](https://github.com/Basekick-Labs/arc/issues/1841))
+
+The migrate endpoint ignored a body it could not parse, and treated it as an empty body, which migrates every database. In each of these cases a request meant for one database migrated all of them, and the answer looked like the scoped run that was asked for:
+
+- `{"database": "x"}` sent with `curl -d`, which sends a form Content-Type;
+- the same body sent with `text/plain` or no Content-Type;
+- malformed JSON;
+- a misspelt field such as `databse`.
+
+Worse, `dry_run=true` sent as a form field was dropped, so a dry run asked for that way ran a real migration.
+
+Now:
+
+- An empty body migrates every database, as before.
+- A body starting with `{` is read as JSON whatever its Content-Type. Unknown fields and anything after the object are refused.
+- Form fields (`application/x-www-form-urlencoded`) are read by their documented names (`database`, `measurement`, `from_tier`, `to_tier`, `dry_run`), and `dry_run` now works. Unknown or repeated keys are refused, and so is a `dry_run` that is not `true` or `false`, including a bare `dry_run` or an empty `dry_run=`.
+- In either form, a filter that is present but empty or `null` (`database=` from an unset shell variable, `{"database": ""}`, `{"database": null}`) is refused rather than meaning every database. To migrate every database, leave the field out.
+- Anything else is refused, including a multipart body. A refused body answers `400` and nothing is migrated.
+
+What may now get `400`:
+
+- a client that sent extra fields in the JSON body;
+- a form that used the Go field names the old decoder also matched (`dryrun`, `Database`, `fromtier`);
+- `curl -F` (multipart).
+
+Each must switch to the documented names or to JSON. `POST /api/v1/tiering/reconcile` likewise refuses an unknown field instead of running its default 48-hour window.
+
 ## Fix: with Flight SQL on, a stop with no Flight query running no longer exits 1 on a short shutdown timeout or an unused internal connection ([#1834](https://github.com/Basekick-Labs/arc/issues/1834))
 
 **Who is affected:** builds of `main` with `flight_sql.enabled = true`. Flight SQL is new in this release, so no released version has this.
@@ -1676,7 +1703,7 @@ Four long-running operations had a hardcoded time limit. Each now has a setting.
 
 | Setting | Bounds | Default |
 |---|---|---|
-| `tiered_storage.migration_timeout` | one migration cycle, scheduled or `POST /api/v1/tiering/migrate` | `2h` |
+| `tiered_storage.migration_timeout` | one migration cycle, scheduled or `POST /api/v1/tiering/migrate` (and, since #1830, `POST /api/v1/tiering/reconcile`) | `2h` |
 | `edge_sync.spoke.sync_timeout` | one manual sync pass, `POST /api/v1/spoke-sync/run` | `2h` |
 | `edge_sync.spoke.bundle.timeout` | one air-gap export, `POST /api/v1/spoke-sync/export` | `2h` |
 | `edge_sync.import.timeout` | one air-gap import on the hub, `POST /api/v1/bundle-import` | `4h` |
