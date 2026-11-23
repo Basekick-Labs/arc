@@ -14,9 +14,9 @@ The node had the file on disk and in the cluster manifest, but tiering did not k
 
 One deployment saw 4 such files on its writer over about 190 daily compaction cycles.
 
-Now the sweep (and every other direct move of a staged copy) records the file, as the puller's own adoption always did. It also checks that the manifest still registers the output before counting a copy already at the path as adopted. Adoptions by the puller now count in `tier_registered` too.
+Now the sweep (and every other direct move of a staged copy) records the file, as the puller's own adoption always did. It also checks that the manifest still registers the output, and that it is still hot, before counting a copy already at the path as adopted. Adoptions by the puller now count in the puller's `tier_registered`; the sweep's direct adoptions record the file but are not counted there.
 
-If you saw this before upgrading, `POST /api/v1/tiering/scan` on the affected node before migrating records what was missed; a non-zero `hot_rows_written` in its answer means files had been left out.
+If you saw this before upgrading, `POST /api/v1/tiering/scan` on the affected node before migrating records what was missed; a non-zero `hot_rows_written` in its answer can mean files had been left out.
 
 ## Fix: a migrate cut off by its time budget no longer leaves files read twice ([#1830](https://github.com/Basekick-Labs/arc/issues/1830))
 

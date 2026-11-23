@@ -54,7 +54,10 @@ func TestSweptAdoptionIsRecordedWhileThePullHoldsTheSlot1831(t *testing.T) {
 	r.c.puller = p
 	// The commit's registration queued a pull; the puller has not run it
 	// yet (a backlog), so it holds the path's slot.
-	// As on a writer: the compactor is the output's origin.
+	// As on a writer: the compactor is the output's origin. (The rig staged
+	// and committed the job itself, so the FSM names this node; the sweep
+	// treats it as another node's job only because the rig wires no
+	// compactor hook.)
 	queued := *e
 	queued.OriginNodeID = "compactor-1"
 	p.Enqueue(&queued)
@@ -132,5 +135,57 @@ func TestOnlyTheDirectAdoptReports1831(t *testing.T) {
 	}
 	if got := rec.pulledReports(); len(got) != 2 {
 		t.Fatalf("a file that left the manifest was reported: %v", got)
+	}
+}
+
+// endStagedCopy's fallback (a snapshot dropped the committed job while the
+// puller's slot was taken) reports the output too.
+func TestEndStagedCopyFallbackIsRecorded1831(t *testing.T) {
+	r := stagedRig(t)
+	rec := &fakeTierRecorder{}
+	r.c.SetTierRecorder(rec)
+	job := r.job("j1")
+	r.commitJob(job)
+	e, _ := r.c.raftNode.FSM().GetFile(job.Output.Path)
+	r.c.endStagedCopy(raft.StagedCompaction{Job: "j1", Output: raft.FileEntry{Path: job.Output.Path}})
+	if !r.exists(job.Output.Path) {
+		t.Fatal("not moved into place")
+	}
+	if got := rec.pulledReports(); len(got) != 1 || got[0] != e.Path {
+		t.Fatalf("reports %v, want [%s]", got, e.Path)
+	}
+}
+
+// The puller's own adoption counts in tier_registered.
+func TestPullerAdoptionCountsAsTierRegistered1831(t *testing.T) {
+	r := stagedRig(t)
+	ctx := context.Background()
+	job := r.job("j1")
+	r.commitJob(job)
+	e, _ := r.c.raftNode.FSM().GetFile(job.Output.Path)
+	p, err := filereplication.New(filereplication.Config{
+		SelfNodeID: "writer-2", Backend: r.backend, Fetcher: &recordFetcher{paths: make(chan string, 8)}, PeerResolver: oneResolver{},
+		Workers: 1, QueueSize: 8, RetryMaxAttempts: 1, RetryInitialBackoff: time.Millisecond,
+		FetchTimeout: time.Second, AdoptStaged: r.c.adoptStagedForPull,
+		RecordPulledFile: func(string, int64) bool { return true },
+		ManifestEntry: func(path string) (raft.FileEntry, bool) {
+			e, ok := r.c.raftNode.FSM().GetFile(path)
+			if !ok {
+				return raft.FileEntry{}, false
+			}
+			return *e, true
+		},
+		Logger: zerolog.Nop(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Start(ctx)
+	defer p.Stop()
+	if !p.AdoptNow(e) {
+		t.Fatal("not adopted")
+	}
+	if got := p.Stats()["tier_registered"]; got != 1 {
+		t.Fatalf("tier_registered = %d, want 1", got)
 	}
 }

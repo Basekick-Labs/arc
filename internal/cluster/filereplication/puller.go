@@ -229,7 +229,8 @@ type Config struct {
 	ManifestEntry func(path string) (raft.FileEntry, bool)
 
 	// RecordPulledFile, when set, is called once for every file this node
-	// pulled and kept, so the node's tier metadata describes the file the way
+	// pulled and kept, or moved into place from its staged copy, so the
+	// node's tier metadata describes the file the way
 	// it would a file this node flushed itself. Without it a replicated file
 	// has no tier row until the next tier scan, and the query layer routes
 	// reads from those rows: a measurement with no row loses partition
@@ -372,7 +373,7 @@ type Puller struct {
 	// Every candidate peer disagreed with the manifest's SHA256 for one entry.
 	// Distinct from totalChecksumMismatch, which counts per-peer rejections.
 	totalChecksumMismatchExhausted atomic.Int64
-	totalTierRegistered            atomic.Int64 // pulled files reported to tier metadata
+	totalTierRegistered            atomic.Int64 // pulled or puller-adopted files reported to tier metadata
 	totalPeerLookupFailure         atomic.Int64 // no candidate peers available
 	totalBadOffsetServer           atomic.Int64 // server rejected resume offset (AckCodeBadOffset)
 	// Kept because staging and append support are independent interfaces by

@@ -318,7 +318,8 @@ func (s stagedCommitter) OwnStaged() []string {
 // adoptStaged moves this node's staged copy of a committed output into place,
 // for the callers that do it directly rather than through the puller (the
 // staged sweep and endStagedCopy when the puller's slot for the path is
-// taken, and the puller-less paths): true when the output is at its path.
+// taken, and stagedCommitter.Adopt with replication off): true when the
+// output is at its path.
 //
 // On success it reports the file to tiering, as the puller's own adopt does
 // (#1831). It used to report nothing: the pull the commit queued, which held
@@ -363,8 +364,8 @@ func (c *Coordinator) adoptStagedCopy(ctx context.Context, e *raft.FileEntry, pr
 		// Present already, at the size: the output only if the manifest
 		// still registers it by this job, as the moved branch and the
 		// puller check — adoptStaged reports a true here to tiering.
-		if cur, ok := c.raftNode.FSM().GetFile(e.Path); !ok || cur.CompactionJob != e.CompactionJob || cur.SHA256 != e.SHA256 {
-			return false, errors.New("the output left the manifest")
+		if cur, ok := c.raftNode.FSM().GetFile(e.Path); !ok || cur.CompactionJob != e.CompactionJob || cur.SHA256 != e.SHA256 || !raft.HotTier(cur.Tier) {
+			return false, errors.New("the output left the manifest or moved to the cold tier")
 		}
 		if !c.stagedLocalJob(e.CompactionJob) {
 			_ = mover.RemoveAll(ctx, dir)
