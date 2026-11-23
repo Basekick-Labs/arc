@@ -1554,6 +1554,9 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	// Execute query using DuckDB
 	// With the run's context: without it the statement waited for a pooled
 	// connection, and ran, with no bound at all, past the run's own timeout.
+	// The same context ends when the scheduler stops this query's job (the
+	// query was updated or deleted, or the scheduler reloaded): the run then
+	// fails, its window is not marked done, and the next run covers it.
 	rows, err := h.db.QueryContext(ctx, wrappedQuery)
 	if err != nil {
 		return 0, fmt.Errorf("query execution failed: %w", err)

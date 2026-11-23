@@ -11,9 +11,22 @@
 // it: a governance policy can give a token a longer deadline than the global
 // one.
 //
-// A read enters before its SQL is built and leaves once its statement is
-// bound. The job changes its state, then calls Flip and waits for every read
-// that entered before the flip to leave.
+// A read enters before its SQL is built and leaves no earlier than its
+// statement is bound. In practice it leaves once the statement has executed:
+// the DuckDB driver runs a query to completion inside the call that starts
+// it, and the callers leave when their handler returns. So a wait lasts as
+// long as the longest read in flight, which is bounded by that read's own
+// deadline (the query timeout, a governance policy's, ten minutes for a
+// continuous query). A job that waits needs its own deadline and a way to
+// give up.
+//
+// The job changes its state, then calls Flip and waits for every read that
+// entered before the flip to leave.
+//
+// What is not counted, and a job must handle otherwise: the Iceberg export's
+// listing, DELETE's and retention's own reads of files, compaction, reads on
+// other nodes of a cluster (each node has its own gate), and files the arcx
+// router opens while it streams or shadows a query after the handler returned.
 package readgate
 
 import (
@@ -27,7 +40,8 @@ type Gate struct {
 	mu     sync.Mutex
 	epoch  uint64
 	active map[uint64]int
-	// moved is closed and replaced whenever a read leaves.
+	// moved is closed, and made anew by the next waiter, whenever the last
+	// read of an epoch leaves.
 	moved chan struct{}
 }
 
@@ -51,10 +65,11 @@ func (g *Gate) Enter() (leave func()) {
 			g.mu.Lock()
 			if g.active[e]--; g.active[e] <= 0 {
 				delete(g.active, e)
-			}
-			if g.moved != nil {
-				close(g.moved)
-				g.moved = nil
+				// The last read of an epoch left: a waiter looks again.
+				if g.moved != nil {
+					close(g.moved)
+					g.moved = nil
+				}
 			}
 			g.mu.Unlock()
 		})
@@ -75,7 +90,8 @@ func (g *Gate) Flip() (ended uint64) {
 }
 
 // Wait returns once no read that entered in epoch ended or earlier is still
-// in flight, or with ctx's error.
+// in flight, or with ctx's error. ended must be a value Flip returned: reads
+// keep entering the current epoch, so waiting on it may never end.
 func (g *Gate) Wait(ctx context.Context, ended uint64) error {
 	if g == nil {
 		return nil

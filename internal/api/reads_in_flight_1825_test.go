@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 
@@ -99,6 +101,23 @@ func TestQueriesAreReadsInFlight1825(t *testing.T) {
 		require.Eventually(t, func() bool { return r.h.Reads().InFlight() == 0 }, 5*time.Second, 10*time.Millisecond,
 			"%s: still counted in flight after its response", route)
 	}
+	// The Flight SQL schema route, which lives on the Flight bridge only.
+	bridge := fiber.New(appConfig(DefaultServerConfig(), zerolog.Nop()))
+	r.h.registerFlightSQLSchemaRoute(bridge)
+	seenBefore := len(probe.seen())
+	breq := httptest.NewRequest(http.MethodPost, flightSQLSchemaPath, strings.NewReader(`{"sql":"SELECT n FROM db.cpu WHERE n < 7777"}`))
+	breq.Header.Set("Content-Type", "application/json")
+	bresp, err := bridge.Test(breq, -1)
+	require.NoError(t, err)
+	braw, _ := io.ReadAll(bresp.Body)
+	require.Equal(t, 200, bresp.StatusCode, "body: %s", braw)
+	bseen := probe.seen()[seenBefore:]
+	require.NotEmpty(t, bseen, "the Flight SQL schema route never asked the registry")
+	for _, n := range bseen {
+		require.Equal(t, 1, n, "the Flight SQL schema route: reads in flight while its SQL was built")
+	}
+	require.Equal(t, 0, r.h.Reads().InFlight())
+
 	// The per-measurement route.
 	before := len(probe.seen())
 	resp, err := r.client.Get(r.base + "/api/v1/query/cpu?database=db&limit=1")
@@ -133,24 +152,30 @@ func TestWaitCoversAQueryFromBeforeTheFlip1825(t *testing.T) {
 		return nil
 	}
 	r.h.SetOpenCompactions(probe)
-	done := make(chan time.Time, 1)
+	// Released whatever happens: a failed assertion must not leave the
+	// handler parked, which would hang the server's shutdown.
+	var releaseOnce sync.Once
+	letGo := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(letGo)
+	status := make(chan int, 1)
 	go func() {
 		resp := r.post("/api/v1/query", "SELECT count(*) AS c FROM db.cpu")
-		_ = count1825(t, resp)
-		done <- time.Now()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		status <- resp.StatusCode
 	}()
 	select {
 	case <-waited:
 		t.Fatal("the wait returned while the query was still building its SQL")
 	case <-time.After(150 * time.Millisecond):
 	}
-	close(release)
+	letGo()
 	select {
 	case <-waited:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the wait never returned")
 	}
-	<-done
+	require.Equal(t, 200, <-status)
 }
 
 // The exclusions are read before the path list is built. A job that puts a

@@ -1696,7 +1696,8 @@ type OpenCompactions interface {
 func (h *QueryHandler) SetOpenCompactions(oc OpenCompactions) { h.openCompactions = oc }
 
 // Reads is the count of reads in flight: every query this handler serves
-// enters it before its SQL is built and leaves once its statement is bound.
+// enters it before its SQL is built and leaves when the handler returns,
+// which is after its statement has run (internal/readgate).
 // Other readers of data files (continuous queries) share it.
 func (h *QueryHandler) Reads() *readgate.Gate { return h.reads }
 
@@ -1731,6 +1732,9 @@ func (h *QueryHandler) openCompactionExclusions(ctx context.Context, prefix stri
 // The excluded files are still opened: DuckDB does not skip a file by its
 // name column. The result is volatile.
 func wrapOpenCompactions(ctx context.Context, oc OpenCompactions, backend storage.Backend, expr, database, measurement string) string {
+	if backend == nil {
+		return expr
+	}
 	return snapshotOpenCompactions(ctx, oc, database, measurement).apply(backend, expr)
 }
 
@@ -4589,6 +4593,15 @@ func (h *QueryHandler) buildReadParquetExpr(ctx context.Context, path, originalS
 	// list built first could miss a directory that did not exist yet, and
 	// then be paired with exclusions read after a job put files there and
 	// switched reads to them, leaving out both sides (#1825).
+	//
+	// The price is the other pairing: a replacement that lands after the
+	// snapshot, while the file it replaces is still there when the statement
+	// binds, is read beside it, and its rows count twice. Every source
+	// excludes a file only once its replacement is in storage, so this order
+	// can count twice and never zero; the window existed before
+	// (compaction/open_jobs.go) and now also spans the build of the path
+	// list. Twice is the side to err on: it is visible, and the next read is
+	// right.
 	excl := snapshotOpenCompactions(ctx, h.openCompactions, db, meas)
 	return excl.apply(h.storage, h.buildReadParquetExprRaw(ctx, path, originalSQL, keyword))
 }
