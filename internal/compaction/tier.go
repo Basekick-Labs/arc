@@ -265,6 +265,48 @@ type BaseTier struct {
 
 	Logger zerolog.Logger
 	mu     sync.Mutex
+
+	// exclude names files the tier does not see at all (SetExclude).
+	exclude func(path string) bool
+}
+
+// SetExclude gives the tier a test for files it must treat as absent when it
+// groups a listing into candidates: the files compaction leaves alone as
+// misfiled (misfiled.go). They are dropped before a partition is classified,
+// so a day is judged on the files a job could take: one whose other files
+// are fewer than daily_min_files is a settled day and gets its daily file
+// (#1774), where judged with the refused file it would be a regular
+// candidate that a later filter turns down every cycle.
+func (t *BaseTier) SetExclude(fn func(path string) bool) {
+	t.mu.Lock()
+	t.exclude = fn
+	t.mu.Unlock()
+}
+
+// withoutExcluded returns objects less the files SetExclude names.
+func (t *BaseTier) withoutExcluded(objects []string) []string {
+	t.mu.Lock()
+	fn := t.exclude
+	t.mu.Unlock()
+	if fn == nil {
+		return objects
+	}
+	var kept []string
+	for i, o := range objects {
+		if fn(o) {
+			if kept == nil {
+				kept = append(make([]string, 0, len(objects)), objects[:i]...)
+			}
+			continue
+		}
+		if kept != nil {
+			kept = append(kept, o)
+		}
+	}
+	if kept == nil {
+		return objects
+	}
+	return kept
 }
 
 // BaseTierConfig holds configuration for creating a base tier

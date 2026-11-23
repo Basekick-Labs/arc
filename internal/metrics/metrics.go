@@ -130,10 +130,15 @@ type Metrics struct {
 	// many partitions are remembered now.
 	compactionPartitionsSkippedTooWide atomic.Int64
 	compactionPartitionsTooWide        atomic.Int64
-	compactionFilesCompacted           atomic.Int64
-	compactionBytesRead                atomic.Int64
-	compactionBytesWritten             atomic.Int64
-	compactionManifestsRecovered       atomic.Int64
+	// compactionInputsMisfiled: inputs a job refused because they hold rows
+	// outside the partition they sit in (#1825); the gauge is how many files
+	// compaction leaves alone for that now.
+	compactionInputsMisfiled     atomic.Int64
+	compactionFilesMisfiled      atomic.Int64
+	compactionFilesCompacted     atomic.Int64
+	compactionBytesRead          atomic.Int64
+	compactionBytesWritten       atomic.Int64
+	compactionManifestsRecovered atomic.Int64
 	// compactionScheduledSkips: scheduled ticks that never ran because a cycle
 	// held the claim until the scheduler's next tick, by tier (#220).
 	compactionScheduledSkips [len(CompactionScheduledSkipTiers)]atomic.Int64
@@ -692,6 +697,8 @@ func (m *Metrics) compactionScheduledSkipsTotal() int64 {
 }
 
 func (m *Metrics) SetCompactionPartitionsTooWide(n int64)  { m.compactionPartitionsTooWide.Store(n) }
+func (m *Metrics) AddCompactionInputsMisfiled(n int64)     { m.compactionInputsMisfiled.Add(n) }
+func (m *Metrics) SetCompactionFilesMisfiled(n int64)      { m.compactionFilesMisfiled.Store(n) }
 func (m *Metrics) IncCompactionFilesCompacted(count int64) { m.compactionFilesCompacted.Add(count) }
 func (m *Metrics) IncCompactionBytesRead(bytes int64)      { m.compactionBytesRead.Add(bytes) }
 func (m *Metrics) IncCompactionBytesWritten(bytes int64)   { m.compactionBytesWritten.Add(bytes) }
@@ -1411,6 +1418,8 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"compaction_scheduled_skips":             m.compactionScheduledSkipsTotal(),
 		"compaction_partitions_skipped_too_wide": m.compactionPartitionsSkippedTooWide.Load(),
 		"compaction_partitions_too_wide":         m.compactionPartitionsTooWide.Load(),
+		"compaction_inputs_misfiled":             m.compactionInputsMisfiled.Load(),
+		"compaction_files_misfiled":              m.compactionFilesMisfiled.Load(),
 		"compaction_files_compacted":             m.compactionFilesCompacted.Load(),
 		"compaction_bytes_read":                  m.compactionBytesRead.Load(),
 		"compaction_bytes_written":               m.compactionBytesWritten.Load(),
@@ -1870,6 +1879,14 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_compaction_partitions_too_wide Partitions remembered as too wide to compact in a job's memory\n"...)
 	b = append(b, "# TYPE arc_compaction_partitions_too_wide gauge\n"...)
 	b = appendMetric(b, "arc_compaction_partitions_too_wide", float64(m.compactionPartitionsTooWide.Load()))
+
+	b = append(b, "# HELP arc_compaction_inputs_misfiled_total Input files a compaction job refused because they hold rows outside the hour or day of the directory they sit in; the job then compacted nothing\n"...)
+	b = append(b, "# TYPE arc_compaction_inputs_misfiled_total counter\n"...)
+	b = appendMetric(b, "arc_compaction_inputs_misfiled_total", float64(m.compactionInputsMisfiled.Load()))
+
+	b = append(b, "# HELP arc_compaction_files_misfiled Files compaction leaves alone on this node because they hold rows outside the hour or day of the directory they sit in (GET /api/v1/compaction/misfiled lists them)\n"...)
+	b = append(b, "# TYPE arc_compaction_files_misfiled gauge\n"...)
+	b = appendMetric(b, "arc_compaction_files_misfiled", float64(m.compactionFilesMisfiled.Load()))
 
 	b = append(b, "# HELP arc_compaction_files_compacted_total Input files compacted by successful compaction attempts (a staged job: before the cluster commits it)\n"...)
 	b = append(b, "# TYPE arc_compaction_files_compacted_total counter\n"...)

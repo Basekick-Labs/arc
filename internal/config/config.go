@@ -348,6 +348,14 @@ type CompactionConfig struct {
 	// in compaction rejects batches below 2 files. (default: 30)
 	MaxFilesPerBatch int
 
+	// RefuseMisfiledInputs: a compaction job reads each input's time range
+	// and compacts nothing when one holds rows outside the hour or day of
+	// the directory it sits in; that file is then left out of later jobs
+	// (#1825). false merges such a file with its neighbours, as before: the
+	// output then holds rows of two days, which the Iceberg export leaves
+	// out of its table. (default: true)
+	RefuseMisfiledInputs bool
+
 	// Phase 4: completion-manifest watcher tunables. The watcher polls
 	// {temp_directory}/.completion/pending on a 1s default interval
 	// looking for compaction jobs that finished and need their outputs
@@ -1546,6 +1554,7 @@ func Load() (*Config, error) {
 			ExcludeDatabases:            v.GetStringSlice("compaction.exclude_databases"),
 			CycleTimeout:                cycleTimeout,
 			MaxFilesPerBatch:            v.GetInt("compaction.max_files_per_batch"),
+			RefuseMisfiledInputs:        v.GetBool("compaction.refuse_misfiled_inputs"),
 			TempDirectory:               v.GetString("compaction.temp_directory"),
 			MemoryLimit:                 v.GetString("compaction.memory_limit"),
 			Threads:                     v.GetInt("compaction.threads"),
@@ -2769,6 +2778,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compaction.max_concurrent", 2)                   // 2 concurrent jobs
 	v.SetDefault("compaction.cycle_timeout", "30m")                // Maximum duration per cycle
 	v.SetDefault("compaction.exclude_databases", []string{})       // Databases skipped by scheduled cycles (scoped triggers bypass)
+	v.SetDefault("compaction.refuse_misfiled_inputs", true)        // A job does not merge a file holding rows outside its directory's hour or day (#1825)
 	v.SetDefault("compaction.max_files_per_batch", 30)             // 30 files per DuckDB read_parquet() call; valid range [2, 500]
 	v.SetDefault("compaction.temp_directory", "./data/compaction") // Temp directory for compaction files
 	v.SetDefault("compaction.memory_limit", "")                    // "" = auto: database.memory_limit / max_concurrent (see CompactionConfig.MemoryLimit)
