@@ -216,16 +216,19 @@ run on (`/api/v1/query`, `/api/v1/query/arrow`). A connection refused by
 Flight authentication is not audited, as a refused HTTP request is not. The
 HTTP request metrics also count Flight queries.
 
-On shutdown, in-flight Flight queries get 5 seconds to finish and are then
-cancelled, the queries included; connections still open 2 seconds later are
-closed, so a client that stops reading a result cannot hold shutdown up. With
-the internal drain after it, the listener takes at most about 11 seconds to
-stop, and less when `server.shutdown_timeout` leaves less: every stage is
-scaled to fit in half of the time the shutdown hooks have left when it
-starts. The hooks get 40% of `server.shutdown_timeout` (the rest is kept for
-the buffer flush, the WAL and the database), so at the default 30 s the
-Flight SQL listener takes at most 6 seconds on a standalone node and about
-3 in a cluster, after the ready drain. The
+On shutdown, in-flight Flight queries get up to 5 seconds to finish and are
+then cancelled, the queries included; connections still open up to 2 seconds
+later are closed, so a client that stops reading a result cannot hold shutdown
+up. With the internal drain after it, the listener takes at most about 11
+seconds to stop, and less when `server.shutdown_timeout` leaves less: every
+stage is scaled in proportion to fit in half of the time the shutdown hooks
+have left when it starts. The hooks get 40% of `server.shutdown_timeout` (the
+rest is kept for the buffer flush, the WAL and the database), so at the
+default 30 s the Flight SQL listener takes at most 6 seconds on a standalone
+node and about 3 in a cluster, after the ready drain: in-flight queries get
+about 2.7 seconds there, and about 1.4 in a cluster. The full 5 seconds need
+`server.shutdown_timeout` of 55 or more on a standalone node and 80 or more
+in a cluster. An idle listener stops at once. The
 listener sets no limit on concurrent streams per connection; every call needs
 a valid token when authentication is on.
 
