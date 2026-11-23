@@ -30,6 +30,24 @@ read planned before a file swap is still on its way to the files. For that:
   beside the file it replaces, and its rows count twice in that one read. That window
   already existed during a compaction; it is slightly longer now. It was chosen because
   a double count is visible and gone on the next read, where missing rows are silent.
+## Fix: a leader elected late keeps its node record current ([#1829](https://github.com/Basekick-Labs/arc/issues/1829))
+
+A node writes its own record in cluster state (its addresses, version and role) only while it is the Raft leader; a follower's record is written by the leader when the follower joins. The leader used to write its record once, and only if it won an election within 30 seconds of starting. A writer elected later kept the record of its previous process. That happens after a full cold start where peers are not yet resolvable, and after a failover hours in.
+
+Every node then showed that leader with its old version and old `api_address`. After a cold start that reshuffled pod IPs, that address belonged to a reader:
+
+- Writes forwarded to the leader went to the reader, which refused them with 508. Nothing was written.
+- Cache invalidations meant for the leader also went to the reader, so the leader could serve stale cached results until they expired.
+
+It lasted until the leader restarted.
+
+Now:
+
+- **The leader keeps its record current for as long as it runs.** It writes the record the first time it is leader in a process, whenever that is. After that it checks once a second and rewrites the record if its name, role, cluster name, address, API address, version or capabilities in cluster state differ from its own. A record that matches is not rewritten. Core count, state and writer state are not compared. As at startup before, the write clears a "standby" mark on a writer that becomes leader; the primary designation is kept.
+- **A join the leader cannot record is refused.** If writing the joiner's record failed, the leader still answered success, and the joiner stopped trying. The joiner kept its old record for the rest of its life. Now it gets an error and tries again on its next discovery attempt.
+- **Peers' versions are no longer blank after a join.** The join response carries no version, so a node that had just joined showed an empty `version` for its peers in `GET /api/v1/cluster`. It now keeps the version it already knows from cluster state.
+
+Restarting the leader after a cold start is no longer needed.
 
 ## New: a dry run that shows where a misfiled file's rows belong ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
 
