@@ -47,17 +47,38 @@ func httpShutdownStagesFor(budget time.Duration) httpShutdownStages {
 	return httpShutdownStages{grace: grace, force: force}
 }
 
+// shutdownNewConnAllowance is how long a drain waits on a connection that has
+// never sent a request, counted from when it was accepted: its first request,
+// or its TLS handshake, may still be on the way, and closing it would reset a
+// write its client cannot safely repeat. 5 s is the rule net/http uses.
+// fasthttp has it too, but counts from after the TLS handshake, so with TLS
+// it never closed a connection that did not handshake (#1840).
+//
+// shutdownSweepInterval is how often the drain looks for such connections.
+// Variables so a test can shorten them.
+var (
+	shutdownNewConnAllowance = 5 * time.Second
+	shutdownSweepInterval    = 50 * time.Millisecond
+)
+
 // connTracker records the server's open connections through fasthttp's
 // ConnState hook, so shutdown can close the ones a graceful drain would wait
 // on: a response stream blocked on a client that stopped reading sees no
-// context, only a closed connection.
+// context, only a closed connection; and a connection that never sent a
+// request is not one fasthttp's own drain reliably closes.
 type connTracker struct {
 	mu    sync.Mutex
-	conns map[net.Conn]struct{}
+	conns map[net.Conn]*trackedConn
+}
+
+type trackedConn struct {
+	accepted time.Time
+	used     bool // a request has started on it
+	closing  bool // shutdown has closed it; fasthttp has not reported it yet
 }
 
 func newConnTracker() *connTracker {
-	return &connTracker{conns: map[net.Conn]struct{}{}}
+	return &connTracker{conns: map[net.Conn]*trackedConn{}}
 }
 
 func (t *connTracker) connState(c net.Conn, state fasthttp.ConnState) {
@@ -65,18 +86,46 @@ func (t *connTracker) connState(c net.Conn, state fasthttp.ConnState) {
 	defer t.mu.Unlock()
 	switch state {
 	case fasthttp.StateNew:
-		t.conns[c] = struct{}{}
+		t.conns[c] = &trackedConn{accepted: time.Now()}
+	case fasthttp.StateActive:
+		// The first byte of a request has arrived.
+		if tc := t.conns[c]; tc != nil {
+			tc.used = true
+		}
 	case fasthttp.StateClosed, fasthttp.StateHijacked:
 		delete(t.conns, c)
 	}
 }
 
-// closeAll closes every tracked connection and returns how many. fasthttp
-// closes them again when their serve loops end; a second Close is harmless.
+// closeAll closes every tracked connection and returns how many it had not
+// closed before. fasthttp closes them again when their serve loops end; a
+// second Close is harmless.
 func (t *connTracker) closeAll() int {
+	return t.closeWhere(func(*trackedConn) bool { return true })
+}
+
+// closeUnused closes the connections that have never sent a request and were
+// accepted at least minAge ago, and returns how many.
+func (t *connTracker) closeUnused(minAge time.Duration) int {
+	now := time.Now()
+	return t.closeWhere(func(tc *trackedConn) bool {
+		return !tc.used && now.Sub(tc.accepted) >= minAge
+	})
+}
+
+func (t *connTracker) closeWhere(match func(*trackedConn) bool) int {
+	if t == nil {
+		return 0
+	}
 	t.mu.Lock()
-	conns := make([]net.Conn, 0, len(t.conns))
-	for c := range t.conns {
+	var conns []net.Conn
+	for c, tc := range t.conns {
+		// An entry stays until fasthttp reports the close, so one closed
+		// by an earlier call is still here: not counted or closed twice.
+		if tc.closing || !match(tc) {
+			continue
+		}
+		tc.closing = true
 		conns = append(conns, c)
 	}
 	t.mu.Unlock()
@@ -87,6 +136,23 @@ func (t *connTracker) closeAll() int {
 		go func(c net.Conn) { _ = c.Close() }(c)
 	}
 	return len(conns)
+}
+
+// usedOpen is the number of connections a request has started on that
+// shutdown has not closed: the ones a query can still be running on.
+func (t *connTracker) usedOpen() int {
+	if t == nil {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	n := 0
+	for _, tc := range t.conns {
+		if tc.used && !tc.closing {
+			n++
+		}
+	}
+	return n
 }
 
 // QueryLifetime is the context the query handler runs its reads on
@@ -110,7 +176,8 @@ func (s *Server) endQueries() {
 // ShutdownContext drains the HTTP server within ctx's deadline (#1644):
 //
 //  1. stop accepting, close idle connections, and let in-flight requests
-//     finish for the grace;
+//     finish for the grace; a connection that has never sent a request is
+//     closed once it is shutdownNewConnAllowance old, or when the grace ends;
 //  2. cancel QueryLifetime, which ends the queries still running and their
 //     response streams, and wait one force stage;
 //  3. close the connections still open, and wait one more.
@@ -161,14 +228,35 @@ func (s *Server) ShutdownContext(ctx context.Context, fallback time.Duration) er
 
 	grace := time.NewTimer(st.grace)
 	defer grace.Stop()
-	select {
-	case err := <-stopped:
-		return finish(err)
-	case <-grace.C:
+	sweep := time.NewTicker(shutdownSweepInterval)
+	defer sweep.Stop()
+	closedUnused := func(n int) {
+		if n > 0 {
+			s.logger.Info().Int("connections", n).Msg("HTTP shutdown: closed connections that never sent a request")
+		}
+	}
+graceStage:
+	for {
+		select {
+		case err := <-stopped:
+			return finish(err)
+		case <-grace.C:
+			break graceStage
+		case <-sweep.C:
+			// A connection that has sent nothing since it was accepted:
+			// fasthttp's drain waits on it, without limit when it has not
+			// finished a TLS handshake.
+			closedUnused(s.conns.closeUnused(shutdownNewConnAllowance))
+		}
 	}
 
+	// The grace is over. A connection that never sent a request has had all
+	// the time there is; no query runs on it.
+	closedUnused(s.conns.closeUnused(0))
 	s.endQueries()
-	s.logger.Warn().Dur("grace", st.grace).Msg("HTTP shutdown: cancelled the queries still running after the grace period")
+	if n := s.conns.usedOpen(); n > 0 {
+		s.logger.Warn().Dur("grace", st.grace).Int("connections", n).Msg("HTTP shutdown: cancelled the queries still running after the grace period")
+	}
 	force := time.NewTimer(st.force)
 	defer force.Stop()
 	select {
@@ -177,11 +265,9 @@ func (s *Server) ShutdownContext(ctx context.Context, fallback time.Duration) er
 	case <-force.C:
 	}
 
-	n := 0
-	if s.conns != nil {
-		n = s.conns.closeAll()
+	if n := s.conns.closeAll(); n > 0 {
+		s.logger.Warn().Int("connections", n).Msg("HTTP shutdown: closed connections still open after in-flight queries were cancelled")
 	}
-	s.logger.Warn().Int("connections", n).Msg("HTTP shutdown: closed connections still open after in-flight queries were cancelled")
 	force.Reset(st.force)
 	select {
 	case err := <-stopped:

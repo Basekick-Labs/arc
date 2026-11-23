@@ -2,6 +2,16 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: at shutdown, a connection that never sent a request no longer holds the HTTP drain or is reported as a cancelled query ([#1840](https://github.com/Basekick-Labs/arc/issues/1840))
+
+**Who is affected:** any node stopped while a client holds a connection it has not used yet: a load balancer or Kubernetes TCP check, a client pool that opens connections ahead of use, a port scan. Since the HTTP drain got its stages (#1644).
+
+At shutdown the HTTP server waits a grace period for requests in flight, then cancels the queries still running, then closes the connections left. A connection that was accepted and had sent nothing was waited on as if a request were running on it.
+
+- **With `server.tls_enabled`:** a connection that never finished its TLS handshake was never closed early, so the drain ran its whole grace and both stages after it: 10 s at the default `server.shutdown_timeout` on a standalone node, for a stop that otherwise takes milliseconds.
+- **With a shorter grace** (`server.shutdown_timeout` under about 21 on a standalone node): the grace ran out on such a connection, and the log then said `cancelled the queries still running after the grace period` and `closed connections still open after in-flight queries were cancelled`, with no query running. At `server.shutdown_timeout = 10` that used 3.3 s of the 4 s the shutdown hooks share.
+- **Now** a connection that has never sent a request is closed once it is 5 s old, counted from when it was accepted, with or without TLS, and at the end of the grace if that comes first. The two warnings are logged only when a connection that carried a request is still open; the unused ones are reported as `closed connections that never sent a request`, at info level.
+- **Not changed:** the 5 s itself. It is the allowance Go's `net/http` gives a new connection, and it protects a client whose first request, or handshake, is still on its way: a request that arrives inside it is answered. A stop can therefore still wait up to 5 s on a connection opened just before it. Requests in flight, idle keep-alive connections and the stage lengths are as before.
 ## Fix: `POST /api/v1/tiering/migrate` refuses a body it cannot read instead of migrating every database ([#1841](https://github.com/Basekick-Labs/arc/issues/1841))
 
 The migrate endpoint ignored a body it could not parse, and treated it as an empty body, which migrates every database. In each of these cases a request meant for one database migrated all of them, and the answer looked like the scoped run that was asked for:
