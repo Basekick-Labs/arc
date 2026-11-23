@@ -802,13 +802,15 @@ func (c *Coordinator) Start() error {
 		}
 		c.logger.Info().Msg("Raft consensus started")
 
-		// Re-announce ourselves in cluster state if we take leadership at
-		// startup. Not only when bootstrapping: a node that restarts and wins
-		// its own election never runs peer discovery — a leader has nobody to
-		// join — so this is the only thing that puts it back in every peer's
+		// Keep our own record in cluster state current whenever we lead. Not
+		// only when bootstrapping: a node that restarts and wins its own
+		// election never runs peer discovery — a leader has nobody to join —
+		// so this is the only thing that puts it back in every peer's
 		// registry. That is #858's worst case, and it is deterministic in a
-		// cluster whose only voter is the node being restarted.
-		go c.registerSelfInFSMWhenLeader()
+		// cluster whose only voter is the node being restarted. For the
+		// coordinator's life, not a startup window: a leader elected late
+		// kept its previous process's record (#1829).
+		go c.maintainSelfRecord()
 
 		// A compaction pause restored from the local snapshot at startup
 		// fires no callback (#1087); quiesce and ack it once a leader is
@@ -1760,7 +1762,7 @@ func (c *Coordinator) discoveryLoop() {
 //     node with seeds from dialling peers to be redirected to itself. Not
 //     latched, so a node that loses leadership resumes trying. A node that
 //     TAKES leadership re-announces itself through
-//     registerSelfInFSMWhenLeader instead, which is the other half of #858.
+//     maintainSelfRecord instead, which is the other half of #858.
 //
 // Note what is NOT a condition: whether Raft currently knows a leader. That
 // used to be the whole check, and it is #858. LeaderAddr is in-memory and
@@ -2061,6 +2063,9 @@ func (c *Coordinator) handleJoinResponse(msg *protocol.Message, seedAddr string,
 			// else take the FSM's. Losing it made a later Raft leader see no
 			// primary and fail over the designated one (#1267).
 			node.SetWriterState(c.knownWriterState(nodeInfo.ID))
+			// Nor a version: without this every peer showed a blank one
+			// until the next cluster-state write about it (#1829).
+			node.SetVersion(c.knownVersion(nodeInfo.ID))
 			if err := c.registry.Register(node); err != nil {
 				c.logger.Warn().Err(err).Str("node_id", nodeInfo.ID).Msg("Failed to register peer node")
 			}
@@ -2449,8 +2454,16 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 			Capabilities: req.Capabilities,
 		}
 		if err := c.raftNode.AddNode(nodeInfo, 5*time.Second); err != nil {
-			c.logger.Error().Err(err).Str("node_id", req.NodeID).Msg("Failed to add node to FSM")
-			// Node was added to Raft but not FSM - this is ok, FSM will sync eventually
+			// Refuse the join rather than answer success: the joiner latches
+			// "joined" on success and stops discovery, and nothing else
+			// writes its record, so it would keep its previous process's
+			// address and version in every peer's view for the rest of its
+			// life (#1829). Refused, it tries again on its next discovery
+			// tick; the Raft membership added above is idempotent on retry.
+			c.logger.Error().Err(err).Str("node_id", req.NodeID).Msg("Failed to add node to FSM; refusing the join so the node retries")
+			releaseGate()
+			c.sendJoinError(conn, req, fmt.Sprintf("failed to record the node in cluster state: %v", err))
+			return
 		}
 		// Not across the network reply below.
 		releaseGate()
@@ -4127,45 +4140,137 @@ func (c *Coordinator) checkCoreLimit(maxCores int, nodeID string, coreCount int)
 
 // Phase 3: Raft and routing methods
 
-// onRaftNodeAdded is called when a node is added via Raft consensus.
-// It syncs the Raft FSM state to the local registry.
-// registerSelfInFSMWhenLeader waits for this node to become Raft leader,
-// then registers itself in the FSM so that joining nodes will receive the leader's info.
-func (c *Coordinator) registerSelfInFSMWhenLeader() {
-	// Wait for leader election (check every 100ms for up to 30 seconds)
-	for i := 0; i < 300; i++ {
+// selfRecordInterval is how often the self-record loop checks leadership and
+// this node's record in cluster state (#1829). A variable for tests.
+var selfRecordInterval = time.Second
+
+// selfRecordMaxBackoff caps the wait after a failed write of the record, and
+// is how long a difference that a successful write did not clear is left
+// alone before it is written again.
+const selfRecordMaxBackoff = 30 * time.Second
+
+// selfRecordState is maintainSelfRecord's memory between checks.
+type selfRecordState struct {
+	// announced: this process has written its record while leader. The
+	// first write is unconditional; later ones only fix a difference.
+	announced bool
+	// failures counts consecutive failed writes, for the backoff.
+	failures int
+	// writtenDiff/writtenAt: the last difference a write fixed, to notice
+	// one that does not stay fixed instead of rewriting it every second.
+	writtenDiff string
+	writtenAt   time.Time
+	warnedDiff  string
+}
+
+// maintainSelfRecord keeps this node's own record in cluster state current
+// while it is the Raft leader, for the life of the coordinator (#1829).
+//
+// A follower's record is written by the leader when the follower joins, and
+// peer discovery keeps trying until a join succeeds. A leader joins nobody
+// (discoveryShouldRun), so it has to write its own. That used to happen once,
+// and only if this node won an election within 30 s of starting: a node
+// elected later — its peers not yet resolvable after a full cold start, or a
+// failover hours in — kept the record of its previous process, with that
+// process's version and addresses. The api_address in it feeds the write
+// router, standby forwarding and peer cache invalidation; after a cold start
+// that reshuffled pod IPs it pointed at a reader for 85 minutes.
+func (c *Coordinator) maintainSelfRecord() {
+	var s selfRecordState
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
 		select {
 		case <-c.stopCh:
 			return
-		default:
+		case <-timer.C:
 		}
+		timer.Reset(c.syncSelfRecord(&s))
+	}
+}
 
-		if c.raftNode.IsLeader() {
-			break
+// syncSelfRecord runs one check and returns how long to wait for the next.
+//
+// The first write this process makes while leader is unconditional, as the
+// startup re-announcement always was, and deliberately not short-circuited on
+// "already in the FSM": a restarting leader's own record survives because the
+// peer that would have removed it was never leader, and only an applied
+// AddNode repairs the other nodes' registries, through the onNodeAdded
+// callback (#858). After that, a write happens only when the record differs
+// from this node in an identity field (selfRecordDiff). Later leadership gains
+// in the same process do not rewrite an identical record: for a voting
+// non-writer, applyAddNode's takeoverNodeBackLocked treats a write as the node
+// coming back and releases its stream claims.
+//
+// An absent record is written only by that first write. A leader's own record
+// is not absent otherwise (the remove-node API refuses self,
+// internal/api/cluster.go); if it is, the next process's first write
+// restores it, as before.
+func (c *Coordinator) syncSelfRecord(s *selfRecordState) time.Duration {
+	if c.raftNode == nil || c.leaving.Load() || !c.raftNode.IsLeader() {
+		return selfRecordInterval
+	}
+	want := c.selfNodeInfo()
+	diff := ""
+	if s.announced {
+		if c.raftFSM == nil {
+			return selfRecordInterval
 		}
-		time.Sleep(100 * time.Millisecond)
+		cur, ok := c.raftFSM.GetNode(want.ID)
+		if !ok {
+			return selfRecordInterval
+		}
+		if diff = selfRecordDiff(cur, want); diff == "" {
+			s.warnedDiff = ""
+			return selfRecordInterval
+		}
+		if diff == s.writtenDiff && time.Since(s.writtenAt) < selfRecordMaxBackoff {
+			if s.warnedDiff != diff {
+				s.warnedDiff = diff
+				c.logger.Warn().
+					Str("node_id", want.ID).
+					Str("difference", diff).
+					Msg("This node's record in cluster state still differs after it was rewritten; retrying later")
+			}
+			return selfRecordInterval
+		}
 	}
-
-	if !c.raftNode.IsLeader() {
-		c.logger.Debug().Msg("Not leader after bootstrap, skipping self-registration in FSM")
-		return
+	if err := c.raftNode.AddNode(want, 5*time.Second); err != nil {
+		s.failures++
+		wait := selfRecordInterval << min(s.failures, 5)
+		if wait > selfRecordMaxBackoff {
+			wait = selfRecordMaxBackoff
+		}
+		c.logger.Warn().Err(err).
+			Str("node_id", want.ID).
+			Dur("retry_in", wait).
+			Msg("Could not write this node's record to cluster state; peers keep the old one until it is written")
+		return wait
 	}
+	s.failures = 0
+	if !s.announced {
+		s.announced = true
+		c.logger.Info().
+			Str("node_id", want.ID).
+			Msg("Leader registered self in FSM")
+		return selfRecordInterval
+	}
+	s.writtenDiff, s.writtenAt = diff, time.Now()
+	c.logger.Info().
+		Str("node_id", want.ID).
+		Str("difference", diff).
+		Msg("Refreshed this node's record in cluster state")
+	return selfRecordInterval
+}
 
-	// Deliberately NOT short-circuited on "already in the FSM".
-	//
-	// That check used to skip the re-announcement whenever the FSM already
-	// held this node, which is precisely the state a restarting leader is in:
-	// its own record survived because the peer that would have removed it was
-	// never leader. Being in the FSM was never the question — #858 is a
-	// divergence between the FSM and every OTHER node's registry, and only an
-	// applied AddNode repairs that, through the onNodeAdded callback.
-	//
-	// The cost is one Raft entry per process start on whichever node takes
-	// leadership, and applyAddNode is idempotent in effect (it replaces the
-	// record, preserving a live primary designation, #850).
-
-	// Register ourselves in the FSM
-	nodeInfo := &raft.NodeInfo{
+// selfNodeInfo is this node's record as it should stand in cluster state.
+// WriterState is left empty, as on every join and as the startup write always
+// sent: applyAddNode derives "primary" from primaryWriterID atomically at
+// apply time (#850), which a value read here beforehand could not. A
+// "standby" mark is therefore cleared by the write, as a join clears it; that
+// only changes which standby selectPrimary prefers, never whether one exists.
+func (c *Coordinator) selfNodeInfo() *raft.NodeInfo {
+	return &raft.NodeInfo{
 		ID:           c.localNode.ID,
 		Name:         c.localNode.Name,
 		Role:         string(c.localNode.Role),
@@ -4174,18 +4279,55 @@ func (c *Coordinator) registerSelfInFSMWhenLeader() {
 		APIAddress:   c.localNode.APIAddress,
 		State:        string(StateHealthy),
 		Version:      c.localNode.Version,
-		CoreCount:    runtime.GOMAXPROCS(0), // Leader's core count
+		CoreCount:    runtime.GOMAXPROCS(0),
 		Capabilities: c.localCapabilities(),
 	}
+}
 
-	if err := c.raftNode.AddNode(nodeInfo, 5*time.Second); err != nil {
-		c.logger.Error().Err(err).Msg("Failed to register self in FSM")
-		return
+// selfRecordDiff names the identity fields in which cur differs from want,
+// "" when none does. Not compared: State and WriterState (not identity, and
+// owned by other paths) and CoreCount (GOMAXPROCS follows the cgroup at run
+// time; a resize is not worth a Raft entry, and the next restart writes it).
+func selfRecordDiff(cur, want *raft.NodeInfo) string {
+	var d []string
+	if cur.Name != want.Name {
+		d = append(d, "name")
 	}
+	if cur.Role != want.Role {
+		d = append(d, "role")
+	}
+	if cur.ClusterName != want.ClusterName {
+		d = append(d, "cluster_name")
+	}
+	if cur.Address != want.Address {
+		d = append(d, "address")
+	}
+	if cur.APIAddress != want.APIAddress {
+		d = append(d, "api_address")
+	}
+	if cur.Version != want.Version {
+		d = append(d, "version")
+	}
+	if !sameStringSet(cur.Capabilities, want.Capabilities) {
+		d = append(d, "capabilities")
+	}
+	return strings.Join(d, ",")
+}
 
-	c.logger.Info().
-		Str("node_id", c.localNode.ID).
-		Msg("Bootstrap leader registered self in FSM")
+func sameStringSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	as := append([]string(nil), a...)
+	bs := append([]string(nil), b...)
+	sort.Strings(as)
+	sort.Strings(bs)
+	for i := range as {
+		if as[i] != bs[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // nodeFromRaftInfo builds the registry's view of a node from its FSM record.
@@ -4208,6 +4350,8 @@ func nodeFromRaftInfo(n *raft.NodeInfo) *Node {
 	return node
 }
 
+// onRaftNodeAdded is called when a node is added via Raft consensus.
+// It syncs the Raft FSM state to the local registry.
 func (c *Coordinator) onRaftNodeAdded(n *raft.NodeInfo) {
 	// Roles are validated at join now, but a cluster formed before #848 can
 	// still carry an unrecognised one in the FSM, and this is where it
@@ -4305,6 +4449,25 @@ func (c *Coordinator) knownWriterState(id string) WriterState {
 		return existing.GetWriterState()
 	}
 	return WriterStateNone
+}
+
+// knownVersion is the version this node knows for id: its own when id is this
+// node (its FSM may still hold its previous process's record), else the FSM's
+// record, which the registry is derived from, else the registry entry's. The
+// join response carries none (#1829).
+func (c *Coordinator) knownVersion(id string) string {
+	if c.localNode != nil && id == c.localNode.ID {
+		return c.localNode.Version
+	}
+	if c.raftFSM != nil {
+		if n, ok := c.raftFSM.GetNode(id); ok && n != nil && n.Version != "" {
+			return n.Version
+		}
+	}
+	if existing, ok := c.registry.Get(id); ok {
+		return existing.Version
+	}
+	return ""
 }
 
 // onWriterPromoted is called when the FSM promotes a new primary writer.
