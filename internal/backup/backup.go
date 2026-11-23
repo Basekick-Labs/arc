@@ -659,8 +659,9 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		case strings.HasPrefix(obj.Path, rehomeStagedRoot+"/"):
 			// A re-home job's outputs before they are moved into place
 			// (internal/rehome) are not data: the file they replace is. The
-			// API refuses a backup while such a job is in flight; this
-			// covers a backup started any other way.
+			// API refuses a backup while such a job is in flight, which is
+			// what keeps a backup from holding both a file and the outputs
+			// already moved into place; this only keeps staged files out.
 		case isCompactionState(obj.Path):
 			stateFiles = append(stateFiles, obj)
 		case strings.HasSuffix(obj.Path, ".parquet"):

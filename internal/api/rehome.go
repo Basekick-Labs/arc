@@ -185,6 +185,7 @@ func (h *RehomeHandler) RegisterRoutes(app fiber.Router) {
 	group.Post("/", h.start)
 	group.Get("/", h.list)
 	group.Get("/:id", h.get)
+	group.Post("/:id/resume", h.resumeJob)
 }
 
 type rehomeRequest struct {
@@ -339,6 +340,60 @@ func (h *RehomeHandler) get(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "no such job on this node"})
 	}
 	return c.JSON(out)
+}
+
+// resumeJob handles POST /api/v1/rehome/:id/resume: a job that stopped part
+// way in this process, or that was found at start and could not be taken up,
+// is taken up again. It runs in the job slot, like a new job.
+func (h *RehomeHandler) resumeJob(c *fiber.Ctx) error {
+	if h.swap == nil || h.swap.Registry == nil {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "moving a file's rows is not available on this node"})
+	}
+	if why := h.swapRefusal(); why != "" {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": why})
+	}
+	id := strings.Clone(c.Params("id"))
+	rec, ok := h.swap.Registry.Get(id)
+	if !ok {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "no job with that id is recorded on this node; a job that ended has no record"})
+	}
+	h.mu.Lock()
+	if h.running {
+		h.mu.Unlock()
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "another re-home job is running; one runs at a time"})
+	}
+	job, known := h.jobs[id]
+	if !known {
+		job = &rehomeJob{ID: id, Path: rec.Source.Key, StartedAt: rec.CreatedAt}
+		h.jobs[id] = job
+		h.order = append(h.order, id)
+	}
+	job.State, job.Reason, job.FinishedAt = "running", "", nil
+	h.running = true
+	h.mu.Unlock()
+
+	h.done.Add(1)
+	go func() {
+		defer h.done.Done()
+		jctx, jcancel := context.WithCancel(h.ctx)
+		defer jcancel()
+		state, reason, _ := h.runGuarded(jctx, job, func(ctx context.Context, job *rehomeJob) (string, string, *rehomeReport) {
+			if err := h.resume(ctx, job.ID); err != nil {
+				if why, refused := rehome.IsRefused(err); refused {
+					return "refused", why, nil
+				}
+				h.logger.Error().Err(err).Str("job", job.ID).Msg("Re-home: a job could not be taken up again; its record is kept")
+				return "stopped", "the job could not be taken up again and its record is kept; the server log has the error under this job's id", nil
+			}
+			return "done", "", nil
+		})
+		now := time.Now().UTC()
+		h.mu.Lock()
+		job.State, job.Reason, job.FinishedAt = state, reason, &now
+		h.running = false
+		h.mu.Unlock()
+	}()
+	return c.Status(fiber.StatusAccepted).JSON(h.view(job))
 }
 
 // dryRun copies the file to a scratch directory, splits it there, checks the

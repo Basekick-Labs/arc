@@ -29,21 +29,36 @@ eight clients querying in a loop through 20 jobs, 3,979 answers were right, 40 w
 retry answer, and none was wrong.
 
 **What happens on a stop.** Each step is recorded in a journal file under `_rehome/` in
-the storage root. At the next start a job found part way is finished, or, if it had not
-started moving files, dropped (the file is as it was; send the request again). The
-process was killed a few milliseconds into a job twelve times; every restart ended with
-the right rows and nothing left behind. A job that cannot be taken up is kept as
-recorded, logged at Error, and listed by `GET /api/v1/rehome` as `stuck`; reads still
-see every row once.
+the storage root. At the next start a job that had begun to switch queries over is
+finished, and one that had only staged its files is dropped (the file is as it was;
+send the request again). The process was killed a few milliseconds into a job twelve
+times; every restart ended with the right rows and nothing left behind.
+
+- **A job that stops part way in a running process** (a storage error) keeps its record
+  and its files stay owned. `POST /api/v1/rehome/<id>/resume` takes it up again, and so
+  does the next start.
+- **A job that cannot be taken up** is kept as recorded, logged at Error with what is
+  wrong, and listed by `GET /api/v1/rehome` as `stuck`. That happens only when a file the
+  job recorded was removed or changed by hand: the file being moved while queries still
+  read it, an output after queries were switched to the outputs, or another file sitting
+  at an output's name. Until it is put right, queries may be missing that file's rows.
+- **A journal from a run under another configuration.** If the node has since become a
+  cluster member, or tiering, edge sync or the Iceberg export was turned on, a job that
+  had not switched queries over is undone, and one that had is kept as recorded with an
+  Error line saying how to finish it.
+- **Queries that do not end.** If queries in flight when the job starts have not ended
+  after 15 minutes, the job is undone before it moves anything. After the switch the job
+  waits for as long as it takes, with the original kept and left out of queries.
 
 **What leaves a job's files alone while it runs.** Compaction, DELETE (the response is
 207 naming the files left for a retry), retention (it takes the file on its next run),
 and a database delete (409). A backup or a restore and a job refuse each other (409).
 
 **What is refused, with the reason.** Besides the deployments above and what the dry run
-refuses: a file whose rows all belong where it sits; a file another operation already
-leaves out of reads (a DELETE that could not remove it, a compaction that merged it); a
-measurement with a compaction job open; a file another job owns.
+refuses: a file whose rows all belong where it sits; a file a DELETE rewrote whose
+rewrite is still beside it (run a DELETE on the measurement first, which removes the
+stale copy); a file another operation already leaves out of reads; a measurement with a
+compaction job open; a file another job owns.
 
 **Output files.** Named like ingest files (hour) or `..._daily.parquet` (day), ZSTD,
 with Arc's dedup metadata carried over. Rows whose time is NULL or infinite stay in the
@@ -51,6 +66,10 @@ original's directory, in a file of their own. The staging directory `_rehome_sta
 holds a job's files before they are moved into place; backup skips it.
 
 **Audit.** A job start is recorded as `rehome.started`.
+
+**Startup.** Every node now reads `_rehome/` in its storage root at start, on any
+storage: one listing of a prefix that is empty unless a job was left. A record there
+that cannot be read stops the start and names the file.
 
 **Not in this release:** undoing a job by request, and metrics for jobs.
 

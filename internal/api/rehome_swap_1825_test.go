@@ -207,7 +207,9 @@ func TestSwapMovesTheRows1825(t *testing.T) {
 	if got := strings.Join(steps, " "); got != want {
 		t.Fatalf("steps = %q, want %q", got, want)
 	}
-	if published != 3 || cleared != r.key {
+	// Once per output, and once more with an hour that is never the current
+	// one, so the measurement's stamp moves whatever the outputs are.
+	if published != 4 || cleared != r.key {
 		t.Fatalf("query caches told of %d outputs, misfiled list cleared for %q", published, cleared)
 	}
 	// Each output keeps the dedup metadata and is named like an ingest file.
@@ -425,5 +427,214 @@ func TestSwapOwnsItsFilesAndTakesTheRewriteLock1825(t *testing.T) {
 func TestBackupSkipsTheStagingRoot1825(t *testing.T) {
 	if rehome.StagedRoot != "_rehome_staged" || !storage.IsReservedRootDir(rehome.StagedRoot) || !storage.IsReservedRootDir(rehome.JournalRoot) {
 		t.Fatalf("staging root %q, journal root %q: backup.rehomeStagedRoot must match and both must be reserved", rehome.StagedRoot, rehome.JournalRoot)
+	}
+}
+
+// A file a DELETE rewrote, with the rewrite still beside it, is refused: one
+// of the two holds rows that DELETE removed, and only a DELETE can tell which.
+func TestSwapRefusesAFileWithItsRewriteBesideIt1825(t *testing.T) {
+	r := newSwapRig(t)
+	rewrite := strings.TrimSuffix(swapKey, ".parquet") + "_rewrite_1795000000000000000.parquet"
+	data, err := os.ReadFile(filepath.Join(r.root, swapKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.backend.Write(context.Background(), rewrite, data); err != nil {
+		t.Fatal(err)
+	}
+	if storage.RewriteFamily(rewrite) != storage.RewriteFamily(swapKey) {
+		t.Fatalf("the test's rewrite name is not of the file's family: %s", rewrite)
+	}
+	for _, key := range []string{swapKey, rewrite} {
+		r.key = key
+		id, _, _ := r.start()
+		job := r.wait(id)
+		if job["state"] != "refused" || !strings.Contains(fmt.Sprint(job["reason"]), "rewritten by a DELETE") {
+			t.Fatalf("%s: %v", key, job)
+		}
+	}
+	if left, _ := r.backend.List(context.Background(), "db/cpu/"); len(left) != 2 {
+		t.Fatalf("a refused job changed the files: %v", left)
+	}
+}
+
+// A job that stopped part way in a running process is taken up again by a
+// resume request, and its files stay owned until then.
+func TestSwapResume1825(t *testing.T) {
+	r := newSwapRig(t)
+	moved := 0
+	r.h.afterStep = func(s string) {
+		if s == "moved" {
+			if moved++; moved == 2 {
+				panic("stopped after the second move")
+			}
+		}
+	}
+	id, _, _ := r.start()
+	if job := r.wait(id); job["state"] != "failed" {
+		t.Fatalf("job: %v", job)
+	}
+	r.requireOnce("stopped part way")
+	if !r.reg.Owns(swapKey) {
+		t.Fatal("a job stopped part way no longer owns its file")
+	}
+	if code, out := rehomeDo(t, r.app, "POST", "/api/v1/rehome", "", fmt.Sprintf(`{"path":%q}`, swapKey)); code == 202 {
+		if again := r.wait(out["id"].(string)); again["state"] != "refused" {
+			t.Fatalf("a second job on a file a stopped job owns: %v", again)
+		}
+	}
+	r.h.afterStep = nil
+	if code, out := rehomeDo(t, r.app, "POST", "/api/v1/rehome/"+id+"/resume", "", ""); code != 202 {
+		t.Fatalf("resume: %d %v", code, out)
+	}
+	if job := r.wait(id); job["state"] != "done" {
+		t.Fatalf("after resume: %v", job)
+	}
+	r.requireOnce("after resume")
+	if _, _, files := r.reads(); len(files) != 3 || r.reg.Active() {
+		t.Fatalf("after resume: files %v, registry active %v", files, r.reg.Active())
+	}
+	if code, _ := rehomeDo(t, r.app, "POST", "/api/v1/rehome/"+id+"/resume", "", ""); code != 404 {
+		t.Fatalf("resume of a job that ended: %d, want 404", code)
+	}
+}
+
+// stopAt runs a job on r until the named step, then stands for a restart
+// without recovering.
+func stopAt(t *testing.T, r *swapRig, step string, nth int) {
+	t.Helper()
+	seen := 0
+	r.h.afterStep = func(s string) {
+		if s == step {
+			if seen++; seen == nth {
+				panic("stopped")
+			}
+		}
+	}
+	id, _, _ := r.start()
+	if job := r.wait(id); job["state"] != "failed" {
+		t.Fatalf("job: %v", job)
+	}
+	r.open()
+}
+
+// What recovery refuses to guess about: it keeps the job as recorded, and
+// lists it.
+func TestRecoveryKeepsAJobItCannotFinish1825(t *testing.T) {
+	ctx := context.Background()
+	stuck := func(t *testing.T, r *swapRig) {
+		t.Helper()
+		if err := r.h.Recover(ctx); err != nil {
+			t.Fatalf("Recover: %v", err)
+		}
+		if !r.reg.Active() {
+			t.Fatal("the job was not kept")
+		}
+		_, list := rehomeDo(t, r.app, "GET", "/api/v1/rehome", "", "")
+		jobs := list["jobs"].([]interface{})
+		if len(jobs) != 1 || jobs[0].(map[string]interface{})["state"] != "stuck" {
+			t.Fatalf("list: %v", list)
+		}
+	}
+	t.Run("the file being moved changed while the job was committed", func(t *testing.T) {
+		r := newSwapRig(t)
+		stopAt(t, r, "moved", 1)
+		if err := os.WriteFile(filepath.Join(r.root, swapKey), []byte("truncated"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		stuck(t, r)
+		if _, err := os.Stat(filepath.Join(r.root, swapKey)); err != nil {
+			t.Fatalf("the changed file was removed: %v", err)
+		}
+	})
+	t.Run("an output is gone once reads were switched to the outputs", func(t *testing.T) {
+		r := newSwapRig(t)
+		stopAt(t, r, "latched", 1)
+		job := r.reg.Jobs()[0]
+		if err := os.Remove(filepath.Join(r.root, job.Outputs[1].Key)); err != nil {
+			t.Fatal(err)
+		}
+		stuck(t, r)
+		if _, err := os.Stat(filepath.Join(r.root, swapKey)); err != nil {
+			t.Fatalf("the file was removed though an output is missing: %v", err)
+		}
+	})
+	t.Run("another file sits at an output's key", func(t *testing.T) {
+		r := newSwapRig(t)
+		stopAt(t, r, "committed", 1)
+		job := r.reg.Jobs()[0]
+		other := filepath.Join(r.root, job.Outputs[0].Key)
+		if err := os.MkdirAll(filepath.Dir(other), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		// The same size as the output, other bytes: only the hash tells.
+		theirs, err := os.ReadFile(filepath.Join(r.root, job.Outputs[0].Staged))
+		if err != nil {
+			t.Fatal(err)
+		}
+		theirs[len(theirs)/2] ^= 0xff
+		if err := os.WriteFile(other, theirs, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		stuck(t, r)
+		if got, _ := os.ReadFile(other); string(got) != string(theirs) {
+			t.Fatal("the file at the output's key was overwritten")
+		}
+		if _, err := os.Stat(filepath.Join(r.root, swapKey)); err != nil {
+			t.Fatalf("the file being moved was removed though another file sits at an output's key: %v", err)
+		}
+	})
+	t.Run("an output is lost before it was moved: the job is undone", func(t *testing.T) {
+		r := newSwapRig(t)
+		stopAt(t, r, "moved", 1)
+		job := r.reg.Jobs()[0]
+		if err := os.Remove(filepath.Join(r.root, job.Outputs[2].Staged)); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.h.Recover(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, files := r.reads(); r.reg.Active() || len(files) != 1 || files[0] != swapKey {
+			t.Fatalf("after recovery: registry active %v, files %v; want the job undone and the file as it was", r.reg.Active(), files)
+		}
+		r.requireOnce("undone")
+	})
+}
+
+// A journal left by a run under another configuration: on a deployment that
+// no longer runs such jobs, a job that had not switched reads is undone, and
+// one that had is kept as recorded.
+func TestRecoveryOnADeploymentThatRefusesJobs1825(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		step     string
+		nth      int
+		wantKept bool
+	}{{"staged", 1, false}, {"moved", 2, false}, {"latched", 1, true}} {
+		t.Run(tc.step, func(t *testing.T) {
+			r := newSwapRig(t)
+			stopAt(t, r, tc.step, tc.nth)
+			r.swap.Refusal = func() string { return "this node is now part of a cluster" }
+			if err := r.h.Recover(ctx); err != nil {
+				t.Fatal(err)
+			}
+			r.requireOnce("after recovery")
+			_, _, files := r.reads()
+			if tc.wantKept {
+				if !r.reg.Active() || len(files) != 3 {
+					t.Fatalf("a job that had switched reads: registry active %v, files %v; want it kept, reading the outputs", r.reg.Active(), files)
+				}
+				if _, err := os.Stat(filepath.Join(r.root, swapKey)); err != nil {
+					t.Fatalf("the old file was removed on a deployment that refuses jobs: %v", err)
+				}
+				return
+			}
+			if r.reg.Active() || len(files) != 1 || files[0] != swapKey {
+				t.Fatalf("registry active %v, files %v; want the job undone and the file as it was", r.reg.Active(), files)
+			}
+			if j, s := r.leftovers(); j != 0 || s != 0 {
+				t.Fatalf("left %d journal and %d staged file(s)", j, s)
+			}
+		})
 	}
 }

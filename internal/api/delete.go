@@ -389,8 +389,8 @@ func (h *DeleteHandler) SetRehomeOwns(fn func(path string) bool) { h.rehomeOwns 
 
 // WithRewriteLock runs fn while no DELETE rewrites a file: under the mutex
 // the whole rewrite phase of a DELETE, the removal of leftovers and the
-// drainer hold. A re-home job switches reads from its source to its outputs
-// inside it, after re-checking its source.
+// drainer hold. A re-home job, having registered its ownership, checks its
+// file inside it: a DELETE that was rewriting the file has finished.
 func (h *DeleteHandler) WithRewriteLock(fn func()) {
 	h.rewriteMu.Lock()
 	defer h.rewriteMu.Unlock()
@@ -1353,9 +1353,10 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 	if size, statErr := h.storage.StatFile(ctx, relativePath); statErr == nil && size < 0 {
 		return 0, fmt.Errorf("%w: %s", errSourceRetired, filepath.Base(relativePath))
 	}
-	// Under the rewrite mutex, which a re-home job holds while it switches
-	// reads from its source to its outputs: either the job owns the file
-	// here, or it will see this rewrite's result when it re-checks its source.
+	// A re-home job registers its ownership and then takes the rewrite
+	// mutex once, to check its file: a rewrite that began before that has
+	// finished by the time the job looks, and one that begins after sees
+	// the ownership here.
 	if h.rehomeOwns != nil && h.rehomeOwns(relativePath) {
 		return 0, fmt.Errorf("%w: %s", errFileBeingRehomed, filepath.Base(relativePath))
 	}

@@ -190,7 +190,27 @@ func (h *RehomeHandler) runSwap(ctx context.Context, job *rehomeJob) (state, rea
 		if checkErr == nil && size < 0 {
 			checkErr = rehome.Refusef("%s is not in storage any more", src.Key)
 		}
-		if checkErr != nil || h.swap.OtherExclusions == nil {
+		if checkErr != nil {
+			return
+		}
+		// A file an earlier DELETE rewrote, with the rewrite still beside
+		// it: one of the two holds rows that DELETE removed, and DELETE is
+		// what tells them apart and removes the stale one. Split, its rows
+		// would land under new names that no DELETE can match to the pair,
+		// and the removed rows would be back for good.
+		siblings, err := h.storage.List(ctx, src.Dir+"/")
+		if err != nil {
+			checkErr = err
+			return
+		}
+		family := storage.RewriteFamily(src.Key)
+		for _, k := range siblings {
+			if k != src.Key && storage.RewriteFamily(k) == family {
+				checkErr = rehome.Refusef("%s was rewritten by a DELETE and the two copies are both in storage (%s); run a DELETE on the measurement first, which removes the stale one", src.Key, k)
+				return
+			}
+		}
+		if h.swap.OtherExclusions == nil {
 			return
 		}
 		excluded, err := h.swap.OtherExclusions(ctx, rec.Prefix())
@@ -278,8 +298,12 @@ func (h *RehomeHandler) runSwap(ctx context.Context, job *rehomeJob) (state, rea
 	// From here the job is on disk: what follows is the same code a restart
 	// runs, and a failure leaves the record for it.
 	if err := h.finishSwap(ctx, job.ID); err != nil {
-		h.logger.Error().Err(err).Str("job", job.ID).Str("path", src.Key).Msg("Re-home job stopped; its record is kept and it is taken up again at the next start")
-		return "failed", "the job stopped part way; its record is kept, reads still see every row once, and it is taken up again at the next start. The server log has the error under this job's id", report
+		if errors.Is(err, errUndone) {
+			h.logger.Warn().Str("job", job.ID).Str("path", src.Key).Msg("Re-home job undone: reads in flight did not end in time; nothing was moved")
+			return "failed", fmt.Sprintf("queries in flight did not end within %s, so the job was undone before it moved anything; the file is as it was. Send the request again", rehomeReadWait), report
+		}
+		h.logger.Error().Err(err).Str("job", job.ID).Str("path", src.Key).Msg("Re-home job stopped part way; its record is kept. POST /api/v1/rehome/<id>/resume takes it up again, and so does the next start")
+		return "stopped", "the job stopped part way and its record is kept; its files stay out of compaction, DELETE, retention and backup until it ends. POST /api/v1/rehome/" + job.ID + "/resume takes it up again, and so does the next start. The server log has the error under this job's id", report
 	}
 	h.logger.Info().Str("job", job.ID).Str("path", src.Key).Int64("rows", plan.Rows).
 		Int64("moved_rows", plan.MisfiledRows()).Int("outputs", len(outs)).
@@ -367,10 +391,17 @@ func (h *RehomeHandler) finishSwap(ctx context.Context, id string) error {
 		}
 		// The caches that remember which directories are empty: every
 		// output is there now, and the latch below sends reads to them.
-		for _, o := range job.Outputs {
-			if h.swap.FilePublished != nil {
+		if h.swap.FilePublished != nil {
+			for _, o := range job.Outputs {
 				h.swap.FilePublished(job.Database, job.Measurement, o.Start)
 			}
+			// And once with an hour that is never the current one: the call
+			// does nothing for the current hour, whose absence is not
+			// cached, but a day directory's is, and today's daily output
+			// lands in one. This moves the measurement's stamp whatever the
+			// outputs are, so a read in flight cannot store "absent" for a
+			// directory an output is now in.
+			h.swap.FilePublished(job.Database, job.Measurement, time.Unix(0, 0).UTC())
 		}
 		if h.swap.InvalidateCaches != nil {
 			h.swap.InvalidateCaches()
@@ -421,6 +452,12 @@ func (h *RehomeHandler) finishSwap(ctx context.Context, id string) error {
 	h.hook("removed")
 	if err := reg.End(bg, id); err != nil {
 		return err
+	}
+	// The record's removal made durable too: a record brought back by a
+	// power cut would have recovery look for outputs that compaction may
+	// have merged since.
+	if err := store.Sync(bg, rehome.JournalRoot); err != nil && !storage.IsNotFound(err) && !os.IsNotExist(err) {
+		h.logger.Warn().Err(err).Str("job", id).Msg("Re-home: could not make the removal of the job's record durable")
 	}
 	if err := store.RemoveAll(bg, rehome.StagedDir(id)); err != nil {
 		h.logger.Warn().Err(err).Str("job", id).Msg("Re-home: could not remove the job's staging directory; it is removed at the next start")
@@ -494,14 +531,35 @@ func (h *RehomeHandler) Recover(ctx context.Context) error {
 	if len(jobs) > 0 && !ok {
 		return fmt.Errorf("%d re-home job(s) are recorded under %s/ and this node's storage is not local: they cannot be taken up", len(jobs), rehome.JournalRoot)
 	}
+	// A journal from a run under another configuration: this deployment is
+	// one a swap is refused on (it became a cluster node, or tiering or the
+	// Iceberg export was turned on). Finishing a job would put files in
+	// place that the cluster manifest, the tier rows or the table know
+	// nothing of.
+	refused := ""
+	if h.swap.Refusal != nil {
+		refused = h.swap.Refusal()
+	}
 	for _, job := range jobs {
 		log := h.logger.With().Str("job", job.ID).Str("path", job.Source.Key).Str("state", string(job.State)).Logger()
+		if refused != "" {
+			if job.State == rehome.StateLatched {
+				log.Error().Str("why", refused).Msg("Re-home: a job found at start had switched reads to its new files, and this deployment no longer runs such jobs. It is kept as recorded: reads leave the old file out and read the new ones. Finish it under the configuration it was started with, or remove the old file and the record by hand")
+				continue
+			}
+			if err := h.undoIfSourceWhole(ctx, store, job); err != nil {
+				log.Error().Err(err).Str("why", refused).Msg("Re-home: a job found at start could not be undone on a deployment that no longer runs such jobs; it is kept as recorded. Check by hand")
+				continue
+			}
+			log.Warn().Str("why", refused).Msg("Re-home: a job found at start was undone, because this deployment no longer runs such jobs; the file is as it was")
+			continue
+		}
 		// A job that cannot be taken up stays as it is recorded: its files
 		// stay owned, and reads keep leaving out what its state says, which
 		// is each row once. It is listed by GET /api/v1/rehome and logged
 		// here; the node starts.
 		if err := h.recoverJob(ctx, store, job); err != nil {
-			log.Error().Err(err).Msg("Re-home: a job found at start could not be taken up. It is kept as recorded: its files stay out of compaction, DELETE and retention, and reads see every row once. Check by hand")
+			log.Error().Err(err).Msg("Re-home: a job found at start could not be taken up. It is kept as recorded: its files stay out of compaction, DELETE and retention. The error says which file is not as the job recorded it; until that is put right by hand, reads may be missing that file's rows")
 			continue
 		}
 		log.Info().Msg("Re-home: a job found at start was taken up")
@@ -530,6 +588,44 @@ func (h *RehomeHandler) Recover(ctx context.Context) error {
 	return nil
 }
 
+// sourceWhole reports whether the file a job is moving is in storage at the
+// size the job recorded. While a job is committed, reads see that file and
+// leave the outputs out: if it is gone or changed, neither side is whole.
+func sourceWhole(ctx context.Context, store rehomeStore, job *rehome.Job) error {
+	n, err := store.StatFile(ctx, job.Source.Key)
+	if err != nil {
+		return fmt.Errorf("stat the file being moved: %w", err)
+	}
+	if n != job.Source.Size {
+		return fmt.Errorf("the file being moved, %s, is not as the job recorded it (size %d, recorded %d): reads are left without its rows until it is restored", job.Source.Key, n, job.Source.Size)
+	}
+	return nil
+}
+
+// undoIfSourceWhole undoes a job that has not latched, provided the file it
+// was moving is whole.
+func (h *RehomeHandler) undoIfSourceWhole(ctx context.Context, store rehomeStore, job *rehome.Job) error {
+	if err := sourceWhole(ctx, store, job); err != nil {
+		return err
+	}
+	return h.undo(ctx, job)
+}
+
+// resume takes up a job this process holds a record of and is not running:
+// one that stopped part way, or one found at start that could not be taken
+// up then.
+func (h *RehomeHandler) resume(ctx context.Context, id string) error {
+	store, ok := h.mover()
+	if !ok {
+		return errors.New("storage is not local")
+	}
+	job, ok := h.swap.Registry.Get(id)
+	if !ok {
+		return rehome.Refusef("no job %s is recorded", id)
+	}
+	return h.recoverJob(ctx, store, job)
+}
+
 // hook is a test seam: called after each step, by name.
 func (h *RehomeHandler) hook(step string) {
 	if h.afterStep != nil {
@@ -545,14 +641,8 @@ func (h *RehomeHandler) recoverJob(ctx context.Context, store rehomeStore, job *
 		// again.
 		return h.undo(ctx, job)
 	case rehome.StateCommitted:
-		n, err := store.StatFile(ctx, job.Source.Key)
-		if err != nil {
-			return fmt.Errorf("stat its source: %w", err)
-		}
-		if n != job.Source.Size {
-			// The source is gone or changed with the outputs not all in
-			// place: neither side is known to be whole.
-			return fmt.Errorf("the file being moved is not as the job recorded it (size %d, recorded %d)", n, job.Source.Size)
+		if err := sourceWhole(ctx, store, job); err != nil {
+			return err
 		}
 		for _, o := range job.Outputs {
 			moved, err := h.outputInPlace(ctx, store, o)

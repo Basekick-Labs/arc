@@ -62,6 +62,18 @@ func TestDeleteLeavesAFileBeingRehomed1825(t *testing.T) {
 	if _, err := h.rewriteFileWithoutDeletedRows(context.Background(), full, rel, "host = 'h1'", ""); errors.Is(err, errFileBeingRehomed) {
 		t.Fatalf("a file no job owns: %v", err)
 	}
+	// The removal of files an earlier DELETE left behind leaves an owned
+	// file too.
+	owned = true
+	if _, ok := h.claimForRemoval(context.Background(), rel); ok {
+		t.Fatal("a leftover removal claimed a file a re-home job owns")
+	}
+	owned = false
+	if release, ok := h.claimForRemoval(context.Background(), rel); !ok {
+		t.Fatal("a leftover removal was refused a file no job owns")
+	} else {
+		release()
+	}
 	// WithRewriteLock holds the mutex a DELETE's rewrite phase takes.
 	ran := false
 	h.WithRewriteLock(func() {

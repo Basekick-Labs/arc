@@ -418,6 +418,11 @@ func (h *DeleteHandler) removeLeftovers(ctx context.Context, database, measureme
 // pass: removed and unjournaled mid-copy, its copy would reach cold holding
 // the rows a DELETE took out, with nothing left to say so.
 func (h *DeleteHandler) claimForRemoval(ctx context.Context, path string) (func(), bool) {
+	// A file a re-home job in flight owns is not removed under it (#1825).
+	if h.rehomeOwns != nil && h.rehomeOwns(path) {
+		h.logger.Debug().Str("file", path).Msg("Left for a later pass: a re-home job in flight owns it")
+		return nil, false
+	}
 	if h.moveClaims == nil {
 		return func() {}, true
 	}

@@ -153,6 +153,14 @@ func (j *Job) validate(id string) error {
 		if !strings.HasPrefix(o.Staged, StagedDir(id)+"/") || strings.Contains(o.Staged, "..") {
 			return fmt.Errorf("staged file %q is not under the job's staged directory", o.Staged)
 		}
+		// A size of -1 is what a missing file stats as: a record with one
+		// would pass "the output is in place at its size".
+		if o.Size <= 0 || o.SHA256 == "" {
+			return fmt.Errorf("output %s has no size or hash", o.Key)
+		}
+	}
+	if j.Source.Size <= 0 || j.Source.SHA256 == "" {
+		return errors.New("the source has no size or hash")
 	}
 	return nil
 }
@@ -417,27 +425,8 @@ func (r *Registry) Owns(key string) bool {
 	return ok
 }
 
-// OwnsUnder reports whether a job in flight owns a file under prefix (a
-// database's "db/", a measurement's "db/measurement/").
-func (r *Registry) OwnsUnder(prefix string) bool {
-	if r == nil {
-		return false
-	}
-	if !r.seeded.Load() {
-		return true
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for k := range r.owned {
-		if strings.HasPrefix(k, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-// Claim is taken by an operation that is about to delete or replace a file
-// outside any job (retention, DELETE), across its check and its act: while
+// Claim is taken by an operation that is about to delete a file outside any
+// job (retention), across its check and its act: while
 // held, no job can begin on the file or take it as an output key. ok is false
 // when a job owns the file: the operation must leave it alone.
 func (r *Registry) Claim(key string) (release func(), ok bool) {

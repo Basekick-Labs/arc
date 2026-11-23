@@ -1066,8 +1066,20 @@ func main() {
 	// would let compaction merge a file with the files replacing it. The
 	// jobs are taken up further down (rehomeHandler.Recover).
 	rehomeRegistry := rehome.NewRegistry(storageBackend)
-	if err := rehomeRegistry.Seed(context.Background()); err != nil {
-		log.Fatal().Err(err).Msg("Could not read the re-home job journal")
+	// A few tries: on an object store this is one LIST of a prefix that is
+	// empty on every deployment today, and a blip must not stop the start.
+	var seedErr error
+	for try := 0; try < 5; try++ {
+		if try > 0 {
+			time.Sleep(time.Duration(try) * time.Second)
+		}
+		if seedErr = rehomeRegistry.Seed(context.Background()); seedErr == nil {
+			break
+		}
+		log.Warn().Err(seedErr).Int("try", try+1).Msg("Could not read the re-home job journal; trying again")
+	}
+	if seedErr != nil {
+		log.Fatal().Err(seedErr).Msg("Could not read the re-home job journal")
 	}
 
 	// #1626: a database named after a subdirectory Iceberg warehouse would
@@ -4543,10 +4555,12 @@ func main() {
 	// Re-home (#1825): DELETE leaves a job's files alone, and the swap is
 	// wired and the jobs a stopped process left are taken up, here: after
 	// the query and DELETE handlers exist, before the drainer below and
-	// before anything that reads data files on a schedule or over the
-	// network starts (continuous queries, retention, the Iceberg export, the
-	// HTTP and Flight SQL servers). A job found part way has its file removed
-	// without waiting for reads, because none from before the stop is alive.
+	// before the readers start (continuous queries, retention, the Iceberg
+	// export, the HTTP and Flight SQL servers). The compaction schedulers
+	// are already started; they are kept off a job's files by the registry,
+	// seeded above, not by this order. A job found part way has its file
+	// removed without waiting for reads, because none from before the stop
+	// is alive.
 	deleteHandler.SetRehomeOwns(rehomeRegistry.Owns)
 	rehomeHandler.SetSwap(&api.RehomeSwap{
 		Registry: rehomeRegistry,

@@ -1427,9 +1427,9 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 	}
 	// A re-home job that began between this candidate's filters and here
 	// owns one of its files (#1825). Each side registers, then looks for
-	// the other: the re-home job refuses to commit while a compaction is
-	// open on the measurement, and this job gives up now that it is. One of
-	// the two always sees the other.
+	// the other: the re-home job, right after it takes ownership, refuses
+	// while a compaction is open on the measurement, and this job gives up
+	// now that it is. One of the two always sees the other.
 	if m.anyOwned(candidate.Files) {
 		if activeOutput != "" {
 			m.OpenJobs.finish(activeOutput, true)

@@ -62,7 +62,7 @@ func TestJobStates(t *testing.T) {
 	if err := r.Begin(testJob(id)); err != nil {
 		t.Fatal(err)
 	}
-	if !r.Owns(srcKey) || r.Owns(outA) || r.Open(prefix) || len(r.ExcludedFor(ctx, prefix)) != 0 || !r.OwnsUnder("db/") || r.OwnsUnder("other/") {
+	if !r.Owns(srcKey) || r.Owns(outA) || r.Open(prefix) || len(r.ExcludedFor(ctx, prefix)) != 0 {
 		t.Fatal("preparing: the source is owned, nothing is left out")
 	}
 	if err := r.SetOutputs(id, testOutputs(id)); err != nil {
@@ -234,7 +234,7 @@ func TestPreparingJobIsNotJournaled(t *testing.T) {
 // unread journal may hold a job whose files compaction would merge.
 func TestUnseededRegistryOwnsEverything(t *testing.T) {
 	r := NewRegistry(testStore(t))
-	if !r.Owns("anything/at/all") || !r.OwnsUnder("db/") {
+	if !r.Owns("anything/at/all") {
 		t.Fatal("an unseeded registry must own every file")
 	}
 	if _, ok := r.Claim(srcKey); ok {
@@ -267,6 +267,9 @@ func TestSeedRefusesABadRecord(t *testing.T) {
 		"a staged file elsewhere":     func(j *Job) { j.Outputs[0].Staged = "db/cpu/2026/11/18/23/victim.parquet" },
 		"a staged file climbing out":  func(j *Job) { j.Outputs[0].Staged = StagedDir("ab") + "/../../db/x.parquet" },
 		"no outputs":                  func(j *Job) { j.Outputs = nil },
+		"an output with no size":      func(j *Job) { j.Outputs[0].Size = -1 },
+		"an output with no hash":      func(j *Job) { j.Outputs[1].SHA256 = "" },
+		"a source with no size":       func(j *Job) { j.Source.Size = 0 },
 	} {
 		store := testStore(t)
 		j := good()
@@ -338,7 +341,7 @@ func TestBlock(t *testing.T) {
 
 func TestNilRegistry(t *testing.T) {
 	var r *Registry
-	if r.Owns("x") || r.OwnsUnder("x") || r.Open("x") || r.Active() || r.Generation() != 0 || r.ExcludedFor(context.Background(), "x") != nil {
+	if r.Owns("x") || r.Open("x") || r.Active() || r.Generation() != 0 || r.ExcludedFor(context.Background(), "x") != nil {
 		t.Fatal("a nil registry owns and leaves out nothing")
 	}
 	if release, ok := r.Claim("x"); !ok {
