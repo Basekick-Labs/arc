@@ -87,8 +87,10 @@ func TestLeaderElectedLateRefreshesItsRecord1829(t *testing.T) {
 	rn2 := newUnstartedRaftNode(t, "w-1", addr, dir)
 	t.Cleanup(func() { _ = rn2.Stop() })
 	c := selfRecordCoordinator(t, "w-1", rn2, "10.0.0.9:8000", "27.01.1")
-	go c.maintainSelfRecord()
-	t.Cleanup(func() { close(c.stopCh) })
+	loopDone := make(chan struct{})
+	go func() { c.maintainSelfRecord(); close(loopDone) }()
+	// Wait for the loop to exit before the interval is restored.
+	t.Cleanup(func() { close(c.stopCh); <-loopDone })
 	time.Sleep(300 * time.Millisecond)
 	if err := rn2.Start(); err != nil {
 		t.Fatal(err)
