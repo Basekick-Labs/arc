@@ -274,8 +274,9 @@ func TestFlightSQLShutdownStagesFitTheBudget(t *testing.T) {
 	require.Equal(t, flightSQLShutdownStages{grace: time.Second}, odd.within(time.Second))
 }
 
-// runFlightTestStatement runs one statement to the end of its DoGet, which is
-// the call that crosses the bridge. Its outcome is the test server's business.
+// runFlightTestStatement runs one statement to the end of its DoGet, so at
+// least one request crosses the bridge. Its outcome is the test server's
+// business.
 func runFlightTestStatement(client *flightsql.Client) {
 	info, err := client.Execute(context.Background(), "SELECT 1")
 	if err != nil || len(info.Endpoint) == 0 {
@@ -297,23 +298,20 @@ func TestFlightSQLShutdownGivesAnInFlightCallItsGrace(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	cancelled := make(chan struct{})
-	var once sync.Once
+	var enteredOnce, cancelledOnce, releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
 	// Every bridge request of the call stops here, under the base context
 	// the handlers get, until the test releases it or shutdown cancels it.
 	s := newBridgeTestServer(t, nil, func(c *fiber.Ctx) error {
-		once.Do(func() { close(entered) })
+		enteredOnce.Do(func() { close(entered) })
 		select {
 		case <-release:
 		case <-c.UserContext().Done():
-			select {
-			case <-cancelled:
-			default:
-				close(cancelled)
-			}
+			cancelledOnce.Do(func() { close(cancelled) })
 		}
 		return c.Status(fiber.StatusServiceUnavailable).SendString(`{"error":"test"}`)
 	})
-	require.NoError(t, s.Start())
+	startBridgeTestServer(t, s) // its cleanup stops the server if the test fails early
 	client, err := flightsql.NewClient(s.flightLn.Addr().String(), nil, nil, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
 	defer client.Close()
@@ -345,7 +343,7 @@ func TestFlightSQLShutdownGivesAnInFlightCallItsGrace(t *testing.T) {
 		t.Fatalf("shutdown returned while a call was in flight: %v", err)
 	case <-time.After(500 * time.Millisecond):
 	}
-	close(release)
+	releaseOnce.Do(func() { close(release) })
 	select {
 	case <-rpcDone:
 	case <-time.After(10 * time.Second):
@@ -372,7 +370,11 @@ func TestFlightSQLShutdownOfAnIdleServerIsClean(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
+	start := time.Now()
 	require.NoError(t, s.Shutdown(ctx))
+	// Nothing is in flight, so no stage is waited out: the grace alone is
+	// 2.7 s here. The stop takes about 100 ms, the bridge's drain tick.
+	require.Less(t, time.Since(start), 2*time.Second, "an idle server must not wait out its stages")
 }
 
 // With a short context, a stalled connection and a hung bridge handler,

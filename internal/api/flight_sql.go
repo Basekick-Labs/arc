@@ -75,10 +75,11 @@ const flightSQLInternalKeyHeader = "X-Arc-Flight-Internal-Key"
 // x-arc-* headers change what the Arrow route encodes or whether it forwards.
 const flightSQLDatabaseHeader = "x-arc-database"
 
-// Shutdown stages. The shutdown coordinator gives every hook and component
-// one context and skips everything left once it expires, including the
-// ingest buffer and WAL flushes, so this hook keeps its own deadline well
-// inside it: in-flight queries get flightSQLShutdownGrace to finish and are
+// Shutdown stages. The shutdown hooks share one deadline, their part of
+// server.shutdown_timeout: a hook that overruns it leaves the hooks after it
+// an expired context, and once the whole timeout has passed the coordinator
+// skips everything left, including the ingest buffer and WAL flushes. So this
+// hook keeps its own deadline well inside it: in-flight queries get flightSQLShutdownGrace to finish and are
 // then cancelled; connections still open flightSQLShutdownForce later (a
 // client that stopped reading a stream) are closed, and the server gets
 // flightSQLShutdownForce more to stop; the bridge then drains for up to
