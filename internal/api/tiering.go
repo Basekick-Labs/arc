@@ -1,7 +1,9 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"strconv"
 	"time"
@@ -299,18 +301,23 @@ type ReconcileRequest struct {
 // schedule or restarting.
 // POST /api/v1/tiering/reconcile
 func (h *TieringHandler) Reconcile(c *fiber.Ctx) error {
-	ctx, cancel := context.WithTimeout(c.Context(), h.manager.MigrationBudget())
-	defer cancel()
-
 	var req ReconcileRequest
-	if len(c.Body()) > 0 {
-		if err := c.BodyParser(&req); err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	// JSON whatever the Content-Type: curl -d sends a form type, and the
+	// form decoder would drop window_hours without a word.
+	if body := c.Body(); len(bytes.TrimSpace(body)) > 0 {
+		if err := json.Unmarshal(body, &req); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body: expected JSON such as {\"window_hours\": 72}"})
 		}
 	}
 	if req.WindowHours < 0 || req.WindowHours > 8760 {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "window_hours must be between 1 and 8760"})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "window_hours must be between 0 (the default 48) and 8760"})
 	}
+	windowHours := req.WindowHours
+	if windowHours == 0 {
+		windowHours = 48
+	}
+	ctx, cancel := context.WithTimeout(c.Context(), h.manager.MigrationBudget())
+	defer cancel()
 	res, err := h.manager.Reconcile(ctx, time.Duration(req.WindowHours)*time.Hour)
 	if err != nil {
 		switch {
@@ -327,8 +334,10 @@ func (h *TieringHandler) Reconcile(c *fiber.Ctx) error {
 		case errors.Is(err, tiering.ErrColdSyncFailed):
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 				"error":   err.Error(),
-				"message": "Check that the cold credentials allow listing the bucket or container, and that tiered_storage.scan_timeout covers a full listing.",
+				"message": "Check that the cold credentials allow listing the bucket or container, and that tiered_storage.scan_timeout and tiered_storage.migration_timeout cover a full listing.",
 			})
+		case errors.Is(err, tiering.ErrColdTierDisabled):
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": err.Error()})
 		}
 		h.logger.Error().Err(err).Msg("Reconciliation failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
@@ -339,6 +348,7 @@ func (h *TieringHandler) Reconcile(c *fiber.Ctx) error {
 	}
 	return c.JSON(fiber.Map{
 		"status":                   status,
+		"window_hours":             windowHours,
 		"cold_synced":              res.ColdSynced,
 		"orphans_found":            res.OrphansFound,
 		"orphans_deleted":          res.OrphansDeleted,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"testing"
 	"time"
 )
@@ -245,10 +246,11 @@ func TestMigrationStopsBatchingAtTheBudget1830(t *testing.T) {
 		recordHotRow(t, m, p, manifestPartition)
 	}
 	m.migrator.maxConcurrent = 1
-	ctx, cancel := context.WithCancel(context.Background())
+	// A real deadline: the first write completes, then waits it out.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	cold := m.coldBackend.(*coldLister)
-	m.coldBackend = &endAfterWrite{coldLister: cold, end: cancel}
+	m.coldBackend = &endAfterWrite{coldLister: cold, end: func() { <-ctx.Done() }}
 	r := m.migrator.MigrateTierFilteredResult(ctx, TierHot, TierCold, "", "")
 	if r.Candidates != 3 {
 		t.Fatalf("setup: %d candidates, want 3", r.Candidates)
@@ -269,7 +271,12 @@ type abortWrite struct {
 }
 
 func (a *abortWrite) WriteReader(ctx context.Context, path string, r io.Reader, size int64) error {
+	// The object store finished the upload; this side saw the cancellation.
+	err := a.coldLister.mockBackend.WriteReader(context.Background(), path, r, size)
 	a.end()
+	if err != nil {
+		return err
+	}
 	return ctx.Err()
 }
 
@@ -290,5 +297,90 @@ func TestCopyCutOffByTheBudgetIsNotAFailure1830(t *testing.T) {
 	}
 	if f, _ := m.metadata.GetFile(context.Background(), gateDailyA); f == nil || f.Tier != TierHot {
 		t.Fatalf("row = %+v, want it still hot", f)
+	}
+	if ok, _ := cold.Exists(context.Background(), gateDailyA); ok {
+		t.Fatal("the cut-off copy left a cold object next to the hot row: read twice")
+	}
+	if ok, _ := hot.Exists(context.Background(), gateDailyA); !ok {
+		t.Fatal("the hot copy went")
+	}
+}
+
+// demoteAfterWrite demotes this node as soon as a cold write completes.
+type demoteAfterWrite struct {
+	*coldLister
+	gate *mockGate
+}
+
+func (d *demoteAfterWrite) WriteReader(ctx context.Context, path string, r io.Reader, size int64) error {
+	err := d.coldLister.WriteReader(ctx, path, r, size)
+	d.gate.primary.Store(false)
+	return err
+}
+
+// A writer demoted mid-run stops copying, and the files it did not reach
+// are reported, so the answer does not read "completed".
+func TestDemotedMidRunReportsTheRest1830(t *testing.T) {
+	m, hot, cold, gate, cleanup := setupGatedTest(t)
+	defer cleanup()
+	gate.primary.Store(true)
+	m.migrator.maxConcurrent = 1
+	m.coldBackend = &demoteAfterWrite{coldLister: cold, gate: gate}
+	for _, p := range []string{gateDailyA, gateDailyB, gateDailyC} {
+		mustWrite(t, hot, p)
+		recordHotRow(t, m, p, manifestPartition)
+	}
+	r := m.migrator.MigrateTierFilteredResult(context.Background(), TierHot, TierCold, "", "")
+	if r.Migrated+r.Failed+r.NotAttempted != r.Candidates || r.NotAttempted == 0 || r.TimedOut {
+		t.Fatalf("result = %+v, want the files after the demotion counted as not attempted", r)
+	}
+}
+
+// A manager that is stopping starts no further copies.
+func TestStoppingManagerStartsNoCopies1830(t *testing.T) {
+	m, hot, cold, gate, cleanup := setupGatedTest(t)
+	defer cleanup()
+	gate.primary.Store(true)
+	for _, p := range []string{gateDailyA, gateDailyB} {
+		mustWrite(t, hot, p)
+		recordHotRow(t, m, p, manifestPartition)
+	}
+	m.stopCh = make(chan struct{})
+	close(m.stopCh)
+	r := m.migrator.MigrateTierFilteredResult(context.Background(), TierHot, TierCold, "", "")
+	if r.Migrated != 0 || r.NotAttempted != r.Candidates || cold.writes.Load() != 0 {
+		t.Fatalf("result = %+v, %d cold writes; want nothing copied after Stop", r, cold.writes.Load())
+	}
+}
+
+// stopAfterWrite begins Stop as soon as a cold write completes.
+type stopAfterWrite struct {
+	*coldLister
+	stop func()
+}
+
+func (s *stopAfterWrite) WriteReader(ctx context.Context, path string, r io.Reader, size int64) error {
+	err := s.coldLister.WriteReader(ctx, path, r, size)
+	s.stop()
+	return err
+}
+
+// Stop mid-batch: the copy in flight finishes and is released, the rest of
+// the batch is not started.
+func TestStopMidBatchStartsNoFurtherCopies1830(t *testing.T) {
+	m, hot, cold, gate, cleanup := setupGatedTest(t)
+	defer cleanup()
+	gate.primary.Store(true)
+	m.migrator.maxConcurrent = 1
+	m.stopCh = make(chan struct{})
+	var once sync.Once
+	m.coldBackend = &stopAfterWrite{coldLister: cold, stop: func() { once.Do(func() { close(m.stopCh) }) }}
+	for _, p := range []string{gateDailyA, gateDailyB, gateDailyC} {
+		mustWrite(t, hot, p)
+		recordHotRow(t, m, p, manifestPartition)
+	}
+	b := m.migrator.migrateBatch(context.Background(), []MigrationCandidate{candidateFor(gateDailyA), candidateFor(gateDailyB), candidateFor(gateDailyC)})
+	if b.migrated != 1 || b.notAttempted != 2 || cold.writes.Load() != 1 {
+		t.Fatalf("batch = %+v, %d cold writes; want 1 migrated and 2 not attempted after Stop", b, cold.writes.Load())
 	}
 }

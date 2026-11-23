@@ -5,10 +5,12 @@ import (
 	"errors"
 	"io"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/gofiber/fiber/v2"
+	"github.com/rs/zerolog"
 )
 
 // #1830: the migrate answer says what the run did; it used to answer 200
@@ -44,6 +46,34 @@ func TestMigrationResponse1830(t *testing.T) {
 			}
 			if int(body["kept_hot_copies"].(float64)) != tc.res.Kept || int(body["not_attempted"].(float64)) != tc.res.NotAttempted {
 				t.Fatalf("counts not reported: %s", raw)
+			}
+		})
+	}
+}
+
+// The reconcile body is read as JSON whatever its Content-Type (curl -d sends
+// a form type, whose decoder would drop window_hours), and validated before
+// anything runs.
+func TestReconcileRequestValidation1830(t *testing.T) {
+	h := NewTieringHandler(nil, nil, nil, zerolog.Nop())
+	app := fiber.New()
+	app.Post("/reconcile", h.Reconcile)
+	for _, tc := range []struct{ name, ctype, body string }{
+		{"negative window", "application/json", `{"window_hours": -1}`},
+		{"window too wide", "application/json", `{"window_hours": 9000}`},
+		{"form content type still parsed as JSON", "application/x-www-form-urlencoded", `{"window_hours": 9000}`},
+		{"not JSON", "application/json", `window_hours=72`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", "/reconcile", strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", tc.ctype)
+			resp, err := app.Test(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != 400 {
+				raw, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status %d, want 400: %s", resp.StatusCode, raw)
 			}
 		})
 	}

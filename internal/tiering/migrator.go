@@ -92,14 +92,17 @@ type MigrationResult struct {
 	// Failed counts files that could not be migrated, plus one for a
 	// release that failed.
 	Failed int
-	// NotAttempted files were left hot because the budget ran out before
-	// their copy started or finished; a later run moves them.
+	// NotAttempted files were left hot, with nothing in cold: the run ended
+	// (budget, shutdown) before their copy started or finished, this node
+	// stopped being the writer, a DELETE held them, or a release failure
+	// stopped the run. A later run moves them.
 	NotAttempted int
 	// Kept files are migrated but their hot copy was not released (a
 	// manifest update or a hot delete failed). Until they are reconciled,
 	// a node reading both tiers reads them twice.
 	Kept int
-	// TimedOut: the run's context ended before every candidate was tried.
+	// TimedOut: tiered_storage.migration_timeout ended the run before every
+	// candidate was tried.
 	TimedOut bool
 	// ReleaseErr is the release failure that stopped the run, if any.
 	ReleaseErr error
@@ -132,9 +135,9 @@ func (m *Migrator) MigrateTierFilteredResult(ctx context.Context, fromTier, toTi
 	m.logger.Info().Int("candidates", len(candidates)).Msg("Found migration candidates")
 
 	for i := 0; i < len(candidates); i += m.batchSize {
-		if ctx.Err() != nil {
-			// Out of budget: a batch started now would mark its sync
-			// receipts and copy nothing.
+		if ctx.Err() != nil || m.manager.stopping() || m.manager.roleGated() {
+			// Out of budget, stopping, or no longer the writer: a batch
+			// started now would mark its sync receipts and copy nothing.
 			r.NotAttempted += len(candidates) - i
 			break
 		}
@@ -156,7 +159,7 @@ func (m *Migrator) MigrateTierFilteredResult(ctx context.Context, fromTier, toTi
 			break
 		}
 	}
-	r.TimedOut = ctx.Err() != nil && r.NotAttempted > 0
+	r.TimedOut = errors.Is(ctx.Err(), context.DeadlineExceeded) && r.NotAttempted > 0
 	if r.NotAttempted > 0 && r.ReleaseErr == nil {
 		m.logger.Warn().
 			Int("migrated", r.Migrated).
@@ -408,6 +411,7 @@ func (m *Migrator) releaseContext(ctx context.Context) (context.Context, context
 	if m.manager != nil {
 		stopCh = m.manager.stopCh
 	}
+	drain := releaseDrain
 	go func() {
 		select {
 		case <-relCtx.Done():
@@ -417,7 +421,10 @@ func (m *Migrator) releaseContext(ctx context.Context) (context.Context, context
 			return
 		case <-ctx.Done():
 		}
-		t := time.NewTimer(releaseDrain)
+		if relCtx.Err() != nil {
+			return
+		}
+		t := time.NewTimer(drain)
 		defer t.Stop()
 		select {
 		case <-relCtx.Done():
@@ -429,11 +436,9 @@ func (m *Migrator) releaseContext(ctx context.Context) (context.Context, context
 	return relCtx, cancel
 }
 
-// isBudgetEnd reports a copy that stopped because the run's context ended,
-// not because the file could not be migrated.
-func isBudgetEnd(ctx context.Context, err error) bool {
-	return ctx.Err() != nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled))
-}
+// errCopyCutOff marks a copy the run's end cut off: the file stays hot, with
+// no cold row and no cold object, and is not a failure (#1830).
+var errCopyCutOff = errors.New("copy cut off by the end of the migration run")
 
 // migrateBatch migrates one batch: copies on ctx, releases on a release
 // context that outlives it by releaseDrain.
@@ -503,19 +508,29 @@ func (m *Migrator) migrateBatch(ctx context.Context, candidates []MigrationCandi
 			break
 		}
 		// Asked once a slot is free: the wait for it can outlast a manifest
-		// failure or the writer role.
-		if stop.Load() {
+		// failure or the writer role. What is left is not attempted, so the
+		// answer does not read "completed" (#1830).
+		if stop.Load() || m.manager.stopping() {
 			sem.Release(1)
+			mu.Lock()
+			notAttempted += len(candidates) - i
+			mu.Unlock()
 			break
 		}
 		if m.manager.roleGated() {
 			sem.Release(1)
 			m.logger.Warn().Msg("This node is no longer the primary writer; no further files are copied this cycle")
+			mu.Lock()
+			notAttempted += len(candidates) - i
+			mu.Unlock()
 			break
 		}
 		if !m.manager.claims.claimMove(candidate.Path) {
 			// A DELETE is rewriting it; the next cycle sees the result.
 			sem.Release(1)
+			mu.Lock()
+			notAttempted++
+			mu.Unlock()
 			continue
 		}
 		claimed = append(claimed, candidate.Path)
@@ -526,7 +541,7 @@ func (m *Migrator) migrateBatch(ctx context.Context, candidates []MigrationCandi
 			defer sem.Release(1)
 
 			if err := m.copyAndFlip(ctx, c); err != nil {
-				if isBudgetEnd(ctx, err) {
+				if errors.Is(err, errCopyCutOff) {
 					// Not a failure of the file: the run ran out of time
 					// while copying it. It stays hot, with no cold row.
 					m.logger.Debug().Err(err).Str("path", c.Path).Msg("Copy stopped at the migration budget; the file stays hot")
@@ -697,7 +712,7 @@ func (m *Migrator) releaseHotCopies(ctx context.Context, files []MigrationCandid
 		// The adapter logged the cause at Error; this is the consequence.
 		if err := m.manager.deleteFromManifest(ctx, paths, reason); err != nil {
 			m.logger.Warn().Err(err).Int("kept_hot_copies", len(files)-i).
-				Msg("Manifest update failed. " + keptHotCopiesMsg)
+				Msg("Manifest update failed; the remaining hot copies of this release are kept")
 			return kept + len(files) - i, err
 		}
 		for _, c := range chunk {
@@ -798,12 +813,33 @@ func (m *Migrator) copyAndFlip(ctx context.Context, candidate MigrationCandidate
 	}
 
 	if migrationErr != nil {
+		// Bookkeeping after a failed copy runs even if the run's context
+		// ended: that is when a copy is most often cut off.
+		cctx, ccancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer ccancel()
 		// Record failure
 		if migrationID > 0 {
-			m.manager.metadata.CompleteMigration(ctx, migrationID, migrationErr)
+			m.manager.metadata.CompleteMigration(cctx, migrationID, migrationErr)
 		}
 		if errors.Is(migrationErr, storage.ErrInvalidPath) {
 			return m.quarantineCandidate(ctx, candidate, migrationErr)
+		}
+		if ctx.Err() != nil && (errors.Is(migrationErr, context.DeadlineExceeded) || errors.Is(migrationErr, context.Canceled)) {
+			// Cut off by the run's end, not refused. The upload can still
+			// have completed on the object store while this side saw the
+			// cancellation, leaving a cold object under a row that says hot;
+			// a read globs the cold partition and would count its rows next
+			// to the hot copy's. The row is hot and the hot copy is intact,
+			// so the cold object is unaccounted for: remove it (#1830).
+			if candidate.TargetTier == TierCold {
+				if err := dstBackend.Delete(cctx, candidate.Path); err != nil && !storage.IsNotFound(err) {
+					m.logger.Warn().Err(err).Str("path", candidate.Path).
+						Msg("Could not remove a cold object left by a copy the migration budget cut off; until the file migrates again its rows may be read from both tiers")
+				} else {
+					m.manager.reportColdRemoved([]string{candidate.Path})
+				}
+			}
+			return fmt.Errorf("%w: %w", errCopyCutOff, migrationErr)
 		}
 		return migrationErr
 	}
@@ -819,7 +855,9 @@ func (m *Migrator) copyAndFlip(ctx context.Context, candidate MigrationCandidate
 		if migrationID > 0 {
 			m.manager.metadata.CompleteMigration(ctx, migrationID, errHeldByCompaction)
 		}
-		if err := dstBackend.Delete(ctx, candidate.Path); err != nil && !storage.IsNotFound(err) {
+		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer dcancel()
+		if err := dstBackend.Delete(dctx, candidate.Path); err != nil && !storage.IsNotFound(err) {
 			m.logger.Warn().Err(err).Str("path", candidate.Path).Msg("Could not remove the cold copy of a file a compaction took over")
 		} else {
 			m.manager.reportColdRemoved([]string{candidate.Path})

@@ -10,17 +10,22 @@ Queries read both copies, so their rows were counted twice. A reproduction on a 
 
 Now:
 
-- **Files already moved are always released.** Their hot copies are released on a context of their own, which runs up to 2 minutes past the budget and ends when tiering stops. A copy cut off by the budget leaves its file hot, with nothing written in cold. Once the budget has ended, no new copy or batch starts. This applies to the scheduled cycle too.
+- **Files already moved are always released.** Their hot copies are released on a context of their own, which runs up to 2 minutes past the budget and ends when tiering stops.
+- **A copy cut off by the budget leaves its file hot, with nothing in cold.** An upload the object store finished just as the budget ended used to leave a cold object under a row that still said hot, and its rows were read from both tiers. That object is now removed.
+- **Once the budget has ended, or tiering is stopping, no new copy or batch starts.** This applies to the scheduled cycle too.
+- **Tiering's shutdown waits for API work.** It waits up to 60 seconds for an API-triggered migration or reconciliation to finish before the metadata database closes.
 - **The answer says what happened.** `status` is `completed` or `incomplete`, and the body now includes `candidates`, `not_attempted`, `kept_hot_copies` and `timed_out` alongside `migrated` and `errors`.
   - A run cut off by the budget answers 200 `incomplete` with the count not attempted. Run it again to move them.
   - Files left both cold and hot (a manifest update or hot delete that genuinely failed) make it answer **500** `incomplete` with `kept_hot_copies`.
-  - A copy cut off by the budget counts as not attempted, not as an error.
+  - A copy cut off by the budget counts as not attempted, not as an error. So do the files a run did not reach because the node stopped being the primary writer, tiering was stopping, or a DELETE held them.
 - **New: `POST /api/v1/tiering/reconcile`** (admin, tiering licence, primary writer only). It runs on demand what the scheduled cycle runs after migrating:
   1. the cold metadata sync and hot scan;
   2. the orphan sweep: files whose row says cold but whose hot copy is still there are removed from the manifest, then from hot storage, after the cold copy is verified;
   3. the manifest sweep.
 
-  This is how an API-driven deployment cleans up files left both cold and hot, without enabling the schedule or restarting. The orphan sweep looks back 48 hours by default; `{"window_hours": N}` (up to 8760) reaches older files. It answers 503 when the cold tier cannot be listed, and 409 on a non-primary node or while a migration runs.
+  This is how an API-driven deployment cleans up files left both cold and hot, without enabling the schedule or restarting. The orphan sweep looks back 48 hours by default; `{"window_hours": N}` (up to 8760) reaches older files. The body is read as JSON whatever its content type, and the answer echoes the window used. It answers:
+  - 503 when the cold tier cannot be listed;
+  - 409 on a non-primary node, while a migration runs, or without a usable cold tier.
 - The log line for kept files now says that they are read twice and what finishes them. Before, it said reconciliation would.
 
 **Rebuilding a node from the cold tier on fresh volumes:** each node rebuilds its cold rows from the cold listing at startup. That listing must fit in `tiered_storage.scan_timeout`; check `last_scan` in `GET /api/v1/tiering/status`. Fresh volumes also wipe what the data directory holds besides hot data: by default the Raft state (`raft/`), `arc.db` (API tokens, tier rows, retention policies, continuous queries) and the WAL. A writer whose Raft state is empty bootstraps a new cluster, so rebuild every node together, never one node's Raft state alone.
@@ -71,7 +76,6 @@ Now:
 - **Peers' versions are no longer blank after a join.** The join response carries no version, so a node that had just joined showed an empty `version` for its peers in `GET /api/v1/cluster`. It now keeps the version it already knows from cluster state.
 
 Restarting the leader after a cold start is no longer needed.
-
 
 ## New: a dry run that shows where a misfiled file's rows belong ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
 

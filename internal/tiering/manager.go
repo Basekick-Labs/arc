@@ -178,6 +178,10 @@ type Manager struct {
 	// trigger must not overlap (see ErrMigrationCycleRunning).
 	cycleRunning atomic.Bool
 	stopCh       chan struct{}
+	// apiOps counts API-triggered migrations and reconciliations in
+	// flight, so Stop waits for them before the metadata DB can close under
+	// them (#1830). The scheduled cycle is waited on by scheduler.Stop.
+	apiOps sync.WaitGroup
 
 	logger zerolog.Logger
 	mu     sync.RWMutex
@@ -381,18 +385,46 @@ func (m *Manager) Stop() error {
 	m.tierEventWG.Wait()
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if !m.running.Load() {
+		m.mu.Unlock()
 		return nil
 	}
 
 	close(m.stopCh)
 	m.scheduler.Stop()
 	m.running.Store(false)
+	m.mu.Unlock()
+
+	// stopCh ends their release contexts and stops new copies; their HTTP
+	// request contexts were cancelled by the server's shutdown. Wait,
+	// outside m.mu, so they do not touch the metadata DB after the caller
+	// closes it — bounded, so a stuck object store cannot hold shutdown.
+	done := make(chan struct{})
+	go func() { m.apiOps.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(apiOpsStopWait):
+		m.logger.Warn().Dur("waited", apiOpsStopWait).Msg("A migration or reconciliation requested through the API was still running when tiering stopped")
+	}
 
 	m.logger.Info().Msg("Tiering manager stopped")
 	return nil
+}
+
+// apiOpsStopWait bounds how long Stop waits for API-triggered work.
+const apiOpsStopWait = 60 * time.Second
+
+// stopping reports whether Stop has begun. Nil-safe for hand-built managers.
+func (m *Manager) stopping() bool {
+	if m == nil || m.stopCh == nil {
+		return false
+	}
+	select {
+	case <-m.stopCh:
+		return true
+	default:
+		return false
+	}
 }
 
 // IsRunning returns true if the manager is running
@@ -884,6 +916,8 @@ func (m *Manager) TriggerFilteredMigration(ctx context.Context, fromTier, toTier
 		return MigrationResult{}, ErrMigrationCycleRunning
 	}
 	defer m.cycleRunning.Store(false)
+	m.apiOps.Add(1)
+	defer m.apiOps.Done()
 
 	return m.migrator.MigrateTierFilteredResult(ctx, fromTier, toTier, database, measurement), nil
 }
@@ -892,6 +926,9 @@ func (m *Manager) TriggerFilteredMigration(ctx context.Context, fromTier, toTier
 // tier could not be listed: reconciling from an incomplete view could miss
 // the files it exists for, and runCycle refuses for the same reason.
 var ErrColdSyncFailed = errors.New("cold tier could not be listed; reconciliation did not run")
+
+// ErrColdTierDisabled reports a reconcile on a node without a usable cold tier.
+var ErrColdTierDisabled = errors.New("cold tier is not enabled on this node")
 
 // maxReconcileWindow bounds the orphan sweep's look-back a caller may ask for.
 const maxReconcileWindow = 365 * 24 * time.Hour
@@ -911,7 +948,7 @@ func (m *Manager) Reconcile(ctx context.Context, window time.Duration) (Reconcil
 		return ReconcileResult{}, nil
 	}
 	if !m.coldTierUsable() {
-		return ReconcileResult{}, fmt.Errorf("cold tier is not enabled")
+		return ReconcileResult{}, ErrColdTierDisabled
 	}
 	if window <= 0 {
 		window = orphanReconcileWindow
@@ -923,6 +960,8 @@ func (m *Manager) Reconcile(ctx context.Context, window time.Duration) (Reconcil
 		return ReconcileResult{}, ErrMigrationCycleRunning
 	}
 	defer m.cycleRunning.Store(false)
+	m.apiOps.Add(1)
+	defer m.apiOps.Done()
 
 	// The sync first: after a writer failover this node's rows for files the
 	// old primary migrated still say hot until a listing flips them, and the
@@ -934,6 +973,9 @@ func (m *Manager) Reconcile(ctx context.Context, window time.Duration) (Reconcil
 	}()
 	if scanResult.ColdSyncFailed {
 		m.logger.Warn().Err(err).Msg("Reconciliation did not run: the cold tier could not be listed")
+		// What the partial sync and the scan did write still changes what
+		// this node reads, as in runCycle.
+		m.notifyMigrationComplete(scanResult.ColdSynced+scanResult.HotRowsWritten, 0)
 		return ReconcileResult{}, ErrColdSyncFailed
 	}
 	if err != nil {
