@@ -370,6 +370,23 @@ func TestRecoveryKeepsAJobTieringCannotBeAskedAbout1825(t *testing.T) {
 		t.Fatal("the job was not kept as recorded")
 	}
 	r.requireOnce("kept as recorded")
+	// A resume while tiering still cannot be asked: the job stays where it
+	// is. It must not go on to switch reads without the answer.
+	latched := false
+	r.h.afterStep = func(s string) {
+		if s == "latched" {
+			latched = true
+		}
+	}
+	if code, out := rehomeDo(t, r.app, "POST", "/api/v1/rehome/"+id+"/resume", "", ""); code != 202 {
+		t.Fatalf("resume: %d %v", code, out)
+	}
+	if job := r.wait(id); job["state"] != "stopped" || !strings.Contains(fmt.Sprint(job["reason"]), "could not be asked") {
+		t.Fatalf("a resume while tiering cannot be asked: %v", job)
+	}
+	if latched || !r.reg.Active() || !r.sourceThere() || len(r.reg.Jobs()) != 1 || r.reg.Jobs()[0].State != "committed" {
+		t.Fatal("a resume went on without tiering's answer")
+	}
 	f.mu.Lock()
 	f.checkErr = nil
 	f.mu.Unlock()
@@ -407,4 +424,32 @@ func TestRecoveryFinishesALatchedJobWhateverTieringSays1825(t *testing.T) {
 			r.requireOnce("after recovery")
 		})
 	}
+}
+
+// A resume of a job that has not switched reads, when cold storage turns out
+// to hold its file: the job is undone, not finished.
+func TestResumeUndoesAJobWhoseFileColdStorageHolds1825(t *testing.T) {
+	r := newSwapRig(t)
+	f := withTiering1825(t, r)
+	f.recErr = errors.New("database is locked") // stops the job committed, outputs in place
+	id, _, _ := r.start()
+	if job := r.wait(id); job["state"] != "stopped" {
+		t.Fatalf("job: %v", job)
+	}
+	f.mu.Lock()
+	f.recErr, f.checkErr = nil, fmt.Errorf("%w: x", tiering.ErrRehomeColdCopy)
+	f.mu.Unlock()
+	if code, out := rehomeDo(t, r.app, "POST", "/api/v1/rehome/"+id+"/resume", "", ""); code != 202 {
+		t.Fatalf("resume: %d %v", code, out)
+	}
+	if job := r.wait(id); job["state"] != "refused" || !strings.Contains(fmt.Sprint(job["reason"]), "in cold storage") {
+		t.Fatalf("job: %v", job)
+	}
+	if _, _, files := r.reads(); r.reg.Active() || len(files) != 1 || files[0] != swapKey {
+		t.Fatalf("registry active %v, files %v; want the job undone and the file as it was", r.reg.Active(), files)
+	}
+	if rows := f.hot(); len(rows) != 1 || rows[0] != swapKey {
+		t.Fatalf("rows after the undo: %v", rows)
+	}
+	r.requireOnce("after the undo")
 }
