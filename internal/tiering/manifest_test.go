@@ -216,7 +216,7 @@ func TestReleaseHotCopies_ChunksAndPaces(t *testing.T) {
 	fake := &fakeManifest{hot: hot, entries: map[string]int64{}, probe: files[0].Path}
 	m.manifest = fake
 
-	if err := m.migrator.releaseHotCopies(ctx, files, manifestReasonMigrated); err != nil {
+	if _, err := m.migrator.releaseHotCopies(ctx, files, manifestReasonMigrated); err != nil {
 		t.Fatalf("releaseHotCopies: %v", err)
 	}
 	if len(fake.calls) != 3 {
@@ -255,7 +255,7 @@ func TestReleaseHotCopies_PartialFailureKeepsLaterChunks(t *testing.T) {
 	fake := &fakeManifest{hot: hot, entries: map[string]int64{}, failOnCall: 2}
 	m.manifest = fake
 
-	if err := m.migrator.releaseHotCopies(ctx, files, manifestReasonMigrated); err == nil {
+	if _, err := m.migrator.releaseHotCopies(ctx, files, manifestReasonMigrated); err == nil {
 		t.Fatal("releaseHotCopies succeeded although the second proposal failed")
 	}
 	if len(fake.calls) != 2 {
