@@ -199,7 +199,8 @@ func TestSelfRecordDiff1829(t *testing.T) {
 }
 
 // The join response carries no version: a peer the FSM knows keeps its own,
-// and the joiner shows its own version for itself.
+// and the joiner shows its own current version for itself, not the one its
+// FSM still holds from its previous process.
 func TestJoinResponseKeepsKnownVersions1829(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires a real Raft leader")
@@ -208,6 +209,10 @@ func TestJoinResponseKeepsKnownVersions1829(t *testing.T) {
 	c := selfRecordCoordinator(t, "r-1", rn, "10.0.0.7:8000", "27.01.1")
 	c.cfg.SharedSecret = ""
 	if err := rn.AddNode(&raft.NodeInfo{ID: "w-1", Name: "w-1", Role: string(RoleWriter), ClusterName: "c", Address: "127.0.0.1:1", State: string(StateHealthy), Version: "27.01.1-w"}, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	// This node's own record from its previous process.
+	if err := rn.AddNode(&raft.NodeInfo{ID: "r-1", Name: "r-1", Role: string(RoleReader), ClusterName: "c", Address: "127.0.0.1:2", State: string(StateHealthy), Version: "26.09.4"}, 5*time.Second); err != nil {
 		t.Fatal(err)
 	}
 	resp := &protocol.JoinResponse{Success: true, LeaderID: "w-1", Nodes: []protocol.NodeInfo{

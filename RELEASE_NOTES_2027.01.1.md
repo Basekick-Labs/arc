@@ -15,7 +15,7 @@ It lasted until the leader restarted.
 
 Now:
 
-- **The leader keeps its record current for as long as it runs.** It writes the record the first time it is leader in a process, whenever that is. After that it checks once a second and rewrites the record if the address, API address, version, role or capabilities in cluster state differ from its own. A record that matches is not rewritten. Core count and state are not compared.
+- **The leader keeps its record current for as long as it runs.** It writes the record the first time it is leader in a process, whenever that is. After that it checks once a second and rewrites the record if its name, role, cluster name, address, API address, version or capabilities in cluster state differ from its own. A record that matches is not rewritten. Core count, state and writer state are not compared. As at startup before, the write clears a "standby" mark on a writer that becomes leader; the primary designation is kept.
 - **A join the leader cannot record is refused.** If writing the joiner's record failed, the leader still answered success, and the joiner stopped trying. The joiner kept its old record for the rest of its life. Now it gets an error and tries again on its next discovery attempt.
 - **Peers' versions are no longer blank after a join.** The join response carries no version, so a node that had just joined showed an empty `version` for its peers in `GET /api/v1/cluster`. It now keeps the version it already knows from cluster state.
 

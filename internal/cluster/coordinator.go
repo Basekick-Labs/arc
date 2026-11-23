@@ -4140,8 +4140,6 @@ func (c *Coordinator) checkCoreLimit(maxCores int, nodeID string, coreCount int)
 
 // Phase 3: Raft and routing methods
 
-// onRaftNodeAdded is called when a node is added via Raft consensus.
-// It syncs the Raft FSM state to the local registry.
 // selfRecordInterval is how often the self-record loop checks leadership and
 // this node's record in cluster state (#1829). A variable for tests.
 var selfRecordInterval = time.Second
@@ -4205,8 +4203,9 @@ func (c *Coordinator) maintainSelfRecord() {
 // coming back and releases its stream claims.
 //
 // An absent record is written only by that first write. A leader's own record
-// is not absent otherwise (RemoveNodeViaRaft refuses self); if it is, the
-// next process's first write restores it, as before.
+// is not absent otherwise (the remove-node API refuses self,
+// internal/api/cluster.go); if it is, the next process's first write
+// restores it, as before.
 func (c *Coordinator) syncSelfRecord(s *selfRecordState) time.Duration {
 	if c.raftNode == nil || c.leaving.Load() || !c.raftNode.IsLeader() {
 		return selfRecordInterval
@@ -4222,6 +4221,7 @@ func (c *Coordinator) syncSelfRecord(s *selfRecordState) time.Duration {
 			return selfRecordInterval
 		}
 		if diff = selfRecordDiff(cur, want); diff == "" {
+			s.warnedDiff = ""
 			return selfRecordInterval
 		}
 		if diff == s.writtenDiff && time.Since(s.writtenAt) < selfRecordMaxBackoff {
@@ -4264,9 +4264,11 @@ func (c *Coordinator) syncSelfRecord(s *selfRecordState) time.Duration {
 }
 
 // selfNodeInfo is this node's record as it should stand in cluster state.
-// WriterState is left empty, as on every join: applyAddNode derives
-// "primary" from primaryWriterID atomically at apply time (#850), which a
-// value read here beforehand could not.
+// WriterState is left empty, as on every join and as the startup write always
+// sent: applyAddNode derives "primary" from primaryWriterID atomically at
+// apply time (#850), which a value read here beforehand could not. A
+// "standby" mark is therefore cleared by the write, as a join clears it; that
+// only changes which standby selectPrimary prefers, never whether one exists.
 func (c *Coordinator) selfNodeInfo() *raft.NodeInfo {
 	return &raft.NodeInfo{
 		ID:           c.localNode.ID,
@@ -4348,6 +4350,8 @@ func nodeFromRaftInfo(n *raft.NodeInfo) *Node {
 	return node
 }
 
+// onRaftNodeAdded is called when a node is added via Raft consensus.
+// It syncs the Raft FSM state to the local registry.
 func (c *Coordinator) onRaftNodeAdded(n *raft.NodeInfo) {
 	// Roles are validated at join now, but a cluster formed before #848 can
 	// still carry an unrecognised one in the FSM, and this is where it
@@ -4447,11 +4451,14 @@ func (c *Coordinator) knownWriterState(id string) WriterState {
 	return WriterStateNone
 }
 
-// knownVersion is the version this node knows for id: the FSM's record, which
-// the registry is derived from, else the registry entry's (which for this
-// node is its own, the registry always holding the local node). The join
-// response carries none (#1829).
+// knownVersion is the version this node knows for id: its own when id is this
+// node (its FSM may still hold its previous process's record), else the FSM's
+// record, which the registry is derived from, else the registry entry's. The
+// join response carries none (#1829).
 func (c *Coordinator) knownVersion(id string) string {
+	if c.localNode != nil && id == c.localNode.ID {
+		return c.localNode.Version
+	}
 	if c.raftFSM != nil {
 		if n, ok := c.raftFSM.GetNode(id); ok && n != nil && n.Version != "" {
 			return n.Version
