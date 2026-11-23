@@ -1,7 +1,9 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"strconv"
 	"time"
@@ -162,7 +164,9 @@ func (h *TieringHandler) TriggerMigration(c *fiber.Ctx) error {
 
 	var req TriggerMigrationRequest
 	if err := c.BodyParser(&req); err != nil {
-		// Empty body is OK - run full migration cycle
+		// Empty body is OK: migrate every database. This is a migration,
+		// not the scheduled cycle — no pre-migration scan and no
+		// reconciliation (POST /api/v1/tiering/reconcile runs that).
 	}
 
 	fromTier := tiering.TierHot
@@ -220,7 +224,7 @@ func (h *TieringHandler) TriggerMigration(c *fiber.Ctx) error {
 		})
 	}
 
-	migrated, failed, err := h.manager.TriggerFilteredMigration(ctx, fromTier, toTier, req.Database, req.Measurement)
+	res, err := h.manager.TriggerFilteredMigration(ctx, fromTier, toTier, req.Database, req.Measurement)
 	if err != nil {
 		if errors.Is(err, tiering.ErrMigrationRoleGated) {
 			_, role := h.manager.MigrationGate()
@@ -240,11 +244,116 @@ func (h *TieringHandler) TriggerMigration(c *fiber.Ctx) error {
 		})
 	}
 
+	return migrationResponse(c, res)
+}
+
+// migrationResponse answers a migration with what it did (#1830). It used to
+// say "Migration completed successfully" whatever happened, including a run
+// cut off by its budget that left migrated files hot.
+//   - Files kept hot after their migration (a manifest update or hot delete
+//     failed): 500. They are in cold and still read from hot, so a node
+//     reading both tiers counts them twice until they are reconciled.
+//   - The budget ran out with nothing kept: 200, status "incomplete", and how
+//     many files were not attempted; running it again moves them.
+//   - Otherwise 200, status "completed".
+func migrationResponse(c *fiber.Ctx, res tiering.MigrationResult) error {
+	body := fiber.Map{
+		"status":          "completed",
+		"message":         "Migration completed",
+		"candidates":      res.Candidates,
+		"migrated":        res.Migrated,
+		"errors":          res.Failed,
+		"not_attempted":   res.NotAttempted,
+		"kept_hot_copies": res.Kept,
+		"timed_out":       res.TimedOut,
+	}
+	switch {
+	case res.Kept > 0:
+		body["status"] = "incomplete"
+		body["message"] = "Some migrated files kept their hot copies and are read twice until reconciled; run POST /api/v1/tiering/reconcile"
+		if res.ReleaseErr != nil {
+			body["error"] = res.ReleaseErr.Error()
+		}
+		return c.Status(fiber.StatusInternalServerError).JSON(body)
+	case res.NotAttempted > 0:
+		body["status"] = "incomplete"
+		if res.TimedOut {
+			body["message"] = "Migration stopped at tiered_storage.migration_timeout; run it again to move the files not attempted"
+		} else {
+			body["message"] = "Migration stopped before every file was attempted; run it again to move the rest"
+		}
+	}
+	return c.JSON(body)
+}
+
+// ReconcileRequest is the optional body of POST /api/v1/tiering/reconcile.
+type ReconcileRequest struct {
+	// WindowHours is how far back the orphan sweep looks for migrated files
+	// whose hot copy is still there; default 48 (the scheduled cycle's).
+	WindowHours int `json:"window_hours,omitempty"`
+}
+
+// Reconcile runs the migration cycle's reconciliation on demand (#1830):
+// cold sync and hot scan, then the orphan sweep (migrated files whose hot
+// copy is still there, removed manifest first once the cold copy is
+// verified) and the manifest sweep. It is how an API-driven deployment
+// finishes the files a migration reported as kept, without enabling the
+// schedule or restarting.
+// POST /api/v1/tiering/reconcile
+func (h *TieringHandler) Reconcile(c *fiber.Ctx) error {
+	var req ReconcileRequest
+	// JSON whatever the Content-Type: curl -d sends a form type, and the
+	// form decoder would drop window_hours without a word.
+	if body := c.Body(); len(bytes.TrimSpace(body)) > 0 {
+		if err := json.Unmarshal(body, &req); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body: expected JSON such as {\"window_hours\": 72}"})
+		}
+	}
+	if req.WindowHours < 0 || req.WindowHours > 8760 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "window_hours must be between 0 (the default 48) and 8760"})
+	}
+	windowHours := req.WindowHours
+	if windowHours == 0 {
+		windowHours = 48
+	}
+	ctx, cancel := context.WithTimeout(c.Context(), h.manager.MigrationBudget())
+	defer cancel()
+	res, err := h.manager.Reconcile(ctx, time.Duration(req.WindowHours)*time.Hour)
+	if err != nil {
+		switch {
+		case errors.Is(err, tiering.ErrMigrationRoleGated):
+			_, role := h.manager.MigrationGate()
+			status, body := migrationRoleGatedResponse(role)
+			body["error"] = "Reconciliation runs on the primary writer only; this node is not the primary writer"
+			return c.Status(status).JSON(body)
+		case errors.Is(err, tiering.ErrMigrationCycleRunning):
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"error":   "Migration cycle already running",
+				"message": "A migration or reconciliation is already in progress on this node. Wait for it to complete.",
+			})
+		case errors.Is(err, tiering.ErrColdSyncFailed):
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"error":   err.Error(),
+				"message": "Check that the cold credentials allow listing the bucket or container, and that tiered_storage.scan_timeout and tiered_storage.migration_timeout cover a full listing.",
+			})
+		case errors.Is(err, tiering.ErrColdTierDisabled):
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": err.Error()})
+		}
+		h.logger.Error().Err(err).Msg("Reconciliation failed")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	status := "completed"
+	if res.Errors > 0 {
+		status = "completed_with_errors"
+	}
 	return c.JSON(fiber.Map{
-		"message":  "Migration completed successfully",
-		"status":   "completed",
-		"migrated": migrated,
-		"errors":   failed,
+		"status":                   status,
+		"window_hours":             windowHours,
+		"cold_synced":              res.ColdSynced,
+		"orphans_found":            res.OrphansFound,
+		"orphans_deleted":          res.OrphansDeleted,
+		"manifest_entries_removed": res.ManifestEntriesRemoved,
+		"errors":                   res.Errors,
 	})
 }
 
@@ -394,6 +503,7 @@ func (h *TieringHandler) RegisterRoutes(app fiber.Router) {
 	tiering.Get("/status", h.GetStatus)
 	tiering.Get("/files", h.GetFiles)
 	tiering.Post("/migrate", h.TriggerMigration)
+	tiering.Post("/reconcile", h.Reconcile)
 	tiering.Get("/stats", h.GetStats)
 	tiering.Post("/scan", h.ScanFiles)
 }
