@@ -2,6 +2,18 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: with Flight SQL on, a normal stop no longer exits 1 and in-flight Flight queries get their grace period (PRLINK)
+
+**Who is affected:** builds of `main` with `flight_sql.enabled = true`. Flight SQL is new in this release, so no released version has this.
+
+At shutdown the Flight SQL listener scales its waits (5 s for in-flight queries, 2 s before open connections are closed, 2 s for the internal drain) to fit in half of the time the shutdown hooks have left. That scaling multiplied two durations in nanoseconds and overflowed, so the waits came out wrong, most of them negative, whenever they were scaled at all: on a standalone node with `server.shutdown_timeout` from 10 to 55, the default 30 included.
+
+- **At the default, standalone:** every wait was negative. An idle node stopped with `Flight SQL server did not stop after its connections were closed` and exit code 1 on every `SIGTERM`, after an otherwise clean shutdown (the buffer flush, the WAL and the database all closed). A supervisor that reads the exit code saw a failed stop.
+- **In-flight Flight queries** were cancelled the moment shutdown began, and their connections closed, instead of getting the grace period. In a cluster at the default the grace was negative too.
+- **Now** each wait is its share of the budget, never negative and never more than the unscaled value: at the default 30 s, in-flight queries get about 2.7 s on a standalone node and about 1.4 s in a cluster, and an idle listener stops at once with exit code 0.
+- **What this changes for the rest of shutdown:** the Flight SQL listener stops before the HTTP server, and its waits were never taken before. A Flight client that stalls now uses up to half of the hooks' time (6 s at the default, standalone), and the HTTP drain gets what is left. The time kept for the buffer flush, the WAL and the database is not touched. `docs/operations/flight-sql.md` has the numbers.
+
+Reported, with the cause and a patch, by Grump.
 ## Fix: a continuous query's read of its source runs under the run's timeout ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
 
 A continuous query ran its aggregation statement without the run's context. The run's

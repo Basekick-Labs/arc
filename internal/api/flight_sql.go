@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/bits"
 	"net"
 	"net/http"
 	"regexp"
@@ -386,16 +387,27 @@ func (st flightSQLShutdownStages) total() time.Duration {
 	return st.grace + 2*st.force + st.drain
 }
 
-// within scales every stage so the worst case fits in budget.
+// within scales every stage so the worst case fits in budget: each becomes
+// stage*budget/total, rounded down, so the scaled stages never add up to more
+// than budget and none is negative.
 func (st flightSQLShutdownStages) within(budget time.Duration) flightSQLShutdownStages {
+	// A negative stage or budget counts as zero: no wait.
+	st = flightSQLShutdownStages{grace: max(st.grace, 0), force: max(st.force, 0), drain: max(st.drain, 0)}
+	budget = max(budget, 0)
 	total := st.total()
 	if budget >= total {
 		return st
 	}
-	if budget < 0 {
-		budget = 0
+	// Here 0 <= budget < total and 0 <= d <= total, so d*budget/total is at
+	// most d and Div64's precondition (hi < total) holds. The product is
+	// taken in 128 bits: in int64 nanoseconds it overflows for ordinary
+	// values (5 s * 6 s is 3e19, past 9.2e18) and wrapped, so at the default
+	// server.shutdown_timeout every stage came out negative and none waited.
+	scale := func(d time.Duration) time.Duration {
+		hi, lo := bits.Mul64(uint64(d), uint64(budget))
+		q, _ := bits.Div64(hi, lo, uint64(total))
+		return time.Duration(q)
 	}
-	scale := func(d time.Duration) time.Duration { return time.Duration(int64(d) * int64(budget) / int64(total)) }
 	return flightSQLShutdownStages{grace: scale(st.grace), force: scale(st.force), drain: scale(st.drain)}
 }
 
