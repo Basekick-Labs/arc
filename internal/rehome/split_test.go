@@ -12,6 +12,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet"
+	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/rs/zerolog"
 
 	"github.com/basekick-labs/arc/internal/database"
@@ -33,6 +38,10 @@ func TestParseKey(t *testing.T) {
 		{"db/cpu/2026/02/30/f.parquet", "", ""}, // not a calendar day
 		{"db/cpu/2026/11/18/23/f.txt", "", ""},
 		{"db/cpu/2026/1/18/23/f.parquet", "", ""},
+		{"db/cpu/26/11/18/23/f.parquet", "", ""},
+		{"db/cpu/2026/11/8/23/f.parquet", "", ""},
+		{"db/cpu/2026/11/18/3/f.parquet", "", ""},
+		{"db/cpu/2026/11/18/023/f.parquet", "", ""},
 		{"_compaction_state/cpu/2026/11/18/23/f.parquet", "", ""},
 		{".tmp/cpu/2026/11/18/23/f.parquet", "", ""},
 		{"spoke/db/cpu/2026/11/18/23/f.parquet", "", ""}, // a hub's spoke namespace
@@ -381,5 +390,90 @@ func TestCheckCatchesABadSplit(t *testing.T) {
 	}
 	if err := Check(ctx, db, p, clone()); err != nil {
 		t.Errorf("the good split failed its check: %v", err)
+	}
+}
+
+// Times no directory can hold are refused with the reason, not reported: a
+// year past 9999 (a nanosecond epoch stored as microseconds), a year before
+// 1, and the very first instant of year 1 (an unset time).
+func TestTimesWithNoDirectoryAreRefused(t *testing.T) {
+	ctx := context.Background()
+	src, _ := ParseKey("db/cpu/2026/11/18/23/f.parquet")
+	for name, sel := range map[string]string{
+		"nanoseconds stored as microseconds": `SELECT make_timestamptz(1795000000000000000) AS "time", 1 AS n`,
+		"before year 1":                      `SELECT make_timestamptz(-62167219200000001) AS "time", 1 AS n`,
+		"the start of year 1":                `SELECT TIMESTAMPTZ '0001-01-01 00:00:00Z' AS "time", 1 AS n`,
+	} {
+		path := writeSource(t, sel)
+		db := rewriteDB(t, filepath.Dir(path))
+		if _, err := MakePlan(ctx, db, src, path); err == nil {
+			t.Errorf("%s: planned", name)
+		} else if why, refused := IsRefused(err); !refused {
+			t.Errorf("%s: %v, want a refusal with a reason", name, err)
+		} else if strings.Contains(why, filepath.Dir(path)) {
+			t.Errorf("%s: the reason names a local path: %s", name, why)
+		}
+	}
+	// The last hour of year 9999 and a column named "Time_1" beside one
+	// "time" are taken.
+	for name, sel := range map[string]string{
+		"year 9999":          `SELECT TIMESTAMPTZ '9999-12-31 22:30:00Z' AS "time", 1 AS n`,
+		"a column time_1":    `SELECT TIMESTAMPTZ '2026-11-18 23:10:00Z' AS "time", 1 AS "time_1"`,
+		"only a Time column": `SELECT TIMESTAMPTZ '2026-11-18 23:10:00Z' AS "Time", 1 AS n`,
+	} {
+		path := writeSource(t, sel)
+		out := t.TempDir()
+		db := rewriteDB(t, filepath.Dir(path), out)
+		p, err := MakePlan(ctx, db, src, path)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		if _, err := Split(ctx, db, p, path, out); err != nil {
+			t.Errorf("%s: split: %v", name, err)
+		}
+	}
+}
+
+// A split writes a bounded number of files.
+func TestSplitRefusesTooManyDestinations(t *testing.T) {
+	p := Plan{Source: Source{Key: "db/cpu/2026/11/18/23/f.parquet"}, Destinations: make([]Destination, MaxSplitDestinations+1)}
+	_, err := Split(context.Background(), nil, p, "/x", t.TempDir())
+	if _, refused := IsRefused(err); !refused {
+		t.Fatalf("a split of %d destinations: %v, want a refusal", len(p.Destinations), err)
+	}
+}
+
+// A file with a "time" and a "Time" column, as a writer other than DuckDB can
+// produce: DuckDB reads the second as "Time_1", and a split would write that
+// name. Refused.
+func TestTwoTimeColumnsAreRefused(t *testing.T) {
+	ts := &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}
+	schema := arrow.NewSchema([]arrow.Field{{Name: "time", Type: ts}, {Name: "Time", Type: ts}}, nil)
+	b := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	defer b.Release()
+	b.Field(0).(*array.TimestampBuilder).Append(arrow.Timestamp(1795000000000000))
+	b.Field(1).(*array.TimestampBuilder).Append(arrow.Timestamp(1795090000000000))
+	rec := b.NewRecord()
+	defer rec.Release()
+	path := filepath.Join(t.TempDir(), "two.parquet")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := pqarrow.NewFileWriter(schema, f, parquet.NewWriterProperties(), pqarrow.DefaultWriterProps())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Write(rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	src, _ := ParseKey("db/cpu/2026/11/18/23/f.parquet")
+	_, err = MakePlan(context.Background(), rewriteDB(t, filepath.Dir(path)), src, path)
+	if _, refused := IsRefused(err); !refused {
+		t.Fatalf("a file with time and Time: %v, want a refusal", err)
 	}
 }

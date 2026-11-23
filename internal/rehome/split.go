@@ -247,6 +247,7 @@ func MakePlan(ctx context.Context, db *sql.DB, src Source, localPath string) (Pl
 		return Plan{}, fmt.Errorf("the local path of %s cannot be read as one file: %w", src.Key, err)
 	}
 	p := Plan{Source: src}
+	renamedTime := false
 	var zone string
 	if err := db.QueryRowContext(ctx, `SELECT current_setting('TimeZone')`).Scan(&zone); err != nil {
 		return Plan{}, fmt.Errorf("read the session time zone: %w", err)
@@ -265,14 +266,12 @@ func MakePlan(ctx context.Context, db *sql.DB, src Source, localPath string) (Pl
 			rows.Close()
 			return Plan{}, fmt.Errorf("read the schema of %s: %w", src.Key, err)
 		}
-		// DuckDB binds "time" to a column of any case; two of them would
-		// make every statement below ambiguous.
+		// DuckDB binds "time" to a column of any case.
 		if strings.EqualFold(name, "time") {
-			if p.TimeType != "" {
-				rows.Close()
-				return Plan{}, refuse("%s has more than one column named \"time\"", src.Key)
-			}
 			p.TimeType = typ
+		}
+		if renamedTimeColumn(name) {
+			renamedTime = true
 		}
 	}
 	if err := rows.Close(); err != nil {
@@ -283,6 +282,15 @@ func MakePlan(ctx context.Context, db *sql.DB, src Source, localPath string) (Pl
 	}
 	if p.TimeType == "" {
 		return Plan{}, refuse("%s has no \"time\" column", src.Key)
+	}
+	// Two columns named "time" in different cases: DuckDB reads the second
+	// under a new name ("Time_1"), and a split would write that name.
+	var sameName int
+	if err := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT count(*) FROM parquet_schema(%s) WHERE lower(name) = 'time'`, sqlutil.QuoteStringLiteral(localPath))).Scan(&sameName); err != nil {
+		return Plan{}, fmt.Errorf("read the schema of %s: %w", src.Key, err)
+	}
+	if sameName > 1 && renamedTime {
+		return Plan{}, refuse("%s has more than one column named \"time\" (in different cases); a split would rename one of them", src.Key)
 	}
 	if !timeTypes[p.TimeType] {
 		return Plan{}, refuse("%s stores \"time\" as %s; only a microsecond TIMESTAMP or TIMESTAMP WITH TIME ZONE can be split without changing its values", src.Key, p.TimeType)
@@ -311,6 +319,13 @@ func MakePlan(ctx context.Context, db *sql.DB, src Source, localPath string) (Pl
 			continue
 		}
 		start := time.UnixMicro(bucket.Int64).UTC()
+		// A directory is a four-digit year, and so is a time in a report.
+		// The first hour of year 1 is Go's zero time, which the partition
+		// window does not take. Such a time is almost always a wrong unit
+		// (nanoseconds stored as microseconds) or an unset value.
+		if y := start.Year(); y < 1 || y > 9999 || start.IsZero() {
+			return Plan{}, refuse("%s holds %d row(s) at a time outside years 0001 to 9999 or at the very start of year 1 (first at %d µs since 1970); there is no directory for them", src.Key, n, bucket.Int64)
+		}
 		dir := src.dirFor(start)
 		p.Destinations = append(p.Destinations, Destination{Dir: dir, Start: start, Rows: n, Own: dir == src.Dir})
 	}
@@ -324,6 +339,21 @@ func MakePlan(ctx context.Context, db *sql.DB, src Source, localPath string) (Pl
 	}
 	p.kv = kv
 	return p, nil
+}
+
+// renamedTimeColumn reports a name DuckDB gives a second column called
+// "time": "Time_1", "time_2".
+func renamedTimeColumn(name string) bool {
+	rest, ok := strings.CutPrefix(strings.ToLower(name), "time_")
+	if !ok || rest == "" {
+		return false
+	}
+	for _, r := range rest {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // readKV returns the file's carried key/value metadata, by key. Unlike a
@@ -398,12 +428,19 @@ func timeLiteral(timeType string, t time.Time) string {
 	return fmt.Sprintf("make_timestamptz(%d)", t.UnixMicro())
 }
 
+// MaxSplitDestinations bounds the files one split writes. Each destination
+// is one pass over the source, so the work is destinations times the file.
+const MaxSplitDestinations = 500
+
 // Split writes the plan's rows into dir, one file per destination and one for
 // the remainder, in the source's row order, and checks the result (Check). It
 // publishes nothing. The caller removes dir.
 func Split(ctx context.Context, db *sql.DB, p Plan, localPath, dir string) ([]Output, error) {
 	if err := storage.ValidateGlobSafe(dir); err != nil {
 		return nil, fmt.Errorf("the split's directory cannot be written to: %w", err)
+	}
+	if len(p.Destinations) > MaxSplitDestinations {
+		return nil, refuse("%s holds rows of %d hours or days; a split writes at most %d files", p.Source.Key, len(p.Destinations), MaxSplitDestinations)
 	}
 	var outs []Output
 	write := func(i int, where string) (string, error) {

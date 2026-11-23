@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,6 +40,12 @@ const (
 	rehomeMemoryLimit = 1 << 30
 	// rehomeJobsKept bounds the finished reports kept in memory.
 	rehomeJobsKept = 50
+	// rehomeDestinationsListed bounds the destinations one report lists; the
+	// report says how many there are.
+	rehomeDestinationsListed = 5000
+	// rehomeScratchPrefix names a job's scratch directory under the handler's
+	// scratch root; leftovers of a stopped process are removed at start.
+	rehomeScratchPrefix = "rehome-"
 )
 
 // RehomeHandler serves /api/v1/rehome.
@@ -46,13 +53,21 @@ type RehomeHandler struct {
 	storage     storage.Backend
 	authManager *auth.AuthManager
 	logger      zerolog.Logger
+	// scratchRoot is where a job copies and splits a file: the DELETE
+	// handler's staging directory, on the data volume, not the system's
+	// temporary directory (a small tmpfs in many containers).
+	scratchRoot string
+	// stop ends the running job when the server shuts down.
+	ctx  context.Context
+	stop context.CancelFunc
+	done sync.WaitGroup
 
 	mu      sync.Mutex
 	jobs    map[string]*rehomeJob
 	order   []string // job ids, oldest first
 	running bool
-	// run does a job's work; a test seam.
-	run func(ctx context.Context, job *rehomeJob)
+	// run does a job's work and returns how it ended; a test seam.
+	run func(ctx context.Context, job *rehomeJob) (state, reason string, report *rehomeReport)
 }
 
 // rehomeJob is one request and its report.
@@ -85,21 +100,72 @@ type rehomeReport struct {
 	// RemainderRows have a NULL or infinite time, and so no directory to
 	// belong to; a split keeps them in the file's own directory.
 	RemainderRows int64 `json:"remainder_rows"`
-	// Outputs are the files a split writes, checked: each holds the rows
-	// counted for it, and only times inside its directory.
-	Outputs []rehome.Output `json:"outputs"`
+	// Destinations are the hours or days that hold rows of the file, up to
+	// rehomeDestinationsListed of them; DestinationsTotal is how many there
+	// are.
+	Destinations      []rehome.Destination `json:"destinations"`
+	DestinationsTotal int                  `json:"destinations_total"`
+	// SplitChecked: the file was split in a scratch directory and the split
+	// passed its checks (every row once, every output inside its
+	// directory). False with SplitSkipped saying why when it was not tried.
+	SplitChecked bool   `json:"split_checked"`
+	SplitSkipped string `json:"split_skipped,omitempty"`
+	// Outputs are the files the split wrote, with their rows, sizes and time
+	// ranges. Left out of the list of jobs.
+	Outputs []rehome.Output `json:"outputs,omitempty"`
 }
 
 // NewRehomeHandler creates the handler. authManager may be nil (auth off).
-func NewRehomeHandler(backend storage.Backend, authManager *auth.AuthManager, logger zerolog.Logger) *RehomeHandler {
+// scratchRoot is a directory on local disk the handler may write to; empty
+// uses the system's temporary directory.
+func NewRehomeHandler(backend storage.Backend, authManager *auth.AuthManager, scratchRoot string, logger zerolog.Logger) *RehomeHandler {
+	if scratchRoot == "" {
+		scratchRoot = os.TempDir()
+	}
+	ctx, stop := context.WithCancel(context.Background())
 	h := &RehomeHandler{
 		storage:     backend,
 		authManager: authManager,
 		logger:      logger.With().Str("component", "rehome").Logger(),
+		scratchRoot: scratchRoot,
+		ctx:         ctx,
+		stop:        stop,
 		jobs:        map[string]*rehomeJob{},
 	}
 	h.run = h.dryRun
+	h.removeScratch()
 	return h
+}
+
+// removeScratch removes the scratch directories a stopped process left: a
+// job killed mid-way leaves a full copy of the file it was reading.
+func (h *RehomeHandler) removeScratch() {
+	entries, err := os.ReadDir(h.scratchRoot)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), rehomeScratchPrefix) {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(h.scratchRoot, e.Name())); err != nil {
+			h.logger.Warn().Err(err).Str("dir", e.Name()).Msg("Could not remove a re-home scratch directory left by a stopped process")
+		}
+	}
+}
+
+// Shutdown ends the running job and waits for it to remove its scratch
+// directory, or for ctx.
+func (h *RehomeHandler) Shutdown(ctx context.Context) error {
+	h.stop()
+	ended := make(chan struct{})
+	go func() { h.done.Wait(); close(ended) }()
+	select {
+	case <-ended:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // RegisterRoutes mounts the routes. Admin only: a job reads a whole file and
@@ -126,7 +192,7 @@ func (h *RehomeHandler) start(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "the body must be JSON: {\"path\": \"...\", \"dry_run\": true}"})
 	}
 	if !req.DryRun {
-		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "moving a file's rows is not available in this version; send \"dry_run\": true to see where they belong",
 		})
 	}
@@ -165,19 +231,21 @@ func (h *RehomeHandler) start(c *fiber.Ctx) error {
 	h.running = true
 	h.mu.Unlock()
 
+	h.done.Add(1)
 	go func() {
-		// Not the request's context: the job outlives the request.
-		jctx, jcancel := context.WithTimeout(context.Background(), rehomeJobTimeout)
+		defer h.done.Done()
+		// Not the request's context: the job outlives the request. The
+		// handler's: a shutdown ends it.
+		jctx, jcancel := context.WithTimeout(h.ctx, rehomeJobTimeout)
 		defer jcancel()
-		defer func() {
-			if r := recover(); r != nil {
-				h.finish(job, "failed", fmt.Sprintf("the job panicked: %v", r), nil)
-			}
-			h.mu.Lock()
-			h.running = false
-			h.mu.Unlock()
-		}()
-		h.run(jctx, job)
+		state, reason, report := h.runGuarded(jctx, job)
+		// The job is finished and the slot freed together, after the job's
+		// own cleanup: a client that sees it done can start the next.
+		now := time.Now().UTC()
+		h.mu.Lock()
+		job.State, job.Reason, job.Report, job.FinishedAt = state, reason, report, &now
+		h.running = false
+		h.mu.Unlock()
 	}()
 	return c.Status(fiber.StatusAccepted).JSON(h.view(job))
 }
@@ -197,11 +265,15 @@ func (h *RehomeHandler) view(job *rehomeJob) rehomeJob {
 	return *job
 }
 
-func (h *RehomeHandler) finish(job *rehomeJob, state, reason string, report *rehomeReport) {
-	now := time.Now().UTC()
-	h.mu.Lock()
-	job.State, job.Reason, job.Report, job.FinishedAt = state, reason, report, &now
-	h.mu.Unlock()
+// runGuarded is run with a panic turned into a failed job.
+func (h *RehomeHandler) runGuarded(ctx context.Context, job *rehomeJob) (state, reason string, report *rehomeReport) {
+	defer func() {
+		if r := recover(); r != nil {
+			h.logger.Error().Interface("panic", r).Str("job", job.ID).Msg("Re-home job panicked")
+			state, reason, report = "failed", "the job stopped on an internal error; the server log has it under this job's id", nil
+		}
+	}()
+	return h.run(ctx, job)
 }
 
 // list handles GET /api/v1/rehome: the jobs this process remembers, newest
@@ -211,7 +283,14 @@ func (h *RehomeHandler) list(c *fiber.Ctx) error {
 	h.mu.Lock()
 	out := make([]rehomeJob, 0, len(h.order))
 	for i := len(h.order) - 1; i >= 0; i-- {
-		out = append(out, *h.jobs[h.order[i]])
+		j := *h.jobs[h.order[i]]
+		if j.Report != nil {
+			// Without the per-file detail: a report can list thousands.
+			r := *j.Report
+			r.Outputs, r.Destinations = nil, nil
+			j.Report = &r
+		}
+		out = append(out, j)
 	}
 	h.mu.Unlock()
 	return c.JSON(fiber.Map{"jobs": out, "count": len(out), "scope": "this node"})
@@ -234,53 +313,53 @@ func (h *RehomeHandler) get(c *fiber.Ctx) error {
 
 // dryRun copies the file to a scratch directory, splits it there, checks the
 // split and reports. Everything it writes is in the scratch directory, which
-// it removes.
-func (h *RehomeHandler) dryRun(ctx context.Context, job *rehomeJob) {
-	fail := func(err error) {
-		if reason, refused := rehome.IsRefused(err); refused {
-			h.finish(job, "refused", reason, nil)
-			return
+// it removes before it returns.
+//
+// A failure's reason says which step failed and nothing more: the error
+// itself can name the scratch path, the statement or the storage endpoint,
+// and goes to the log under the job's id.
+func (h *RehomeHandler) dryRun(ctx context.Context, job *rehomeJob) (state, reason string, report *rehomeReport) {
+	fail := func(step string, err error) (string, string, *rehomeReport) {
+		if why, refused := rehome.IsRefused(err); refused {
+			return "refused", why, nil
 		}
-		h.logger.Error().Err(err).Str("job", job.ID).Str("path", job.Path).Msg("Re-home dry run failed")
-		h.finish(job, "failed", err.Error(), nil)
+		h.logger.Error().Err(err).Str("job", job.ID).Str("path", job.Path).Str("step", step).Msg("Re-home dry run failed")
+		if ctx.Err() != nil {
+			return "failed", fmt.Sprintf("the job was stopped while it was %s (it ran out of its %s, or the server is shutting down)", step, rehomeJobTimeout), nil
+		}
+		return "failed", fmt.Sprintf("the job failed while it was %s; the server log has the error under this job's id", step), nil
 	}
 	src, err := rehome.ParseKey(job.Path)
 	if err != nil {
-		fail(err)
-		return
+		return fail("reading the path", err)
 	}
-	scratch, err := os.MkdirTemp("", "arc-rehome-")
+	scratch, err := os.MkdirTemp(h.scratchRoot, rehomeScratchPrefix+"*")
 	if err != nil {
-		fail(fmt.Errorf("create a scratch directory: %w", err))
-		return
+		return fail("creating a scratch directory", err)
 	}
 	defer os.RemoveAll(scratch)
 	spill, outDir := filepath.Join(scratch, "spill"), filepath.Join(scratch, "out")
 	for _, d := range []string{spill, outDir} {
 		if err := os.Mkdir(d, 0o700); err != nil {
-			fail(fmt.Errorf("create a scratch directory: %w", err))
-			return
+			return fail("creating a scratch directory", err)
 		}
 	}
 
 	local := filepath.Join(scratch, "source.parquet")
 	f, err := os.OpenFile(local, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		fail(fmt.Errorf("create the local copy: %w", err))
-		return
+		return fail("creating the local copy", err)
 	}
 	err = h.storage.ReadTo(ctx, src.Key, f)
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
-		fail(fmt.Errorf("copy %s to local disk: %w", src.Key, err))
-		return
+		return fail("copying the file to local disk", err)
 	}
 	st, err := os.Stat(local)
 	if err != nil {
-		fail(err)
-		return
+		return fail("copying the file to local disk", err)
 	}
 
 	db, err := database.OpenRewriteDB(ctx, database.RewriteDBOptions{
@@ -289,28 +368,35 @@ func (h *RehomeHandler) dryRun(ctx context.Context, job *rehomeJob) {
 		AllowedDirs:      []string{scratch, spill, outDir},
 	}, h.logger)
 	if err != nil {
-		fail(fmt.Errorf("open the private DuckDB instance: %w", err))
-		return
+		return fail("opening the private DuckDB instance", err)
 	}
 	defer db.Close()
 
 	plan, err := rehome.MakePlan(ctx, db, src, local)
 	if err != nil {
-		fail(err)
-		return
+		return fail("reading the file's schema and times (it may not be a readable Parquet file)", err)
 	}
-	outs, err := rehome.Split(ctx, db, plan, local, outDir)
-	if err != nil {
-		fail(err)
-		return
-	}
-	h.finish(job, "done", "", &rehomeReport{
+	report = &rehomeReport{
 		Database: src.Database, Measurement: src.Measurement, Shape: string(src.Shape), Directory: src.Dir,
 		TimeType: plan.TimeType, Rows: plan.Rows, Bytes: st.Size(),
 		Misfiled: plan.Misfiled(), MisfiledRows: plan.MisfiledRows(), RemainderRows: plan.RemainderRows,
-		Outputs: outs,
-	})
+		Destinations:      plan.Destinations[:min(len(plan.Destinations), rehomeDestinationsListed)],
+		DestinationsTotal: len(plan.Destinations),
+	}
+	if len(plan.Destinations) > rehome.MaxSplitDestinations {
+		// The plan is the answer the caller asked for; the split is the
+		// check on it, and its cost is one pass over the file per output.
+		report.SplitSkipped = fmt.Sprintf("the file holds rows of %d hours or days; a split writes at most %d files", len(plan.Destinations), rehome.MaxSplitDestinations)
+	} else {
+		outs, err := rehome.Split(ctx, db, plan, local, outDir)
+		if err != nil {
+			return fail("splitting the file and checking the split", err)
+		}
+		report.SplitChecked, report.Outputs = true, outs
+	}
 	h.logger.Info().Str("job", job.ID).Str("path", src.Key).Int64("rows", plan.Rows).
 		Int64("misfiled_rows", plan.MisfiledRows()).Int("destinations", len(plan.Destinations)).
+		Bool("split_checked", report.SplitChecked).
 		Msg("Re-home dry run done; nothing was changed")
+	return "done", "", report
 }

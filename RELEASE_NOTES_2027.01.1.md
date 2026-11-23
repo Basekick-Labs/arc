@@ -18,22 +18,34 @@ not in this release: a request without `dry_run` is refused.
   rows into one file per UTC hour (a file in an hour directory) or per UTC day (a file
   in a day directory), checks the split, reports, and removes the scratch directory.
 - **What it reports:** rows, how many belong in another directory, and per destination
-  the directory, the rows and their time range. Rows whose time is NULL or infinite
-  have no directory to belong to and are counted apart.
+  the directory and the rows (up to 5,000 destinations listed; the total is always
+  given). Rows whose time is NULL or infinite have no directory to belong to and are
+  counted apart. For each file the split wrote: its rows, size and time range.
+- **A very scattered file:** when the rows belong to more than 500 hours or days, the
+  destinations are reported and the split is skipped (`split_checked: false`, with the
+  reason). A split reads the file once per output.
 - **The check:** every output holds the rows counted for it, so together they hold
   every row once, and every output's times are inside its directory, by the same read
   compaction's own check uses.
 - **What is refused, with the reason:** a file whose `time` is not a timestamp (a
   string, an integer, a date) or is in nanoseconds, since splitting it would change
-  its values; a path that is not a data file of a database and measurement; files of an
-  edge-sync spoke namespace; a file that is not in this node's storage, which includes
-  files on the cold tier.
+  its values; a file holding a time outside years 0001 to 9999 (usually nanoseconds
+  stored as microseconds), which no directory can hold; a file with two columns named
+  `time` in different cases; a path that is not a data file of a database and
+  measurement; files of an edge-sync spoke namespace; a file that is not in this node's
+  storage, which includes files on the cold tier.
+- **A job that fails** says which step failed. The error itself is in the server log
+  under the job's id, not in the response.
+- **GeoParquet:** the split's files carry Arc's own Parquet metadata (dedup columns and
+  markers) and not the `geo` entry, as a DELETE rewrite does.
 - **How it runs:** in the background, one job at a time, on a private single-threaded
   DuckDB instance with a 1 GiB memory limit, for up to 30 minutes.
   `GET /api/v1/rehome/<id>` returns the job and its report; `GET /api/v1/rehome` lists
   the jobs this process remembers. Reports are kept in memory and are gone at a restart.
 - **Cost:** local disk for a copy of the file and for the split, about twice the file's
-  size, in the system's temporary directory.
+  size plus what DuckDB spills, in the staging directory DELETE uses. Leftovers of a
+  process that stopped mid-job are removed at the next start; a shutdown stops a running
+  job.
 - **Who may call it:** admin tokens only.
 
 ## Fix: compaction no longer merges a file whose rows belong to another hour or day ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))

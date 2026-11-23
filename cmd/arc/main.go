@@ -4463,7 +4463,10 @@ func main() {
 	// Re-homing a misfiled file (#1825): the dry run. Its own routes, not
 	// compaction's: it reads storage and needs no compaction manager, so it
 	// works with compaction off. Admin only when auth is on.
-	api.NewRehomeHandler(storageBackend, authManager, logger.Get("rehome")).RegisterRoutes(server.GetApp())
+	rehomeHandler := api.NewRehomeHandler(storageBackend, authManager, dbConfig.UploadDir, logger.Get("rehome"))
+	rehomeHandler.RegisterRoutes(server.GetApp())
+	// Before storage closes: a running job reads from it.
+	shutdownCoordinator.RegisterHook("rehome-jobs", rehomeHandler.Shutdown, shutdown.PriorityCompaction)
 
 	// Register Compaction handler (if compaction is enabled)
 	if compactionManager != nil {
