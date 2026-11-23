@@ -315,10 +315,24 @@ func (s stagedCommitter) OwnStaged() []string {
 	return out
 }
 
-// adoptStaged moves this node's staged copy of a committed output into place
-// (the puller's AdoptStaged): true when the output is at its path.
+// adoptStaged moves this node's staged copy of a committed output into place,
+// for the callers that do it directly rather than through the puller (the
+// staged sweep and endStagedCopy when the puller's slot for the path is
+// taken, and the puller-less paths): true when the output is at its path.
+//
+// On success it reports the file to tiering, as the puller's own adopt does
+// (#1831). It used to report nothing: the pull the commit queued, which held
+// the path's slot and so sent the sweep here, then found the file present at
+// its size and skipped it without reporting either. The node had the file on
+// disk and in the manifest but no hot row, so a migrate that does not scan
+// first left it out, and no drop or failure counter moved. Reported here and
+// not in adoptStagedCopy, which the puller's path shares and reports itself.
 func (c *Coordinator) adoptStaged(ctx context.Context, e *raft.FileEntry) (bool, error) {
-	return c.adoptStagedCopy(ctx, e, true)
+	ok, err := c.adoptStagedCopy(ctx, e, true)
+	if ok {
+		c.recordPulledFileInTiering(e.Path, e.SizeBytes)
+	}
+	return ok, err
 }
 
 // adoptStagedForPull is the puller's AdoptStaged: only an actual move counts.
@@ -346,6 +360,12 @@ func (c *Coordinator) adoptStagedCopy(ctx context.Context, e *raft.FileEntry, pr
 		return false, nil
 	}
 	if size, err := c.storage.StatFile(ctx, e.Path); err == nil && size == e.SizeBytes && presentCounts {
+		// Present already, at the size: the output only if the manifest
+		// still registers it by this job, as the moved branch and the
+		// puller check — adoptStaged reports a true here to tiering.
+		if cur, ok := c.raftNode.FSM().GetFile(e.Path); !ok || cur.CompactionJob != e.CompactionJob || cur.SHA256 != e.SHA256 {
+			return false, errors.New("the output left the manifest")
+		}
 		if !c.stagedLocalJob(e.CompactionJob) {
 			_ = mover.RemoveAll(ctx, dir)
 		}

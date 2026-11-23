@@ -2,6 +2,22 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: a replicated compaction output is always recorded in the receiving node's tiering index ([#1831](https://github.com/Basekick-Labs/arc/issues/1831))
+
+On a node-local-storage cluster, each node moves its staged copy of a committed compaction output into place and records the file in its tiering index as hot. When the pull the commit queued was still waiting (a backlogged pull queue), the 30-second staged sweep moved the copy into place itself, without recording it. The queued pull then found the file present and skipped it without recording it either.
+
+The node had the file on disk and in the cluster manifest, but tiering did not know about it:
+
+- No drop or failure counter moved, and nothing was logged.
+- `POST /api/v1/tiering/migrate`, which does not scan first, left the file out, and a dry run did not list it.
+- Only the next scan picked it up: the one at startup, the scheduled migration cycle's, or `POST /api/v1/tiering/scan`.
+
+One deployment saw 4 such files on its writer over about 190 daily compaction cycles.
+
+Now the sweep (and every other direct move of a staged copy) records the file, as the puller's own adoption always did. It also checks that the manifest still registers the output before counting a copy already at the path as adopted. Adoptions by the puller now count in `tier_registered` too.
+
+If you saw this before upgrading, `POST /api/v1/tiering/scan` on the affected node before migrating records what was missed; a non-zero `hot_rows_written` in its answer means files had been left out.
+
 ## Fix: a migrate cut off by its time budget no longer leaves files read twice ([#1830](https://github.com/Basekick-Labs/arc/issues/1830))
 
 `POST /api/v1/tiering/migrate` ran everything on one context bounded by `tiered_storage.migration_timeout`, including releasing the hot copies of the files it had just moved. When the budget ran out, the files copied in the last second or so were already marked cold, but their manifest update was refused on the expired context. They were left in cold, still hot on every node, and still in the cluster manifest.
@@ -29,6 +45,7 @@ Now:
 - The log line for kept files now says that they are read twice and what finishes them. Before, it said reconciliation would.
 
 **Rebuilding a node from the cold tier on fresh volumes:** each node rebuilds its cold rows from the cold listing at startup. That listing must fit in `tiered_storage.scan_timeout`; check `last_scan` in `GET /api/v1/tiering/status`. Fresh volumes also wipe what the data directory holds besides hot data: by default the Raft state (`raft/`), `arc.db` (API tokens, tier rows, retention policies, continuous queries) and the WAL. A writer whose Raft state is empty bootstraps a new cluster, so rebuild every node together, never one node's Raft state alone.
+
 
 ## Fix: with Flight SQL on, a normal stop no longer exits 1 and in-flight Flight queries get their grace period ([#1835](https://github.com/Basekick-Labs/arc/pull/1835))
 

@@ -2387,9 +2387,9 @@ func (p *Puller) adoptStaged(log zerolog.Logger, entry *raft.FileEntry) bool {
 		return false
 	}
 	p.totalAdopted.Add(1)
-	if p.cfg.RecordPulledFile != nil {
-		p.cfg.RecordPulledFile(entry.Path, entry.SizeBytes)
-	}
+	// Through the counting wrapper, as a pull is: an adoption is a file
+	// kept here as much as a fetched one.
+	p.recordPulledFile(entry.Path, entry.SizeBytes)
 	return true
 }
 
