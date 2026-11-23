@@ -411,3 +411,22 @@ func (m *misfiledMemo) writeLocked() {
 		m.logger.Warn().Err(err).Str("path", m.path).Msg("Could not save the misfiled-inputs memo; after a restart compaction finds those files again")
 	}
 }
+
+// FileTimeRange is the smallest and largest time of a Parquet file, as the
+// input check reads them: found is false for a file with no "time" column or
+// no usable time value. The re-home job checks its outputs with it.
+func FileTimeRange(ctx context.Context, db *sql.DB, localPath string) (lo, hi time.Time, found bool, err error) {
+	return fileTimeRange(ctx, db, localPath)
+}
+
+// PartitionWindow is the half-open range of times the files of a partition
+// of tier ("hourly" or "daily") starting at partitionTime may hold.
+func PartitionWindow(tier string, partitionTime time.Time) (start, end time.Time, ok bool) {
+	return partitionWindow(tier, partitionTime)
+}
+
+// Tier names, as partitions and the misfiled list carry them.
+const (
+	TierHourly = tierNameHourly
+	TierDaily  = tierNameDaily
+)
