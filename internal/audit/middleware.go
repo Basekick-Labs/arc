@@ -238,6 +238,15 @@ func classifyEvent(method, path string, statusCode int) string {
 		return "compaction." + strings.ToLower(method)
 	}
 
+	// Re-home (#1825): a POST to the collection starts a job, which may move
+	// a file's rows. Matched at a segment boundary, like compaction.
+	if path == "/api/v1/rehome" || strings.HasPrefix(path, "/api/v1/rehome/") {
+		if method == "POST" && strings.TrimSuffix(path, "/") == "/api/v1/rehome" {
+			return "rehome.started"
+		}
+		return "rehome." + strings.ToLower(method)
+	}
+
 	// Tiering
 	if strings.HasPrefix(path, "/api/v1/tiering") {
 		return "tiering." + strings.ToLower(method)

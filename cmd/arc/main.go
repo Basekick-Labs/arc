@@ -41,6 +41,7 @@ import (
 	"github.com/basekick-labs/arc/internal/mqtt"
 	"github.com/basekick-labs/arc/internal/queryregistry"
 	"github.com/basekick-labs/arc/internal/reconciliation"
+	"github.com/basekick-labs/arc/internal/rehome"
 	"github.com/basekick-labs/arc/internal/scheduler"
 	"github.com/basekick-labs/arc/internal/shutdown"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -1058,6 +1059,29 @@ func main() {
 	shutdownCoordinator.Register("storage", storageBackend, shutdown.PriorityStorage)
 	logStorageReady()
 
+	// The re-home jobs a stopped process left (#1825), read before anything
+	// lists data files: the registry is what keeps compaction, DELETE and
+	// retention off a job's files and tells reads which side of a swap to
+	// leave out. A journal that cannot be read stops the start: guessing
+	// would let compaction merge a file with the files replacing it. The
+	// jobs are taken up further down (rehomeHandler.Recover).
+	rehomeRegistry := rehome.NewRegistry(storageBackend)
+	// A few tries: on an object store this is one LIST of a prefix that is
+	// empty on every deployment today, and a blip must not stop the start.
+	var seedErr error
+	for try := 0; try < 5; try++ {
+		if try > 0 {
+			time.Sleep(time.Duration(try) * time.Second)
+		}
+		if seedErr = rehomeRegistry.Seed(context.Background()); seedErr == nil {
+			break
+		}
+		log.Warn().Err(seedErr).Int("try", try+1).Msg("Could not read the re-home job journal; trying again")
+	}
+	if seedErr != nil {
+		log.Fatal().Err(seedErr).Msg("Could not read the re-home job journal")
+	}
+
 	// #1626: a database named after a subdirectory Iceberg warehouse would
 	// write inside it. Set before any writer starts (MQTT subscriptions start
 	// below, long before the Iceberg block), from the same warehouse URI the
@@ -2067,6 +2091,8 @@ func main() {
 		// CleanupOrphanedTempDirs skips the Phase 4 reserved ".completion"
 		// subdirectory so a crash that left pending completion manifests on
 		// disk doesn't silently lose them on restart.
+		// Files a re-home job in flight owns stay out of compaction (#1825).
+		compactionManager.SetOwnedFilter(rehomeRegistry.Owns)
 		if err := compactionManager.CleanupOrphanedTempDirs(); err != nil {
 			log.Warn().Err(err).Msg("Failed to cleanup orphaned compaction temp directories")
 		}
@@ -4170,7 +4196,10 @@ func main() {
 		}
 		retiredOpen = retiredReads
 	}
-	openCompactions := api.CombineOpenCompactions(compactionJobs, clusterOpen, retiredOpen)
+	// What every source other than a re-home job leaves out of reads: a job
+	// checks its file against it before it starts (#1825).
+	otherExclusions := api.CombineOpenCompactions(compactionJobs, clusterOpen, retiredOpen)
+	openCompactions := api.CombineOpenCompactions(compactionJobs, clusterOpen, retiredOpen, rehomeRegistry)
 	queryHandler.SetOpenCompactions(openCompactions)
 	queryHandler.RegisterRoutes(server.GetApp())
 	// Start the handler's background workers (currently the partition
@@ -4463,6 +4492,8 @@ func main() {
 	// Re-homing a misfiled file (#1825): the dry run. Its own routes, not
 	// compaction's: it reads storage and needs no compaction manager, so it
 	// works with compaction off. Admin only when auth is on.
+	// rehomeBackupRunning is set once the backup manager exists, further down.
+	var rehomeBackupRunning atomic.Pointer[func() bool]
 	rehomeHandler := api.NewRehomeHandler(storageBackend, authManager, dbConfig.UploadDir, logger.Get("rehome"))
 	rehomeHandler.RegisterRoutes(server.GetApp())
 	// Before storage closes: a running job reads from it.
@@ -4521,6 +4552,60 @@ func main() {
 		retiredCancel()
 		return nil
 	}, shutdown.PriorityHTTPServer)
+	// Re-home (#1825): DELETE leaves a job's files alone, and the swap is
+	// wired and the jobs a stopped process left are taken up, here: after
+	// the query and DELETE handlers exist, before the drainer below and
+	// before the readers start (continuous queries, retention, the Iceberg
+	// export, the HTTP and Flight SQL servers). The compaction schedulers
+	// are already started; they are kept off a job's files by the registry,
+	// seeded above, not by this order. A job found part way has its file
+	// removed without waiting for reads, because none from before the stop
+	// is alive.
+	deleteHandler.SetRehomeOwns(rehomeRegistry.Owns)
+	rehomeHandler.SetSwap(&api.RehomeSwap{
+		Registry: rehomeRegistry,
+		Reads:    queryHandler.Reads(),
+		Refusal: func() string {
+			switch {
+			case cfg.Cluster.Enabled:
+				return "moving a file's rows is not available on a cluster in this version"
+			case cfg.TieredStorage.Enabled:
+				return "moving a file's rows is not available with tiered storage in this version"
+			case cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Active() || cfg.EdgeSync.Spoke.Active():
+				return "moving a file's rows is not available with edge sync in this version"
+			case cfg.Iceberg.Enabled:
+				return "moving a file's rows is not available with the Iceberg export in this version"
+			}
+			return ""
+		},
+		RewriteLock: deleteHandler.WithRewriteLock,
+		OtherExclusions: func(ctx context.Context, prefix string) ([]string, error) {
+			if otherExclusions == nil {
+				return nil, nil
+			}
+			if strict, ok := otherExclusions.(api.StrictExcluder); ok {
+				return strict.ExcludedForStrict(ctx, prefix)
+			}
+			return otherExclusions.ExcludedFor(ctx, prefix), nil
+		},
+		CompactionOpen: func(prefix string) bool {
+			return compactionManager != nil && compactionManager.OpenJobs.Open(prefix)
+		},
+		BackupRunning: func() bool {
+			running := rehomeBackupRunning.Load()
+			return running != nil && (*running)()
+		},
+		FilePublished:    queryHandler.FilePublished,
+		InvalidateCaches: invalidateQueryCaches,
+		ClearMisfiled: func(path string) {
+			if compactionManager != nil {
+				compactionManager.ClearMisfiled("", path)
+			}
+		},
+	})
+	if err := rehomeHandler.Recover(context.Background()); err != nil {
+		log.Fatal().Err(err).Msg("Could not take up the re-home jobs found at start")
+	}
 	deleteHandler.StartRetiredDrainer(retiredCtx)
 	if cfg.Delete.Enabled {
 		log.Info().
@@ -4534,6 +4619,9 @@ func main() {
 
 	// Register Databases handler
 	databasesHandler := api.NewDatabasesHandler(storageBackend, &cfg.Delete, authManager, logger.Get("databases"))
+	// A database delete and a re-home job on one of its files keep each
+	// other out (#1825).
+	databasesHandler.SetRehomeBlock(rehomeRegistry.Block)
 	if hubNamespaceRemover != nil {
 		databasesHandler.SetOnSpokeNamespaceRemoved(hubNamespaceRemover)
 	}
@@ -4581,6 +4669,9 @@ func main() {
 			log.Fatal().Err(err).Msg("Failed to initialize retention handler")
 		}
 		retentionHandler.SetOnFilesRemoved(invalidateQueryCaches)
+		// Retention claims a file before deleting it, against the re-home
+		// jobs in flight (#1825).
+		retentionHandler.SetRehomeClaim(rehomeRegistry.Claim)
 		retentionHandler.SetOnPathsChanged(notifyIcebergPaths)
 		if hubRemovalMarker != nil {
 			retentionHandler.SetOnSpokeFilesRemoved(hubRemovalMarker)
@@ -5879,6 +5970,14 @@ func main() {
 			log.Error().Err(err).Str("target", cfg.Backup.DefaultTarget).Msg("Failed to initialize backup manager")
 		} else {
 			backupHandler := api.NewBackupHandler(backupManager, authManager, cfg.Backup.OperationTimeout, logger.Get("backup-api"))
+			// A backup or restore and a re-home job keep each other out
+			// (#1825).
+			backupHandler.SetRehomeBlock(rehomeRegistry.Block)
+			backupRunning := func() bool {
+				p := backupManager.GetProgress()
+				return p != nil && p.Status == "running"
+			}
+			rehomeBackupRunning.Store(&backupRunning)
 			// Cluster safety (#1083). Only when the coordinator exists: an
 			// interface holding a typed nil *Coordinator is not == nil (#713),
 			// and both setters would then keep a pointer whose methods panic.

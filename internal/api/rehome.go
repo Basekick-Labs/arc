@@ -3,8 +3,11 @@ package api
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -68,6 +71,10 @@ type RehomeHandler struct {
 	running bool
 	// run does a job's work and returns how it ended; a test seam.
 	run func(ctx context.Context, job *rehomeJob) (state, reason string, report *rehomeReport)
+	// swap is what a real swap needs (SetSwap); nil: dry runs only.
+	swap *RehomeSwap
+	// afterStep is a test seam: called after each step of a swap.
+	afterStep func(step string)
 }
 
 // rehomeJob is one request and its report.
@@ -178,6 +185,7 @@ func (h *RehomeHandler) RegisterRoutes(app fiber.Router) {
 	group.Post("/", h.start)
 	group.Get("/", h.list)
 	group.Get("/:id", h.get)
+	group.Post("/:id/resume", h.resumeJob)
 }
 
 type rehomeRequest struct {
@@ -192,9 +200,9 @@ func (h *RehomeHandler) start(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "the body must be JSON: {\"path\": \"...\", \"dry_run\": true}"})
 	}
 	if !req.DryRun {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "moving a file's rows is not available in this version; send \"dry_run\": true to see where they belong",
-		})
+		if why := h.swapRefusal(); why != "" {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": why})
+		}
 	}
 	src, err := rehome.ParseKey(req.Path)
 	if err != nil {
@@ -221,7 +229,7 @@ func (h *RehomeHandler) start(c *fiber.Ctx) error {
 		h.mu.Unlock()
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not create a job id"})
 	}
-	job := &rehomeJob{ID: id, Path: src.Key, DryRun: true, State: "running", StartedAt: time.Now().UTC()}
+	job := &rehomeJob{ID: id, Path: src.Key, DryRun: req.DryRun, State: "running", StartedAt: time.Now().UTC()}
 	h.jobs[id] = job
 	h.order = append(h.order, id)
 	for len(h.order) > rehomeJobsKept {
@@ -236,9 +244,18 @@ func (h *RehomeHandler) start(c *fiber.Ctx) error {
 		defer h.done.Done()
 		// Not the request's context: the job outlives the request. The
 		// handler's: a shutdown ends it.
-		jctx, jcancel := context.WithTimeout(h.ctx, rehomeJobTimeout)
+		// A dry run is bounded. A swap is not: once its files are moving
+		// it must be able to wait for the reads in flight, however long.
+		jctx, jcancel := context.WithCancel(h.ctx)
+		if job.DryRun {
+			jctx, jcancel = context.WithTimeout(h.ctx, rehomeJobTimeout)
+		}
 		defer jcancel()
-		state, reason, report := h.runGuarded(jctx, job)
+		run := h.run
+		if !job.DryRun {
+			run = h.runSwap
+		}
+		state, reason, report := h.runGuarded(jctx, job, run)
 		// The job is finished and the slot freed together, after the job's
 		// own cleanup: a client that sees it done can start the next.
 		now := time.Now().UTC()
@@ -266,14 +283,14 @@ func (h *RehomeHandler) view(job *rehomeJob) rehomeJob {
 }
 
 // runGuarded is run with a panic turned into a failed job.
-func (h *RehomeHandler) runGuarded(ctx context.Context, job *rehomeJob) (state, reason string, report *rehomeReport) {
+func (h *RehomeHandler) runGuarded(ctx context.Context, job *rehomeJob, run func(context.Context, *rehomeJob) (string, string, *rehomeReport)) (state, reason string, report *rehomeReport) {
 	defer func() {
 		if r := recover(); r != nil {
 			h.logger.Error().Interface("panic", r).Str("job", job.ID).Msg("Re-home job panicked")
 			state, reason, report = "failed", "the job stopped on an internal error; the server log has it under this job's id", nil
 		}
 	}()
-	return h.run(ctx, job)
+	return run(ctx, job)
 }
 
 // list handles GET /api/v1/rehome: the jobs this process remembers, newest
@@ -292,7 +309,21 @@ func (h *RehomeHandler) list(c *fiber.Ctx) error {
 		}
 		out = append(out, j)
 	}
+	known := make(map[string]bool, len(h.jobs))
+	for id := range h.jobs {
+		known[id] = true
+	}
 	h.mu.Unlock()
+	// Jobs recorded on disk that this process did not start: found at start
+	// and not finished.
+	if h.swap != nil && h.swap.Registry != nil {
+		for _, j := range h.swap.Registry.Jobs() {
+			if !known[j.ID] {
+				out = append(out, rehomeJob{ID: j.ID, Path: j.Source.Key, State: "stuck", StartedAt: j.CreatedAt,
+					Reason: "found at start in state " + string(j.State) + " and could not be taken up; the server log has the reason"})
+			}
+		}
+	}
 	return c.JSON(fiber.Map{"jobs": out, "count": len(out), "scope": "this node"})
 }
 
@@ -309,6 +340,60 @@ func (h *RehomeHandler) get(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "no such job on this node"})
 	}
 	return c.JSON(out)
+}
+
+// resumeJob handles POST /api/v1/rehome/:id/resume: a job that stopped part
+// way in this process, or that was found at start and could not be taken up,
+// is taken up again. It runs in the job slot, like a new job.
+func (h *RehomeHandler) resumeJob(c *fiber.Ctx) error {
+	if h.swap == nil || h.swap.Registry == nil {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "moving a file's rows is not available on this node"})
+	}
+	if why := h.swapRefusal(); why != "" {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": why})
+	}
+	id := strings.Clone(c.Params("id"))
+	rec, ok := h.swap.Registry.Get(id)
+	if !ok {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "no job with that id is recorded on this node; a job that ended has no record"})
+	}
+	h.mu.Lock()
+	if h.running {
+		h.mu.Unlock()
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "another re-home job is running; one runs at a time"})
+	}
+	job, known := h.jobs[id]
+	if !known {
+		job = &rehomeJob{ID: id, Path: rec.Source.Key, StartedAt: rec.CreatedAt}
+		h.jobs[id] = job
+		h.order = append(h.order, id)
+	}
+	job.State, job.Reason, job.FinishedAt = "running", "", nil
+	h.running = true
+	h.mu.Unlock()
+
+	h.done.Add(1)
+	go func() {
+		defer h.done.Done()
+		jctx, jcancel := context.WithCancel(h.ctx)
+		defer jcancel()
+		state, reason, _ := h.runGuarded(jctx, job, func(ctx context.Context, job *rehomeJob) (string, string, *rehomeReport) {
+			if err := h.resume(ctx, job.ID); err != nil {
+				if why, refused := rehome.IsRefused(err); refused {
+					return "refused", why, nil
+				}
+				h.logger.Error().Err(err).Str("job", job.ID).Msg("Re-home: a job could not be taken up again; its record is kept")
+				return "stopped", "the job could not be taken up again and its record is kept; the server log has the error under this job's id", nil
+			}
+			return "done", "", nil
+		})
+		now := time.Now().UTC()
+		h.mu.Lock()
+		job.State, job.Reason, job.FinishedAt = state, reason, &now
+		h.running = false
+		h.mu.Unlock()
+	}()
+	return c.Status(fiber.StatusAccepted).JSON(h.view(job))
 }
 
 // dryRun copies the file to a scratch directory, splits it there, checks the
@@ -329,56 +414,15 @@ func (h *RehomeHandler) dryRun(ctx context.Context, job *rehomeJob) (state, reas
 		}
 		return "failed", fmt.Sprintf("the job failed while it was %s; the server log has the error under this job's id", step), nil
 	}
-	src, err := rehome.ParseKey(job.Path)
+	prep, step, err := h.prepare(ctx, job.Path)
 	if err != nil {
-		return fail("reading the path", err)
+		return fail(step, err)
 	}
-	scratch, err := os.MkdirTemp(h.scratchRoot, rehomeScratchPrefix+"*")
-	if err != nil {
-		return fail("creating a scratch directory", err)
-	}
-	defer os.RemoveAll(scratch)
-	spill, outDir := filepath.Join(scratch, "spill"), filepath.Join(scratch, "out")
-	for _, d := range []string{spill, outDir} {
-		if err := os.Mkdir(d, 0o700); err != nil {
-			return fail("creating a scratch directory", err)
-		}
-	}
-
-	local := filepath.Join(scratch, "source.parquet")
-	f, err := os.OpenFile(local, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return fail("creating the local copy", err)
-	}
-	err = h.storage.ReadTo(ctx, src.Key, f)
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		return fail("copying the file to local disk", err)
-	}
-	st, err := os.Stat(local)
-	if err != nil {
-		return fail("copying the file to local disk", err)
-	}
-
-	db, err := database.OpenRewriteDB(ctx, database.RewriteDBOptions{
-		MemoryLimitBytes: rehomeMemoryLimit,
-		SpillDir:         spill,
-		AllowedDirs:      []string{scratch, spill, outDir},
-	}, h.logger)
-	if err != nil {
-		return fail("opening the private DuckDB instance", err)
-	}
-	defer db.Close()
-
-	plan, err := rehome.MakePlan(ctx, db, src, local)
-	if err != nil {
-		return fail("reading the file's schema and times (it may not be a readable Parquet file)", err)
-	}
+	defer prep.close()
+	src, plan, local, outDir, db := prep.src, prep.plan, prep.local, prep.outDir, prep.db
 	report = &rehomeReport{
 		Database: src.Database, Measurement: src.Measurement, Shape: string(src.Shape), Directory: src.Dir,
-		TimeType: plan.TimeType, Rows: plan.Rows, Bytes: st.Size(),
+		TimeType: plan.TimeType, Rows: plan.Rows, Bytes: prep.size,
 		Misfiled: plan.Misfiled(), MisfiledRows: plan.MisfiledRows(), RemainderRows: plan.RemainderRows,
 		Destinations:      plan.Destinations[:min(len(plan.Destinations), rehomeDestinationsListed)],
 		DestinationsTotal: len(plan.Destinations),
@@ -399,4 +443,82 @@ func (h *RehomeHandler) dryRun(ctx context.Context, job *rehomeJob) (state, reas
 		Bool("split_checked", report.SplitChecked).
 		Msg("Re-home dry run done; nothing was changed")
 	return "done", "", report
+}
+
+// rehomePrep is a source file copied to a scratch directory, with the private
+// DuckDB instance that reads it and the plan of where its rows belong.
+type rehomePrep struct {
+	src     rehome.Source
+	scratch string
+	local   string // the copy of the source
+	outDir  string // where a split writes
+	size    int64
+	sha256  string
+	db      *sql.DB
+	plan    rehome.Plan
+}
+
+// close removes the scratch directory and closes the instance.
+func (p *rehomePrep) close() {
+	if p.db != nil {
+		p.db.Close()
+	}
+	if p.scratch != "" {
+		os.RemoveAll(p.scratch)
+	}
+}
+
+// prepare copies the file at key to a scratch directory, hashing it on the
+// way, opens the private DuckDB instance and plans the split. On an error it
+// returns the step that failed, for the job's reason, and has cleaned up.
+func (h *RehomeHandler) prepare(ctx context.Context, key string) (prep *rehomePrep, step string, err error) {
+	p := &rehomePrep{}
+	defer func() {
+		if err != nil {
+			p.close()
+		}
+	}()
+	if p.src, err = rehome.ParseKey(key); err != nil {
+		return nil, "reading the path", err
+	}
+	if p.scratch, err = os.MkdirTemp(h.scratchRoot, rehomeScratchPrefix+"*"); err != nil {
+		return nil, "creating a scratch directory", err
+	}
+	spill := filepath.Join(p.scratch, "spill")
+	p.outDir = filepath.Join(p.scratch, "out")
+	for _, d := range []string{spill, p.outDir} {
+		if err = os.Mkdir(d, 0o700); err != nil {
+			return nil, "creating a scratch directory", err
+		}
+	}
+	p.local = filepath.Join(p.scratch, "source.parquet")
+	f, err := os.OpenFile(p.local, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, "creating the local copy", err
+	}
+	sum := sha256.New()
+	err = h.storage.ReadTo(ctx, p.src.Key, io.MultiWriter(f, sum))
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return nil, "copying the file to local disk", err
+	}
+	st, err := os.Stat(p.local)
+	if err != nil {
+		return nil, "copying the file to local disk", err
+	}
+	p.size, p.sha256 = st.Size(), hex.EncodeToString(sum.Sum(nil))
+
+	if p.db, err = database.OpenRewriteDB(ctx, database.RewriteDBOptions{
+		MemoryLimitBytes: rehomeMemoryLimit,
+		SpillDir:         spill,
+		AllowedDirs:      []string{p.scratch, spill, p.outDir},
+	}, h.logger); err != nil {
+		return nil, "opening the private DuckDB instance", err
+	}
+	if p.plan, err = rehome.MakePlan(ctx, p.db, p.src, p.local); err != nil {
+		return nil, "reading the file's schema and times (it may not be a readable Parquet file)", err
+	}
+	return p, "", nil
 }

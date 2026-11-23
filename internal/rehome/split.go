@@ -69,6 +69,9 @@ func refuse(format string, args ...any) error {
 	return &ErrRefused{Reason: fmt.Sprintf(format, args...)}
 }
 
+// Refusef is a refusal with a formatted reason.
+func Refusef(format string, args ...any) error { return refuse(format, args...) }
+
 // IsRefused reports whether err is a refusal, and its reason.
 func IsRefused(err error) (string, bool) {
 	var r *ErrRefused

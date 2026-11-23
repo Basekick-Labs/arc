@@ -384,6 +384,8 @@ type Manager struct {
 	// the drain can register a source after compaction dropped it, leaving an
 	// entry for a file about to be deleted. Such files wait a cycle.
 	isPending func(path string) bool
+	// isOwned reports a file a re-home job in flight owns (SetOwnedFilter).
+	isOwned func(path string) bool
 
 	// Staged commit (#1207 d2a2a), guarded by mu: stagedMode reports whether
 	// a job launched now is staged (the cluster's compaction commit is on
@@ -766,19 +768,48 @@ func (m *Manager) SetPendingFilter(fn func(path string) bool) {
 	m.isPending = fn
 }
 
-// dropPending removes objects still pending cluster registration.
+// SetOwnedFilter keeps files a re-home job in flight owns out of compaction
+// (#1825): the file being moved, which a job with
+// compaction.refuse_misfiled_inputs off would merge, and the files its rows
+// are moved into, which are not all in place yet. Safe to call concurrently
+// with a cycle.
+func (m *Manager) SetOwnedFilter(fn func(path string) bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.isOwned = fn
+}
+
+// anyOwned reports whether a re-home job in flight owns one of files.
+func (m *Manager) anyOwned(files []string) bool {
+	m.mu.Lock()
+	isOwned := m.isOwned
+	m.mu.Unlock()
+	if isOwned == nil {
+		return false
+	}
+	for _, f := range files {
+		if isOwned(f) {
+			return true
+		}
+	}
+	return false
+}
+
+// dropPending removes objects still pending cluster registration, and
+// objects a re-home job in flight owns.
 func (m *Manager) dropPending(objects []string) []string {
 	m.mu.Lock()
-	isPending := m.isPending
+	isPending, isOwned := m.isPending, m.isOwned
 	m.mu.Unlock()
-	if isPending == nil {
+	if isPending == nil && isOwned == nil {
 		return objects
 	}
 	kept := objects[:0:0]
 	for _, o := range objects {
-		if !isPending(o) {
-			kept = append(kept, o)
+		if (isPending != nil && isPending(o)) || (isOwned != nil && isOwned(o)) {
+			continue
 		}
+		kept = append(kept, o)
 	}
 	return kept
 }
@@ -865,7 +896,7 @@ func (m *Manager) filterPending(candidate Candidate, tier Tier) (Candidate, bool
 		Str("partition", candidate.PartitionPath).
 		Str("tier", candidate.Tier).
 		Int("pending", len(candidate.Files)-len(kept)).
-		Msg("Files pending cluster registration wait for the next compaction cycle")
+		Msg("Files pending cluster registration, or owned by a re-home job in flight, wait for the next compaction cycle")
 	if len(kept) < minFilesFor(candidate, tier) {
 		return candidate, false
 	}
@@ -1393,6 +1424,21 @@ func (m *Manager) compactPartition(ctx context.Context, candidate Candidate, att
 	if !config.Staged {
 		config.OutputName = CompactionOutputName(candidate.Measurement, candidate.Tier, candidate.BatchNumber, time.Now())
 		activeOutput = m.registerOpenJob(candidate, jobID, config.OutputName)
+	}
+	// A re-home job that began between this candidate's filters and here
+	// owns one of its files (#1825). Each side registers, then looks for
+	// the other: the re-home job, right after it takes ownership, refuses
+	// while a compaction is open on the measurement, and this job gives up
+	// now that it is. One of the two always sees the other.
+	if m.anyOwned(candidate.Files) {
+		if activeOutput != "" {
+			m.OpenJobs.finish(activeOutput, true)
+		}
+		m.logger.Info().
+			Str("partition", candidate.PartitionPath).
+			Str("tier", candidate.Tier).
+			Msg("Not compacting: a re-home job began on one of the partition's files; the next cycle takes the rest")
+		return nil
 	}
 
 	// Run compaction in subprocess for memory isolation

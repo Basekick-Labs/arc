@@ -76,6 +76,10 @@ type RetentionHandler struct {
 	// clusterOwned: this node's table has been the cluster's mirror (the
 	// retention_cluster_state marker), so its own rows are never run again.
 	clusterOwned atomic.Bool
+	// rehomeClaim claims a file retention is about to delete, against the
+	// re-home jobs in flight (SetRehomeClaim, #1825): free is false when a
+	// job owns the file. nil: no such jobs.
+	rehomeClaim func(path string) (release func(), free bool)
 }
 
 // RetentionPolicy represents a retention policy
@@ -325,6 +329,12 @@ func NewRetentionHandler(storage storage.Backend, duckdb *database.DuckDB, cfg *
 // not disappear, and the scheduler replays them forever. Without this the only
 // signal is a listing error buried in a scheduled run hours later, attributed
 // to storage rather than to the policy.
+// SetRehomeClaim gives retention the claim it takes on a file before
+// deleting it, so a re-home job and retention never act on one file (#1825).
+func (h *RetentionHandler) SetRehomeClaim(fn func(path string) (release func(), free bool)) {
+	h.rehomeClaim = fn
+}
+
 func (h *RetentionHandler) warnUnusablePolicies() {
 	// Inactive rows are included: a disabled policy with a broken name is one
 	// toggle away from failing, and the point is to report it before then.
@@ -1391,6 +1401,17 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 	var eligibleRows []int64   // row counts parallel to eligiblePaths
 
 	for _, relativePath := range parquetFiles {
+		// A file a re-home job in flight owns (#1825) is left for the next
+		// run: the job is replacing it, or writing it. Not counted as
+		// skipped, which reports files that can never be processed.
+		if h.rehomeClaim != nil {
+			release, free := h.rehomeClaim(relativePath)
+			release()
+			if !free {
+				h.logger.Info().Str("file", relativePath).Msg("Retention leaves a file a re-home job in flight owns for its next run")
+				continue
+			}
+		}
 		fullPath, err := readParquetPath(h.storage, relativePath)
 		if err != nil {
 			// Counted, not just logged. A file that can never be resolved is
@@ -1499,7 +1520,20 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 		}
 
 		for j, relativePath := range subPaths {
-			if err := h.storage.Delete(ctx, relativePath); err != nil {
+			// Claimed across the check and the delete: the scan above ran
+			// some time ago, and a re-home job that began since owns the
+			// file. While the claim is held no job can begin on it.
+			release := func() {}
+			if h.rehomeClaim != nil {
+				var free bool
+				if release, free = h.rehomeClaim(relativePath); !free {
+					h.logger.Info().Str("file", relativePath).Msg("Retention leaves a file a re-home job in flight owns for its next run")
+					continue
+				}
+			}
+			err := h.storage.Delete(ctx, relativePath)
+			release()
+			if err != nil {
 				// Storage errors are transient (network blip, file already gone) —
 				// log as Warn and continue so one bad file doesn't abort the cycle.
 				h.logger.Warn().Err(err).Str("file", relativePath).Msg("Failed to delete file from storage; skipping")
