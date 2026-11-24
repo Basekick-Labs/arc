@@ -543,6 +543,14 @@ func TestDeferRehomeUnlink1860(t *testing.T) {
 	if c.deferRehomeUnlink(deleteRequest{path: in.Path, reason: "delete"}) {
 		t.Fatal("another reason was deferred")
 	}
+	// The source of a job this node records: never unlinked by the workers,
+	// whatever the reason and whether or not the job still exists.
+	c.SetRehomeLocalSources(func(p string) bool { return p == in.Path })
+	for _, reason := range []string{"rehome:ffff", "snapshot:removed", "delete"} {
+		if !c.deferRehomeUnlink(deleteRequest{path: in.Path, reason: reason}) {
+			t.Fatalf("a recorded job's source unlinked (reason %s)", reason)
+		}
+	}
 	// With this node's records the only source of exclusions, the cluster
 	// source still owns the job's files but leaves nothing out.
 	if err := c.RehomeAdvance(context.Background(), "ab12", raft.RehomeCommitted); err != nil {

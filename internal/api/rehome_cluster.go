@@ -184,7 +184,7 @@ func (h *RehomeHandler) runClusterSwap(ctx context.Context, job *rehomeJob) (sta
 	if err := reg.Begin(rec); err != nil {
 		return refuse(fmt.Sprintf("%s cannot be moved now: %v", src.Key, err))
 	}
-	defer reg.Drop(job.ID)
+	defer reg.DropOwn(job.ID) // never this node's record of the cluster job
 
 	entry, ok := c.ManifestFile(src.Key)
 	if !ok {
@@ -304,7 +304,7 @@ func (h *RehomeHandler) runClusterSwap(ctx context.Context, job *rehomeJob) (sta
 	if err := h.waitLocalJob(ctx, job.ID); err != nil {
 		return fail("recording the job in the cluster", err)
 	}
-	reg.Drop(job.ID)
+	reg.DropOwn(job.ID)
 	h.hook("staged")
 
 	err = h.driveCluster(ctx, job.ID, files)
@@ -527,7 +527,7 @@ func (h *RehomeHandler) driveCluster(ctx context.Context, id string, files map[s
 			}
 		case raft.RehomeReverting:
 			// On local storage each node removes its own copies (reverted).
-			if derr := h.deleteOutputs(bg, j); !h.localCluster() && derr != nil {
+			if derr := h.deleteOutputs(bg, j); derr != nil {
 				err = derr
 				break
 			}
@@ -854,6 +854,15 @@ func (h *RehomeHandler) StartClusterTakeover() {
 
 func (h *RehomeHandler) takeOverOnce(ctx context.Context) {
 	c := h.swap.Cluster
+	if h.localCluster() {
+		// No read lease on local storage: a node just restarted may hold a
+		// state the job left; caught up first.
+		if lc, ok := c.(rehomeLocalCluster); ok {
+			if err := lc.SyncManifest(ctx); err != nil {
+				return
+			}
+		}
+	}
 	if !c.IsPrimaryWriter() && !c.IsLeader() {
 		return
 	}

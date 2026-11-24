@@ -74,6 +74,13 @@ func (c *Coordinator) FetchRehomeStaged(ctx context.Context, j raft.RehomeJob, o
 // latch ended; a node that does not take part (it joined later) unlinks it
 // when the job ends (rehomeEndedUnlink).
 func (c *Coordinator) deferRehomeUnlink(item deleteRequest) bool {
+	// The source of a job this node records, whatever the reason (a delete
+	// replayed after the job ended, a snapshot install): its record decides
+	// what reads see here, and SweepLocal removes the source only once the
+	// outputs are in place.
+	if p := c.rehomeLocalSources.Load(); p != nil && (*p)(item.path) {
+		return true
+	}
 	id, ok := strings.CutPrefix(item.reason, rehomeDeleteReasonPrefix)
 	if !ok || c.raftNode == nil {
 		return false
@@ -106,6 +113,9 @@ func (c *Coordinator) rehomeEndedUnlink(j raft.RehomeJob) {
 	}
 	if p := c.rehomeLocalRecords.Load(); p != nil && (*p)(j.ID) {
 		return // this node records the job: SweepLocal settles it, outputs first
+	}
+	if p := c.rehomeLocalSources.Load(); p != nil && (*p)(j.Source.Path) {
+		return
 	}
 	c.enqueueLocalDelete(j.Source.Path, "rehome-ended:"+j.ID)
 }

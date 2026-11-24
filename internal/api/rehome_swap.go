@@ -754,6 +754,11 @@ func (h *RehomeHandler) Recover(ctx context.Context) error {
 	if h.swap.Refusal != nil {
 		refused = h.swap.Refusal()
 	}
+	if refused == "" && h.swap.Cluster != nil {
+		// A job of this node's own from before it was a cluster node: the
+		// cluster's manifest knows nothing of its files (#1860).
+		refused = "this node is a cluster node now"
+	}
 	var later []*rehome.Job
 	for _, job := range jobs {
 		log := h.logger.With().Str("job", job.ID).Str("path", job.Source.Key).Str("state", string(job.State)).Logger()

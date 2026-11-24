@@ -176,6 +176,8 @@ type Coordinator struct {
 	rehomeLocalExclusions atomic.Bool
 	// rehomeLocalRecords: jobs this node records (SetRehomeLocalRecords).
 	rehomeLocalRecords atomic.Pointer[func(string) bool]
+	// rehomeLocalSources: sources of jobs this node records (SetRehomeLocalSources).
+	rehomeLocalSources atomic.Pointer[func(string) bool]
 	// rehomeLocalRecorder: records a job on this node (SetRehomeLocalRecorder).
 	rehomeLocalRecorder atomic.Pointer[func(context.Context, raft.RehomeJob) error]
 	// Compaction read fences (#1852, compaction_fences.go): the flag's join

@@ -2,6 +2,7 @@ package filereplication
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 
@@ -106,5 +107,27 @@ func TestPullerAdoptNowFallsBackToAPull(t *testing.T) {
 	waitStats(t, p, func(map[string]int64) bool { return fetcher.calls.Load() == 1 })
 	if fetcher.calls.Load() != 1 {
 		t.Fatal("the output was not pulled after a failed adoption")
+	}
+}
+
+// #1860: BeforePull runs before a fetch; an error defers it, and the pull
+// goes ahead once it returns nil.
+func TestPullerBeforePullDefers(t *testing.T) {
+	backend := newFakeBackend()
+	fetcher := newRepeatingFetcher([]byte("abcd"))
+	p := newTestPuller(t, backend, fetcher, staticResolver{nodeID: "writer-1", addrs: []string{"w1:9100"}, ok: true})
+	var calls atomic.Int64
+	p.cfg.BeforePull = func(_ context.Context, e *raft.FileEntry) error {
+		if calls.Add(1) == 1 {
+			return errors.New("not yet")
+		}
+		return nil
+	}
+	p.Start(context.Background())
+	defer p.Stop()
+	p.Enqueue(makeEntry("db/cpu/2026/10/13/10/o.parquet", "writer-1", 4))
+	waitStats(t, p, func(map[string]int64) bool { return fetcher.calls.Load() == 1 })
+	if calls.Load() < 2 || fetcher.calls.Load() != 1 {
+		t.Fatalf("before-pull calls %d, fetches %d", calls.Load(), fetcher.calls.Load())
 	}
 }

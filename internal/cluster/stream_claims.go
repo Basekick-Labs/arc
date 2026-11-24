@@ -44,7 +44,10 @@ func (c *Coordinator) localCapabilities() []string {
 	// Compaction read fences (#1852): every build applies and keeps them,
 	// whatever the node's role.
 	caps = append(caps, raft.CapabilityCompactionFences)
-	if c.rehomeInScope.Load() {
+	// On local storage a node takes part only once it keeps local copies
+	// of every file (its puller runs): it fetches and holds a job's outputs
+	// (#1860).
+	if c.rehomeInScope.Load() && (c.storage == nil || c.storage.Type() != "local" || c.keepsLocalReplicas()) {
 		caps = append(caps, raft.CapabilityRehomeInScope)
 	}
 	if c.keepsLocalReplicas() {

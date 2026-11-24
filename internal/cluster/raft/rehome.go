@@ -84,8 +84,10 @@ const (
 	// MaxRehomeOutputs bounds the outputs of one job, so its stage entry
 	// stays far under the forward frame.
 	MaxRehomeOutputs = 500
-	// RehomeStagedRoot names an output's StagedKey: reserved, never
-	// written (outputs are uploaded straight to their final keys).
+	// RehomeStagedRoot names an output's StagedKey: on a shared store never
+	// written (outputs are uploaded straight to their final keys); on local
+	// storage each node holds the outputs there until it moves them into
+	// place (#1860).
 	RehomeStagedRoot = "_rehome_staged"
 	// maxRehomeStageBytes bounds a stage entry's encoded size, well under
 	// the forward frame (file_registrar.go).
@@ -288,7 +290,7 @@ type rehomeState struct {
 	Gen uint64 `json:"gen,omitempty"`
 }
 
-// RehomeStagedKey is an output's reserved StagedKey (never written).
+// RehomeStagedKey is an output's StagedKey (see RehomeStagedRoot).
 func RehomeStagedKey(job string, i int) string {
 	return fmt.Sprintf("%s/%s/%06d.parquet", RehomeStagedRoot, job, i)
 }
@@ -879,7 +881,6 @@ func (f *ClusterFSM) RehomeStagedOutput(key string) (RehomeOutput, bool) {
 	return RehomeOutput{}, false
 }
 
-// RehomeJob returns a copy of one job.
 // RehomeJobOfOutput returns the job one of whose outputs is at path.
 func (f *ClusterFSM) RehomeJobOfOutput(path string) (RehomeJob, bool) {
 	f.mu.RLock()
@@ -895,6 +896,7 @@ func (f *ClusterFSM) RehomeJobOfOutput(path string) (RehomeJob, bool) {
 	return j.Copy(), true
 }
 
+// RehomeJob returns a copy of one job.
 func (f *ClusterFSM) RehomeJob(id string) (RehomeJob, bool) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()

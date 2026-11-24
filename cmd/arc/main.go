@@ -2537,6 +2537,13 @@ func main() {
 					// retaking the read lease do to its reads and caches
 					// (bound to the query handler once it exists).
 					clusterCoordinator.SetRehomeInScope(rehomeCfgInScope)
+					if rehomeLocalCluster {
+						// Before Start: a delete replayed from the log at start
+						// must leave the source of a job this node records to
+						// the job (#1860).
+						clusterCoordinator.SetRehomeLocalRecords(rehomeRegistry.HasCluster)
+						clusterCoordinator.SetRehomeLocalSources(rehomeRegistry.ClusterSource)
+					}
 					if rehomeSharedCluster {
 						clusterCoordinator.SetReadLeaseHooks(func() {
 							if fn := rehomeLeaseLost.Load(); fn != nil {
@@ -4294,7 +4301,6 @@ func main() {
 			// Each node's own job records (rehomeRegistry) say what its
 			// reads leave out; the cluster's record answers ownership.
 			clusterCoordinator.SetRehomeLocalExclusions()
-			clusterCoordinator.SetRehomeLocalRecords(rehomeRegistry.HasCluster)
 		}
 		if src := clusterCoordinator.RehomeSource(); src != nil {
 			rehomeClusterSrc.Store(src)
@@ -4719,15 +4725,18 @@ func main() {
 			}
 		},
 	})
-	if rehomeLocalOn && rehomeClusterInScope {
+	if rehomeLocalOn {
 		// Before Recover: on a cluster node, staged directories are this
-		// node's part of cluster jobs, settled by SweepLocal once synced.
+		// node's part of cluster jobs, settled by SweepLocal once synced, and
+		// a job journaled before it was one is undone. Every member, in
+		// scope or not: a node out of scope still does its part of a job
+		// in flight (#1859).
 		rehomeHandler.SetCluster(clusterCoordinator, clusterCoordinator.ReadReady)
 	}
 	if err := rehomeHandler.Recover(context.Background()); err != nil {
 		log.Fatal().Err(err).Msg("Could not take up the re-home jobs found at start")
 	}
-	if rehomeLocalOn && rehomeClusterInScope {
+	if rehomeLocalOn {
 		// Every node's part of a job on its own disk (#1860); the puller
 		// records a job here before an output of it lands.
 		clusterCoordinator.SetRehomeParticipant(rehomeHandler.ParticipateLocal)
@@ -4788,6 +4797,8 @@ func main() {
 		// The driver, on the primary writer.
 		rehomeHandler.SetCluster(clusterCoordinator, clusterCoordinator.ReadReady)
 		rehomeHandler.StartClusterTakeover()
+	}
+	if rehomeLocalOn {
 		rehomeHandler.StartLocalSweep()
 	}
 	deleteHandler.StartRetiredDrainer(retiredCtx)

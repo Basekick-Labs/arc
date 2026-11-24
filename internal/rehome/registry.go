@@ -447,6 +447,22 @@ func outputKeys(j *Job) []string {
 	return out
 }
 
+// ClusterSource reports whether key is the source of a cluster job this node
+// records.
+func (r *Registry) ClusterSource(key string) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id, ok := r.owned[key]
+	if !ok {
+		return false
+	}
+	j, ok := r.jobs[id]
+	return ok && j.Cluster && j.Source.Key == key
+}
+
 // HasCluster reports a cluster job this node records (Mirror).
 func (r *Registry) HasCluster(id string) bool {
 	if r == nil {
@@ -473,14 +489,29 @@ func (r *Registry) End(ctx context.Context, id string) error {
 func (r *Registry) Drop(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, ok := r.jobs[id]; !ok {
+	j, ok := r.jobs[id]
+	if !ok {
 		return
+	}
+	if j.State == StateCommitted || j.State == StateLatched {
+		r.gen.Add(1) // what reads leave out changes
 	}
 	delete(r.jobs, id)
 	for k, owner := range r.owned {
 		if owner == id {
 			delete(r.owned, k)
 		}
+	}
+}
+
+// DropOwn is Drop for a job of this node's own: a cluster job's record under
+// the id (Mirror) is kept.
+func (r *Registry) DropOwn(id string) {
+	r.mu.Lock()
+	j, ok := r.jobs[id]
+	r.mu.Unlock()
+	if ok && !j.Cluster {
+		r.Drop(id)
 	}
 }
 

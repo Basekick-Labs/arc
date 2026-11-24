@@ -174,7 +174,8 @@ shutdown (a clean shutdown leaves), is still refused while a job runs.
 
 ## New: moving a misfiled file's rows on a cluster with local storage ([#1860](https://github.com/Basekick-Labs/arc/issues/1860))
 
-**Who is affected:** clusters on local storage with `cluster.replication_enabled = true`, with
+**Who is affected:** clusters on local storage with `cluster.replication_enabled = true` (a node
+takes part once its file puller runs), with
 tiered storage, the Iceberg export and edge sync off on every node and stream takeover off.
 `POST /api/v1/rehome` (not a dry run) now runs there, on the primary writer, as it does on a
 cluster sharing an object store. A local-storage cluster without replication is still refused
@@ -194,18 +195,24 @@ Every node keeps its own copy of each file, so every node does each step on its 
 5. Every node ends its record. The job ends.
 
 What a node's reads leave out comes from its own record, not from its copy of the cluster's state,
-so a node that restarts mid-job reads every row once even before it has caught up with the leader.
-At no step does a query on any node count a row twice or miss one; a query that had listed the file
-before it was removed and opens it after fails (503, retry) rather than returning wrong rows.
+so a node that restarts mid-job reads every row once even before it has caught up with the leader;
+the old file stays on a node until its record says the outputs are in place there. A query that had
+listed the file before it was removed and opens it after fails (503, retry) rather than returning
+wrong rows.
 
-- **A node that stops answering** holds the job at its step: before the outputs are published the
-  job reverts after 15 minutes; after, it waits. `GET /api/v1/cluster` (`rehome.jobs`) names the
-  nodes it waits for. A node shut down cleanly leaves the cluster and is not waited for; when it
-  comes back it settles each job it missed by what the manifest lists (keeps the outputs, removes
-  the old file, or the reverse for a reverted job) within a minute of rejoining.
+- **A node that stops answering** holds the job at its step: until the job switches reads to the
+  new files (steps 2 and 3) it reverts after 15 minutes; from then on it waits. `GET
+  /api/v1/cluster` (`rehome.jobs`) names the nodes it waits for. A node shut down cleanly leaves
+  the cluster, and the job goes on without it 30 seconds later; when it comes back it settles each
+  job it missed by what the manifest lists (keeps the outputs, removes the old file, or the reverse
+  for a reverted job), checking every minute until the outputs have reached it.
 - **A node that joins mid-job** fetches the outputs itself, or records the job before its puller
   brings them, so it reads the old file until every output is there.
 - No read lease is added on local storage: queries are served as before throughout.
+- A node that stopped before the outputs were published, and rejoins after the job ended with no
+  record of it, removes the old file and pulls the outputs independently: for that moment its
+  queries may see both or neither. Every other node, and that node once the pull lands, reads each
+  row once.
 
 ## New: moving a misfiled file's rows on a cluster whose nodes share one object store ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
 
