@@ -129,6 +129,22 @@ const readLeaseRetryMax = 5 * time.Second
 
 // step checks the lease once: drops it when contact is lost or the leader
 // returns whether the lease is held afterwards.
+// drop ends the lease now, as losing contact would: the next step syncs
+// with the leader again before it is retaken (#1852: the leader waived this
+// node's read fence).
+func (l *readLease) drop(why string) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	was := l.held
+	l.held, l.why = false, why
+	l.mu.Unlock()
+	if was {
+		l.changed(false, why)
+	}
+}
+
 func (l *readLease) step(ctx context.Context) bool {
 	leader, contact := l.inContact()
 	l.mu.Lock()

@@ -698,7 +698,8 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	deadline := requestDeadline(effectiveTimeout)
 	transformCtx, cancelTransform := transformContext(c.Context(), deadline)
 	// A read in flight until its statement is bound (internal/readgate).
-	defer h.reads.Enter()()
+	entered, leave := h.reads.EnterAt()
+	defer leave()
 	convertedSQL, _, emittedRefs, err := h.getTransformedSQLWithRefs(transformCtx, req.SQL, headerDB)
 	cancelTransform()
 	if err != nil {
@@ -761,7 +762,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		ctx, cancel = context.WithCancel(ctx)
 	}
 	// Stopped if this node loses its cluster read lease (readgate.Bind).
-	cancel = h.reads.Bind(cancel)
+	cancel = h.reads.Bind(entered, cancel)
 	recordDisconnect := h.watchQueryClientDisconnect(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathArrowIPC)
 
 	// The arcx hook may install an asynchronous stream writer. A successful

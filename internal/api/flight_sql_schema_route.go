@@ -106,7 +106,9 @@ func (h *QueryHandler) describeFlightSQLSchema(c *fiber.Ctx, binds chan struct{}
 		ctx, cancel = context.WithDeadline(parent, deadline)
 	}
 	// Stopped if this node loses its cluster read lease (readgate.Bind).
-	cancel = h.reads.Bind(cancel)
+	// Bound before the read enters (below, after its slot): the epoch now
+	// is at or before the one it enters in.
+	cancel = h.reads.Bind(h.reads.Epoch(), cancel)
 	defer cancel()
 	// Always on, whatever query.cancel_on_client_disconnect says: the client
 	// is the Flight side of the bridge, which closes the request when its RPC

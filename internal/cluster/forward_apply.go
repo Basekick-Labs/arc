@@ -680,6 +680,20 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	// readers included, acks the job's states, like the pause ack. Each must
 	// name the requesting node. Enable is leader-only and never accepted
 	// from a peer.
+	// Compaction read fences (#1852): a node raises its own fence (any role,
+	// readers included); the finisher advances a job (compaction roles). A
+	// waived fence is the leader's own and never forwarded; enable is
+	// leader-only.
+	isFence := cmd.Type == clusterraft.CommandReadFence
+	isAdvanceCompaction := cmd.Type == clusterraft.CommandAdvanceCompaction
+	if isFence || isAdvanceCompaction {
+		if err := fenceCommandSpeaksFor(&cmd, req.NodeID); err != nil {
+			c.logger.Warn().Err(err).Str("requesting_node", req.NodeID).Int("cmd_type", int(cmd.Type)).
+				Msg("ForwardApply rejected: read fence command names another node, or is a waiver")
+			c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "read fence command must name the requesting node")
+			return
+		}
+	}
 	isRehome := isRehomeDriveCommand(cmd.Type)
 	isRehomeAck := cmd.Type == clusterraft.CommandAckRehome
 	if isRehome || isRehomeAck {
@@ -773,7 +787,7 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 			return
 		}
 	}
-	if !isManifest && !isAuth && !isRBAC && !isBarrier && !isPauseSet && !isPauseAck && !isTakeOver && !isCompaction && !isCompactionHeld && !isPolicy && !isWatermark && !isColdMark && !isColdMarkAck && !isIcebergNotice && !isRehome && !isRehomeAck {
+	if !isManifest && !isAuth && !isRBAC && !isBarrier && !isPauseSet && !isPauseAck && !isTakeOver && !isCompaction && !isCompactionHeld && !isPolicy && !isWatermark && !isColdMark && !isColdMarkAck && !isIcebergNotice && !isRehome && !isRehomeAck && !isFence && !isAdvanceCompaction {
 		c.logger.Warn().
 			Str("requesting_node", req.NodeID).
 			Int("cmd_type", int(cmd.Type)).
@@ -781,7 +795,7 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeInvalidCommand, "command type not allowed via forwarding")
 		return
 	}
-	if ((isManifest || isPauseSet) && !caps.CanIngest && !caps.CanCompact) || (isTakeOver && !caps.CanIngest) || (isCompaction && !caps.CanIngest && !caps.CanCompact) || (isIcebergNotice && !caps.CanIngest) || (isRehome && !caps.CanIngest) {
+	if ((isManifest || isPauseSet) && !caps.CanIngest && !caps.CanCompact) || (isTakeOver && !caps.CanIngest) || (isCompaction && !caps.CanIngest && !caps.CanCompact) || (isIcebergNotice && !caps.CanIngest) || (isRehome && !caps.CanIngest) || (isAdvanceCompaction && !caps.CanIngest && !caps.CanCompact) {
 		c.logger.Warn().
 			Str("peer", remoteAddr).
 			Str("requesting_node", req.NodeID).

@@ -57,6 +57,10 @@ type openState struct {
 	// onOutputSeen runs the first time an object job's output is seen (drop
 	// DuckDB's object-store listing cache when it is on).
 	onOutputSeen atomic.Pointer[func()]
+	// onSwitched runs the first time this node reads an Acked object job at
+	// switched (#1852): the query caches that remember the output's
+	// directory as empty must not answer for it.
+	onSwitched atomic.Pointer[func(output raft.FileEntry)]
 }
 
 // localDelete is one pending local unlink. For a compaction input, output is
@@ -102,6 +106,15 @@ func (s *openState) init() {
 func (c *Coordinator) SetOnObjectOutputSeen(fn func()) {
 	if c != nil && fn != nil {
 		c.open.onOutputSeen.Store(&fn)
+	}
+}
+
+// SetOnCompactionSwitched sets what runs the first time a read here sees a
+// fenced object job switched to its output, before the read takes its
+// exclusions.
+func (c *Coordinator) SetOnCompactionSwitched(fn func(output raft.FileEntry)) {
+	if c != nil && fn != nil {
+		c.open.onSwitched.Store(&fn)
 	}
 }
 
@@ -269,9 +282,9 @@ func (c *Coordinator) objectExcluded(ctx context.Context, fsm *raft.ClusterFSM, 
 		for _, s := range fsm.FinalizingObjectJobsUnder("") {
 			live[s.Job] = true
 		}
-		for job := range c.open.seen {
-			if !live[job] {
-				delete(c.open.seen, job)
+		for key := range c.open.seen {
+			if !live[strings.TrimSuffix(key, "#switched")] {
+				delete(c.open.seen, key)
 			}
 		}
 	}
@@ -279,6 +292,32 @@ func (c *Coordinator) objectExcluded(ctx context.Context, fsm *raft.ClusterFSM, 
 	var out []string
 	hold := stagedCommitter{c: c}.HoldsRegistration
 	for _, s := range jobs {
+		if s.Acked {
+			// A fenced job (#1852): the phase alone decides, every node at
+			// the same log index the same way.
+			switch s.Phase {
+			case raft.PhaseSwitched, raft.PhaseRemoved:
+				key := s.Job + "#switched"
+				c.open.mu.Lock()
+				first := !c.open.seen[key]
+				c.open.seen[key] = true
+				c.open.mu.Unlock()
+				if first {
+					c.open.gen.Add(1)
+					if fn := c.open.onSwitched.Load(); fn != nil {
+						(*fn)(s.Output)
+					}
+				}
+				for _, in := range s.Inputs {
+					if !fsm.HasFile(in.Path) {
+						out = append(out, in.Path)
+					}
+				}
+			default:
+				out = append(out, s.Output.Path)
+			}
+			continue
+		}
 		if e, ok := fsm.GetFile(s.Output.Path); !ok || e.CompactionJob != s.Job || e.SHA256 != s.Output.SHA256 {
 			continue
 		}

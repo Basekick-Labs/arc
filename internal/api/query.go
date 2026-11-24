@@ -2713,7 +2713,8 @@ localProcessing:
 
 	// A read in flight, from before its SQL is built until its statement is
 	// bound (internal/readgate): a job that swaps files waits for it.
-	defer h.reads.Enter()()
+	entered, leave := h.reads.EnterAt()
+	defer leave()
 	// Convert SQL to storage paths
 	transformCtx, cancelTransform := transformContext(c.Context(), deadline)
 	convertedSQL, cached, emittedRefs, err := h.getTransformedSQLForQueryWithRefs(transformCtx, req.SQL, headerDB)
@@ -2783,7 +2784,7 @@ localProcessing:
 		ctx, cancel = context.WithCancel(ctx)
 	}
 	// Stopped if this node loses its cluster read lease (readgate.Bind).
-	cancel = h.reads.Bind(cancel)
+	cancel = h.reads.Bind(entered, cancel)
 	recordDisconnect := h.watchQueryClientDisconnect(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathSQLJSON)
 
 	// arcx router hook. Decides eligibility on the RAW req.SQL (date_trunc
@@ -6215,7 +6216,8 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 
 	// A read in flight, from before its SQL is built until its statement is
 	// bound (internal/readgate): a job that swaps files waits for it.
-	defer h.reads.Enter()()
+	entered, leave := h.reads.EnterAt()
+	defer leave()
 	// Convert SQL to storage paths (with caching)
 	transformCtx, cancelTransform := transformContext(c.Context(), deadline)
 	convertedSQL, _, emittedRefs, err := h.getTransformedSQLWithRefs(transformCtx, req.SQL, headerDB)
@@ -6262,7 +6264,7 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 		ctx, cancel = context.WithCancel(ctx)
 	}
 	// Stopped if this node loses its cluster read lease (readgate.Bind).
-	defer h.reads.Bind(cancel)()
+	defer h.reads.Bind(entered, cancel)()
 
 	// Execute count query with timeout support
 	rows, err := h.db.QueryContext(ctx, countSQL)
@@ -6825,7 +6827,8 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 
 	// A read in flight, from before its SQL is built until its statement is
 	// bound (internal/readgate): a job that swaps files waits for it.
-	defer h.reads.Enter()()
+	entered, leave := h.reads.EnterAt()
+	defer leave()
 	// Convert SQL to storage paths (with caching)
 	// Note: This endpoint builds its own db.measurement SQL, so no header optimization
 	transformCtx, cancelTransform := transformContext(c.Context(), deadline)
@@ -6923,7 +6926,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		ctx, cancel = context.WithCancel(ctx)
 	}
 	// Stopped if this node loses its cluster read lease (readgate.Bind).
-	cancel = h.reads.Bind(cancel)
+	cancel = h.reads.Bind(entered, cancel)
 	recordDisconnect := h.watchQueryClientDisconnect(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathSQLJSON)
 
 	// Dispositions for the Arrow JSON path, which owns the response once it

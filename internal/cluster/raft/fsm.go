@@ -275,6 +275,11 @@ const (
 	CommandAckRehome
 	CommandClaimRehomeFinisher
 	CommandEndRehome
+	// Read fences for staged compaction on a shared object store (#1852),
+	// see compaction_fences.go.
+	CommandEnableCompactionFences
+	CommandReadFence
+	CommandAdvanceCompaction
 )
 
 // Command represents a command to be applied to the FSM.
@@ -669,6 +674,9 @@ type FSMSnapshot struct {
 	// Rehome: the #1825 flag and jobs. nil in an older snapshot, or before
 	// the flag was applied.
 	Rehome *rehomeState `json:"rehome,omitempty"`
+	// CompactionFences: the #1852 flag and every node's read fence. nil in
+	// an older snapshot, or before the flag was applied.
+	CompactionFences *compactionFencesState `json:"compaction_fences,omitempty"`
 }
 
 // ClusterFSM implements the raft.FSM interface for cluster state management.
@@ -895,6 +903,9 @@ type ClusterFSM struct {
 	rehomeJobs    map[string]*RehomeJob
 	rehomePaths   map[string]string
 	rehomeGen     uint64
+	// Compaction read fences (#1852), under mu; see compaction_fences.go.
+	compactionFences bool
+	readFences       map[string]uint64
 	// clusterPolicies is the #1324 flag; policiesSeeded the kinds whose
 	// policies live here; tieringPolicies by database. See
 	// cluster_policies.go.
@@ -936,6 +947,7 @@ type ClusterFSM struct {
 	onCompactionCommitted func(job string, output FileEntry)
 	onRehomeChanged       func(RehomeJob)
 	onRehomeEnded         func(RehomeJob)
+	onReadFenceWaived     func(node string)
 	pendingEvents         []func()
 
 	// Callbacks for state changes
@@ -1022,6 +1034,7 @@ func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 		staged:                  map[string]*StagedCompaction{},
 		stagedPaths:             map[string]string{},
 		rehomeJobs:              map[string]*RehomeJob{},
+		readFences:              map[string]uint64{},
 		rehomePaths:             map[string]string{},
 		policiesSeeded:          map[string]bool{},
 		tieringPolicies:         map[string]*TieringPolicyEntry{},
@@ -1565,6 +1578,13 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 	case CommandEndRehome:
 		defer f.deliverCompactionEvents()
 		return f.applyEndRehome(cmd.Payload, log.Index)
+	case CommandEnableCompactionFences:
+		return f.applyEnableCompactionFences(cmd.Payload)
+	case CommandReadFence:
+		defer f.deliverCompactionEvents()
+		return f.applyReadFence(cmd.Payload, log.Index)
+	case CommandAdvanceCompaction:
+		return f.applyAdvanceCompaction(cmd.Payload, log.Index)
 
 	default:
 		return fmt.Errorf("unknown command type: %d", cmd.Type)
@@ -1814,6 +1834,7 @@ func (f *ClusterFSM) applyRemoveNode(payload []byte) interface{} {
 	delete(f.nodes, p.NodeID)
 	f.compactionNodeRemovedLocked(p.NodeID)
 	f.rehomeNodeRemovedLocked(p.NodeID, f.applyStarted.Load())
+	delete(f.readFences, p.NodeID)
 	// A removed node no longer holds the cold mark fence or counts toward
 	// its liveness (#1552).
 	f.coldMarkNodeRemovedLocked(p.NodeID)
@@ -1893,6 +1914,10 @@ func (f *ClusterFSM) ReferencesNode(id string) bool {
 	}
 	// rehomeNodeRemovedLocked
 	if f.rehomeReferencesLocked(id) {
+		return true
+	}
+	// readFences (applyRemoveNode)
+	if _, ok := f.readFences[id]; ok {
 		return true
 	}
 	// compactionNodeRemovedLocked
@@ -2129,7 +2154,7 @@ func (f *ClusterFSM) applyRegisterFileStruct(p RegisterFilePayload, logIndex uin
 	}
 
 	f.mu.Lock()
-	if f.adoptRefusedLocked(p) || f.rehomeOwnsLocked(p.File.Path) {
+	if f.adoptRefusedLocked(p) || f.rehomeOwnsLocked(p.File.Path) || f.compactionFencedOwnsLocked(p.File.Path) {
 		f.mu.Unlock()
 		return &ManifestChangedError{Paths: []string{p.File.Path}}
 	}
@@ -2226,7 +2251,7 @@ func (f *ClusterFSM) applyDeleteFileStruct(p DeleteFilePayload) interface{} {
 	}
 
 	f.mu.Lock()
-	if (p.ExpectSHA != "" && f.compactionCommit && !f.registeredAtLocked(p.Path, p.ExpectSHA)) || f.rehomeOwnsLocked(p.Path) {
+	if (p.ExpectSHA != "" && f.compactionCommit && !f.registeredAtLocked(p.Path, p.ExpectSHA)) || f.rehomeOwnsLocked(p.Path) || f.compactionFencedOwnsLocked(p.Path) {
 		f.mu.Unlock()
 		return &ManifestChangedError{Paths: []string{p.Path}}
 	}
@@ -2320,7 +2345,7 @@ func (f *ClusterFSM) applyUpdateFileStruct(p UpdateFilePayload, logIndex uint64)
 	}
 
 	f.mu.Lock()
-	if f.updateRefusedLocked(p) || f.rehomeOwnsLocked(p.File.Path) {
+	if f.updateRefusedLocked(p) || f.rehomeOwnsLocked(p.File.Path) || f.compactionFencedOwnsLocked(p.File.Path) {
 		f.mu.Unlock()
 		return &ManifestChangedError{Paths: []string{p.File.Path}}
 	}
@@ -3184,6 +3209,7 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 	return &fsmSnapshot{
 		compactionCommit: f.snapshotCompactionCommitLocked(),
 		rehome:           f.snapshotRehomeLocked(),
+		compactionFences: f.snapshotCompactionFencesLocked(),
 		clusterPolicies:  f.snapshotClusterPoliciesLocked(),
 		coldMark:         f.snapshotColdMarkLocked(),
 		streamClaims:     claimsState,
@@ -3551,6 +3577,7 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	f.refreshUnackedDeletesLocked()
 	f.restoreCompactionCommitLocked(snapshot.CompactionCommit)
 	f.restoreRehomeLocked(snapshot.Rehome)
+	f.restoreCompactionFencesLocked(snapshot.CompactionFences)
 	f.restoreClusterPoliciesLocked(snapshot.ClusterPolicies)
 	f.restoreColdMarkLocked(snapshot.ColdMark)
 	onCompactionPauseChanged := f.onCompactionPauseChanged
@@ -4088,6 +4115,7 @@ type fsmSnapshot struct {
 	streamClaims           *streamClaimsState
 	compactionCommit       *compactionCommitState
 	rehome                 *rehomeState
+	compactionFences       *compactionFencesState
 	clusterPolicies        *clusterPoliciesState
 	coldMark               *coldMarkState
 }
@@ -4111,6 +4139,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 		StreamClaims:           s.streamClaims,
 		CompactionCommit:       s.compactionCommit,
 		Rehome:                 s.rehome,
+		CompactionFences:       s.compactionFences,
 		ClusterPolicies:        s.clusterPolicies,
 		ColdMark:               s.coldMark,
 	}

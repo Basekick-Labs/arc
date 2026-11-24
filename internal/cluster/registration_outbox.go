@@ -47,6 +47,12 @@ type OutboxManifest interface {
 	StreamClaimsEnabled() bool
 }
 
+// fencedOwnedChecker reports a path a compaction being finished under read
+// fences owns (Coordinator, #1852).
+type fencedOwnedChecker interface {
+	CompactionFencedOwns(path string) bool
+}
+
 // rehomeOwnedChecker reports a path a re-home job owns (Coordinator).
 type rehomeOwnedChecker interface {
 	RehomeOwnsPath(path string) bool
@@ -1077,6 +1083,15 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 			continue
 		}
 		if rehomed != nil && e.rec.Supersedes != "" && rehomed.RehomeOwnsPath(e.rec.Supersedes) {
+			deferred = append(deferred, e)
+			continue
+		}
+		// A path a compaction being finished under read fences owns
+		// (#1852): the cluster refuses it until the job's inputs are gone,
+		// and the whole batch with it. Deferred, not settled: a different
+		// file at an input's path is registered once the job ends.
+		if fenced, ok := manifest.(fencedOwnedChecker); ok && (fenced.CompactionFencedOwns(e.rec.Path) ||
+			(e.rec.Supersedes != "" && fenced.CompactionFencedOwns(e.rec.Supersedes))) {
 			deferred = append(deferred, e)
 			continue
 		}

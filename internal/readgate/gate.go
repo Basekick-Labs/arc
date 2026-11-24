@@ -56,18 +56,23 @@ type Gate struct {
 	cancelAllNow context.CancelFunc
 	// closed: CancelAll was called and Reopen was not since.
 	closed bool
+	// cancelled: CancelAll was called; cancelledThrough is the last epoch it
+	// ended. A read that entered in it or earlier is cancelled at Bind, even
+	// after Reopen: its exclusions may be from before what the node missed.
+	cancelled        bool
+	cancelledThrough uint64
 }
 
 // Bind ties a read's cancel function to CancelAll: it runs when CancelAll is
 // called before the read's own cancel. The returned function replaces
 // cancel: it unbinds, then cancels. A nil cancel is allowed (nothing to
 // cancel, nothing bound).
-func (g *Gate) Bind(cancel context.CancelFunc) context.CancelFunc {
+func (g *Gate) Bind(entered uint64, cancel context.CancelFunc) context.CancelFunc {
 	if g == nil || cancel == nil {
 		return cancel
 	}
 	g.mu.Lock()
-	if g.closed {
+	if g.closed || (g.cancelled && entered <= g.cancelledThrough) {
 		g.mu.Unlock()
 		cancel()
 		return cancel
@@ -94,6 +99,8 @@ func (g *Gate) CancelAll() {
 	now := g.cancelAllNow
 	g.cancelAll, g.cancelAllNow = nil, nil
 	g.closed = true
+	g.cancelled, g.cancelledThrough = true, g.epoch
+	g.epoch++
 	g.mu.Unlock()
 	if now != nil {
 		now()
@@ -114,8 +121,14 @@ func (g *Gate) Reopen() {
 // records it as bound. The returned function is safe to call more than once
 // and from any goroutine.
 func (g *Gate) Enter() (leave func()) {
+	_, leave = g.EnterAt()
+	return leave
+}
+
+// EnterAt is Enter, with the epoch the read entered in, for Bind.
+func (g *Gate) EnterAt() (epoch uint64, leave func()) {
 	if g == nil {
-		return func() {}
+		return 0, func() {}
 	}
 	g.mu.Lock()
 	e := g.epoch
@@ -125,7 +138,7 @@ func (g *Gate) Enter() (leave func()) {
 	g.active[e]++
 	g.mu.Unlock()
 	var once sync.Once
-	return func() {
+	return e, func() {
 		once.Do(func() {
 			g.mu.Lock()
 			if g.active[e]--; g.active[e] <= 0 {
@@ -139,6 +152,16 @@ func (g *Gate) Enter() (leave func()) {
 			g.mu.Unlock()
 		})
 	}
+}
+
+// Epoch is the epoch a read entering now would enter in.
+func (g *Gate) Epoch() uint64 {
+	if g == nil {
+		return 0
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.epoch
 }
 
 // Flip starts a new epoch and returns the one that ended: reads that enter

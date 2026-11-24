@@ -171,7 +171,9 @@ func (s *RehomeSource) Owns(key string) bool {
 		// owned file in any case).
 		return f.RehomeEnabled()
 	}
-	return f.RehomeOwns(key)
+	// And a compaction being finished under read fences (#1852): its FSM
+	// refuses a change to its files until its inputs are gone.
+	return f.RehomeOwns(key) || f.CompactionFencedOwns(key)
 }
 
 // OwnsUnder reports whether a job owns a file under prefix ("" is every
@@ -187,7 +189,7 @@ func (s *RehomeSource) OwnsUnder(prefix string) bool {
 		// owned file in any case).
 		return f.RehomeEnabled()
 	}
-	return f.RehomeOwnsUnder(prefix)
+	return f.RehomeOwnsUnder(prefix) || f.CompactionFencedOwnsUnder(prefix)
 }
 
 // Active reports whether any job is in flight. True while not synced.
