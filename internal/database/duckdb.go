@@ -1294,6 +1294,16 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 			if _, err := db.Exec("SET GLOBAL cache_httpfs_type='in_mem'"); err != nil {
 				logger.Warn().Err(err).Msg("Failed to set cache_httpfs_type to in_mem")
 			}
+			// No file-handle cache (#1861): cache_httpfs_clear_cache (which
+			// Arc runs whenever files are replaced) resets the file-handle
+			// cache and its in-use counter without a lock while other threads
+			// open files through them (cache_httpfs 0.14.x), so a concurrent
+			// open throws "Attempted to dereference shared_ptr that is NULL"
+			// or hangs. The data blocks, glob and metadata caches stay; their
+			// clears are locked.
+			if _, err := db.Exec("SET GLOBAL cache_httpfs_enable_file_handle_cache=false"); err != nil {
+				logger.Error().Err(err).Msg("Could not turn off cache_httpfs's file handle cache: queries can fail or hang while the cache is cleared (#1861)")
+			}
 			// Calculate max blocks from cache size (each block is 512KB)
 			if cfg.S3CacheSize > 0 {
 				maxBlocks := cfg.S3CacheSize / (512 * 1024) // 512KB per block
@@ -1301,20 +1311,16 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 					if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_max_in_mem_cache_block_count=%d", maxBlocks)); err != nil {
 						logger.Warn().Err(err).Int64("max_blocks", maxBlocks).Msg("Failed to set cache_httpfs_max_in_mem_cache_block_count")
 					}
-					// Scale glob/metadata/file-handle cache sizes proportionally.
+					// Scale glob/metadata cache sizes proportionally.
 					// A 7-day hourly query generates ~168 glob patterns — the default
 					// 64 entries causes constant eviction on large deployments.
 					globEntries := max(maxBlocks/20, 64)      // ~5% of blocks, floor at default
 					metadataEntries := max(maxBlocks/10, 250) // ~10% of blocks, floor at default
-					fileHandleEntries := max(maxBlocks/10, 250)
 					if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_glob_cache_entry_size=%d", globEntries)); err != nil {
 						logger.Warn().Err(err).Msg("Failed to set cache_httpfs_glob_cache_entry_size")
 					}
 					if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_metadata_cache_entry_size=%d", metadataEntries)); err != nil {
 						logger.Warn().Err(err).Msg("Failed to set cache_httpfs_metadata_cache_entry_size")
-					}
-					if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_file_handle_cache_entry_size=%d", fileHandleEntries)); err != nil {
-						logger.Warn().Err(err).Msg("Failed to set cache_httpfs_file_handle_cache_entry_size")
 					}
 				} else {
 					logger.Warn().
@@ -1327,13 +1333,10 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 				if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_in_mem_cache_block_timeout_millisec=%d", ttlMs)); err != nil {
 					logger.Warn().Err(err).Int("ttl_ms", ttlMs).Msg("Failed to set cache_httpfs_in_mem_cache_block_timeout_millisec")
 				}
-				// Metadata and file handle TTLs match s3_cache_ttl_seconds — these
+				// The metadata TTL matches s3_cache_ttl_seconds — these
 				// reference immutable individual parquet files.
 				if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_metadata_cache_entry_timeout_millisec=%d", ttlMs)); err != nil {
 					logger.Warn().Err(err).Msg("Failed to set cache_httpfs_metadata_cache_entry_timeout_millisec")
-				}
-				if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_file_handle_cache_entry_timeout_millisec=%d", ttlMs)); err != nil {
-					logger.Warn().Err(err).Msg("Failed to set cache_httpfs_file_handle_cache_entry_timeout_millisec")
 				}
 			}
 			// Glob TTL: 10s — directory listings change during compaction and S3 LIST
@@ -1344,6 +1347,7 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 			logger.Info().
 				Int64("cache_size_bytes", cfg.S3CacheSize).
 				Int("ttl_seconds", cfg.S3CacheTTLSeconds).
+				Bool("file_handle_cache", false).
 				Msg("cache_httpfs extension loaded with in_mem mode")
 		}
 	}

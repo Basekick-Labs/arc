@@ -74,6 +74,19 @@ remove a file such a stream was still reading, and the query failed part way. It
 the stream ends. Results were never wrong. DuckDB-served results (JSON, Arrow IPC, the
 per-measurement endpoint) are complete before the handler returns and are unchanged; arcx does not
 serve on a cluster sharing an object store, so compactions there are unaffected.
+## Fix: with the S3 cache on, queries no longer fail or hang while files are replaced ([#1861](https://github.com/Basekick-Labs/arc/issues/1861))
+
+**Who is affected:** deployments with `query.enable_s3_cache = true` (off by default), standalone or
+cluster.
+
+Arc clears the S3 cache whenever files are replaced (a compaction, a DELETE, a re-home). The
+cache extension also cached open file handles, and a clear reset that cache without a lock while
+other queries were opening files through it: those queries failed with `INTERNAL Error: Attempted to dereference shared_ptr that is
+NULL!`, or hung inside DuckDB until their client gave up. On a 5-node cluster during 10 compactions,
+two nodes failed about 5,600 queries each over 2.5 minutes. The file-handle cache is now off; the
+data, glob and metadata caches stay. Same run: no errors, no hung queries. The cost: each query
+opens the files it reads again instead of reusing an open handle, which can add a request per file
+to the object store; the file data itself is still served from the cache.
 
 ## Fix: on a cluster sharing one object store, a query no longer counts a compaction's rows twice ([#1852](https://github.com/Basekick-Labs/arc/issues/1852))
 
@@ -106,11 +119,10 @@ fail and ask to be retried):
   deadline is not waited for (it is logged; it fails if its files are removed).
 - **Queries cancelled by a lease loss stay cancelled** after the lease is retaken, so a query that
   started before a node lost contact never reads with what it knew before.
-- **With `query.enable_s3_cache` on:** clearing DuckDB's HTTP cache while queries read it makes some
-  of them fail with an internal error, or hang inside DuckDB; this happens without this change too
-  ([#1861](https://github.com/Basekick-Labs/arc/issues/1861)). Totals stay right; a hung query
-  delays compaction until 30 seconds after its own deadline, or for as long as it hangs with
-  `query.timeout = 0` and a client that stays connected.
+- **A query that hangs inside DuckDB** delays compaction until 30 seconds after its own deadline, or
+  for as long as it hangs with `query.timeout = 0` and a client that stays connected (with the S3
+  cache on such hangs were common; fixed by
+  [#1861](https://github.com/Basekick-Labs/arc/issues/1861), above).
 - **What shows it:** `GET /api/v1/cluster`, `compaction_commit.read_fences_enabled` and, while a
   compaction waits, `read_fences_behind` (the nodes it waits for).
 - **Rolling upgrade:** the change turns on once every node runs this release, like compaction

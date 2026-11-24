@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -207,22 +208,26 @@ func TestSilentNodes(t *testing.T) {
 // one path.
 type fencingManifest struct {
 	*fakeOutboxManifest
-	owned string
+	owned atomic.Value // string; read by the outbox's goroutine
 }
 
-func (m *fencingManifest) CompactionFencedOwns(path string) bool { return path == m.owned }
+func (m *fencingManifest) CompactionFencedOwns(path string) bool {
+	owned, _ := m.owned.Load().(string)
+	return path == owned
+}
 
 // A pending registration of a path a fenced compaction owns is deferred, not
 // sent (the cluster would refuse the whole batch) and not settled.
 func TestOutboxDefersAFencedPath(t *testing.T) {
 	r := loadPending(t, t.TempDir(), map[string]int64{outPathA: 10, outPathB: 20})
-	m := &fencingManifest{fakeOutboxManifest: newFakeOutboxManifest(), owned: outPathA}
+	m := &fencingManifest{fakeOutboxManifest: newFakeOutboxManifest()}
+	m.owned.Store(outPathA)
 	r.HandOff(m, &fakeOutboxStorage{sizes: map[string]int64{outPathA: 10, outPathB: 20}}, "writer-1")
 	waitOutbox(t, "the unrelated file registered", func() bool { return m.isRegistered(outPathB) })
 	if m.isRegistered(outPathA) || r.Pending() != 1 {
 		t.Fatalf("fenced path: registered %v, pending %d", m.isRegistered(outPathA), r.Pending())
 	}
-	m.owned = ""
+	m.owned.Store("")
 	waitOutbox(t, "the deferred file registered once the job ended", func() bool { return m.isRegistered(outPathA) })
 }
 
