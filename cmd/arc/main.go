@@ -4734,7 +4734,7 @@ func main() {
 			}
 			if n := reads.Hung(); n > 0 {
 				log.Error().Int("hung_reads", n).
-					Msg("Queries on this node outlived their deadline by more than 30 s inside the query engine; compaction no longer waits for them. They fail if a file they read was removed")
+					Msg("Queries on this node are still running more than 30 s after their deadline (stuck in the query engine, or streaming to a slow client); compaction no longer waits for them. They fail if a file they read was removed")
 			}
 			dropFor(outputs)
 			return nil

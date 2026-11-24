@@ -2714,7 +2714,8 @@ localProcessing:
 	// A read in flight, from before its SQL is built until its statement is
 	// bound (internal/readgate): a job that swaps files waits for it.
 	entered, leave := h.reads.EnterAt()
-	defer leave()
+	// Held until an arcx-served stream ends, when there is one (#1858).
+	defer holdRead(c.Context(), leave)()
 	// Convert SQL to storage paths
 	transformCtx, cancelTransform := transformContext(c.Context(), deadline)
 	convertedSQL, cached, emittedRefs, err := h.getTransformedSQLForQueryWithRefs(transformCtx, req.SQL, headerDB)

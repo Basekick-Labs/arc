@@ -64,6 +64,17 @@ outage too.
 Clusters on local storage (which replicate files and have their own opt-in gate,
 `cluster.query_gate_on_catchup`) and standalone nodes are unchanged.
 
+## Fix: a re-home job waits for an arcx-served result to finish streaming ([#1858](https://github.com/Basekick-Labs/arc/issues/1858))
+
+**Who is affected:** standalone nodes using the arcx engine, during a re-home job (#1825).
+
+A result the arcx engine serves reads its Parquet files as it streams, after the request's handler
+has returned. A re-home job waited for queries only until the handler returned, so it could
+remove a file such a stream was still reading, and the query failed part way. It now waits until
+the stream ends. Results were never wrong. DuckDB-served results (JSON, Arrow IPC, the
+per-measurement endpoint) are complete before the handler returns and are unchanged; arcx does not
+serve on a cluster sharing an object store, so compactions there are unaffected.
+
 ## Fix: on a cluster sharing one object store, a query no longer counts a compaction's rows twice ([#1852](https://github.com/Basekick-Labs/arc/issues/1852))
 
 **Who is affected:** clusters whose primary storage is S3, Azure or GCS, with compaction on.
@@ -171,10 +182,6 @@ Not handled in this version:
 - A backup, a DELETE or retention still running on a former primary writer after a failover does
   not see a job the new one starts (a DELETE rewrite that lands before the switch-over makes the
   job revert; one that lands after is not caught).
-- An Arrow IPC stream, and the arcx engine's streamed or shadowed reads, can still be reading
-  after their request's handler returned, and an ack does not wait for them: such a read fails if
-  its file is deleted, it does not return wrong rows. Schema reads (`getMeasurementSchema`) are not
-  counted either.
 - A new job is started on the primary writer only.
 
 ## Change: a cluster records re-home jobs in its replicated state; an older build cannot join once every node supports it ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
