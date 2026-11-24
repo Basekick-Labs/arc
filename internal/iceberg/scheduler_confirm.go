@@ -50,6 +50,10 @@ func (a PassAnswer) Clear() bool {
 // before it changes anything, which names no file: there the pass itself
 // must have gone through, not only an earlier one's publish, since the job
 // is about to depend on the next one.
+// NotExportingReason is PassAnswer.Blocked on a node whose export gate is
+// closed: another node exports (or none does).
+const NotExportingReason = "this node is not the one exporting to Iceberg"
+
 func (a PassAnswer) Verdict(asked bool) (clear bool, why string) {
 	if a.Clear() && (asked || a.NotExported || a.Err == nil) {
 		return true, ""
@@ -134,7 +138,7 @@ func (s *Scheduler) serviceConfirms(ctx context.Context) {
 	}
 	if !s.gateOpen() {
 		for _, w := range waiters {
-			w.ch <- PassAnswer{Blocked: "this node is not the one exporting to Iceberg"}
+			w.ch <- PassAnswer{Blocked: NotExportingReason}
 		}
 		return
 	}

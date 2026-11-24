@@ -39,8 +39,9 @@ type rehomeGate struct {
 }
 
 // SetRehomeInScope records whether this node's configuration is one a
-// re-home job can run under: no Iceberg export, no edge sync (tiered storage
-// since #1869, with its cold tier running). Advertised at the next join, and
+// re-home job can run under: no edge sync (tiered storage since #1869, with
+// its cold tier running; the Iceberg export since #1870, following the
+// compactor lease). Advertised at the next join, and
 // by the self-record refresh when it changes after Start.
 func (c *Coordinator) SetRehomeInScope(ok bool) {
 	if c != nil {
@@ -444,4 +445,60 @@ func (s *RehomeSource) BeginBackupMark(ctx context.Context) (release func(), err
 			}
 		})
 	}, nil
+}
+
+// Replaced returns, for each job under prefix whose reads use its outputs
+// (latched or removed), its source's key with its outputs' keys: the Iceberg
+// export commits such a file's removal together with them (#1870).
+func (s *RehomeSource) Replaced(prefix string) map[string][]string {
+	f := s.fsm()
+	if f == nil {
+		return nil
+	}
+	var out map[string][]string
+	for _, j := range f.RehomeJobs() {
+		if j.Database+"/"+j.Measurement+"/" != prefix || (j.State != raft.RehomeLatched && j.State != raft.RehomeRemoved) {
+			continue
+		}
+		if out == nil {
+			out = map[string][]string{}
+		}
+		keys := make([]string, len(j.Outputs))
+		for i, o := range j.Outputs {
+			keys[i] = o.Key
+		}
+		out[j.Source.Path] = keys
+	}
+	return out
+}
+
+// CapabilityIcebergExport is advertised by a node that runs the Iceberg
+// export when it holds the compactor lease (#1870).
+const CapabilityIcebergExport = "iceberg_export_v1"
+
+// SetIcebergOn records whether this node runs the Iceberg export when it
+// holds the compactor lease. Advertised at the next join, and by the
+// self-record refresh when it changes after Start.
+func (c *Coordinator) SetIcebergOn(on bool) {
+	if c != nil {
+		c.icebergOn.Store(on)
+	}
+}
+
+// IcebergExporterPresent reports whether a node exports to Iceberg now: the
+// compactor lease is held, by a node that runs the export (#1870).
+func (c *Coordinator) IcebergExporterPresent() bool {
+	if c == nil || c.raftNode == nil {
+		return false
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return false
+	}
+	holder := fsm.GetActiveCompactorID()
+	if holder == "" {
+		return false
+	}
+	n, ok := fsm.GetNode(holder)
+	return ok && hasCapability(n.Capabilities, CapabilityIcebergExport)
 }

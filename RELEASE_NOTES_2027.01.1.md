@@ -215,6 +215,22 @@ out of scope, and a job that has not yet switched reads to its new files is reve
 one that has finishes. A node joining for the first time, or one that left the cluster on a clean
 shutdown (a clean shutdown leaves), is still refused while a job runs.
 
+## New: moving a misfiled file's rows on a cluster with the Iceberg export on ([#1870](https://github.com/Basekick-Labs/arc/issues/1870))
+
+**Who is affected:** clusters with the Iceberg export on and `cluster.failover_enabled = true` (the
+export follows the compactor lease, so one node exports). `POST /api/v1/rehome` was refused on a
+cluster with the export on; it now runs there, as it does on a standalone node (#1844). Without
+`cluster.failover_enabled`, a cluster with the export on still refuses it.
+
+The node that exports does the export's part of the job, on its own acknowledgement of each step:
+before the outputs are published it checks that the table can be published (every other node with
+the export on checks that some node exports), and once reads use the outputs it holds the step until
+the published table no longer names the old file, which the export removes in the same commit that
+adds the files replacing it. Only then is the old file removed. A node that started holding keeps
+holding if the compactor lease moves away. `POST /api/v1/rehome/<id>/resume {"skip_export_wait": true}`,
+sent to the node that holds, ends its wait: the old file is then removed while the table still names
+it, and readers of the table fail on it until the export's next commit.
+
 ## New: moving a misfiled file's rows on a cluster with tiered storage on, for a file on the hot tier ([#1869](https://github.com/Basekick-Labs/arc/issues/1869))
 
 **Who is affected:** clusters with tiered storage (shared object store, or local storage with
