@@ -107,14 +107,22 @@ func (g *Gate) Bind(e Entry, ctx context.Context, cancel context.CancelFunc) con
 	all := g.cancelAll
 	g.mu.Unlock()
 	stop := context.AfterFunc(all, cancel)
+	rec := e.rec
+	markDone := func() {
+		if rec != nil {
+			rec.doneAt.CompareAndSwap(0, time.Now().UnixNano())
+		}
+	}
 	stopDone := func() bool { return true }
-	if e.rec != nil && ctx != nil {
-		rec := e.rec
-		stopDone = context.AfterFunc(ctx, func() { rec.doneAt.Store(time.Now().UnixNano()) })
+	if rec != nil && ctx != nil {
+		stopDone = context.AfterFunc(ctx, markDone)
 	}
 	return func() {
 		stop()
 		stopDone()
+		// Its context ends here too (a client that went away, the end of
+		// a stream): a read that does not leave after this is hung.
+		markDone()
 		cancel()
 	}
 }

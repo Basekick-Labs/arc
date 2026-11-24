@@ -205,7 +205,7 @@ func TestWaitSkipsHungReads(t *testing.T) {
 		t.Fatal("a live read did not hold the wait")
 	}
 	wcancel()
-	cancel() // its context ends; it does not leave (stuck in the engine)
+	done() // cancelled through the gate (a client that went away); it does not leave
 	start := time.Now()
 	if err := g.Wait(context.Background(), ended); err != nil {
 		t.Fatal(err)
