@@ -23,9 +23,7 @@ func TestLocalParticipantKeepsTierRows1869(t *testing.T) {
 	r.advance(raft.RehomeCommitted)
 	// A cold copy found by this node's check: published is not acked.
 	ft.checkErr = tiering.ErrRehomeColdCopy
-	if err := r.c.RehomeAdvance(context.Background(), "ab12", raft.RehomePublished); err != nil {
-		t.Fatal(err)
-	}
+	r.advanceOnly(raft.RehomePublished)
 	j, _ := r.c.RehomeJob("ab12")
 	if err := r.h.ParticipateLocal(context.Background(), j, true); err == nil {
 		t.Fatal("acked published with a cold copy of the source")
@@ -67,9 +65,7 @@ func TestLocalParticipantRevertForgetsTierRows1869(t *testing.T) {
 	if !ft.rows[r.job.Outputs[0].Key] {
 		t.Fatal("no output row at published")
 	}
-	if err := r.c.RehomeAdvance(context.Background(), "ab12", raft.RehomeReverting); err != nil {
-		t.Fatal(err)
-	}
+	r.advanceOnly(raft.RehomeReverting)
 	r.end() // to reverted
 	r.part()
 	for _, o := range r.job.Outputs {

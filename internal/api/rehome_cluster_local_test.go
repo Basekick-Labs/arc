@@ -135,6 +135,23 @@ func (r *localRig) end() {
 	}
 }
 
+// advanceOnly is advance without this node's part: it retries until every
+// node acked the state the job leaves.
+func (r *localRig) advanceOnly(to string) {
+	r.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := r.c.RehomeAdvance(context.Background(), "ab12", to)
+		if err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			r.t.Fatalf("advance to %s: %v", to, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func (r *localRig) part() {
 	r.t.Helper()
 	j, ok := r.c.RehomeJob("ab12")
@@ -287,10 +304,7 @@ func TestLocalParticipantLateJoinerAtLatch1860(t *testing.T) {
 	r := newLocalRig(t)
 	ctx := context.Background()
 	for _, to := range []string{raft.RehomeCommitted, raft.RehomePublished} {
-		if err := r.c.RehomeAdvance(ctx, "ab12", to); err != nil {
-			t.Fatal(err)
-		}
-		time.Sleep(50 * time.Millisecond) // the others ack
+		r.advanceOnly(to)
 	}
 	if err := r.c.RehomeClaim(ctx, "ab12"); err != nil {
 		t.Fatal(err)
@@ -368,10 +382,7 @@ func TestLocalParticipantRemovedLatchesFirst1860(t *testing.T) {
 	r := newLocalRig(t)
 	ctx := context.Background()
 	for _, to := range []string{raft.RehomeCommitted, raft.RehomePublished} {
-		if err := r.c.RehomeAdvance(ctx, "ab12", to); err != nil {
-			t.Fatal(err)
-		}
-		time.Sleep(50 * time.Millisecond)
+		r.advanceOnly(to)
 	}
 	if err := r.c.RehomeClaim(ctx, "ab12"); err != nil {
 		t.Fatal(err)
