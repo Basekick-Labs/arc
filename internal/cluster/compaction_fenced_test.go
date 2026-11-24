@@ -202,3 +202,61 @@ func TestSilentNodes(t *testing.T) {
 		t.Fatal("an old observation still counts")
 	}
 }
+
+// fencingManifest is the outbox's manifest with a fenced compaction that owns
+// one path.
+type fencingManifest struct {
+	*fakeOutboxManifest
+	owned string
+}
+
+func (m *fencingManifest) CompactionFencedOwns(path string) bool { return path == m.owned }
+
+// A pending registration of a path a fenced compaction owns is deferred, not
+// sent (the cluster would refuse the whole batch) and not settled.
+func TestOutboxDefersAFencedPath(t *testing.T) {
+	r := loadPending(t, t.TempDir(), map[string]int64{outPathA: 10, outPathB: 20})
+	m := &fencingManifest{fakeOutboxManifest: newFakeOutboxManifest(), owned: outPathA}
+	r.HandOff(m, &fakeOutboxStorage{sizes: map[string]int64{outPathA: 10, outPathB: 20}}, "writer-1")
+	waitOutbox(t, "the unrelated file registered", func() bool { return m.isRegistered(outPathB) })
+	if m.isRegistered(outPathA) || r.Pending() != 1 {
+		t.Fatalf("fenced path: registered %v, pending %d", m.isRegistered(outPathA), r.Pending())
+	}
+	m.owned = ""
+	waitOutbox(t, "the deferred file registered once the job ended", func() bool { return m.isRegistered(outPathA) })
+}
+
+// A fenced job's files are owned for DELETE, retention, database delete and
+// backup (RehomeSource), until removed.
+func TestRehomeSourceOwnsFencedPaths(t *testing.T) {
+	r := objectRig(t)
+	r.enableFences()
+	job := r.objectJob("j1")
+	src := r.c.RehomeSource()
+	if !src.Owns(job.Output.Path) || !src.Owns(job.Inputs[0].Path) {
+		t.Fatal("a fenced job's files are not owned")
+	}
+	if !src.OwnsUnder(job.Output.Path[:strings.Index(job.Output.Path, "/")+1]) {
+		t.Fatal("not owned under the database")
+	}
+	if src.Owns("other/x.parquet") {
+		t.Fatal("an unrelated file is owned")
+	}
+}
+
+// A node fences without its read lease: it serves no reads then.
+func TestReadFenceWithoutTheLease(t *testing.T) {
+	r := objectRig(t)
+	r.enableFences()
+	r.objectJob("j1")
+	r.c.readLease = &readLease{why: "not synced"}
+	ran := 0
+	r.c.SetReadFenceFunc(func(context.Context, []raft.FileEntry) error { ran++; return nil })
+	if err := r.c.readFencePass(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	fsm := r.c.raftNode.FSM()
+	if ran != 1 || fsm.ReadFence(r.c.LocalNodeID()) < fsm.FenceTop() {
+		t.Fatalf("ran %d, fence %d, top %d", ran, fsm.ReadFence(r.c.LocalNodeID()), fsm.FenceTop())
+	}
+}

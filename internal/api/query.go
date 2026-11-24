@@ -2784,7 +2784,7 @@ localProcessing:
 		ctx, cancel = context.WithCancel(ctx)
 	}
 	// Stopped if this node loses its cluster read lease (readgate.Bind).
-	cancel = h.reads.Bind(entered, cancel)
+	cancel = h.reads.Bind(entered, ctx, cancel)
 	recordDisconnect := h.watchQueryClientDisconnect(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathSQLJSON)
 
 	// arcx router hook. Decides eligibility on the RAW req.SQL (date_trunc
@@ -6264,7 +6264,7 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 		ctx, cancel = context.WithCancel(ctx)
 	}
 	// Stopped if this node loses its cluster read lease (readgate.Bind).
-	defer h.reads.Bind(entered, cancel)()
+	defer h.reads.Bind(entered, ctx, cancel)()
 
 	// Execute count query with timeout support
 	rows, err := h.db.QueryContext(ctx, countSQL)
@@ -6926,7 +6926,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		ctx, cancel = context.WithCancel(ctx)
 	}
 	// Stopped if this node loses its cluster read lease (readgate.Bind).
-	cancel = h.reads.Bind(entered, cancel)
+	cancel = h.reads.Bind(entered, ctx, cancel)
 	recordDisconnect := h.watchQueryClientDisconnect(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathSQLJSON)
 
 	// Dispositions for the Arrow JSON path, which owns the response once it

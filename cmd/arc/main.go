@@ -4732,6 +4732,10 @@ func main() {
 			if err := reads.Wait(ctx, reads.Flip()); err != nil {
 				return err
 			}
+			if n := reads.Hung(); n > 0 {
+				log.Error().Int("hung_reads", n).
+					Msg("Queries on this node outlived their deadline by more than 30 s inside the query engine; compaction no longer waits for them. They fail if a file they read was removed")
+			}
 			dropFor(outputs)
 			return nil
 		})

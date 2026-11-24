@@ -906,6 +906,7 @@ type ClusterFSM struct {
 	// Compaction read fences (#1852), under mu; see compaction_fences.go.
 	compactionFences bool
 	readFences       map[string]uint64
+	lastWaiver       uint64
 	// clusterPolicies is the #1324 flag; policiesSeeded the kinds whose
 	// policies live here; tieringPolicies by database. See
 	// cluster_policies.go.

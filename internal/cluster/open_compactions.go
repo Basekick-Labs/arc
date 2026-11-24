@@ -262,7 +262,10 @@ func (c *Coordinator) OpenGeneration() uint64 {
 	return h.Sum64()
 }
 
-// objectExcluded: the inputs of every committed object job under prefix
+// objectExcluded: for a job finished under read fences (#1852), what its
+// phase says: the output before the switch, every input the manifest does
+// not list after it. For a job committed before the fences were on: the
+// inputs of every committed object job under prefix
 // whose output is registered by the job and at its final key. Known from the
 // commit on every node, so a reader whose FSM lags the finisher still knows
 // the job. A job whose output left the manifest (it is being reverted, or

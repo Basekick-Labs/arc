@@ -182,11 +182,10 @@ func (c *Coordinator) readFencePass(ctx context.Context) error {
 	if fsm.FenceTop() <= mine {
 		return nil
 	}
-	if ok, _ := c.ReadReady(); !ok {
-		return nil
-	}
-	// Everything at or below w is applied here: a read that enters the
-	// gate from now on sees it.
+	// No read lease needed: the fence speaks for this node's own applied
+	// index, and a node without the lease serves no reads (and drops its
+	// caches before it does again). Everything at or below w is applied
+	// here: a read that enters the gate from now on sees it.
 	w := fsm.AppliedDone()
 	if w <= mine {
 		return nil
@@ -195,10 +194,6 @@ func (c *Coordinator) readFencePass(ctx context.Context) error {
 	defer cancel()
 	if err := (*p)(wctx, fsm.FenceCacheOutputs(mine, w)); err != nil {
 		return err
-	}
-	// A node that lost the lease meanwhile may have been behind.
-	if ok, _ := c.ReadReady(); !ok {
-		return nil
 	}
 	raw, err := json.Marshal(raft.ReadFencePayload{Node: self, Index: w})
 	if err != nil {
@@ -223,7 +218,8 @@ type silentPeer struct {
 
 // silentObservedWithin: a failure observed longer ago than this is not
 // evidence the peer is silent now (hashicorp/raft backs failed heartbeats
-// off to about 41 s, and reports no resumption after a peer re-joins).
+// off up to half its heartbeat timeout, and reports no resumption after a
+// peer re-joins: a membership change clears the record instead).
 const silentObservedWithin = 60 * time.Second
 
 func (s *silentNodes) observe(peer string, failed bool, lastContact time.Time) {
@@ -235,7 +231,7 @@ func (s *silentNodes) observe(peer string, failed bool, lastContact time.Time) {
 	}
 	now := time.Now()
 	if lastContact.IsZero() {
-		// Never heard from by this leader: from the first failure on.
+		// Defensive: replication starts a peer's last contact at now.
 		if prev, ok := s.since[peer]; ok {
 			lastContact = prev.lastContact
 		} else {

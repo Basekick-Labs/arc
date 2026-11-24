@@ -72,6 +72,8 @@ type readLease struct {
 	mu   sync.Mutex
 	held bool
 	why  string
+	// drops counts drop calls: a sync that a drop overlapped grants nothing.
+	drops uint64
 	// leader is the leader the lease was taken under: a new one ends it.
 	leader string
 	// nextSync is when a sync may be tried again after one failed.
@@ -127,8 +129,6 @@ func (l *readLease) inContact() (string, bool) {
 // readLeaseRetryMax caps the pause between failed syncs.
 const readLeaseRetryMax = 5 * time.Second
 
-// step checks the lease once: drops it when contact is lost or the leader
-// returns whether the lease is held afterwards.
 // drop ends the lease now, as losing contact would: the next step syncs
 // with the leader again before it is retaken (#1852: the leader waived this
 // node's read fence).
@@ -139,12 +139,15 @@ func (l *readLease) drop(why string) {
 	l.mu.Lock()
 	was := l.held
 	l.held, l.why = false, why
+	l.drops++
 	l.mu.Unlock()
 	if was {
 		l.changed(false, why)
 	}
 }
 
+// step checks the lease once: drops it when contact is lost or the leader
+// returns whether the lease is held afterwards.
 func (l *readLease) step(ctx context.Context) bool {
 	leader, contact := l.inContact()
 	l.mu.Lock()
@@ -159,6 +162,7 @@ func (l *readLease) step(ctx context.Context) bool {
 	resync := held && !lost && leader != l.leader
 	why := l.why
 	wait := !l.nextSync.IsZero() && l.now().Before(l.nextSync)
+	drops := l.drops
 	l.mu.Unlock()
 	if lost {
 		l.changed(false, why)
@@ -190,6 +194,14 @@ func (l *readLease) step(ctx context.Context) bool {
 		return held
 	}
 	l.mu.Lock()
+	if l.drops != drops {
+		// Dropped while the sync ran (a waived read fence): the sync's
+		// hook ran before the drop closed the gate; the next step syncs
+		// again.
+		held = l.held
+		l.mu.Unlock()
+		return held
+	}
 	granted := !l.held
 	l.held, l.why, l.leader, l.failures, l.nextSync = true, "", leader, 0, time.Time{}
 	l.mu.Unlock()

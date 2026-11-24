@@ -1088,8 +1088,9 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 		}
 		// A path a compaction being finished under read fences owns
 		// (#1852): the cluster refuses it until the job's inputs are gone,
-		// and the whole batch with it. Deferred, not settled: a different
-		// file at an input's path is registered once the job ends.
+		// and the whole batch with it. Deferred, not settled: once the job
+		// ends the entry settles (a consumed input, or an object gone) or
+		// registers.
 		if fenced, ok := manifest.(fencedOwnedChecker); ok && (fenced.CompactionFencedOwns(e.rec.Path) ||
 			(e.rec.Supersedes != "" && fenced.CompactionFencedOwns(e.rec.Supersedes))) {
 			deferred = append(deferred, e)

@@ -39,6 +39,8 @@ package readgate
 import (
 	"context"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // Gate counts reads in flight, by the epoch they entered in. The zero value
@@ -46,9 +48,9 @@ import (
 type Gate struct {
 	mu     sync.Mutex
 	epoch  uint64
-	active map[uint64]int
-	// moved is closed, and made anew by the next waiter, whenever the last
-	// read of an epoch leaves.
+	active map[*readRec]struct{}
+	// moved is closed, and made anew by the next waiter, whenever a read
+	// leaves.
 	moved chan struct{}
 	// cancelAll is cancelled by CancelAll, which then makes a new one; every
 	// bound read's cancel function runs when it is (Bind).
@@ -56,23 +58,45 @@ type Gate struct {
 	cancelAllNow context.CancelFunc
 	// closed: CancelAll was called and Reopen was not since.
 	closed bool
-	// cancelled: CancelAll was called; cancelledThrough is the last epoch it
-	// ended. A read that entered in it or earlier is cancelled at Bind, even
-	// after Reopen: its exclusions may be from before what the node missed.
+	// cancelled: CancelAll or Reopen was called; cancelledThrough is the last
+	// epoch it ended. A read that entered in it or earlier is cancelled at
+	// Bind, even after Reopen: its exclusions may be from before what the
+	// node missed.
 	cancelled        bool
 	cancelledThrough uint64
 }
 
+// readRec is one read in flight.
+type readRec struct {
+	epoch uint64
+	// doneAt: when the context its statement runs under ended (Bind), in
+	// Unix nanoseconds; 0 while it has not.
+	doneAt atomic.Int64
+}
+
+// HungAfter: a read whose context ended this long ago and that has still not
+// left is hung (the engine did not stop it); Wait no longer waits for it. A
+// read's context ends at its own deadline, so a read that runs as long as it
+// may is always waited for. A variable for tests.
+var HungAfter = 30 * time.Second
+
+// Entry is a read's place in the gate, for Bind.
+type Entry struct {
+	Epoch uint64
+	rec   *readRec
+}
+
 // Bind ties a read's cancel function to CancelAll: it runs when CancelAll is
-// called before the read's own cancel. The returned function replaces
-// cancel: it unbinds, then cancels. A nil cancel is allowed (nothing to
-// cancel, nothing bound).
-func (g *Gate) Bind(entered uint64, cancel context.CancelFunc) context.CancelFunc {
+// called before the read's own cancel. ctx is the context the read's
+// statement runs under: once it ends, the read may be counted as hung
+// (HungAfter). The returned function replaces cancel: it unbinds, then
+// cancels. A nil cancel is allowed (nothing to cancel, nothing bound).
+func (g *Gate) Bind(e Entry, ctx context.Context, cancel context.CancelFunc) context.CancelFunc {
 	if g == nil || cancel == nil {
 		return cancel
 	}
 	g.mu.Lock()
-	if g.closed || (g.cancelled && entered <= g.cancelledThrough) {
+	if g.closed || (g.cancelled && e.Epoch <= g.cancelledThrough) {
 		g.mu.Unlock()
 		cancel()
 		return cancel
@@ -83,8 +107,14 @@ func (g *Gate) Bind(entered uint64, cancel context.CancelFunc) context.CancelFun
 	all := g.cancelAll
 	g.mu.Unlock()
 	stop := context.AfterFunc(all, cancel)
+	stopDone := func() bool { return true }
+	if e.rec != nil && ctx != nil {
+		rec := e.rec
+		stopDone = context.AfterFunc(ctx, func() { rec.doneAt.Store(time.Now().UnixNano()) })
+	}
 	return func() {
 		stop()
+		stopDone()
 		cancel()
 	}
 }
@@ -107,12 +137,18 @@ func (g *Gate) CancelAll() {
 	}
 }
 
-// Reopen lets reads that bind from now on run.
+// Reopen lets reads that enter from now on run. A read that entered while
+// the gate was closed stays cancelled at its Bind: it passed the node's
+// readiness check just before the node lost its lease.
 func (g *Gate) Reopen() {
 	if g == nil {
 		return
 	}
 	g.mu.Lock()
+	if g.closed {
+		g.cancelled, g.cancelledThrough = true, g.epoch
+		g.epoch++
+	}
 	g.closed = false
 	g.mu.Unlock()
 }
@@ -125,29 +161,27 @@ func (g *Gate) Enter() (leave func()) {
 	return leave
 }
 
-// EnterAt is Enter, with the epoch the read entered in, for Bind.
-func (g *Gate) EnterAt() (epoch uint64, leave func()) {
+// EnterAt is Enter, with the read's entry, for Bind.
+func (g *Gate) EnterAt() (entry Entry, leave func()) {
 	if g == nil {
-		return 0, func() {}
+		return Entry{}, func() {}
 	}
 	g.mu.Lock()
-	e := g.epoch
+	rec := &readRec{epoch: g.epoch}
 	if g.active == nil {
-		g.active = map[uint64]int{}
+		g.active = map[*readRec]struct{}{}
 	}
-	g.active[e]++
+	g.active[rec] = struct{}{}
 	g.mu.Unlock()
 	var once sync.Once
-	return e, func() {
+	return Entry{Epoch: rec.epoch, rec: rec}, func() {
 		once.Do(func() {
 			g.mu.Lock()
-			if g.active[e]--; g.active[e] <= 0 {
-				delete(g.active, e)
-				// The last read of an epoch left: a waiter looks again.
-				if g.moved != nil {
-					close(g.moved)
-					g.moved = nil
-				}
+			delete(g.active, rec)
+			// A waiter looks again.
+			if g.moved != nil {
+				close(g.moved)
+				g.moved = nil
 			}
 			g.mu.Unlock()
 		})
@@ -178,8 +212,9 @@ func (g *Gate) Flip() (ended uint64) {
 }
 
 // Wait returns once no read that entered in epoch ended or earlier is still
-// in flight, or with ctx's error. ended must be a value Flip returned: reads
-// keep entering the current epoch, so waiting on it may never end.
+// in flight, but for hung ones (HungAfter), or with ctx's error. ended must be
+// a value Flip returned: reads keep entering the current epoch, so waiting on
+// it may never end.
 func (g *Gate) Wait(ctx context.Context, ended uint64) error {
 	if g == nil {
 		return nil
@@ -187,11 +222,16 @@ func (g *Gate) Wait(ctx context.Context, ended uint64) error {
 	for {
 		g.mu.Lock()
 		busy := false
-		for e := range g.active {
-			if e <= ended {
-				busy = true
-				break
+		now := time.Now().UnixNano()
+		for r := range g.active {
+			if r.epoch > ended {
+				continue
 			}
+			if d := r.doneAt.Load(); d != 0 && time.Duration(now-d) >= HungAfter {
+				continue
+			}
+			busy = true
+			break
 		}
 		if !busy {
 			g.mu.Unlock()
@@ -202,12 +242,33 @@ func (g *Gate) Wait(ctx context.Context, ended uint64) error {
 		}
 		moved := g.moved
 		g.mu.Unlock()
+		// A read whose context ended becomes hung without leaving: look
+		// again now and then.
 		select {
 		case <-moved:
+		case <-time.After(time.Second):
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
+}
+
+// Hung is how many reads in flight are hung: their context ended HungAfter
+// ago and they have not left.
+func (g *Gate) Hung() int {
+	if g == nil {
+		return 0
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	n := 0
+	now := time.Now().UnixNano()
+	for r := range g.active {
+		if d := r.doneAt.Load(); d != 0 && time.Duration(now-d) >= HungAfter {
+			n++
+		}
+	}
+	return n
 }
 
 // InFlight is how many reads have entered and not left.
@@ -217,9 +278,5 @@ func (g *Gate) InFlight() int {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	n := 0
-	for _, c := range g.active {
-		n += c
-	}
-	return n
+	return len(g.active)
 }

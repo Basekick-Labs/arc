@@ -34,6 +34,11 @@ var fencedDroppedWait = 30 * time.Second
 // fencedPoll is how often a waiting finisher looks at the fences.
 var fencedPoll = 250 * time.Millisecond
 
+// fencedWaiverGrace: after a fence was waived, how long a step waits before
+// it acts: a waived node that was in fact reading drops its read lease (and
+// its reads) when it applies the waiver, within about a lease period.
+var fencedWaiverGrace = readLeaseTimeout + 2*readLeaseTick
+
 func (c *Coordinator) finishFencedJob(ctx context.Context, copier storage.ObjectCopier, job, staged string) error {
 	self := c.localNode.ID
 	for {
@@ -129,9 +134,11 @@ func (c *Coordinator) fencedCopy(ctx context.Context, copier storage.ObjectCopie
 }
 
 // deleteFencedInputs deletes every input object the manifest does not list.
-// The FSM refused any registration of them since the commit, and a pending
-// one is settled by the outbox as consumed (ConsumedByCompaction), so no
-// node's outbox holds them back.
+// The FSM refused any registration of them since the commit, and the outbox
+// defers a pending one until the job ends (then it settles: the input was
+// consumed, or its object is gone). Paths are unique per flush (#1282): a
+// different file at an input's path would need a reuse that a restore,
+// which pauses compaction, is the only source of.
 func (c *Coordinator) deleteFencedInputs(ctx context.Context, s raft.StagedCompaction) error {
 	fsm := c.raftNode.FSM()
 	return c.withLease(ctx, s.Job, func(ctx context.Context) error {
@@ -173,7 +180,7 @@ func (c *Coordinator) waitFences(ctx context.Context, s raft.StagedCompaction) e
 	for _, n := range fsm.GetAllNodes() {
 		start[n.ID] = true
 	}
-	var left time.Time
+	var left, waived time.Time
 	began := time.Now()
 	warned := false
 	return c.withLease(ctx, s.Job, func(ctx context.Context) error {
@@ -191,9 +198,21 @@ func (c *Coordinator) waitFences(ctx context.Context, s raft.StagedCompaction) e
 					left = time.Now()
 				}
 			}
-			blockers, err := c.RehomeConfigBlockers()
-			ready := err == nil && len(blockers) == 0 && fsm.FencesAt(s.PhaseIndex) &&
-				(left.IsZero() || time.Since(left) >= fencedDroppedWait)
+			var blockers []string
+			var err error
+			ready := fsm.FencesAt(s.PhaseIndex) && (left.IsZero() || time.Since(left) >= fencedDroppedWait)
+			if ready {
+				// The Raft configuration only once the fences are in: it
+				// goes through Raft's main loop.
+				blockers, err = c.RehomeConfigBlockers()
+				ready = err == nil && len(blockers) == 0
+			}
+			if ready && fsm.WaivedSince(s.PhaseIndex) {
+				if waived.IsZero() {
+					waived = time.Now()
+				}
+				ready = time.Since(waived) >= fencedWaiverGrace
+			}
 			if ready {
 				return nil
 			}

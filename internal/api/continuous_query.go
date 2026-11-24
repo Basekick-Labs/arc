@@ -1578,7 +1578,7 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	defer leaveRead()
 	// Stopped if this node loses its cluster read lease (readgate.Bind).
 	ctx, cancelRead := context.WithCancel(ctx)
-	defer h.reads.Bind(entered, cancelRead)()
+	defer h.reads.Bind(entered, ctx, cancelRead)()
 	wrappedQuery := wrapSourceMeasurement(query, cq.Database, cq.SourceMeasurement, h.sourceRead(ctx, cq, measurementPath))
 
 	h.logger.Debug().Str("query", sqlutil.ForLog(wrappedQuery)).Msg("Executing wrapped query")

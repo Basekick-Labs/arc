@@ -151,6 +151,7 @@ func (f *ClusterFSM) applyReadFence(payload []byte, logIndex uint64) interface{}
 	}
 	f.readFences[p.Node] = p.Index
 	if p.Waived {
+		f.lastWaiver = logIndex
 		f.logger.Warn().Str("node", p.Node).Uint64("index", p.Index).
 			Msg("Read fence waived for a node the leader has not heard from: it cannot be reading")
 		// The waived node itself acts as if it had lost its read lease
@@ -270,6 +271,16 @@ func (f *ClusterFSM) CompactionFencedOwnsUnder(prefix string) bool {
 		}
 	}
 	return false
+}
+
+// WaivedSince reports whether a fence was waived at or after index: the
+// waived node may still be reading until it applies the waiver (it then
+// drops its read lease), so a step after one waits a lease period first.
+// Not in the snapshot: after a restore the wait is skipped once.
+func (f *ClusterFSM) WaivedSince(index uint64) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.lastWaiver >= index && f.lastWaiver > 0
 }
 
 // FencesAt reports whether every node's read fence is at or above index.
