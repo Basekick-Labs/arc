@@ -227,3 +227,52 @@ func TestRehomeSourceFailsClosedWhileNotSynced(t *testing.T) {
 		t.Fatal("a source without a coordinator")
 	}
 }
+
+// While a job is in flight, a node that does not take part in jobs is refused
+// at join, even with the record's capability.
+func TestRehomeJoinGateRefusesANonParticipantMidJob(t *testing.T) {
+	c := originRig(t, "writer-1", RoleWriter)
+	inScope := append([]string{raft.CapabilityRehomeInScope}, rhList...)
+	capNodes(t, c, map[string][]string{"raft-1": inScope, "writer-1": inScope, "writer-2": inScope, "reader-1": inScope})
+	c.maybeEnableCompactionCommit()
+	waitFSM(t, c.CompactionCommitActive)
+	c.maybeEnableRehome()
+	waitFSM(t, c.raftNode.FSM().RehomeEnabled)
+	if why, release := c.rehomeJoinGate(&protocol.JoinRequest{NodeID: "w9", Capabilities: rhList}); why != "" {
+		t.Fatalf("refused with no job: %s", why)
+	} else {
+		release()
+	}
+	in := makeFileEntry("testdb/cpu/2026/10/12/10/x.parquet", []byte("x"), "writer-1")
+	in.CreatedAt = time.Now()
+	if err := c.raftNode.RegisterFile(in, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(raft.StageRehomePayload{Job: "j1", Origin: "writer-1", Database: "testdb", Measurement: "cpu",
+		Source:  raft.CompactionInput{Path: in.Path, SizeBytes: in.SizeBytes, SHA256: in.SHA256},
+		Outputs: []raft.RehomeOutput{{Key: "testdb/cpu/2026/10/11/10/o.parquet", StagedKey: raft.RehomeStagedKey("j1", 0), SizeBytes: 1, SHA256: "s"}},
+		Now:     time.Now()})
+	if err := c.raftNode.Apply(&raft.Command{Type: raft.CommandStageRehome, Payload: raw}, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if why, _ := c.rehomeJoinGate(&protocol.JoinRequest{NodeID: "w9", Capabilities: rhList}); why == "" {
+		t.Fatal("a node that does not take part joined mid-job")
+	}
+	if !c.rehomeGate.mu.TryLock() {
+		t.Fatal("a refused join left the gate locked")
+	}
+	c.rehomeGate.mu.Unlock()
+	why, release := c.rehomeJoinGate(&protocol.JoinRequest{NodeID: "w9", Capabilities: inScope})
+	if why != "" {
+		t.Fatalf("a participant refused: %s", why)
+	}
+	release()
+}
+
+func TestRehomeStatusSaysWhyWhileCompactionCommitIsOff(t *testing.T) {
+	c := originRig(t, "writer-1", RoleWriter)
+	c.maybeEnableRehome()
+	if st := c.RehomeStatus(); st.Enabled || len(st.Blocking) != 1 || st.Blocking[0] != "(compaction commit is off)" {
+		t.Fatalf("status = %+v", st)
+	}
+}

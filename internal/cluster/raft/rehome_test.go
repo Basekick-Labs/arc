@@ -568,3 +568,65 @@ func TestRehomeConflictReasonFromText(t *testing.T) {
 type errorString string
 
 func (e errorString) Error() string { return string(e) }
+
+// Scope is checked at every step: a node that does not take part, or stream
+// claims turned on, mid-job leave the job only its revert.
+func TestRehomeAdvanceRefusedWhenScopeChangesMidJob(t *testing.T) {
+	for name, change := range map[string]func(x *tkFSM){
+		"a node without in-scope joins": func(x *tkFSM) {
+			x.ok(CommandAddNode, AddNodePayload{Node: NodeInfo{ID: "r2", Role: "reader", State: "healthy",
+				Capabilities: []string{CapabilityRehome}}})
+		},
+		"stream claims on": func(x *tkFSM) {
+			x.ok(CommandEnableStreamClaims, EnableStreamClaimsPayload{Nodes: rhNodes, Now: t0})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			x := rhFSM(t)
+			x.ok(CommandStageRehome, rhStage("j1"))
+			x.ok(CommandAdvanceRehome, AdvanceRehomePayload{Job: "j1", By: "w1", To: RehomeCommitted, Now: t0})
+			x.rhAckAll("j1", RehomeCommitted)
+			change(x)
+			if r := x.rhConflict(CommandAdvanceRehome, AdvanceRehomePayload{Job: "j1", By: "w1", To: RehomePublished, Now: t0}); r != RehomeOutOfScope {
+				t.Fatalf("reason %q", r)
+			}
+			x.ok(CommandAdvanceRehome, AdvanceRehomePayload{Job: "j1", By: "w1", To: RehomeReverting, Now: t0})
+		})
+	}
+}
+
+func TestStageRehomeRefusesAColdSource(t *testing.T) {
+	x := rhFSM(t)
+	cold := ccFile("x.parquet", "sx", 100)
+	cold.Tier = "cold"
+	x.ok(CommandUpdateFile, UpdateFilePayload{File: cold})
+	if r := x.rhConflict(CommandStageRehome, rhStage("j1")); r != RehomeOutOfScope {
+		t.Fatalf("reason %q", r)
+	}
+}
+
+// An ack from a node the state does not wait for is not recorded.
+func TestRehomeAckFromAnUnwantedNodeIgnored(t *testing.T) {
+	x := rhFSM(t)
+	x.ok(CommandStageRehome, rhStage("j1"))
+	x.ok(CommandAdvanceRehome, AdvanceRehomePayload{Job: "j1", By: "w1", To: RehomeCommitted, Now: t0})
+	x.ok(CommandAddNode, AddNodePayload{Node: NodeInfo{ID: "r2", Role: "reader", State: "healthy",
+		Capabilities: []string{CapabilityRehome, CapabilityRehomeInScope}}})
+	x.ok(CommandAckRehome, AckRehomePayload{Job: "j1", Node: "r2", State: RehomeCommitted})
+	if j, _ := x.f.RehomeJob("j1"); j.Acks["r2"] {
+		t.Fatalf("a late joiner's ack recorded: %+v", j.Acks)
+	}
+}
+
+// What a build without these commands does with one (as an older node in the
+// log would): refused, nothing changed.
+func TestUnknownCommandTypeChangesNothing(t *testing.T) {
+	x := rhFSM(t)
+	before := x.f.RehomeGeneration()
+	if res := x.apply(CommandType(250), map[string]string{"job": "j1"}); res == nil {
+		t.Fatal("an unknown command applied")
+	}
+	if x.f.RehomeGeneration() != before || len(x.f.RehomeJobs()) != 0 {
+		t.Fatal("an unknown command changed state")
+	}
+}

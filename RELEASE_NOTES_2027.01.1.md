@@ -66,24 +66,28 @@ Clusters on local storage (which replicate files and have their own opt-in gate,
 
 ## Change: a cluster records re-home jobs in its replicated state; an older build cannot join once every node supports it ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
 
-Groundwork for moving a misfiled file's rows on a cluster whose nodes share one object store.
-No job runs on a cluster yet (a re-home there is still refused); what changes now is the
-cluster's handshake and state:
+**Who is affected:** clusters. Standalone nodes are not. No job runs on a cluster yet (a
+re-home there is still refused); this is groundwork for moving a misfiled file's rows on a
+cluster whose nodes share one object store. What changes now is the cluster's handshake and
+state:
 
 - **A new capability, and a flag.** Every node advertises re-home support at join. Once
   compaction commit is on and every node and Raft server advertises it, the leader turns the
-  re-home flag on, as it does for compaction commit. From then on, **a node running an older
-  release is refused at join** ("re-home is enabled in this cluster: the node must run a release
-  that supports it"). In a rolling upgrade, upgrade every node before the flag turns on, or
-  expect the last older node to be refused when it restarts.
+  re-home flag on, as it does for compaction commit. From then on, a node whose build lacks it
+  is refused at join ("re-home is enabled in this cluster: the node must run a release that
+  supports it"). For a node on a 2026 release this changes nothing: compaction commit, which the
+  flag needs, already turns those away.
 - **What shows it:** `GET /api/v1/cluster` has `rehome` with `enabled`, on the leader the
-  `blocking_nodes` keeping it off, and the jobs in flight (none yet).
+  `blocking_nodes` keeping it off (or `(compaction commit is off)`), and the jobs in flight
+  (none yet).
 - **What it holds, for the next release step:** a job's source file and its outputs, its state,
   and which nodes have acknowledged each state. While a job owns a path, the cluster refuses
   every other manifest change to it (a DELETE, retention, a registration, a compaction) except
   the job's own switch-over, and a node removed from the cluster stops being waited for. A job
-  can only be staged when every node says its configuration is one a job can run under (no
-  tiered storage, no Iceberg export, no edge sync, no stream takeover); no node says so yet.
+  goes forward only while every node takes part in jobs and has a configuration one can run
+  under (no tiered storage, no Iceberg export, no edge sync) and stream takeover is off, and
+  only on a file on the hot tier; otherwise it can only be reverted. No node says it takes part
+  yet.
 
 ## Fix: at shutdown, a connection that never sent a request no longer holds the HTTP drain or is reported as a cancelled query ([#1840](https://github.com/Basekick-Labs/arc/issues/1840))
 

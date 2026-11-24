@@ -48,13 +48,17 @@ import (
 // stage could merge the source under the job.
 
 // CapabilityRehome is advertised at join by every build that applies the
-// rules above.
+// FSM's rules above (records jobs, refuses changes to owned paths). It does
+// not say the build leaves outputs out of reads or acks: a build that only
+// has the record (2027.01.1's first step) advertises it too.
 const CapabilityRehome = "rehome_v1"
 
-// CapabilityRehomeInScope is advertised by a node whose configuration a job
-// can run under (no tiered storage, no Iceberg export, no edge sync: their
-// state is per node, and a job does not account for it). StageRehome refuses
-// while any node lacks it.
+// CapabilityRehomeInScope is advertised by a node that takes part in a job
+// (leaves its files out of reads, acks its states) and whose configuration a
+// job can run under (no tiered storage, no Iceberg export, no edge sync: their
+// state is per node, and a job does not account for it). Every step but a
+// revert refuses while any node lacks it, and a node without it cannot join
+// while a job is in flight.
 const CapabilityRehomeInScope = "rehome_in_scope_v1"
 
 // Re-home job states.
@@ -69,7 +73,7 @@ const (
 
 // Bounds on the replicated re-home state.
 const (
-	// maxRehomeJobs bounds the jobs in flight (one runs at a time per node).
+	// maxRehomeJobs bounds the jobs in flight.
 	maxRehomeJobs = 64
 	// MaxRehomeOutputs bounds the outputs of one job, so its stage entry
 	// stays far under the forward frame.
@@ -86,8 +90,10 @@ const (
 	// RehomeRevertedGrace is how long a reverted job keeps its output keys
 	// owned and left out of reads: a driver that lost its lease without
 	// knowing it can still have a copy in flight for its lease plus one
-	// copy.
-	RehomeRevertedGrace = FinisherLease + RehomeCopyTimeout
+	// copy. Measured between two proposers' clocks (the one that reverted,
+	// the one that ends), so it carries a margin for their skew.
+	RehomeRevertedGrace = FinisherLease + RehomeCopyTimeout + rehomeClockMargin
+	rehomeClockMargin   = 5 * time.Minute
 )
 
 // Re-home conflict reasons.
@@ -232,8 +238,7 @@ type StageRehomePayload struct {
 	Now         time.Time       `json:"now"`
 }
 
-// AdvanceRehomePayload moves a job to To. By must hold the job's lease (or,
-// with no lease taken, be its origin).
+// AdvanceRehomePayload moves a job to To. By must hold the job's lease.
 type AdvanceRehomePayload struct {
 	Job string    `json:"job"`
 	By  string    `json:"by"`
@@ -257,8 +262,8 @@ type ClaimRehomeFinisherPayload struct {
 
 // EndRehomePayload ends a latched job (its source object and staged objects
 // deleted); moves a reverting one to reverted (its outputs and staged objects
-// deleted); and ends a reverted one FinisherLease after that (its output keys
-// deleted again).
+// deleted); and ends a reverted one RehomeRevertedGrace after that (its
+// output keys deleted again).
 type EndRehomePayload struct {
 	Job string    `json:"job"`
 	By  string    `json:"by"`
@@ -384,15 +389,13 @@ func (f *ClusterFSM) applyStageRehome(payload []byte, logIndex uint64) interface
 	if f.compactionPause.Active && p.Now.Before(f.compactionPause.ExpiresAt) {
 		return &RehomeConflictError{Job: p.Job, Reason: RehomePaused}
 	}
-	// Stream takeover settles files by their coverage, and the latch
-	// replaces a covered file with uncovered ones: out of scope.
-	if f.streamClaims {
+	if f.rehomeOutOfScopeLocked() {
 		return &RehomeConflictError{Job: p.Job, Reason: RehomeOutOfScope}
 	}
-	for _, n := range f.nodes {
-		if !containsString(n.Capabilities, CapabilityRehomeInScope) {
-			return &RehomeConflictError{Job: p.Job, Reason: RehomeOutOfScope}
-		}
+	if e, ok := f.files[p.Source.Path]; ok && e.Tier != "" && e.Tier != "hot" {
+		// Reads name a cold file by its cold address, and a cluster job
+		// leaves out hot keys only.
+		return &RehomeConflictError{Job: p.Job, Reason: RehomeOutOfScope}
 	}
 	if !f.inputUnchangedLocked(p.Source) {
 		return &RehomeConflictError{Job: p.Job, Reason: RehomeSourceChanged}
@@ -401,7 +404,12 @@ func (f *ClusterFSM) applyStageRehome(payload []byte, logIndex uint64) interface
 	if src.Database != p.Database || src.Measurement != p.Measurement {
 		return fmt.Errorf("stage re-home: source %q is not in %s", p.Source.Path, prefix)
 	}
-	for path := range seen {
+	// In order, so the reason of a refusal does not depend on map order.
+	paths := []string{p.Source.Path}
+	for _, o := range p.Outputs {
+		paths = append(paths, o.Key)
+	}
+	for _, path := range paths {
 		if _, owned := f.stagedPaths[path]; owned {
 			return &RehomeConflictError{Job: p.Job, Reason: RehomeOwned}
 		}
@@ -468,6 +476,14 @@ func (f *ClusterFSM) applyAdvanceRehome(payload []byte, logIndex uint64) interfa
 		if f.compactionPause.Generation != j.PauseGen || (f.compactionPause.Active && p.Now.Before(f.compactionPause.ExpiresAt)) {
 			f.mu.Unlock()
 			return &RehomeConflictError{Job: p.Job, Reason: RehomePaused}
+		}
+		// Scope is checked at every step, not only at the stage: stream
+		// claims turned on, or a node without the capability that joined
+		// (one that does not leave the outputs out), leave the job only
+		// its revert.
+		if f.rehomeOutOfScopeLocked() {
+			f.mu.Unlock()
+			return &RehomeConflictError{Job: p.Job, Reason: RehomeOutOfScope}
 		}
 	}
 	if rehomeNeedsAcks(j.State, p.To) && len(j.MissingAcks()) > 0 {
@@ -632,6 +648,22 @@ func (f *ClusterFSM) applyEndRehome(payload []byte, logIndex uint64) interface{}
 		f.pendingEvents = append(f.pendingEvents, func() { cb(c) })
 	}
 	return nil
+}
+
+// rehomeOutOfScopeLocked reports whether a job may not go on: stream
+// takeover is on (it settles files by their coverage, and the latch replaces
+// a covered file with uncovered ones), or a node lacks
+// CapabilityRehomeInScope.
+func (f *ClusterFSM) rehomeOutOfScopeLocked() bool {
+	if f.streamClaims {
+		return true
+	}
+	for _, n := range f.nodes {
+		if !containsString(n.Capabilities, CapabilityRehomeInScope) {
+			return true
+		}
+	}
+	return false
 }
 
 // rehomeDriverLocked reports whether by may drive the job: it holds the
@@ -803,8 +835,8 @@ func (f *ClusterFSM) RehomeOwns(path string) bool {
 
 // RehomeExcludedFor returns, for the jobs under prefix ("db/measurement/"),
 // the keys a read must leave out now, and the generation they belong to, in
-// one read: committed, published and reverting jobs' outputs; latched jobs'
-// sources.
+// one read: committed, published, reverting and reverted jobs' outputs;
+// latched jobs' sources.
 func (f *ClusterFSM) RehomeExcludedFor(prefix string) (keys []string, gen uint64) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -836,6 +868,13 @@ func (f *ClusterFSM) RehomeOpen(prefix string) bool {
 		}
 	}
 	return false
+}
+
+// RehomeJobsInFlight reports whether any job is in flight.
+func (f *ClusterFSM) RehomeJobsInFlight() bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return len(f.rehomeJobs) > 0
 }
 
 // RehomeGeneration moves whenever what a job leaves out of reads may change:

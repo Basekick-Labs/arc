@@ -52,6 +52,15 @@ func (c *Coordinator) rehomeJoinGate(req interface {
 	g := &c.rehomeGate
 	g.mu.Lock()
 	if hasCapability(req.GetCapabilities(), raft.CapabilityRehome) {
+		// A node that does not take part in jobs (leave their files out of
+		// reads, ack) would read both sides of one in flight. Jobs are
+		// staged on the leader's log and a join is handled on the leader,
+		// so its FSM is current here; the FSM also refuses every step but a
+		// revert once such a node is a member.
+		if !hasCapability(req.GetCapabilities(), raft.CapabilityRehomeInScope) && fsm != nil && fsm.RehomeJobsInFlight() {
+			g.mu.Unlock()
+			return "a re-home job is in flight and this node does not take part in one (its release or configuration); retry when it has ended", nil
+		}
 		return "", g.mu.Unlock
 	}
 	enabled := fsm != nil && fsm.RehomeEnabled()
@@ -89,10 +98,15 @@ func (c *Coordinator) maybeEnableRehome() {
 		return
 	}
 	fsm := c.raftNode.FSM()
-	if fsm == nil || fsm.RehomeEnabled() || !fsm.CompactionCommitEnabled() || !c.raftNode.IsLeader() {
+	if fsm == nil || fsm.RehomeEnabled() || !c.raftNode.IsLeader() {
 		return
 	}
 	g := &c.rehomeGate
+	if !fsm.CompactionCommitEnabled() {
+		off := []string{"(compaction commit is off)"}
+		g.blockers.Store(&off)
+		return
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	nodes, blockers := capabilityCandidates(fsm.GetAllNodes(), c.raftNode.ConfigurationServerIDs, raft.CapabilityRehome)
