@@ -53,7 +53,7 @@ A client can present the token in two ways:
 
 With the Arrow Flight SQL JDBC driver, set the `user` and `password`
 connection properties, with the token as the password; this is what a tool's
-user name and password fields send (DBeaver, DataGrip, Tableau):
+user name and password fields send (DBeaver, Tableau):
 
 ```text
 URL:      jdbc:arrow-flight-sql://localhost:50051?useEncryption=false
@@ -363,9 +363,9 @@ FROM "mydb"."orders"
 ```
 
 The column is then a date, and Tableau's date parts (year, month, day, hour)
-work. Times are UTC. In an **Extract**, Tableau reads these timestamps in the
-computer's time zone, so hours shift unless the computer runs in UTC; a
-**Live** connection is not affected.
+work. Times are UTC. In an **Extract**, the hours shift by the computer's
+offset from UTC; set the computer's time zone to UTC before refreshing the
+Extract. A **Live** connection is not affected.
 
 **Expected refusals:** when it connects, Tableau probes the server with
 `CREATE LOCAL TEMPORARY TABLE`, `DROP TABLE` and `SELECT TOP 1`. Arc refuses

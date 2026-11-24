@@ -831,7 +831,7 @@ When a database is deleted, or retention or compaction removes a directory that 
 
 ## Fix: the JSON metrics no longer report a query count that is always 0 ([#1747](https://github.com/Basekick-Labs/arc/issues/1747))
 
-**Who is affected:** anyone reading the keys below from Arc's JSON metrics endpoints: dashboards, scripts, or an agent through the arc-mcp `arc_query_pool_metrics` or `arc_metrics` tools. They always read `0`, because nothing ever counted them, and they are now gone from the response. **This is a response-shape change**: a client that requires these keys must stop reading them. Prometheus `/metrics` (text format) is unchanged: it stopped serving `arc_db_queries_total` in v26.09.2 (#802) and never served a DuckDB-level error counter.
+**Who is affected:** anyone reading the keys below from Arc's JSON metrics endpoints: dashboards, scripts or agents. They always read `0`, because nothing ever counted them, and they are now gone from the response. **This is a response-shape change**: a client that requires these keys must stop reading them. Prometheus `/metrics` (text format) is unchanged: it stopped serving `arc_db_queries_total` in v26.09.2 (#802) and never served a DuckDB-level error counter.
 
 | Endpoint | Removed keys | Read instead |
 |---|---|---|
@@ -886,7 +886,7 @@ Two failures on a shared bucket (where the node that handles a `DELETE` is not t
 
 Flight SQL metadata names a database as a catalog with one empty-named schema. Tableau's JDBC connection cannot select an empty schema, so it listed Arc's databases but never reached a table. A client can now send the call header `x-arc-metadata: schemas`: there are then no catalogs, each database is a schema, and measurements are its tables.
 
-- **Without the header nothing changes:** every client that does not send it (DBeaver, DataGrip, ADBC, the Power BI connector) gets the same metadata as before. `catalogs` asks for the default explicitly; any other value is `INVALID_ARGUMENT`.
+- **Without the header nothing changes:** every client that does not send it (DBeaver, ADBC) gets the same metadata as before. `catalogs` asks for the default explicitly; any other value is `INVALID_ARGUMENT`.
 - **Tableau:** add `x-arc-metadata=schemas` to the JDBC URL (the driver passes unknown URL properties as call headers), for example `jdbc:arrow-flight-sql://host:port?useEncryption=false&x-arc-metadata=schemas`. With ADBC, set `adbc.flight.sql.rpc.call_header.x-arc-metadata`.
 - **In the schemas shape** the catalog filter is ignored (Tableau sends one it remembers), the database named exactly as the schema pattern is listed first, and the key listings (primary, imported, exported, cross-reference) answer empty instead of unimplemented: Tableau ends the connection on an unimplemented call when a table is added. Permissions, governance limits and `GetSqlInfo` are the same in both shapes.
 - **Tested** with Tableau Desktop 2026.3 and `flight-sql-jdbc-driver` 19.0.0. `docs/operations/flight-sql.md` has a Tableau section, including the cast that makes `time` a date in Tableau.
@@ -1181,7 +1181,7 @@ Notes:
 
 ## New: Flight SQL prepared statements, so the JDBC driver and Tableau can run queries ([#1645](https://github.com/Basekick-Labs/arc/issues/1645))
 
-The Flight SQL listener now takes prepared statements without parameters. The Arrow Flight SQL JDBC driver, which Tableau, DBeaver and DataGrip use, prepares every query, even a plain `Statement.executeQuery`, so until now it could connect and browse tables but every query failed with `UNIMPLEMENTED`. With JDBC 19.0.0, `executeQuery` and `PreparedStatement` now return results. The ADBC drivers, which prepare before each execute when the server allows it, now take the prepared path too.
+The Flight SQL listener now takes prepared statements without parameters. The Arrow Flight SQL JDBC driver, which Tableau and DBeaver use, prepares every query, even a plain `Statement.executeQuery`, so until now it could connect and browse tables but every query failed with `UNIMPLEMENTED`. With JDBC 19.0.0, `executeQuery` and `PreparedStatement` now return results. The ADBC drivers, which prepare before each execute when the server allows it, now take the prepared path too.
 
 - **A prepare binds the statement; the execute runs it.** DuckDB resolves the statement's tables and columns, which lists the files and reads their Parquet footers but scans no data, and the result schema comes from that. It is the schema the execute streams, with Arc's decimal handling. The execute then runs as an unprepared statement does. The bind is not free of work: DuckDB's optimizer is off during it, but the binder still evaluates constant arguments of functions (`SELECT length(repeat('x', 500000000))` costs a large part of what running it does), and DuckDB does not interrupt a bind, so the query timeout applies when it ends.
 - **One query per execute.** The prepare is not counted as a query: it does not appear in `/api/v1/queries`, the query metrics or the slow-query log, and it does not spend governance rate limits or quotas. But it is refused with `RESOURCE_EXHAUSTED` when the token's next query would be. It runs the query's checks: SQL validation, RBAC on every table (no schema for a table the token cannot read), and the query or governance timeout.
