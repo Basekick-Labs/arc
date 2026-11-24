@@ -68,6 +68,12 @@ const CapabilityRehome = "rehome_v1"
 // while a job is in flight.
 const CapabilityRehomeInScope = "rehome_in_scope_v1"
 
+// CapabilityRehomeStreamClaims is advertised by every build that applies the
+// stream-takeover rule of rehomeOutOfScopeWhyLocked (#1872): with stream
+// takeover on, a job runs on a source without coverage. While any node lacks
+// it, a job is refused whenever stream takeover is on.
+const CapabilityRehomeStreamClaims = "rehome_stream_claims_v1"
+
 // Re-home job states.
 const (
 	RehomeStaged    = "staged"
@@ -407,7 +413,7 @@ func (f *ClusterFSM) applyStageRehome(payload []byte, logIndex uint64) interface
 	if f.backupRunningLocked(p.Now) {
 		return &RehomeConflictError{Job: p.Job, Reason: RehomeBackupRunning}
 	}
-	if f.rehomeOutOfScopeLocked() {
+	if f.rehomeOutOfScopeLocked(p.Source.Path) {
 		return &RehomeConflictError{Job: p.Job, Reason: RehomeOutOfScope}
 	}
 	if e, ok := f.files[p.Source.Path]; ok && e.Tier != "" && e.Tier != "hot" {
@@ -505,7 +511,7 @@ func (f *ClusterFSM) applyAdvanceRehome(payload []byte, logIndex uint64) interfa
 		// claims turned on, or a node without the capability that joined
 		// (one that does not leave the outputs out), leave the job only
 		// its revert.
-		if f.rehomeOutOfScopeLocked() {
+		if f.rehomeOutOfScopeLocked(j.Source.Path) {
 			f.mu.Unlock()
 			return &RehomeConflictError{Job: p.Job, Reason: RehomeOutOfScope}
 		}
@@ -689,16 +695,48 @@ func (f *ClusterFSM) rehomeWaitForAllLocked(j *RehomeJob) {
 // takeover is on (it settles files by their coverage, and the latch replaces
 // a covered file with uncovered ones), or a node lacks
 // CapabilityRehomeInScope.
-func (f *ClusterFSM) rehomeOutOfScopeLocked() bool {
-	if f.streamClaims {
-		return true
-	}
-	for _, n := range f.nodes {
+func (f *ClusterFSM) rehomeOutOfScopeLocked(source string) bool {
+	return f.rehomeOutOfScopeWhyLocked(source) != ""
+}
+
+// rehomeOutOfScopeWhyLocked is why a job on source may not go on, or "".
+// With stream takeover on (#1872), a source whose entry carries coverage
+// is refused (the claimant settles a dead writer's batches by the files
+// that cover them, and coverage cannot be split across the outputs); an
+// uncovered one goes on as with takeover off: the latch registers the
+// outputs uncovered and keeps the source's batches settled, as a
+// compaction commit does. Every node must apply that rule, so it holds
+// only while every node advertises CapabilityRehomeStreamClaims. source ""
+// asks for the cluster-wide part only.
+func (f *ClusterFSM) rehomeOutOfScopeWhyLocked(source string) string {
+	var out []string
+	for id, n := range f.nodes {
 		if !containsString(n.Capabilities, CapabilityRehomeInScope) {
-			return true
+			out = append(out, id)
 		}
 	}
-	return false
+	if len(out) > 0 {
+		sort.Strings(out)
+		return fmt.Sprintf("nodes %v do not take part in moving a file's rows (a release without it, edge sync on there, the Iceberg export without cluster.failover_enabled or on a release before #1870, or tiered storage on a release before #1869); not available until each does", out)
+	}
+	if !f.streamClaims {
+		return ""
+	}
+	for id, n := range f.nodes {
+		if !containsString(n.Capabilities, CapabilityRehomeStreamClaims) {
+			out = append(out, id)
+		}
+	}
+	if len(out) > 0 {
+		sort.Strings(out)
+		return fmt.Sprintf("stream takeover is on in this cluster and nodes %v run a release that cannot move a file's rows with it on", out)
+	}
+	if source != "" {
+		if e, ok := f.files[source]; ok && len(e.Coverage) > 0 {
+			return fmt.Sprintf("stream takeover is on and %s carries stream coverage (its rows settle a writer's batches, and a move cannot divide that among the new files)", source)
+		}
+	}
+	return ""
 }
 
 // rehomeDriverLocked reports whether by may drive the job: it holds the
@@ -973,20 +1011,15 @@ func (f *ClusterFSM) RehomeOwnsUnder(prefix string) bool {
 func (f *ClusterFSM) RehomeOutOfScope() string {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	if f.streamClaims {
-		return "stream takeover is on in this cluster; moving a file's rows is not available with it in this version"
-	}
-	var out []string
-	for id, n := range f.nodes {
-		if !containsString(n.Capabilities, CapabilityRehomeInScope) {
-			out = append(out, id)
-		}
-	}
-	if len(out) > 0 {
-		sort.Strings(out)
-		return fmt.Sprintf("nodes %v do not take part in moving a file's rows (a release without it, edge sync on there, the Iceberg export without cluster.failover_enabled or on a release before #1870, or tiered storage on a release before #1869); not available until each does", out)
-	}
-	return ""
+	return f.rehomeOutOfScopeWhyLocked("")
+}
+
+// RehomeOutOfScopeFor is RehomeOutOfScope for a job on source: also why that
+// file cannot be moved (stream coverage, #1872).
+func (f *ClusterFSM) RehomeOutOfScopeFor(source string) string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.rehomeOutOfScopeWhyLocked(source)
 }
 
 // RehomeJobsInFlight reports whether any job is in flight.

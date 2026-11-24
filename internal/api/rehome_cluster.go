@@ -190,6 +190,11 @@ func (h *RehomeHandler) runClusterSwap(ctx context.Context, job *rehomeJob) (sta
 	if !ok {
 		return refuse(fmt.Sprintf("%s is not in the cluster's manifest", src.Key))
 	}
+	if sc, ok := c.(interface{ RehomeOutOfScopeFor(string) string }); ok {
+		if why := sc.RehomeOutOfScopeFor(src.Key); why != "" {
+			return refuse(why)
+		}
+	}
 	// Tiered storage (#1869): the file must be hot here with no copy in cold
 	// storage. Every node checks again before it acks published.
 	if err := h.clusterTieringReady(); err != nil {

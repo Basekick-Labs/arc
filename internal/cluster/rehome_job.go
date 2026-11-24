@@ -301,3 +301,12 @@ func (c *Coordinator) RehomeOwnsPath(path string) bool {
 	}
 	return c.raftNode.FSM().RehomeOwns(path)
 }
+
+// RehomeOutOfScopeFor is why no job can run on source now, or "" (#1872:
+// a file with stream coverage, with stream takeover on).
+func (c *Coordinator) RehomeOutOfScopeFor(source string) string {
+	if c == nil || c.raftNode == nil || c.raftNode.FSM() == nil {
+		return ""
+	}
+	return c.raftNode.FSM().RehomeOutOfScopeFor(source)
+}

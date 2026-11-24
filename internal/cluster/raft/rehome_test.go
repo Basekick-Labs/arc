@@ -778,3 +778,47 @@ func TestRehomeStagedOutputServedWhileCommittedOrPublished(t *testing.T) {
 		t.Fatal("served while reverting")
 	}
 }
+
+// rhFSMStreamClaims is rhFSM with every node on a release that applies the
+// stream-takeover rule of #1872, and stream claims on.
+func rhFSMStreamClaims(t *testing.T) *tkFSM {
+	t.Helper()
+	x := &tkFSM{t: t, f: NewClusterFSM(zerolog.Nop())}
+	for _, n := range rhNodes {
+		role := "writer"
+		if n == "r1" {
+			role = "reader"
+		}
+		x.ok(CommandAddNode, AddNodePayload{Node: NodeInfo{ID: n, Role: role, State: "healthy",
+			Capabilities: []string{CapabilityRehome, CapabilityRehomeInScope, CapabilityRehomeStreamClaims}}})
+	}
+	x.ok(CommandPromoteWriter, PromoteWriterPayload{NodeID: "w1"})
+	x.ok(CommandEnableCompactionCommit, EnableCompactionCommitPayload{Nodes: rhNodes, Now: t0})
+	x.ok(CommandEnableRehome, EnableRehomePayload{Nodes: rhNodes, Now: t0})
+	x.ok(CommandRegisterFile, RegisterFilePayload{File: ccFile("x.parquet", "sx", 100)})
+	x.ok(CommandEnableStreamClaims, EnableStreamClaimsPayload{Nodes: rhNodes, Now: t0})
+	return x
+}
+
+// #1872: with stream takeover on and every node on a release with the rule,
+// a source without coverage is moved as with takeover off; one with coverage
+// is refused, at the stage and at every step.
+func TestStageRehomeWithStreamClaims1872(t *testing.T) {
+	x := rhFSMStreamClaims(t)
+	x.ok(CommandStageRehome, rhStage("j1"))
+	x.ok(CommandAdvanceRehome, AdvanceRehomePayload{Job: "j1", By: "w1", To: RehomeCommitted, Now: t0})
+
+	y := rhFSMStreamClaims(t)
+	y.f.mu.Lock()
+	y.f.files[rhSource().Path].Coverage = []InstanceCoverage{{Instance: 1, Key: "k", Ranges: [][2]uint64{{1, 2}}}}
+	y.f.mu.Unlock()
+	if r := y.rhConflict(CommandStageRehome, rhStage("j1")); r != RehomeOutOfScope {
+		t.Fatalf("a covered source: reason %q", r)
+	}
+	if why := y.f.RehomeOutOfScopeFor(rhSource().Path); why == "" {
+		t.Fatal("no reason given for a covered source")
+	}
+	if why := y.f.RehomeOutOfScope(); why != "" {
+		t.Fatalf("the cluster-wide check refused: %s", why)
+	}
+}
