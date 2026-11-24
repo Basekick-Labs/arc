@@ -82,7 +82,10 @@ func (c *Coordinator) startRehomeParticipant(ctx context.Context) {
 		return
 	}
 	// On the apply goroutine: a non-blocking nudge only.
-	fsm.SetRehomeCallbacks(func(raft.RehomeJob) { c.nudgeRehome() }, func(raft.RehomeJob) { c.nudgeRehome() })
+	fsm.SetRehomeCallbacks(func(raft.RehomeJob) { c.nudgeRehome() }, func(j raft.RehomeJob) {
+		c.rehomeEndedUnlink(j)
+		c.nudgeRehome()
+	})
 	go c.rehomeParticipantLoop(ctx)
 }
 

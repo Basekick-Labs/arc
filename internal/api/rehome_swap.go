@@ -724,7 +724,12 @@ func (h *RehomeHandler) Recover(ctx context.Context) error {
 	}
 	reg := h.swap.Registry
 	store, ok := h.mover()
-	jobs := reg.Jobs()
+	var jobs []*rehome.Job
+	for _, j := range reg.Jobs() {
+		if !j.Cluster { // the cluster participant ends those (#1860)
+			jobs = append(jobs, j)
+		}
+	}
 	if len(jobs) > 0 && !ok {
 		return fmt.Errorf("%d re-home job(s) are recorded under %s/ and this node's storage is not local: they cannot be taken up", len(jobs), rehome.JournalRoot)
 	}
@@ -783,8 +788,10 @@ func (h *RehomeHandler) Recover(ctx context.Context) error {
 		h.recoverLater(later)
 	}
 	// Staging directories with no record: a job that stopped before it was
-	// journaled.
-	if ok {
+	// journaled. Not on a cluster node: a cluster job holds staged copies
+	// before this node records it, and SweepLocal settles those once synced
+	// (#1860).
+	if ok && h.swap.Cluster == nil {
 		keys, err := store.List(ctx, rehome.StagedRoot+"/")
 		if err != nil {
 			return fmt.Errorf("list %s/: %w", rehome.StagedRoot, err)

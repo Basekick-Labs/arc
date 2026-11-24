@@ -752,3 +752,29 @@ func TestBackupMarkPruneOwnOnly(t *testing.T) {
 		}
 	}
 }
+
+// #1860: a staged output is served while its job is committed or published.
+func TestRehomeStagedOutputServedWhileCommittedOrPublished(t *testing.T) {
+	x := rhFSM(t)
+	key := RehomeStagedKey("j1", 1)
+	x.ok(CommandStageRehome, rhStage("j1"))
+	if _, ok := x.f.RehomeStagedOutput(key); ok {
+		t.Fatal("served while staged")
+	}
+	x.rhAdvance("j1", RehomeCommitted, t0)
+	if o, ok := x.f.RehomeStagedOutput(key); !ok || o.SHA256 != "o1" {
+		t.Fatalf("committed: %+v %v", o, ok)
+	}
+	x.rhAckAll("j1", RehomeCommitted)
+	x.rhAdvance("j1", RehomePublished, t0)
+	if _, ok := x.f.RehomeStagedOutput(key); !ok {
+		t.Fatal("not served while published")
+	}
+	if _, ok := x.f.RehomeStagedOutput("db/cpu/2026/10/13/10/j1-1.parquet"); ok {
+		t.Fatal("a final key served as staged")
+	}
+	x.rhAdvance("j1", RehomeReverting, t0)
+	if _, ok := x.f.RehomeStagedOutput(key); ok {
+		t.Fatal("served while reverting")
+	}
+}

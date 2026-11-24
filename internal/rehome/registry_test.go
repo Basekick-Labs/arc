@@ -414,3 +414,40 @@ func TestExcludedTiered(t *testing.T) {
 		}
 	}
 }
+
+// #1860: a cluster job is recorded durably in committed then latched, seeds
+// back as such, and is left alone by nothing but End.
+func TestMirrorClusterJob(t *testing.T) {
+	store := testStore(t)
+	r := seeded(t, store)
+	j := &Job{ID: "ab12", Database: "db", Measurement: "cpu", State: StateCommitted,
+		Source:  FileRef{Key: "db/cpu/2026/11/18/23/x.parquet", Size: 10, SHA256: "s"},
+		Outputs: []FileRef{{Key: "db/cpu/2026/11/18/22/o.parquet", Staged: StagedDir("ab12") + "/000000.parquet", Size: 5, SHA256: "o"}}}
+	if err := r.Mirror(context.Background(), j); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.ExcludedFor(context.Background(), "db/cpu/"); len(got) != 1 || got[0] != j.Outputs[0].Key {
+		t.Fatalf("committed excludes %v", got)
+	}
+	again := NewRegistry(store)
+	if err := again.Seed(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if g, ok := again.Get("ab12"); !ok || !g.Cluster || g.State != StateCommitted {
+		t.Fatalf("seeded %+v", g)
+	}
+	j.State = StateLatched
+	if err := r.Mirror(context.Background(), j); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.ExcludedFor(context.Background(), "db/cpu/"); len(got) != 1 || got[0] != j.Source.Key {
+		t.Fatalf("latched excludes %v", got)
+	}
+	j.State = StateCommitted
+	if err := r.Mirror(context.Background(), j); err == nil {
+		t.Fatal("went back from latched")
+	}
+	if err := r.End(context.Background(), "ab12"); err != nil || r.Active() {
+		t.Fatalf("end: %v", err)
+	}
+}

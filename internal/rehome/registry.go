@@ -96,8 +96,13 @@ type Job struct {
 	Source      FileRef   `json:"source"`
 	Outputs     []FileRef `json:"outputs"`
 	State       State     `json:"state"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	// Cluster: a job the cluster drives (#1860), recorded on this node so
+	// its reads leave the right files out whatever its Raft state after a
+	// restart. Recover leaves it alone; this node's part of the job ends it
+	// (at removed or reverted), or SweepLocal once the job is gone.
+	Cluster   bool      `json:"cluster,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // Prefix is the measurement's key prefix, as read exclusions are asked for.
@@ -363,6 +368,94 @@ func (r *Registry) Advance(ctx context.Context, id string, to State) error {
 		}
 	}
 	return nil
+}
+
+// Mirror records a job the cluster drives (#1860) on this node, durably, in
+// state committed (reads leave every output out) or latched (they leave the
+// source out), and then makes it the state reads see. The record is written
+// first, as Advance does. It may be called again with the same or the next
+// state; a job of this node's own (not Cluster) under the id is an error.
+func (r *Registry) Mirror(ctx context.Context, j *Job) error {
+	if !r.seeded.Load() {
+		return errors.New("the re-home journal has not been read")
+	}
+	if j.State != StateCommitted && j.State != StateLatched {
+		return fmt.Errorf("a cluster job is recorded committed or latched, not %s", j.State)
+	}
+	rec := j.clone()
+	rec.Cluster = true
+	if rec.CreatedAt.IsZero() {
+		rec.CreatedAt = time.Now().UTC()
+	}
+	rec.UpdatedAt = time.Now().UTC()
+	if err := rec.validate(rec.ID); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	if cur, ok := r.jobs[rec.ID]; ok {
+		if !cur.Cluster {
+			r.mu.Unlock()
+			return fmt.Errorf("job %s is this node's own", rec.ID)
+		}
+		if cur.State == StateLatched && rec.State == StateCommitted {
+			r.mu.Unlock()
+			return fmt.Errorf("job %s is latched here; it cannot go back to committed", rec.ID)
+		}
+		rec.CreatedAt = cur.CreatedAt
+	}
+	for _, k := range append([]string{rec.Source.Key}, outputKeys(rec)...) {
+		if owner, ok := r.owned[k]; ok && owner != rec.ID {
+			r.mu.Unlock()
+			return fmt.Errorf("%s: %w", k, ErrOwned)
+		}
+		// A backup or restore here, or a retention delete about to act:
+		// the step waits for it (it is retried).
+		if r.claims[k] > 0 || r.blockedLocked(k) {
+			r.mu.Unlock()
+			return fmt.Errorf("%s is being deleted, backed up or restored by another operation", k)
+		}
+	}
+	r.mu.Unlock()
+
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	if err := r.store.Write(ctx, journalKey(rec.ID), data); err != nil {
+		return fmt.Errorf("write the job's record: %w", err)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	prev, had := r.jobs[rec.ID]
+	r.jobs[rec.ID] = rec
+	r.owned[rec.Source.Key] = rec.ID
+	for _, k := range outputKeys(rec) {
+		r.owned[k] = rec.ID
+	}
+	if !had || prev.State != rec.State {
+		r.gen.Add(1)
+	}
+	return nil
+}
+
+func outputKeys(j *Job) []string {
+	out := make([]string, len(j.Outputs))
+	for i, o := range j.Outputs {
+		out[i] = o.Key
+	}
+	return out
+}
+
+// HasCluster reports a cluster job this node records (Mirror).
+func (r *Registry) HasCluster(id string) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	j, ok := r.jobs[id]
+	return ok && j.Cluster
 }
 
 // End removes the job's record and then the job. The record goes first: a

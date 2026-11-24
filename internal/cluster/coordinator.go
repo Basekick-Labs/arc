@@ -171,6 +171,11 @@ type Coordinator struct {
 	rehomePart   atomic.Pointer[RehomeParticipantFunc]
 	rehomeNotify chan struct{}
 	rehomeSteps  rehomeSteps
+	// rehomeLocalExclusions: re-home exclusions come from this node's own
+	// records only (SetRehomeLocalExclusions, #1860).
+	rehomeLocalExclusions atomic.Bool
+	// rehomeLocalRecords: jobs this node records (SetRehomeLocalRecords).
+	rehomeLocalRecords atomic.Pointer[func(string) bool]
 	// Compaction read fences (#1852, compaction_fences.go): the flag's join
 	// gate and this node's part of a fence.
 	fencesGate compactionFencesGate
@@ -1536,6 +1541,11 @@ func (c *Coordinator) unlinkOne(item deleteRequest, relisted func(string) (bool,
 	if c.deferRewriteUnlink(context.Background(), item) {
 		return
 	}
+	// A re-home job's source: unlinked by this node's part of the job,
+	// after its reads (rehome_local.go, #1860).
+	if c.deferRehomeUnlink(item) {
+		return
+	}
 	// A compaction input stays readable until this node's staged copy of
 	// the output is in place (#1207 d2a2a; bounded).
 	// The wait can last seconds: a path registered again meanwhile keeps its
@@ -2862,6 +2872,23 @@ func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequ
 		if st, staged := fsm.StagedCompactionByKey(sanitized); staged {
 			sanitized = raft.StagedCompactionKey(st.Job, st.Output.Path)
 			entry, ok = &raft.FileEntry{Path: sanitized, SHA256: st.Output.SHA256, SizeBytes: st.Output.SizeBytes}, true
+		} else if out, rehomed := fsm.RehomeStagedOutput(sanitized); rehomed {
+			// A re-home job's staged output on local storage (#1860), while
+			// its job is committed or published, with its checksum and size.
+			// A node that already moved its copy into place (published)
+			// serves it from there: the output is not registered yet.
+			sanitized = out.StagedKey
+			c.mu.RLock()
+			b := c.storage
+			c.mu.RUnlock()
+			if b != nil {
+				sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				if n, err := b.StatFile(sctx, out.StagedKey); err == nil && n < 0 {
+					sanitized = out.Key
+				}
+				cancel()
+			}
+			entry, ok = &raft.FileEntry{Path: sanitized, SHA256: out.SHA256, SizeBytes: out.SizeBytes}, true
 		}
 	}
 	if !ok {
