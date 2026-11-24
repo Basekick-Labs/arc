@@ -2,6 +2,16 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: deleting a backup answers 404 for an unknown id and 503 for an unreachable destination ([#1122](https://github.com/Basekick-Labs/arc/issues/1122))
+
+**Who is affected:** clients of `DELETE /api/v1/backup/:id`.
+
+It answered 500 for both, so an operator could not tell a wrong id from a destination that is down.
+It now answers as `GET /api/v1/backup/:id` does: **404** when no configured target holds the backup,
+and **503** naming the target(s) that could not be reached (in `target` and `targets`) when one could
+not be — what could be reached was deleted, and running the delete again finishes it. A client that
+treated any 5xx as "retry" keeps working; one that checked for exactly 500 should check for 503.
+
 ## Change: on a cluster that shares one object store, a node serves no reads while its cluster state may be behind ([#1852](https://github.com/Basekick-Labs/arc/issues/1852), [#1825](https://github.com/Basekick-Labs/arc/issues/1825))
 
 On a cluster whose nodes share one bucket (S3, Azure or GCS as primary storage), every node

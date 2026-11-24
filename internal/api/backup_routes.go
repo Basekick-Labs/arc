@@ -530,16 +530,29 @@ func (h *BackupHandler) DeleteBackup(c *fiber.Ctx) error {
 			}
 			return h.operationConflict(c, operation)
 		}
-		// The manager's error now names the destination (#1085 stage B2b-1), and
-		// the target is a field as well so an operator with more than one
-		// configured store can tell which one failed. The status code is
-		// deliberately left at 500: splitting it into 404/503 the way GET
-		// /:id does is a separate change this stage did not scope, and no
-		// behaviour here depends on the distinction.
-		h.logger.Error().Err(err).Str("backup_id", id).Strs("targets", h.manager.TargetNames()).
+		// An unknown id and an unreachable destination are different answers
+		// (#1122), as for GET /:id: 404 means the id is wrong, 503 that a
+		// destination is down and the delete can be run again.
+		if errors.Is(err, backup.ErrBackupNotFound) {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"error": "Backup not found",
+			})
+		}
+		targets := h.manager.TargetNames()
+		var unreachable *backup.TargetsUnreachableError
+		if errors.As(err, &unreachable) {
+			targets = unreachable.Targets
+		}
+		h.logger.Error().Err(err).Str("backup_id", id).Strs("targets", targets).
 			Msg("Failed to delete backup")
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to delete backup",
+		target := h.manager.TargetName()
+		if len(targets) > 0 {
+			target = targets[0]
+		}
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error":   fmt.Sprintf("could not delete backup %s: %s is unreachable; what could be reached was deleted, run the delete again", id, describeTargets(targets)),
+			"target":  target,
+			"targets": targets,
 		})
 	}
 

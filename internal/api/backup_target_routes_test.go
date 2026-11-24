@@ -366,6 +366,16 @@ func TestUnreachableTargetIsReportedPerOperationNamingTheTarget(t *testing.T) {
 		assertNamesTarget(t, payload, "audit")
 	})
 
+	// #1122: a delete against a destination that cannot be reached is 503
+	// naming it, not 500, and not 404.
+	t.Run("delete", func(t *testing.T) {
+		status, payload := rig.do(t, http.MethodDelete, "/api/v1/backup/"+id, "")
+		if status != fiber.StatusServiceUnavailable {
+			t.Fatalf("DELETE /api/v1/backup/:id = %d %v, want 503", status, payload)
+		}
+		assertNamesTarget(t, payload, "audit")
+	})
+
 	t.Run("restore", func(t *testing.T) {
 		status, payload := rig.do(t, http.MethodPost, "/api/v1/backup/restore",
 			`{"backup_id":"`+id+`","confirm":true,"restore_metadata":false}`)
@@ -413,6 +423,11 @@ func TestGetBackupStillAnswers404ForAnUnknownID(t *testing.T) {
 	status, payload := rig.do(t, http.MethodGet, "/api/v1/backup/backup-20261007-120000-abcdef01", "")
 	if status != fiber.StatusNotFound {
 		t.Fatalf("GET /api/v1/backup/:id for an unknown id = %d %v, want 404", status, payload)
+	}
+	// #1122: and so does DELETE.
+	status, payload = rig.do(t, http.MethodDelete, "/api/v1/backup/backup-20261007-120000-abcdef01", "")
+	if status != fiber.StatusNotFound {
+		t.Fatalf("DELETE /api/v1/backup/:id for an unknown id = %d %v, want 404", status, payload)
 	}
 }
 
