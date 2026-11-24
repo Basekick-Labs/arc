@@ -97,8 +97,8 @@ At no step does a query on any node count a row twice or miss one.
   a job stop waiting for a removed node after a fixed time. Each such node also drops its query
   caches whenever it re-syncs with the leader, and reads what jobs leave out and acks their
   steps whatever its own configuration.
-- **Failover.** A job whose driver stopped is taken up by the primary writer once its 5-minute
-  lease lapses (within 30 seconds on the same node after a restart). Taken up before its outputs
+- **Failover.** A job whose driver stopped is taken up by the primary writer or the Raft leader
+  once its 5-minute lease lapses (within 30 seconds on the same node after a restart). Taken up before its outputs
   are published, it is reverted: only the node that split the file writes them. A reverted job
   keeps its output keys out of reads for 20 minutes, in case a former driver's upload was still in
   flight. A step that fails for a passing reason (a leader election, a storage error) is retried
@@ -120,7 +120,7 @@ Not handled in this version:
   after their request's handler returned, and an ack does not wait for them: such a read fails if
   its file is deleted, it does not return wrong rows. Schema reads (`getMeasurementSchema`) are not
   counted either.
-- A cluster whose Raft leader is not a writer runs no job (reads stay right, the job waits).
+- A new job is started on the primary writer only.
 
 ## Change: a cluster records re-home jobs in its replicated state; an older build cannot join once every node supports it ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
 

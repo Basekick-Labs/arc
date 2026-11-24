@@ -145,6 +145,7 @@ func (c *fakeCluster) must(t raft.CommandType, p any) {
 
 func (c *fakeCluster) LocalNodeID() string    { return "w1" }
 func (c *fakeCluster) IsPrimaryWriter() bool  { return true }
+func (c *fakeCluster) IsLeader() bool         { return true }
 func (c *fakeCluster) RehomeRunnable() string { return c.f.RehomeOutOfScope() }
 func (c *fakeCluster) RehomeStage(_ context.Context, p raft.StageRehomePayload) error {
 	p.Origin = "w1"

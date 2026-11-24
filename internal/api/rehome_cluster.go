@@ -46,6 +46,10 @@ import (
 type RehomeCluster interface {
 	LocalNodeID() string
 	IsPrimaryWriter() bool
+	// IsLeader: this node leads Raft. It takes over a job whose lease
+	// lapsed too: the primary-writer designation can stay with a node that
+	// died (no writer failover), and the job must not wait for it.
+	IsLeader() bool
 	// RehomeRunnable is why no job can run from this node now, or "".
 	RehomeRunnable() string
 	RehomeStage(ctx context.Context, p raft.StageRehomePayload) error
@@ -747,9 +751,10 @@ func (h *RehomeHandler) SetCluster(c RehomeCluster, readReady func() (bool, stri
 	h.swap.Cluster, h.swap.ReadReady = c, readReady
 }
 
-// StartClusterTakeover runs, on whichever node is the primary writer, the
-// jobs this process is not running: its own after a restart, and any whose
-// lease lapsed. Until the handler shuts down.
+// StartClusterTakeover runs, on the primary writer and on the Raft leader,
+// the jobs this process is not running: its own after a restart, and any
+// whose lease lapsed (the record's lease decides between the two). Until the
+// handler shuts down.
 func (h *RehomeHandler) StartClusterTakeover() {
 	if !h.clusterMode() {
 		return
@@ -773,7 +778,7 @@ func (h *RehomeHandler) StartClusterTakeover() {
 
 func (h *RehomeHandler) takeOverOnce(ctx context.Context) {
 	c := h.swap.Cluster
-	if !c.IsPrimaryWriter() {
+	if !c.IsPrimaryWriter() && !c.IsLeader() {
 		return
 	}
 	if ok, _ := h.clusterReadReady(); !ok {
