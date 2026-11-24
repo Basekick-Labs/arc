@@ -300,10 +300,16 @@ func TestColdRecovery1825(t *testing.T) {
 			} else {
 				c.tier.coldRow = map[string]bool{}
 			}
+			// The id before Recover: a job it finishes at once leaves the
+			// registry before Recover returns.
+			jobs := c.reg.Jobs()
+			if len(jobs) != 1 {
+				t.Fatalf("recorded jobs before recovery: %d", len(jobs))
+			}
+			id := jobs[0].ID
 			if err := c.h.Recover(context.Background()); err != nil {
 				t.Fatal(err)
 			}
-			id := c.reg.Jobs()[0].ID
 			if job := c.wait(id); job["state"] != "done" {
 				t.Fatalf("job: %v", job)
 			}
