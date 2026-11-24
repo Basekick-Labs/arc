@@ -117,6 +117,10 @@ type Manager struct {
 	// view of it (#1085 stage B3), nil without tiering.
 	cluster      ClusterManifest
 	tierRecorder TierRecorder
+	// onDataRestored runs once a restore of data files ends, whatever its
+	// outcome: query caches made before it must not answer for the files it
+	// wrote (#1764).
+	onDataRestored func()
 	tierLookup   TierLookup
 	coldCounter  ColdCounter
 	// coldSource is the cold tier itself (#1086 stage C): the store a backup

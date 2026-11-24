@@ -153,6 +153,15 @@ func (m *Manager) SetClusterManifest(cm ClusterManifest) {
 	m.logger.Info().Msg("Cluster manifest wired: backups cross-check the listing against the manifest and restores register the files they write")
 }
 
+// SetOnDataRestored sets what runs once a restore of data files ends,
+// whatever its outcome (some files may be written): dropping the query
+// caches, which may hold "this hour is empty" or a file list made before the
+// restore (#1764). A restore is a rare bulk operation, so a wholesale drop is
+// cheap.
+func (m *Manager) SetOnDataRestored(fn func()) {
+	m.onDataRestored = fn
+}
+
 // SetTierRecorder wires this node's tier metadata. Nil is ignored, as above.
 func (m *Manager) SetTierRecorder(r TierRecorder) {
 	if r == nil {

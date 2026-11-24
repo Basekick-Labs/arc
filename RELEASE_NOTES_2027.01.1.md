@@ -2,6 +2,17 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: files a backup restore writes are read at once ([#1764](https://github.com/Basekick-Labs/arc/issues/1764))
+
+**Who is affected:** anyone restoring data files from a backup into measurements that already have
+files.
+
+A restore writes its files without an ingest flush, so the query caches were not told about them,
+and a query could keep answering from a cache made before the restore ("this hour is empty", or a
+file list without them) for up to 60 seconds. A restore of data files now drops the query caches
+when it ends, whatever its outcome. Files an edge-sync hub receives were already read at once: on
+the hub's layout pruning never caches an empty hour, and the query reads the full glob.
+
 ## Fix: on a cluster, a late row is read at once on every node, not only on the one that wrote it ([#1763](https://github.com/Basekick-Labs/arc/issues/1763))
 
 **Who is affected:** clusters that receive rows stamped outside the current hour (late or future data).

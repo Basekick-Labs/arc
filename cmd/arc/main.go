@@ -6213,6 +6213,9 @@ func main() {
 			log.Error().Err(err).Str("target", cfg.Backup.DefaultTarget).Msg("Failed to initialize backup manager")
 		} else {
 			backupHandler := api.NewBackupHandler(backupManager, authManager, cfg.Backup.OperationTimeout, logger.Get("backup-api"))
+			// Files a restore wrote are read at once, not after the query
+			// caches' TTL (#1764).
+			backupManager.SetOnDataRestored(queryHandler.InvalidateCaches)
 			// A backup or restore and a re-home job keep each other out
 			// (#1825).
 			backupHandler.SetRehomeBlock(rehomeBlock)

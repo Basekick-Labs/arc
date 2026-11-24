@@ -112,3 +112,22 @@ func TestDataRestoreRefusedWhenTheColdWindowCannotOpen(t *testing.T) {
 		t.Fatalf("the cold object was restored anyway (stat: %v)", err)
 	}
 }
+
+// #1764: a data restore drops the query caches once it ends.
+func TestDataRestoreDropsQueryCaches(t *testing.T) {
+	ctx := context.Background()
+	rig := newColdRig(t, nil)
+	rig.writeCold(t, "prod/cpu/2026/01/01/00/cold.parquet", "PAR1cold")
+	result, err := rig.m.CreateBackup(ctx, BackupOptions{})
+	if err != nil {
+		t.Fatalf("CreateBackup: %v", err)
+	}
+	calls := 0
+	rig.m.SetOnDataRestored(func() { calls++ })
+	if _, err := rig.m.RestoreBackup(ctx, RestoreOptions{BackupID: result.Manifest.BackupID, RestoreData: true}); err != nil {
+		t.Fatalf("RestoreBackup: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("query caches dropped %d times, want once", calls)
+	}
+}
