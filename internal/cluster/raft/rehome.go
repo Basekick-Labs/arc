@@ -60,8 +60,9 @@ const CapabilityRehome = "rehome_v1"
 
 // CapabilityRehomeInScope is advertised by a node that takes part in a job
 // (leaves its files out of reads, acks its states) and whose configuration a
-// job can run under (no tiered storage, no Iceberg export, no edge sync: their
-// state is per node, and a job does not account for it). Every step but a
+// job can run under (no Iceberg export, no edge sync: their state is per node,
+// and a job does not account for it; tiered storage since #1869, whose rows
+// each node's part of a job keeps). Every step but a
 // revert refuses while any node lacks it, and a node without it cannot join
 // while a job is in flight.
 const CapabilityRehomeInScope = "rehome_in_scope_v1"
@@ -982,7 +983,7 @@ func (f *ClusterFSM) RehomeOutOfScope() string {
 	}
 	if len(out) > 0 {
 		sort.Strings(out)
-		return fmt.Sprintf("nodes %v do not take part in moving a file's rows (a release without it, or tiered storage, the Iceberg export or edge sync on there); not available until each does", out)
+		return fmt.Sprintf("nodes %v do not take part in moving a file's rows (a release without it, or the Iceberg export or edge sync on there, or tiered storage on a release before #1869); not available until each does", out)
 	}
 	return ""
 }

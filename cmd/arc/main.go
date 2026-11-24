@@ -1081,16 +1081,17 @@ func main() {
 	// On a cluster whose nodes share one object store, jobs run through the
 	// cluster record (#1825 slice 4b). Every such node reads what the record
 	// says to leave out, keeps off the files it owns and acks its states,
-	// whatever its configuration: a node restarted with tiering on stays in
-	// the Raft configuration, and must not read both sides of a job in flight.
-	// A node advertises that it can run under a job (rehomeCfgInScope) only
-	// with tiered storage, the Iceberg export and edge sync off.
+	// whatever its configuration: a node restarted with the Iceberg export on
+	// stays in the Raft configuration, and must not read both sides of a job
+	// in flight. A node advertises that it can run under a job
+	// (rehomeCfgInScope) only with the Iceberg export and edge sync off;
+	// tiered storage is in scope for a file on the hot tier (#1869).
 	rehomeSharedCluster := cfg.Cluster.Enabled && cluster.IsSharedObjectStore(storageBackend)
 	// A cluster on local storage with replication on (#1860): every node
 	// holds its own copy of each file and does each step of a job on it.
 	rehomeLocalCluster := cfg.Cluster.Enabled && storageBackend != nil && storageBackend.Type() == "local" && cfg.Cluster.ReplicationEnabled
 	rehomeCfgInScope := (rehomeSharedCluster || rehomeLocalCluster) &&
-		!cfg.TieredStorage.Enabled && !cfg.Iceberg.Enabled &&
+		!cfg.Iceberg.Enabled &&
 		!(cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Active() || cfg.EdgeSync.Spoke.Active())
 	// The cluster's side of ownership, bound once the coordinator runs:
 	// compaction is wired before it exists.
@@ -4690,7 +4691,7 @@ func main() {
 		Refusal: func() string {
 			switch {
 			case cfg.Cluster.Enabled && !rehomeClusterInScope:
-				return "moving a file's rows on a cluster needs a shared object store (S3, Azure or GCS) as primary storage or local storage with cluster.replication_enabled, and tiered storage, the Iceberg export and edge sync off, in this version"
+				return "moving a file's rows on a cluster needs a shared object store (S3, Azure or GCS) as primary storage or local storage with cluster.replication_enabled, and the Iceberg export and edge sync off, in this version"
 			case cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Active() || cfg.EdgeSync.Spoke.Active():
 				return "moving a file's rows is not available with edge sync in this version"
 			}
@@ -6071,6 +6072,15 @@ func main() {
 		rehomeHandler.SetTiering(tieringManager)
 	}
 	rehomeHandler.Wired()
+	// A node whose cold tier is configured and not running (no licence, or
+	// cold storage unreachable at start) would refuse every job's published
+	// step, holding each for 15 minutes before it reverts (#1869): it does not
+	// take part, so the cluster refuses jobs up front.
+	if clusterCoordinator != nil && rehomeCfgInScope && cfg.TieredStorage.Enabled && cfg.TieredStorage.Cold.Enabled &&
+		(tieringManager == nil || tieringManager.ColdTierMissing()) {
+		clusterCoordinator.SetRehomeInScope(false)
+		log.Warn().Msg("Re-home: this node's cold tier is configured but not running (no licence, or cold storage unreachable at start), so it does not take part in moving a file's rows, and no such job starts on the cluster until it does (restart once the cold tier is reachable)")
+	}
 
 	// Initialize Backup/Restore (OSS feature — no license required)
 	if cfg.Backup.Enabled {
@@ -7149,6 +7159,12 @@ func (a *tieringManifestAdapter) DeleteFilesFromManifest(ctx context.Context, pa
 	}, func(err error) bool {
 		return errors.Is(err, cluster.ErrNoLeaderKnown) || errors.Is(err, cluster.ErrLeaderUnreachable)
 	})
+	if err != nil && clusterraft.IsManifestChanged(err) {
+		// A file of the batch was taken by a compaction or a re-home job
+		// between the migrator's check and this proposal (#1869): the
+		// migrator drops it and proposes the rest again.
+		return fmt.Errorf("%w: %v", tiering.ErrManifestChanged, err)
+	}
 	if err != nil {
 		a.logger.Error().Err(err).
 			Int("count", len(ops)).

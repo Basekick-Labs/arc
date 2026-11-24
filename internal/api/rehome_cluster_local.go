@@ -11,6 +11,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/rehome"
 	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/basekick-labs/arc/internal/tiering"
 )
 
 // A re-home job on a cluster with local storage (#1860). Every node holds its
@@ -119,6 +120,11 @@ func (h *RehomeHandler) ParticipateLocal(ctx context.Context, j raft.RehomeJob, 
 		}
 		return h.holdStaged(ctx, store, lc, j)
 	case raft.RehomePublished:
+		// Tier rows (#1869): this node's check of the source, and the
+		// outputs' rows before its reads may see them.
+		if err := h.clusterTierStep(ctx, j, acked); err != nil {
+			return err
+		}
 		// A node that did not take part in committed (it joined since)
 		// fetches here.
 		for _, o := range j.Outputs {
@@ -175,6 +181,9 @@ func (h *RehomeHandler) ParticipateLocal(ctx context.Context, j raft.RehomeJob, 
 		if err := h.removeLocalOutputs(ctx, store, j); err != nil {
 			return err
 		}
+		if err := h.clusterTierStep(ctx, j, acked); err != nil {
+			return err
+		}
 		if err := reg.End(ctx, j.ID); err != nil {
 			return err
 		}
@@ -210,7 +219,24 @@ func (h *RehomeHandler) latchLocal(ctx context.Context, store rehomeStore, j raf
 	}
 	if n, _ := store.StatFile(ctx, j.Source.Path); n < 0 {
 		if _, had := reg.Get(j.ID); !had {
-			return nil // nothing here to swap: the outputs are read, the source is not
+			// Nothing here to swap: the outputs are read, the source is
+			// not. Their tier rows still (#1869).
+			if h.swap.TieringExpected {
+				if err := h.clusterRecordTier(ctx, j); err != nil {
+					return err
+				}
+				if err := h.clusterForgetSourceTier(ctx, j); err != nil {
+					return err
+				}
+			}
+			h.dropLocalCaches(j)
+			return nil
+		}
+	}
+	// The outputs' tier rows before reads may see them (#1869).
+	if h.swap.TieringExpected {
+		if err := h.clusterRecordTier(ctx, j); err != nil {
+			return err
 		}
 	}
 	if err := reg.Mirror(ctx, localRecord(j, rehome.StateLatched)); err != nil {
@@ -233,6 +259,11 @@ func (h *RehomeHandler) latchLocal(ctx context.Context, store rehomeStore, j raf
 	}
 	if err := h.unlinkLocalSource(ctx, store, j); err != nil {
 		return err
+	}
+	if h.swap.TieringExpected {
+		if err := h.clusterForgetSourceTier(ctx, j); err != nil {
+			return err
+		}
 	}
 	if rc, ok := h.swap.Cluster.(interface{ RecordRehomeOutputs(raft.RehomeJob) }); ok {
 		rc.RecordRehomeOutputs(j) // the outputs' content is known: not hashed again
@@ -432,6 +463,32 @@ func (h *RehomeHandler) settleEndedLocal(ctx context.Context, store rehomeStore,
 	}
 	if err := store.RemoveAll(ctx, rehome.StagedDir(rec.ID)); err != nil {
 		return err
+	}
+	if h.swap.TieringExpected {
+		// Tier rows by what the manifest lists (#1869): the outputs it lists
+		// with the job's checksum are hot files here; the rest, and a source
+		// it no longer lists, have no row.
+		if err := h.clusterTieringReady(); err != nil {
+			return err
+		}
+		var gone []string
+		var files []tiering.RehomedFile
+		for _, o := range j.Outputs {
+			if e, ok := h.swap.Cluster.ManifestFile(o.Key); ok && e.SHA256 == o.SHA256 {
+				files = append(files, tiering.RehomedFile{Path: o.Key, SizeBytes: o.SizeBytes})
+			} else if !ok {
+				gone = append(gone, o.Key)
+			}
+		}
+		if _, listed := h.swap.Cluster.ManifestFile(rec.Source.Key); !listed {
+			gone = append(gone, rec.Source.Key)
+		}
+		if t := h.tieringManager(); t != nil && len(files) > 0 {
+			if err := t.RecordRehomedFiles(ctx, files); err != nil {
+				return err
+			}
+		}
+		h.forgetTierRows(ctx, rec.ID, gone)
 	}
 	if err := h.swap.Registry.End(ctx, rec.ID); err != nil {
 		return err

@@ -288,10 +288,12 @@ func (m *Migrator) FindCandidatesFiltered(ctx context.Context, fromTier, toTier 
 //   - A compaction that committed over the file (#1207 d2a2b): its rows are
 //     in the compaction's output, and the hot copy is the finisher's to
 //     delete.
-//   - A re-home job that owns the file (#1825). This is reached only for a
-//     file the job does not end up taking: the job's check of its source
-//     (CheckRehomeSource) is refused while the move claim is held, which is
-//     until after this. The hot copy stays, as a hot file.
+//   - A re-home job that owns the file (#1825). On a standalone node this is
+//     reached only for a file the job does not end up taking: the job's
+//     check of its source (CheckRehomeSource) is refused while the move
+//     claim is held, which is until after this. On a cluster the job, staged
+//     by another node, may go on to take it once this node's check passes
+//     (#1869). Either way the hot copy stays, as a hot file.
 func (m *Migrator) dropTakenOver(ctx context.Context, files []MigrationCandidate) []MigrationCandidate {
 	kept := files[:0:0]
 	var removed []string
@@ -711,6 +713,15 @@ func (m *Migrator) MigrateFile(ctx context.Context, candidate MigrationCandidate
 // keptHotCopiesMsg is logged when migrated files keep their hot copy (#1830).
 const keptHotCopiesMsg = "Migrated files kept their hot copies: they are in cold already, and a node reading both tiers reads them twice until they are reconciled. POST /api/v1/tiering/reconcile, or the scheduled migration cycle, finishes them"
 
+// ErrManifestChanged: a manifest proposal was refused because one of its
+// files was taken by a compaction or a re-home job since it was checked.
+var ErrManifestChanged = errors.New("a file of the batch was taken over")
+
+const (
+	manifestChangedRetries = 3
+	manifestChangedPause   = 500 * time.Millisecond
+)
+
 // releaseHotCopies removes migrated files' hot copies in chunks: each chunk
 // leaves the cluster manifest first (one proposal, paced by the manager so
 // every node's unlink queue drains between proposals), then its hot copies
@@ -734,8 +745,29 @@ func (m *Migrator) releaseHotCopies(ctx context.Context, files []MigrationCandid
 		// (no file that day) must not answer for them: that read would find
 		// neither copy. After, a cached hot glob naming them must not either.
 		m.manager.notifyReadCachesStale()
-		// The adapter logged the cause at Error; this is the consequence.
-		if err := m.manager.deleteFromManifest(ctx, paths, reason); err != nil {
+		err := m.manager.deleteFromManifest(ctx, paths, reason)
+		// One file of the chunk taken by a compaction or a re-home job since
+		// the check refuses the whole proposal (#1869): drop the taken ones
+		// (once this node has seen the take) and propose the rest again.
+		for retry := 0; retry < manifestChangedRetries && errors.Is(err, ErrManifestChanged); retry++ {
+			if serr := sleepCtx(ctx, manifestChangedPause); serr != nil {
+				err = serr
+				break
+			}
+			chunk = m.dropTakenOver(ctx, chunk)
+			paths = paths[:0]
+			for _, c := range chunk {
+				paths = append(paths, c.Path)
+			}
+			if len(paths) == 0 {
+				err = nil
+				break
+			}
+			err = m.manager.deleteFromManifest(ctx, paths, reason)
+		}
+		// The adapter logged the cause at Error (a take-over refusal that
+		// outlasted the retries is logged only here); this is the consequence.
+		if err != nil {
 			m.logger.Warn().Err(err).Int("kept_hot_copies", len(files)-i).
 				Msg("Manifest update failed; the remaining hot copies of this release are kept")
 			return kept + len(files) - i, err
