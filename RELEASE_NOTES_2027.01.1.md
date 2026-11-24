@@ -157,9 +157,10 @@ At no step does a query on any node count a row twice or miss one.
 - **Refusals.** A job is refused while any node does not take part (an older release, or tiered
   storage, the Iceberg export or edge sync on there), with stream takeover on, or for a file on
   the cold tier; and a node that does not take part cannot join while a job is running. A node
-  that restarts with one of those turned on while a job runs does not re-join, so it is not
-  refused: it still reads what the job leaves out, keeps tiering and compaction off the job's
-  files, and acks. While a job runs, a DELETE,
+  that restarts with one of those turned on while a job runs is let back in (it never left): its
+  record says it is out of scope, and the job is reverted
+  ([#1859](https://github.com/Basekick-Labs/arc/issues/1859)). Meanwhile it reads what the job
+  leaves out, keeps tiering and compaction off the job's files, and acks. While a job runs, a DELETE,
   retention, a database delete, a backup or a compaction of its files is refused or leaves them
   alone, on any node; so is any of them on a node that has not synced with the leader yet.
 
