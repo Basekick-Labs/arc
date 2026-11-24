@@ -217,8 +217,19 @@ func TestRehomeSourceFailsClosedWhileNotSynced(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.readLease = &readLease{why: "not synced"}
-	if !src.Owns("testdb/cpu/a.parquet") || !src.Active() {
-		t.Fatal("not synced, and does not own every key")
+	if src.Owns("testdb/cpu/a.parquet") || src.Active() {
+		t.Fatal("not synced, re-home off: owns a key")
+	}
+	c.readLease = nil
+	inScope := append([]string{raft.CapabilityRehomeInScope}, rhList...)
+	capNodes(t, c, map[string][]string{"raft-1": inScope, "writer-1": inScope, "writer-2": inScope, "reader-1": inScope})
+	c.maybeEnableCompactionCommit()
+	waitFSM(t, c.CompactionCommitActive)
+	c.maybeEnableRehome()
+	waitFSM(t, c.raftNode.FSM().RehomeEnabled)
+	c.readLease = &readLease{why: "not synced"}
+	if !src.Owns("testdb/cpu/a.parquet") || !src.Active() || !src.OwnsUnder("testdb/") {
+		t.Fatal("not synced, re-home on, and does not own every key")
 	}
 	if _, err := src.ExcludedForStrict(ctx, "testdb/cpu/"); err == nil {
 		t.Fatal("a strict read went on while not synced")

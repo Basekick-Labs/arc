@@ -261,6 +261,24 @@ func (r *Registry) CancelWithReason(queryID, reason string) bool {
 	return true
 }
 
+// CancelAllWithReason cancels every running query, recording why, and
+// returns how many it cancelled.
+func (r *Registry) CancelAllWithReason(reason string) int {
+	r.mu.Lock()
+	ids := make([]string, 0, len(r.active))
+	for id := range r.active {
+		ids = append(ids, id)
+	}
+	r.mu.Unlock()
+	n := 0
+	for _, id := range ids {
+		if r.CancelWithReason(id, reason) {
+			n++
+		}
+	}
+	return n
+}
+
 // GetActive returns a snapshot of all active queries.
 func (r *Registry) GetActive() []*TrackedQuery {
 	r.mu.RLock()

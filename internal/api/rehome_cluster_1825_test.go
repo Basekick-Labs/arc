@@ -77,6 +77,10 @@ type fakeCluster struct {
 	// stopAt: the driver's proposals of this state fail (a stand-in for a
 	// driver that stopped).
 	stopAt atomic.Value
+	// failOnce: the first proposal of this state fails with a transient
+	// error.
+	failOnce atomic.Value
+	onFail   func()
 }
 
 var fakeClusterNodes = []string{"w1", "w2", "r1"}
@@ -84,6 +88,7 @@ var fakeClusterNodes = []string{"w1", "w2", "r1"}
 func newFakeCluster(t *testing.T) *fakeCluster {
 	c := &fakeCluster{t: t, f: raft.NewClusterFSM(zerolog.Nop())}
 	c.stopAt.Store("")
+	c.failOnce.Store("")
 	for _, n := range fakeClusterNodes {
 		c.must(raft.CommandAddNode, raft.AddNodePayload{Node: raft.NodeInfo{ID: n, Role: "writer", State: "healthy",
 			Capabilities: []string{raft.CapabilityRehome, raft.CapabilityRehomeInScope}}})
@@ -147,7 +152,14 @@ func (c *fakeCluster) RehomeStage(_ context.Context, p raft.StageRehomePayload) 
 }
 func (c *fakeCluster) RehomeAdvance(_ context.Context, id, to string) error {
 	if s, _ := c.stopAt.Load().(string); s == to {
-		return fmt.Errorf("stopped before %s", to)
+		// As if another node had taken the job: the driver stops at once.
+		return &raft.RehomeConflictError{Job: id, Reason: raft.RehomeNotFinisher}
+	}
+	if s, _ := c.failOnce.Load().(string); s == to && c.failOnce.CompareAndSwap(s, "") {
+		if c.onFail != nil {
+			c.onFail()
+		}
+		return fmt.Errorf("leader changed")
 	}
 	return c.apply(raft.CommandAdvanceRehome, raft.AdvanceRehomePayload{Job: id, By: "w1", To: to, Now: time.Now().UTC()})
 }
@@ -376,6 +388,13 @@ func TestClusterOutputKeyTakenReverts1825(t *testing.T) {
 	if n, _ := r.store.StatFile(context.Background(), r.key); n < 0 {
 		t.Fatal("the source is gone")
 	}
+	r.h.takeOverOnce(context.Background())
+	for i := 0; i < 500 && len(r.c.f.RehomeJobs()) != 0; i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n, _ := r.store.StatFile(context.Background(), planted); n != 13 {
+		t.Fatalf("the planted object was touched by the cleanup (size %d)", n)
+	}
 	if len(r.c.f.RehomeJobs()) != 0 {
 		t.Fatal("the job did not end")
 	}
@@ -414,6 +433,11 @@ func TestClusterAckTimeoutReverts1825(t *testing.T) {
 	job := r.wait(id)
 	if job["state"] != "failed" || !strings.Contains(fmt.Sprint(job["reason"]), "reverted") {
 		t.Fatalf("job: %v", job)
+	}
+	// The rest of a reverted job runs in the background.
+	r.h.takeOverOnce(context.Background())
+	for i := 0; i < 500 && len(r.c.f.RehomeJobs()) != 0; i++ {
+		time.Sleep(10 * time.Millisecond)
 	}
 	select {
 	case <-sawReverted:
@@ -495,4 +519,36 @@ func TestParticipateClusterWaitsForReads1825(t *testing.T) {
 	if err := h.ParticipateCluster(context.Background(), j3, true); err != nil {
 		t.Fatalf("a retry waited for a later read: %v", err)
 	}
+}
+
+// A takeover pass while the request path is between its stage and its drive
+// does not take the job for one left by a restart.
+func TestClusterTakeoverDuringStageLeavesTheJob1825(t *testing.T) {
+	r := newClusterRig(t)
+	r.h.afterStep = func(s string) {
+		if s == "staged" {
+			r.h.takeOverOnce(context.Background())
+		}
+	}
+	id, _, _ := r.start()
+	if job := r.wait(id); job["state"] != "done" {
+		t.Fatalf("job: %v", job)
+	}
+	r.requireOnce("after the swap")
+}
+
+// A transient failure of a step is retried where it is, not reverted.
+func TestClusterTransientFailureRetried1825(t *testing.T) {
+	r := newClusterRig(t)
+	var failed atomic.Int32
+	r.c.failOnce.Store(raft.RehomePublished)
+	r.c.onFail = func() { failed.Add(1) }
+	id, _, _ := r.start()
+	if job := r.wait(id); job["state"] != "done" {
+		t.Fatalf("job: %v", job)
+	}
+	if failed.Load() != 1 {
+		t.Fatalf("failures injected: %d", failed.Load())
+	}
+	r.requireOnce("after the swap")
 }

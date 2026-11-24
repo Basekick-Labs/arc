@@ -24,9 +24,11 @@
 // entered before the flip to leave.
 //
 // A read also binds the cancel function of the context its statement runs
-// under (Bind), and CancelAll cancels every read bound so far: a cluster node
-// that loses its read lease stops its reads, so a job waiting for such a node
-// knows within a fixed time that it no longer reads (#1825).
+// under (Bind), and CancelAll cancels every read bound so far and closes the
+// gate: until Reopen, a read that binds is cancelled at once. A cluster node
+// that loses its read lease stops its reads, those that had not bound yet
+// included, so a job waiting for such a node knows within a fixed time that
+// it no longer reads (#1825).
 //
 // What is not counted, and a job must handle otherwise: the Iceberg export's
 // listing, DELETE's and retention's own reads of files, compaction, reads on
@@ -52,6 +54,8 @@ type Gate struct {
 	// bound read's cancel function runs when it is (Bind).
 	cancelAll    context.Context
 	cancelAllNow context.CancelFunc
+	// closed: CancelAll was called and Reopen was not since.
+	closed bool
 }
 
 // Bind ties a read's cancel function to CancelAll: it runs when CancelAll is
@@ -63,6 +67,11 @@ func (g *Gate) Bind(cancel context.CancelFunc) context.CancelFunc {
 		return cancel
 	}
 	g.mu.Lock()
+	if g.closed {
+		g.mu.Unlock()
+		cancel()
+		return cancel
+	}
 	if g.cancelAll == nil {
 		g.cancelAll, g.cancelAllNow = context.WithCancel(context.Background())
 	}
@@ -75,8 +84,8 @@ func (g *Gate) Bind(cancel context.CancelFunc) context.CancelFunc {
 	}
 }
 
-// CancelAll cancels every read bound so far. Reads bound later are not
-// affected.
+// CancelAll cancels every read bound so far, and every read that binds until
+// Reopen.
 func (g *Gate) CancelAll() {
 	if g == nil {
 		return
@@ -84,10 +93,21 @@ func (g *Gate) CancelAll() {
 	g.mu.Lock()
 	now := g.cancelAllNow
 	g.cancelAll, g.cancelAllNow = nil, nil
+	g.closed = true
 	g.mu.Unlock()
 	if now != nil {
 		now()
 	}
+}
+
+// Reopen lets reads that bind from now on run.
+func (g *Gate) Reopen() {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	g.closed = false
+	g.mu.Unlock()
 }
 
 // Enter records a read about to build its SQL and returns the function that

@@ -1079,11 +1079,14 @@ func main() {
 		log.Warn().Err(seedErr).Int("try", try+1).Msg("Could not read the re-home job journal; trying again")
 	}
 	// On a cluster whose nodes share one object store, jobs run through the
-	// cluster record (#1825 slice 4b), when this node's configuration takes
-	// part in them: no tiered storage, no Iceberg export, no edge sync. One
-	// answer decides what this node advertises, what its reads leave out and
-	// whether it acks, so it never advertises one without the others.
-	rehomeCfgInScope := cfg.Cluster.Enabled && cluster.IsSharedObjectStore(storageBackend) &&
+	// cluster record (#1825 slice 4b). Every such node reads what the record
+	// says to leave out, keeps off the files it owns and acks its states,
+	// whatever its configuration: a node restarted with tiering on stays in
+	// the Raft configuration, and must not read both sides of a job in flight.
+	// A node advertises that it can run under a job (rehomeCfgInScope) only
+	// with tiered storage, the Iceberg export and edge sync off.
+	rehomeSharedCluster := cfg.Cluster.Enabled && cluster.IsSharedObjectStore(storageBackend)
+	rehomeCfgInScope := rehomeSharedCluster &&
 		!cfg.TieredStorage.Enabled && !cfg.Iceberg.Enabled &&
 		!(cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Active() || cfg.EdgeSync.Spoke.Active())
 	// The cluster's side of ownership, bound once the coordinator runs:
@@ -2512,7 +2515,7 @@ func main() {
 					// retaking the read lease do to its reads and caches
 					// (bound to the query handler once it exists).
 					clusterCoordinator.SetRehomeInScope(rehomeCfgInScope)
-					if rehomeCfgInScope {
+					if rehomeSharedCluster {
 						clusterCoordinator.SetReadLeaseHooks(func() {
 							if fn := rehomeLeaseLost.Load(); fn != nil {
 								(*fn)()
@@ -4260,9 +4263,10 @@ func main() {
 	otherExclusions := api.CombineOpenCompactions(compactionJobs, clusterOpen, retiredOpen)
 	// Re-home on the cluster (#1825 slice 4b): the cluster record is the
 	// fourth source of exclusions, and of ownership from here on.
+	rehomeClusterOn := rehomeSharedCluster && clusterCoordinator != nil
 	rehomeClusterInScope := rehomeCfgInScope && clusterCoordinator != nil
 	var rehomeClusterOpen api.OpenCompactions
-	if rehomeClusterInScope {
+	if rehomeClusterOn {
 		if src := clusterCoordinator.RehomeSource(); src != nil {
 			rehomeClusterSrc.Store(src)
 			rehomeClusterOpen = src
@@ -4688,19 +4692,24 @@ func main() {
 	if err := rehomeHandler.Recover(context.Background()); err != nil {
 		log.Fatal().Err(err).Msg("Could not take up the re-home jobs found at start")
 	}
-	if rehomeClusterInScope {
-		// Every node's part of a job's states, the driver on the primary
-		// writer, and what the read lease does to reads and caches.
-		rehomeHandler.SetCluster(clusterCoordinator, clusterCoordinator.ReadReady)
+	if rehomeClusterOn {
+		// Every node's part of a job's states, and what the read lease does
+		// to reads and caches: losing it stops the reads in flight and those
+		// that have not bound yet; retaking it drops the caches first.
 		clusterCoordinator.SetRehomeParticipant(rehomeHandler.ParticipateCluster)
-		rehomeHandler.StartClusterTakeover()
-		cancelReads := func() { queryHandler.Reads().CancelAll() }
-		dropCaches := func() {
+		stopReads := func() { queryHandler.StopReads("this node lost its cluster read lease") }
+		resumeReads := func() {
 			db.ClearHTTPCache()
 			queryHandler.InvalidateCaches()
+			queryHandler.ResumeReads()
 		}
-		rehomeLeaseLost.Store(&cancelReads)
-		rehomeLeaseSynced.Store(&dropCaches)
+		rehomeLeaseLost.Store(&stopReads)
+		rehomeLeaseSynced.Store(&resumeReads)
+	}
+	if rehomeClusterInScope {
+		// The driver, on the primary writer.
+		rehomeHandler.SetCluster(clusterCoordinator, clusterCoordinator.ReadReady)
+		rehomeHandler.StartClusterTakeover()
 	}
 	deleteHandler.StartRetiredDrainer(retiredCtx)
 	if cfg.Delete.Enabled {

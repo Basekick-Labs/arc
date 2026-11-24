@@ -1744,6 +1744,19 @@ type OpenCompactions interface {
 	Generation() uint64
 }
 
+// StopReads cancels every read in flight on this node and every read that
+// binds until ResumeReads, recording why in the query registry: the node lost
+// its cluster read lease (#1825).
+func (h *QueryHandler) StopReads(reason string) {
+	h.reads.CancelAll()
+	if h.queryRegistry != nil {
+		h.queryRegistry.CancelAllWithReason(reason)
+	}
+}
+
+// ResumeReads lets reads run again after StopReads.
+func (h *QueryHandler) ResumeReads() { h.reads.Reopen() }
+
 // SetOpenCompactions wires the compaction jobs a read must account for.
 func (h *QueryHandler) SetOpenCompactions(oc OpenCompactions) { h.openCompactions = oc }
 

@@ -86,29 +86,41 @@ that started before:
 
 At no step does a query on any node count a row twice or miss one.
 
-- **A node that stops answering** holds the job at its step. Before the outputs are in use, the
-  job reverts after 15 minutes. After, it waits; `GET /api/v1/cluster` (`rehome.jobs`) names the
-  nodes it waits for. Removing a node that is gone for good from the cluster lets the job go on
-  30 seconds later.
-- **A node that loses its read lease now cancels its queries in flight** (they fail as cancelled),
-  besides refusing new ones. That is what lets a job stop waiting for a removed node after a fixed
-  time. It applies on every node that takes part in jobs, whether or not one is running. Each
-  node also drops its query caches whenever it re-syncs with the leader.
+- **A node that stops answering** holds the job at its step. Before the outputs are published,
+  the job reverts after 15 minutes. After, it waits; `GET /api/v1/cluster` (`rehome.jobs`) names
+  the nodes it waits for. Removing a node that is gone for good from the cluster lets the job go
+  on 30 seconds later. A reverted job also waits for every node before it ends (it keeps the
+  file out of other jobs until then): the same removal applies.
+- **On every node of a cluster sharing an object store, losing the read lease now cancels the
+  queries in flight** (they fail as cancelled, recorded in `/api/v1/queries` with the reason),
+  and any that had passed the check but not started, besides refusing new ones. That is what lets
+  a job stop waiting for a removed node after a fixed time. Each such node also drops its query
+  caches whenever it re-syncs with the leader, and reads what jobs leave out and acks their
+  steps whatever its own configuration.
 - **Failover.** A job whose driver stopped is taken up by the primary writer once its 5-minute
-  lease lapses (at once on the same node after a restart). Taken up before its outputs are in use,
-  it is reverted: only the node that split the file writes them. A reverted job keeps its output
-  keys out of reads for 20 minutes, in case a former driver's upload was still in flight.
+  lease lapses (within 30 seconds on the same node after a restart). Taken up before its outputs
+  are published, it is reverted: only the node that split the file writes them. A reverted job
+  keeps its output keys out of reads for 20 minutes, in case a former driver's upload was still in
+  flight. A step that fails for a passing reason (a leader election, a storage error) is retried
+  where it is.
 - **Refusals.** A job is refused while any node does not take part (an older release, or tiered
   storage, the Iceberg export or edge sync on there), with stream takeover on, or for a file on
-  the cold tier; and a node that does not take part cannot join while a job is running. While a
-  job runs, a DELETE, retention, a database delete, a backup or a compaction of its files is
-  refused or leaves them alone, on any node.
+  the cold tier; and a node that does not take part cannot join while a job is running. A node
+  that restarts with one of those turned on while a job runs does not re-join, so it is not
+  refused: it still reads what the job leaves out, keeps tiering and compaction off the job's
+  files, and acks. While a job runs, a DELETE,
+  retention, a database delete, a backup or a compaction of its files is refused or leaves them
+  alone, on any node; so is any of them on a node that has not synced with the leader yet.
 
-Not handled in this version: a backup still running on a former primary writer after a failover
-does not see a job the new one starts; an Arrow IPC stream can still be sending rows after its
-request's handler returned, and an ack does not wait for it (such a stream fails if its file is
-deleted, it does not return wrong rows); a cluster whose Raft leader is not a writer runs no
-job (reads stay right, the job waits).
+Not handled in this version:
+- A backup, a DELETE or retention still running on a former primary writer after a failover does
+  not see a job the new one starts (a DELETE rewrite that lands before the switch-over makes the
+  job revert; one that lands after is not caught).
+- An Arrow IPC stream, and the arcx engine's streamed or shadowed reads, can still be reading
+  after their request's handler returned, and an ack does not wait for them: such a read fails if
+  its file is deleted, it does not return wrong rows. Schema reads (`getMeasurementSchema`) are not
+  counted either.
+- A cluster whose Raft leader is not a writer runs no job (reads stay right, the job waits).
 
 ## Change: a cluster records re-home jobs in its replicated state; an older build cannot join once every node supports it ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
 

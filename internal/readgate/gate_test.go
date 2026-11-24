@@ -134,7 +134,15 @@ func TestCancelAllCancelsBoundReads(t *testing.T) {
 	if ctx2.Err() == nil {
 		t.Fatal("unreachable: done2 cancels its own context")
 	}
-	// Bound after: not cancelled by the earlier call.
+	// Bound while closed: cancelled at once.
+	ctxC, cancelC := context.WithCancel(context.Background())
+	doneC := g.Bind(cancelC)
+	if ctxC.Err() == nil {
+		t.Fatal("a read bound after CancelAll and before Reopen ran")
+	}
+	doneC()
+	g.Reopen()
+	// Bound after the reopen: not cancelled by the earlier call.
 	ctx3, cancel3 := context.WithCancel(context.Background())
 	done3 := g.Bind(cancel3)
 	defer done3()

@@ -47,14 +47,14 @@ type OutboxManifest interface {
 	StreamClaimsEnabled() bool
 }
 
-// consumedInputChecker is the optional part of OutboxManifest that knows the
-// inputs of the compactions it has not finished (#1358). The coordinator
-// implements it.
 // rehomeOwnedChecker reports a path a re-home job owns (Coordinator).
 type rehomeOwnedChecker interface {
 	RehomeOwnsPath(path string) bool
 }
 
+// consumedInputChecker is the optional part of OutboxManifest that knows the
+// inputs of the compactions it has not finished (#1358). The coordinator
+// implements it.
 type consumedInputChecker interface {
 	ConsumedByCompaction(path string, size int64, sha256 string) bool
 }

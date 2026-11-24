@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -250,11 +251,22 @@ func (h *RehomeHandler) runClusterSwap(ctx context.Context, job *rehomeJob) (sta
 			SizeBytes: o.Bytes, SHA256: sum, PartitionTime: o.Start})
 		files[key] = o.LocalPath
 	}
+	// This process runs the job from before its stage: a takeover pass in
+	// between would take it for one left by a restart and revert it.
+	if !h.claimRunning(job.ID) {
+		return fail("running the job", errors.New("the job is already running in this process"))
+	}
+	defer h.releaseRunning(job.ID)
 	if err := c.RehomeStage(ctx, payload); err != nil {
 		if r := raft.RehomeConflictReason(err); r != "" {
 			return refuse(fmt.Sprintf("the cluster refused the job (%s); nothing was changed", r))
 		}
-		return fail("recording the job in the cluster", err)
+		// An apply that timed out may have committed: the job is in the
+		// record then, and is run as any staged job.
+		if werr := h.waitLocalJob(ctx, job.ID); werr != nil {
+			return fail("recording the job in the cluster", err)
+		}
+		h.logger.Warn().Err(err).Str("job", job.ID).Msg("Re-home: the stage reported an error but is in the cluster record; going on")
 	}
 	// The local ownership goes only once this node's record has the job:
 	// in between, a DELETE here must still see the file as owned.
@@ -264,20 +276,16 @@ func (h *RehomeHandler) runClusterSwap(ctx context.Context, job *rehomeJob) (sta
 	reg.Drop(job.ID)
 	h.hook("staged")
 
-	if !h.claimRunning(job.ID) {
-		return fail("running the job", errors.New("the job is already running in this process"))
-	}
-	defer h.releaseRunning(job.ID)
 	err = h.driveCluster(ctx, job.ID, files)
 	switch {
 	case err == nil:
 	case errors.Is(err, errRehomeReverted):
-		return "failed", "the job was reverted before it changed anything for readers (the server log says why); the file is as it was. Send the request again", report
+		return "failed", "the job was reverted before it changed anything for readers (the server log says why); the file is as it was, and its outputs are cleaned up in the background (GET /api/v1/cluster shows the job until then). Send the request again once it is gone", report
 	case errors.Is(err, errRehomeNotMine):
 		return "stopped", "another node took the job over; GET /api/v1/cluster shows it", report
 	default:
 		h.logger.Error().Err(err).Str("job", job.ID).Str("path", src.Key).Msg("Re-home job stopped part way; the cluster keeps its record and the primary writer takes it up again")
-		return "stopped", "the job stopped part way; the cluster keeps its record and the primary writer takes it up again within a minute. The server log has the error under this job's id", report
+		return "stopped", "the job stopped part way; the cluster keeps its record, and the primary writer takes it up within a minute: before its outputs were published that reverts it, after it finishes it. The server log has the error under this job's id", report
 	}
 	h.logger.Info().Str("job", job.ID).Str("path", src.Key).Int64("rows", plan.Rows).
 		Int64("moved_rows", plan.MisfiledRows()).Int("outputs", len(outs)).
@@ -356,6 +364,7 @@ func (h *RehomeHandler) driveCluster(ctx context.Context, id string, files map[s
 		}
 		return nil
 	}
+	failures := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -444,6 +453,7 @@ func (h *RehomeHandler) driveCluster(ctx context.Context, id string, files map[s
 			}
 			err = h.clusterErr(c.RehomeEnd(bg, id))
 			if err == nil {
+				h.forgetDropped(id)
 				if h.swap.ClearMisfiled != nil {
 					h.swap.ClearMisfiled(j.Source.Path)
 				}
@@ -456,6 +466,12 @@ func (h *RehomeHandler) driveCluster(ctx context.Context, id string, files map[s
 			}
 			err = h.clusterErr(c.RehomeEnd(bg, id))
 		case raft.RehomeReverted:
+			if files != nil {
+				// The request has its answer: the rest (the grace, every
+				// node's ack, the outputs deleted again) runs in the
+				// background (takeOverOnce), not in the job slot.
+				return errRehomeReverted
+			}
 			wait := time.Until(j.RevertedAt.Add(raft.RehomeRevertedGrace))
 			if wait > 0 {
 				select {
@@ -477,16 +493,36 @@ func (h *RehomeHandler) driveCluster(ctx context.Context, id string, files map[s
 			}
 			err = h.clusterErr(c.RehomeEnd(bg, id))
 			if err == nil {
+				h.forgetDropped(id)
 				return errRehomeReverted
 			}
 		default:
 			return fmt.Errorf("job %s in state %q", id, j.State)
 		}
-		if err != nil {
+		if err == nil || errors.Is(err, errRehomeMoved) {
+			failures = 0
+			continue
+		}
+		if errors.Is(err, errRehomeNotMine) || errors.Is(err, errRehomeReverted) || ctx.Err() != nil {
 			return err
+		}
+		// Transient (a leader election, a storage error): the state is in
+		// the record, and every step is safe to repeat.
+		failures++
+		if failures > rehomeDriveRetries {
+			return err
+		}
+		h.logger.Warn().Err(err).Str("job", id).Int("attempt", failures).Msg("Re-home: a step failed; retrying")
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(failures) * time.Second):
 		}
 	}
 }
+
+// rehomeDriveRetries bounds the retries of one failing step.
+const rehomeDriveRetries = 10
 
 // clusterErr maps a refusal that says another node drives the job.
 func (h *RehomeHandler) clusterErr(err error) error {
@@ -507,6 +543,10 @@ func (h *RehomeHandler) renewLease(ctx context.Context, j raft.RehomeJob) error 
 
 var errRehomeAckTimeout = errors.New("not every node acked the job's state in time")
 
+// errRehomeMoved: the job left the state being waited on; the driver looks
+// at it again.
+var errRehomeMoved = errors.New("the job's state moved")
+
 // waitClusterAcks returns once every node the job's state waits for has
 // acked it, no Raft server is outside the node table, and every node removed
 // without acking has been gone rehomeDroppedWait (its reads stopped). limit
@@ -519,7 +559,7 @@ func (h *RehomeHandler) waitClusterAcks(ctx context.Context, j raft.RehomeJob, l
 	for {
 		cur, ok := c.RehomeJob(j.ID)
 		if !ok || cur.StateIndex != j.StateIndex {
-			return nil
+			return errRehomeMoved
 		}
 		if cur.FinisherNode != c.LocalNodeID() {
 			return errRehomeNotMine
@@ -577,6 +617,18 @@ func (h *RehomeHandler) droppedWait(j raft.RehomeJob, clean bool) time.Duration 
 		}
 	}
 	return longest
+}
+
+// forgetDropped drops what droppedWait remembers of an ended job.
+func (h *RehomeHandler) forgetDropped(id string) {
+	s := &h.cluster
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k := range s.dropped {
+		if strings.HasPrefix(k, id+"/") {
+			delete(s.dropped, k)
+		}
+	}
 }
 
 // errRehomeRevert: the job cannot go on and has not changed anything for
@@ -746,6 +798,11 @@ func (h *RehomeHandler) takeOverOnce(ctx context.Context) {
 		go func() {
 			defer h.done.Done()
 			defer h.releaseRunning(id)
+			defer func() {
+				if r := recover(); r != nil {
+					h.logger.Error().Interface("panic", r).Str("job", id).Msg("Re-home: a job taken up on this node stopped on an internal error; it is tried again")
+				}
+			}()
 			err := h.driveCluster(ctx, id, nil)
 			switch {
 			case err == nil:

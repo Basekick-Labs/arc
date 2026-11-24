@@ -174,6 +174,8 @@ type Coordinator struct {
 	// Read lease hooks (SetReadLeaseHooks).
 	onReadLeaseLost atomic.Pointer[func()]
 	onReadSynced    atomic.Pointer[func()]
+	syncedHookMu    sync.Mutex
+	syncedHookDone  chan struct{}
 	// coldMarkGate / coldWriteMu: the #1552 cold mark's join gate and write
 	// fence (cold_mark.go).
 	coldMarkGate coldMarkGate

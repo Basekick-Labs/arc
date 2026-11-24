@@ -17,12 +17,13 @@ import (
 // steps are Raft entries, and a step that changes what a node's reads must
 // leave out waits for every node to say it has drained the reads from before:
 //
-//	staged     the record: the source as the manifest has it, the outputs
-//	           uploaded under the staging root. Reads change nothing.
+//	staged     the record: the source as the manifest has it, the
+//	           outputs' keys, sizes and checksums (nothing is written yet). Reads
+//	           change nothing.
 //	committed  reads leave every output out by name and read the source.
 //	           Each node acks once its reads from before the apply ended.
-//	published  the outputs are at their final keys (the finisher copied
-//	           them); reads still leave them out. Each node acks once it has
+//	published  the outputs are at their final keys (the driver uploaded them
+//	           once every node acked committed); reads still leave them out. Each node acks once it has
 //	           dropped its query caches, which may remember their directories
 //	           as empty.
 //	latched    one entry: the outputs are registered, the source's entry is
@@ -83,14 +84,14 @@ const (
 	// MaxRehomeOutputs bounds the outputs of one job, so its stage entry
 	// stays far under the forward frame.
 	MaxRehomeOutputs = 500
-	// RehomeStagedRoot is the reserved storage root of a job's uploaded
-	// outputs before they are copied to their final keys.
+	// RehomeStagedRoot names an output's StagedKey: reserved, never
+	// written (outputs are uploaded straight to their final keys).
 	RehomeStagedRoot = "_rehome_staged"
 	// maxRehomeStageBytes bounds a stage entry's encoded size, well under
 	// the forward frame (file_registrar.go).
 	maxRehomeStageBytes = 128 << 10
-	// RehomeCopyTimeout bounds one copy of an output to its final key: a
-	// driver must give up on a copy it began by then.
+	// RehomeCopyTimeout bounds one upload of an output to its final key: a
+	// driver gives up on an upload it began by then.
 	RehomeCopyTimeout = 10 * time.Minute
 	// RehomeRevertedGrace is how long a reverted job keeps its output keys
 	// owned and left out of reads: a driver that lost its lease without
@@ -267,9 +268,9 @@ type ClaimRehomeFinisherPayload struct {
 	Now time.Time `json:"now"`
 }
 
-// EndRehomePayload ends a latched job (its source object and staged objects
-// deleted); moves a reverting one to reverted (its outputs and staged objects
-// deleted); and ends a reverted one RehomeRevertedGrace after that (its
+// EndRehomePayload ends a removed job (its source object deleted, every node
+// acked); moves a reverting one to reverted (its outputs deleted); and ends a
+// reverted one RehomeRevertedGrace after that, once every node acked (its
 // output keys deleted again).
 type EndRehomePayload struct {
 	Job string    `json:"job"`
@@ -285,7 +286,7 @@ type rehomeState struct {
 	Gen uint64 `json:"gen,omitempty"`
 }
 
-// RehomeStagedKey is where an output waits for its copy to its final key.
+// RehomeStagedKey is an output's reserved StagedKey (never written).
 func RehomeStagedKey(job string, i int) string {
 	return fmt.Sprintf("%s/%s/%06d.parquet", RehomeStagedRoot, job, i)
 }
