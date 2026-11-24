@@ -87,6 +87,7 @@ type RehomeHandler struct {
 	// is closed once it is set. waitingExport is the id of the job waiting
 	// for the export, skipExport that its wait was waived, skipCh wakes it.
 	export        RehomeExportFunc
+	exportCheck   RehomeExportCheckFunc
 	exportBound   chan struct{}
 	waitingExport string
 	skipExport    bool
@@ -410,9 +411,6 @@ func (h *RehomeHandler) resumeJob(c *fiber.Ctx) error {
 	if h.swap == nil || h.swap.Registry == nil {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "moving a file's rows is not available on this node"})
 	}
-	if why := h.swapRefusal(); why != "" {
-		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": why})
-	}
 	id := strings.Clone(c.Params("id"))
 	// A cluster job's export wait is waived on the node that holds it
 	// (#1870): the job is the cluster's, the hold is this node's.
@@ -428,11 +426,19 @@ func (h *RehomeHandler) resumeJob(c *fiber.Ctx) error {
 		if !body.SkipExportWait {
 			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "the cluster drives this job; it is not taken up from this node (skip_export_wait waives this node's wait for the Iceberg export)"})
 		}
-		if !h.waiveClusterExport(id) {
+		ok, held := h.waiveClusterExport(id)
+		if !ok {
 			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "that job is not in the cluster's record"})
 		}
-		h.logger.Warn().Str("job", id).Msg("Re-home: asked to end this node's wait for the Iceberg export of a cluster job")
-		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{"id": id, "waived": true})
+		h.logger.Warn().Str("job", id).Bool("was_waiting", held).Msg("Re-home: asked to end this node's wait for the Iceberg export of a cluster job")
+		note := "this node was waiting for the Iceberg export; it goes on at its next step"
+		if !held {
+			note = "this node was not waiting for the Iceberg export for that job (GET /api/v1/cluster names the nodes a job waits for); it will not wait for it"
+		}
+		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{"id": id, "waived": true, "was_waiting": held, "note": note})
+	}
+	if why := h.swapRefusal(); why != "" {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": why})
 	}
 	rec, ok := h.swap.Registry.Get(id)
 	if ok && rec.Cluster {

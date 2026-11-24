@@ -3,6 +3,7 @@ package iceberg
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -45,15 +46,15 @@ func (a PassAnswer) Clear() bool {
 	return a.NotExported || (a.Blocked == "" && a.Published && !a.Named)
 }
 
+// NotExportingReason is PassAnswer.Blocked on a node whose export gate is
+// closed: another node exports (or none does).
+const NotExportingReason = "this node is not the one exporting to Iceberg"
+
 // Verdict is the answer as a re-home job uses it: whether it may go on, and
 // if not, what is in the way. asked is false for the question a job puts
 // before it changes anything, which names no file: there the pass itself
 // must have gone through, not only an earlier one's publish, since the job
 // is about to depend on the next one.
-// NotExportingReason is PassAnswer.Blocked on a node whose export gate is
-// closed: another node exports (or none does).
-const NotExportingReason = "this node is not the one exporting to Iceberg"
-
 func (a PassAnswer) Verdict(asked bool) (clear bool, why string) {
 	if a.Clear() && (asked || a.NotExported || a.Err == nil) {
 		return true, ""
@@ -73,6 +74,19 @@ type confirmWaiter struct {
 	m   Measurement
 	key string // the storage key asked about; "" asks only for a pass
 	ch  chan PassAnswer
+	// readOnly: no pass, only whether the published table names key;
+	// answered whatever the gate (CheckPublished, #1870).
+	readOnly bool
+}
+
+// CheckPublished reports, without running a pass and whichever node exports,
+// whether the published table of the measurement names the data file at
+// storage key fileKey: on a shared warehouse every node reads the version the
+// exporting node published (#1870). Safe from any goroutine; answered on the
+// scheduler's loop.
+func (s *Scheduler) CheckPublished(ctx context.Context, database, measurement, fileKey string) (PassAnswer, error) {
+	w := &confirmWaiter{m: Measurement{Database: database, Measurement: measurement}, key: fileKey, ch: make(chan PassAnswer, 1), readOnly: true}
+	return s.awaitConfirm(ctx, w)
 }
 
 // ReconcileAndConfirm runs one pass of the table on the scheduler's
@@ -82,6 +96,10 @@ type confirmWaiter struct {
 // ends. Safe from any goroutine.
 func (s *Scheduler) ReconcileAndConfirm(ctx context.Context, database, measurement, fileKey string) (PassAnswer, error) {
 	w := &confirmWaiter{m: Measurement{Database: database, Measurement: measurement}, key: fileKey, ch: make(chan PassAnswer, 1)}
+	return s.awaitConfirm(ctx, w)
+}
+
+func (s *Scheduler) awaitConfirm(ctx context.Context, w *confirmWaiter) (PassAnswer, error) {
 	s.reqMu.Lock()
 	s.confirms = append(s.confirms, w)
 	s.reqMu.Unlock()
@@ -134,6 +152,35 @@ func (s *Scheduler) serviceConfirms(ctx context.Context) {
 		for _, w := range waiters {
 			w.ch <- PassAnswer{Blocked: "the Iceberg export is paused until the server restarts (a restore staged a catalog)"}
 		}
+		return
+	}
+	// Read-only questions: answered whatever the gate, with no pass.
+	rest := waiters[:0]
+	for _, w := range waiters {
+		if !w.readOnly {
+			rest = append(rest, w)
+			continue
+		}
+		a := PassAnswer{Outcome: "checked"}
+		if s.exporter != nil {
+			mctx, cancel := context.WithTimeout(ctx, measurementTimeout)
+			exists, published, named, err := s.exporter.publishedNames(mctx, w.m.Database, w.m.Measurement, w.key)
+			cancel()
+			switch {
+			case err != nil:
+				a.Err = err
+			case !exists:
+				a.Published = true // no table: nothing names the file
+			default:
+				a.Published, a.Named = published, named
+			}
+		} else {
+			a.Err = errors.New("the Iceberg export is not running on this node")
+		}
+		w.ch <- a
+	}
+	waiters = rest
+	if len(waiters) == 0 {
 		return
 	}
 	if !s.gateOpen() {

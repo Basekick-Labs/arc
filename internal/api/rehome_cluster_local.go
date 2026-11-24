@@ -193,6 +193,7 @@ func (h *RehomeHandler) ParticipateLocal(ctx context.Context, j raft.RehomeJob, 
 		}
 		h.dropLocalCaches(j)
 		h.localLocks.forget(j.ID)
+		h.clusterExport.forget(j.ID)
 		return nil
 	}
 	return nil

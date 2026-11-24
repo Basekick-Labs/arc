@@ -11,7 +11,7 @@ import (
 // exportingCluster is the fake cluster with an answer to "does a node
 // export".
 type exportingCluster struct {
-	*fakeCluster
+	*localFake
 	present bool
 }
 
@@ -46,12 +46,16 @@ func (f *fakeClusterExport) set(exporter, clear bool) {
 
 func exportRig(t *testing.T) (*RehomeHandler, *exportingCluster, *fakeClusterExport, raft.RehomeJob) {
 	t.Helper()
+	old, oldMax := rehomeExportRetry, rehomeExportRetryMax
+	rehomeExportRetry, rehomeExportRetryMax = 0, 0 // no pacing between the test's questions
+	t.Cleanup(func() { rehomeExportRetry, rehomeExportRetryMax = old, oldMax })
 	r := newLocalRig(t)
-	c := &exportingCluster{fakeCluster: r.c.fakeCluster, present: true}
+	c := &exportingCluster{localFake: r.c, present: true}
 	r.h.swap.ExportExpected = true
 	r.h.SetCluster(c, func() (bool, string) { return true, "" })
 	f := &fakeClusterExport{}
 	r.h.SetExport(f.ask)
+	r.h.Wired()
 	j, _ := c.RehomeJob("ab12")
 	return r.h, c, f, j
 }
@@ -75,40 +79,64 @@ func TestClusterExportReady1870(t *testing.T) {
 	}
 }
 
-// #1870: the exporting node holds latched until the table no longer names the
-// source; once holding, it keeps holding if the lease moves away; a waiver
-// ends it; a node that never exported does not hold.
-func TestClusterExportHold1870(t *testing.T) {
-	h, _, f, j := exportRig(t)
+// #1870, local storage: the exporting node holds until its table no longer
+// names the source; a non-exporting node goes on while some node exports,
+// and holds while none does; a waiver ends a hold.
+func TestClusterExportHoldLocal1870(t *testing.T) {
+	h, c, f, j := exportRig(t)
 	ctx := context.Background()
-	f.set(false, false)
-	if err := h.clusterExportHold(ctx, j); err != nil {
-		t.Fatalf("a node that does not export held: %v", err)
-	}
 	f.set(true, false)
 	if err := h.clusterExportHold(ctx, j); err == nil {
 		t.Fatal("the exporting node did not hold while the table names the source")
 	}
-	f.set(false, false) // the lease moved away
-	if err := h.clusterExportHold(ctx, j); err == nil {
-		t.Fatal("stopped holding when the lease moved away")
-	}
-	f.set(true, true) // the lease is back, the table is published without it
+	f.set(true, true)
 	if err := h.clusterExportHold(ctx, j); err != nil {
 		t.Fatalf("held after the table was confirmed: %v", err)
 	}
-	// Holding again, then waived.
-	f.set(true, false)
-	if err := h.clusterExportHold(ctx, j); err == nil {
-		t.Fatal("not holding")
+	f.set(false, false)
+	if err := h.clusterExportHold(ctx, j); err != nil {
+		t.Fatalf("a non-exporting node held while a node exports: %v", err)
 	}
-	if !h.waiveClusterExport(j.ID) {
-		t.Fatal("waiver refused for a live job")
+	c.present = false
+	if err := h.clusterExportHold(ctx, j); err == nil {
+		t.Fatal("went on with no node exporting")
+	}
+	ok, held := h.waiveClusterExport(j.ID)
+	if !ok || !held {
+		t.Fatalf("waiver: ok %v held %v", ok, held)
 	}
 	if err := h.clusterExportHold(ctx, j); err != nil {
 		t.Fatalf("held after the waiver: %v", err)
 	}
-	if h.waiveClusterExport("ffff") {
+	if ok, _ := h.waiveClusterExport("ffff"); ok {
 		t.Fatal("waived a job the cluster does not have")
+	}
+}
+
+// #1870: the latched step does not unlink the source while the export holds.
+func TestLocalLatchWaitsForTheExport1870(t *testing.T) {
+	old, oldMax := rehomeExportRetry, rehomeExportRetryMax
+	rehomeExportRetry, rehomeExportRetryMax = 0, 0
+	t.Cleanup(func() { rehomeExportRetry, rehomeExportRetryMax = old, oldMax })
+	r := newLocalRig(t)
+	c := &exportingCluster{localFake: r.c, present: true}
+	r.h.swap.ExportExpected = true
+	r.h.SetCluster(c, func() (bool, string) { return true, "" })
+	f := &fakeClusterExport{exporter: true}
+	r.h.SetExport(f.ask)
+	r.h.Wired()
+	r.advance(raft.RehomeCommitted)
+	r.advance(raft.RehomePublished)
+	if err := r.c.RehomeClaim(context.Background(), "ab12"); err != nil {
+		t.Fatal(err)
+	}
+	r.advanceOnly(raft.RehomeLatched)
+	j, _ := r.c.RehomeJob("ab12")
+	if err := r.h.ParticipateLocal(context.Background(), j, true); err == nil || !r.has(lrSource) {
+		t.Fatalf("latched with the table still naming the source: err %v, source here %v", err, r.has(lrSource))
+	}
+	f.set(true, true)
+	if err := r.h.ParticipateLocal(context.Background(), j, true); err != nil || r.has(lrSource) {
+		t.Fatalf("after the table was published: err %v, source here %v", err, r.has(lrSource))
 	}
 }

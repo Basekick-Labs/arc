@@ -2540,7 +2540,10 @@ func main() {
 					// advertised at join; and, when it does, what losing and
 					// retaking the read lease do to its reads and caches
 					// (bound to the query handler once it exists).
-					clusterCoordinator.SetRehomeInScope(rehomeCfgInScope)
+					// With the Iceberg export on, only where it follows the
+					// compactor lease (the failover manager runs: a licence
+					// with writer failover, #1870).
+					clusterCoordinator.SetRehomeInScope(rehomeCfgInScope && (!cfg.Iceberg.Enabled || clusterCoordinator.HasCompactorFailover()))
 					// Whether this node exports to Iceberg when it holds the
 					// compactor lease: re-home jobs check an exporter exists.
 					clusterCoordinator.SetIcebergOn(cfg.Iceberg.Enabled)
@@ -4301,7 +4304,8 @@ func main() {
 	// fourth source of exclusions, and of ownership from here on.
 	rehomeClusterOn := rehomeSharedCluster && clusterCoordinator != nil
 	rehomeLocalOn := rehomeLocalCluster && clusterCoordinator != nil
-	rehomeClusterInScope := rehomeCfgInScope && clusterCoordinator != nil
+	rehomeClusterInScope := rehomeCfgInScope && clusterCoordinator != nil &&
+		(!cfg.Iceberg.Enabled || clusterCoordinator.HasCompactorFailover())
 	var rehomeClusterOpen api.OpenCompactions
 	if rehomeClusterOn || rehomeLocalOn {
 		if rehomeLocalOn {
@@ -4702,7 +4706,7 @@ func main() {
 		Refusal: func() string {
 			switch {
 			case cfg.Cluster.Enabled && !rehomeClusterInScope:
-				return "moving a file's rows on a cluster needs a shared object store (S3, Azure or GCS) as primary storage or local storage with cluster.replication_enabled, edge sync off, and with the Iceberg export on, cluster.failover_enabled, in this version"
+				return "moving a file's rows on a cluster needs a shared object store (S3, Azure or GCS) as primary storage or local storage with cluster.replication_enabled, and edge sync off; with the Iceberg export on, it also needs compactor failover (cluster.failover_enabled, with a licence that includes it), in this version"
 			case cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Active() || cfg.EdgeSync.Spoke.Active():
 				return "moving a file's rows is not available with edge sync in this version"
 			}
@@ -5141,6 +5145,18 @@ func main() {
 			}
 			clear, why := a.Verdict(fileKey != "")
 			return api.RehomeExportAnswer{Clear: clear, Why: why, NotExporter: a.Blocked == iceberg.NotExportingReason}, nil
+		})
+		// The published table read without a pass, whichever node exports
+		// (#1870): on a shared warehouse every node waits for the same table.
+		rehomeHandler.SetExportCheck(func(ctx context.Context, database, measurement, fileKey string) (bool, bool, error) {
+			a, err := icebergScheduler.CheckPublished(ctx, database, measurement, fileKey)
+			if err != nil {
+				return false, false, err
+			}
+			if a.Blocked != "" {
+				return false, false, errors.New(a.Blocked)
+			}
+			return a.Published, a.Named, a.Err
 		})
 		// #1731: with node-local warehouses (not icebergTopo.barrier, which is a shared bucket or
 		// shared_storage_mode), a database DELETE on the writer drops only the writer's tables.
