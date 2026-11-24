@@ -721,6 +721,15 @@ const keptHotCopiesMsg = "Migrated files kept their hot copies: they are in cold
 // already say cold, and reconciliation finishes them, manifest-first,
 // within its window. It returns how many hot copies were kept: those of a
 // failed manifest chunk and after it, and those whose delete failed.
+// ErrManifestChanged: a manifest proposal was refused because one of its
+// files was taken by a compaction or a re-home job since it was checked.
+var ErrManifestChanged = errors.New("a file of the batch was taken over")
+
+const (
+	manifestChangedRetries = 3
+	manifestChangedPause   = 500 * time.Millisecond
+)
+
 func (m *Migrator) releaseHotCopies(ctx context.Context, files []MigrationCandidate, reason string) (int, error) {
 	files = m.dropTakenOver(ctx, files)
 	kept := 0
@@ -734,8 +743,28 @@ func (m *Migrator) releaseHotCopies(ctx context.Context, files []MigrationCandid
 		// (no file that day) must not answer for them: that read would find
 		// neither copy. After, a cached hot glob naming them must not either.
 		m.manager.notifyReadCachesStale()
+		err := m.manager.deleteFromManifest(ctx, paths, reason)
+		// One file of the chunk taken by a compaction or a re-home job since
+		// the check refuses the whole proposal (#1869): drop the taken ones
+		// (once this node has seen the take) and propose the rest again.
+		for retry := 0; retry < manifestChangedRetries && errors.Is(err, ErrManifestChanged); retry++ {
+			if serr := sleepCtx(ctx, manifestChangedPause); serr != nil {
+				err = serr
+				break
+			}
+			chunk = m.dropTakenOver(ctx, chunk)
+			paths = paths[:0]
+			for _, c := range chunk {
+				paths = append(paths, c.Path)
+			}
+			if len(paths) == 0 {
+				err = nil
+				break
+			}
+			err = m.manager.deleteFromManifest(ctx, paths, reason)
+		}
 		// The adapter logged the cause at Error; this is the consequence.
-		if err := m.manager.deleteFromManifest(ctx, paths, reason); err != nil {
+		if err != nil {
 			m.logger.Warn().Err(err).Int("kept_hot_copies", len(files)-i).
 				Msg("Manifest update failed; the remaining hot copies of this release are kept")
 			return kept + len(files) - i, err

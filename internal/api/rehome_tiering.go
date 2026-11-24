@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/rehome"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
@@ -155,4 +156,92 @@ func (h *RehomeHandler) forgetTierRows(ctx context.Context, id string, keys []st
 	if err := t.ForgetRehomedFiles(ctx, keys); err != nil {
 		h.logger.Warn().Err(err).Str("job", id).Msg("Re-home: could not remove the tier rows of files the job removed; a later tiering scan retires them")
 	}
+}
+
+// Tiered storage on a cluster (#1869). Each node keeps its own tier rows, so
+// each node's part of a job keeps them: the outputs' rows recorded before its
+// reads may see the outputs (published, and again at latched and removed for
+// a node that joined since), the source's row forgotten once the source is
+// gone (removed), the outputs' rows forgotten on a revert. And each node checks,
+// before it acks published, that its own tiering holds the source hot with no
+// copy in cold storage: a migration that ran on another node before it saw the
+// job makes the job revert rather than leave a cold copy read beside the
+// outputs.
+
+// clusterTieringReady fails while tiered storage is configured here and not
+// yet bound (or found absent): the step is retried.
+func (h *RehomeHandler) clusterTieringReady() error {
+	if h.swap != nil && h.swap.TieringExpected && !h.isWired() {
+		return errors.New("tiered storage on this node is not running yet")
+	}
+	return nil
+}
+
+// clusterTierCheck is this node's check of the source before it acks
+// published.
+func (h *RehomeHandler) clusterTierCheck(ctx context.Context, j raft.RehomeJob) error {
+	if err := h.clusterTieringReady(); err != nil {
+		return err
+	}
+	return h.checkTieringSource(ctx, j.Source.Path)
+}
+
+// clusterRecordTier records j's outputs as hot files on this node.
+func (h *RehomeHandler) clusterRecordTier(ctx context.Context, j raft.RehomeJob) error {
+	if err := h.clusterTieringReady(); err != nil {
+		return err
+	}
+	return h.recordTierRows(ctx, localRecord(j, rehome.StateCommitted))
+}
+
+// clusterForgetSourceTier removes the source's row on this node.
+func (h *RehomeHandler) clusterForgetSourceTier(ctx context.Context, j raft.RehomeJob) error {
+	if err := h.clusterTieringReady(); err != nil {
+		return err
+	}
+	h.forgetTierRows(ctx, j.ID, []string{j.Source.Path})
+	return nil
+}
+
+// clusterForgetOutputsTier removes the outputs' rows on this node.
+func (h *RehomeHandler) clusterForgetOutputsTier(ctx context.Context, j raft.RehomeJob) error {
+	if err := h.clusterTieringReady(); err != nil {
+		return err
+	}
+	keys := make([]string, len(j.Outputs))
+	for i, o := range j.Outputs {
+		keys[i] = o.Key
+	}
+	h.forgetTierRows(ctx, j.ID, keys)
+	return nil
+}
+
+// clusterTierStep is this node's tier-row part of j's state (#1869): before
+// it acks published, its check of the source and the outputs' rows; at
+// latched and removed the outputs' rows again (a node that joined since), and
+// at removed the source's row forgotten; at reverted the outputs' rows
+// forgotten. A no-op without tiered storage.
+func (h *RehomeHandler) clusterTierStep(ctx context.Context, j raft.RehomeJob, acked bool) error {
+	if h.swap == nil || !h.swap.TieringExpected {
+		return nil
+	}
+	switch j.State {
+	case raft.RehomePublished:
+		if acked {
+			if err := h.clusterTierCheck(ctx, j); err != nil {
+				return err
+			}
+		}
+		return h.clusterRecordTier(ctx, j)
+	case raft.RehomeLatched:
+		return h.clusterRecordTier(ctx, j)
+	case raft.RehomeRemoved:
+		if err := h.clusterRecordTier(ctx, j); err != nil {
+			return err
+		}
+		return h.clusterForgetSourceTier(ctx, j)
+	case raft.RehomeReverted:
+		return h.clusterForgetOutputsTier(ctx, j)
+	}
+	return nil
 }

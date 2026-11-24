@@ -190,6 +190,14 @@ func (h *RehomeHandler) runClusterSwap(ctx context.Context, job *rehomeJob) (sta
 	if !ok {
 		return refuse(fmt.Sprintf("%s is not in the cluster's manifest", src.Key))
 	}
+	// Tiered storage (#1869): the file must be hot here with no copy in cold
+	// storage. Every node checks again before it acks published.
+	if err := h.clusterTieringReady(); err != nil {
+		return refuse(err.Error() + "; send the request again shortly")
+	}
+	if err := h.checkTieringSource(ctx, src.Key); err != nil {
+		return fail("checking the file", err)
+	}
 	if entry.Tier != "" && entry.Tier != "hot" {
 		return refuse(fmt.Sprintf("%s is on the %s tier; moving a file's rows on a cluster needs it on the hot tier in this version", src.Key, entry.Tier))
 	}
@@ -266,6 +274,11 @@ func (h *RehomeHandler) runClusterSwap(ctx context.Context, job *rehomeJob) (sta
 
 	// 2. Stage. Each final key must be free in storage now; the cluster
 	// record owns it from the stage on.
+	for _, o := range outs {
+		if err := h.canRecordTier(o.Dir + "/x.parquet"); err != nil {
+			return refuse(fmt.Sprintf("tiered storage cannot record a file in %s: %v", o.Dir, err))
+		}
+	}
 	payload := raft.StageRehomePayload{Job: job.ID, Database: src.Database, Measurement: src.Measurement,
 		Source: raft.CompactionInput{Path: src.Key, SizeBytes: entry.SizeBytes, SHA256: entry.SHA256}, Now: time.Now().UTC()}
 	files := map[string]string{}
@@ -919,7 +932,12 @@ func (h *RehomeHandler) clusterReadReady() (bool, string) {
 // after a state that put files in place or removed them, drop this node's
 // caches first and again after the wait.
 func (h *RehomeHandler) ParticipateCluster(ctx context.Context, j raft.RehomeJob, acked bool) error {
-	caches := j.State == raft.RehomePublished || j.State == raft.RehomeRemoved || j.State == raft.RehomeReverted
+	// Tier rows first (#1869): a read after the caches drop must find the
+	// outputs' rows.
+	if err := h.clusterTierStep(ctx, j, acked); err != nil {
+		return err
+	}
+	caches := j.State == raft.RehomePublished || j.State == raft.RehomeLatched || j.State == raft.RehomeRemoved || j.State == raft.RehomeReverted
 	if caches {
 		h.dropLocalCaches(j)
 	}
