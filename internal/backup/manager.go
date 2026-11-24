@@ -121,8 +121,8 @@ type Manager struct {
 	// outcome: query caches made before it must not answer for the files it
 	// wrote (#1764).
 	onDataRestored func()
-	tierLookup   TierLookup
-	coldCounter  ColdCounter
+	tierLookup     TierLookup
+	coldCounter    ColdCounter
 	// coldSource is the cold tier itself (#1086 stage C): the store a backup
 	// reads cold objects from and a restore writes them back to. Nil without
 	// tiering, with cold disabled, or when the cold backend failed to build.

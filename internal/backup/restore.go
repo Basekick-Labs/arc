@@ -422,10 +422,12 @@ func (m *Manager) RestoreBackup(ctx context.Context, opts RestoreOptions) (*Rest
 			}
 			defer g.EndColdRestore()
 		}
-		err := m.restoreDataFiles(ctx, opts.BackupID, read, progress, mode, pause)
-		if m.onDataRestored != nil {
-			m.onDataRestored()
-		}
+		err := func() error {
+			if m.onDataRestored != nil {
+				defer m.onDataRestored() // whatever the outcome, a panic too
+			}
+			return m.restoreDataFiles(ctx, opts.BackupID, read, progress, mode, pause)
+		}()
 		if err != nil {
 			progress.Status = "failed"
 			progress.Error = err.Error()
