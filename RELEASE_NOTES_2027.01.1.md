@@ -105,6 +105,15 @@ fail and ask to be retried):
 - **Rolling upgrade:** the change turns on once every node runs this release, like compaction
   commit; a node on an older release is then refused at join. Compactions that were finishing when
   it turned on finish the earlier way.
+## Fix: a node restarted with tiering, the Iceberg export or edge sync on no longer counts as taking part in a re-home job ([#1859](https://github.com/Basekick-Labs/arc/issues/1859))
+
+**Who is affected:** clusters sharing one object store, while a re-home job runs.
+
+A node that restarted (without leaving the cluster) with one of those turned on was refused at join
+while a job ran, and so kept its old record, which said it could take part. The job went on as if
+the node were in scope. Its join is now accepted: its record says it is out of scope, and the
+running job can only be reverted (it is, by its driver). A node joining for the first time is still
+refused while a job runs.
 
 ## New: moving a misfiled file's rows on a cluster whose nodes share one object store ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
 

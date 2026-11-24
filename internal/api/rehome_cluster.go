@@ -510,6 +510,17 @@ func (h *RehomeHandler) driveCluster(ctx context.Context, id string, files map[s
 		if errors.Is(err, errRehomeNotMine) || errors.Is(err, errRehomeReverted) || ctx.Err() != nil {
 			return err
 		}
+		// A node went out of scope (#1859): no step but a revert is
+		// allowed from here, which only a job before latched has.
+		if raft.RehomeConflictReason(err) == raft.RehomeOutOfScope {
+			if cur, ok := c.RehomeJob(id); ok && (cur.State == raft.RehomeStaged || cur.State == raft.RehomeCommitted || cur.State == raft.RehomePublished) {
+				if rerr := revert("a node no longer takes part in re-home jobs: " + err.Error()); rerr != nil {
+					return rerr
+				}
+				failures = 0
+				continue
+			}
+		}
 		// Transient (a leader election, a storage error): the state is in
 		// the record, and every step is safe to repeat.
 		failures++

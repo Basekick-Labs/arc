@@ -57,7 +57,13 @@ func (c *Coordinator) rehomeJoinGate(req interface {
 		// staged on the leader's log and a join is handled on the leader,
 		// so its FSM is current here; the FSM also refuses every step but a
 		// revert once such a node is a member.
-		if !hasCapability(req.GetCapabilities(), raft.CapabilityRehomeInScope) && fsm != nil && fsm.RehomeJobsInFlight() {
+		// A member (a node that restarted without leaving) is let through:
+		// refusing it would not keep it out (it is in the Raft configuration
+		// and applies the log), only keep its old capabilities in its record,
+		// and the cluster would count it in scope (#1859). Its join rewrites
+		// the record; the FSM then refuses every step but a revert.
+		if !hasCapability(req.GetCapabilities(), raft.CapabilityRehomeInScope) && fsm != nil && fsm.RehomeJobsInFlight() &&
+			!c.isMember(req.GetNodeID()) {
 			g.mu.Unlock()
 			return "a re-home job is in flight and this node does not take part in one (its release or configuration); retry when it has ended", nil
 		}
@@ -283,4 +289,27 @@ func (c *Coordinator) RehomeStatus() RehomeStatus {
 		}
 	}
 	return st
+}
+
+// isMember reports whether id is in the node table or the Raft
+// configuration.
+func (c *Coordinator) isMember(id string) bool {
+	if c == nil || c.raftNode == nil {
+		return false
+	}
+	if fsm := c.raftNode.FSM(); fsm != nil {
+		if _, ok := fsm.GetNode(id); ok {
+			return true
+		}
+	}
+	ids, err := c.raftNode.ConfigurationServerIDs()
+	if err != nil {
+		return false
+	}
+	for _, s := range ids {
+		if s == id {
+			return true
+		}
+	}
+	return false
 }

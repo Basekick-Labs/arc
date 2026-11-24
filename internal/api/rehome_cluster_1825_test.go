@@ -553,3 +553,29 @@ func TestClusterTransientFailureRetried1825(t *testing.T) {
 	}
 	r.requireOnce("after the swap")
 }
+
+// #1859: a node that goes out of scope mid-job makes the next step refused;
+// the driver reverts the job at once, and reads never change.
+func TestClusterNodeOutOfScopeReverts1859(t *testing.T) {
+	r := newClusterRig(t)
+	r.h.afterStep = func(s string) {
+		if s == "staged" {
+			r.c.must(raft.CommandAddNode, raft.AddNodePayload{Node: raft.NodeInfo{ID: "r9", Role: "reader", State: "healthy",
+				Capabilities: []string{raft.CapabilityRehome}}})
+		}
+		r.requireOnce("after step " + s)
+	}
+	id, _, _ := r.start()
+	job := r.wait(id)
+	if job["state"] != "failed" || !strings.Contains(fmt.Sprint(job["reason"]), "reverted") {
+		t.Fatalf("job: %v", job)
+	}
+	r.h.takeOverOnce(context.Background())
+	for i := 0; i < 500 && len(r.c.f.RehomeJobs()) != 0; i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(r.c.f.RehomeJobs()) != 0 {
+		t.Fatalf("jobs %v", r.c.f.RehomeJobs())
+	}
+	r.requireOnce("after the revert")
+}

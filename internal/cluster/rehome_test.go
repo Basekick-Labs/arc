@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -365,4 +366,36 @@ func TestRehomeParticipantAcks(t *testing.T) {
 	if calls.Load() != 1 {
 		t.Fatalf("part run %d times after the ack", calls.Load())
 	}
+}
+
+// #1859: a member that restarted out of scope while a job runs is let in, so
+// its record says so and the job can only revert; a new node is still refused.
+func TestRehomeJoinGateLetsAMemberRefreshItsRecord(t *testing.T) {
+	c := originRig(t, "writer-1", RoleWriter)
+	inScope := append([]string{raft.CapabilityRehomeInScope}, rhList...)
+	capNodes(t, c, map[string][]string{"raft-1": inScope, "writer-1": inScope, "writer-2": inScope, "reader-1": inScope})
+	c.maybeEnableCompactionCommit()
+	waitFSM(t, c.CompactionCommitActive)
+	c.maybeEnableRehome()
+	waitFSM(t, c.raftNode.FSM().RehomeEnabled)
+	in := makeFileEntry("testdb/cpu/2026/10/12/10/x.parquet", []byte("x"), "writer-1")
+	in.CreatedAt = time.Now()
+	if err := c.raftNode.RegisterFile(in, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RehomeStage(context.Background(), raft.StageRehomePayload{Job: "j1", Database: "testdb", Measurement: "cpu",
+		Source:  raft.CompactionInput{Path: in.Path, SizeBytes: in.SizeBytes, SHA256: in.SHA256},
+		Outputs: []raft.RehomeOutput{{Key: "testdb/cpu/2026/10/11/10/o.parquet", StagedKey: raft.RehomeStagedKey("j1", 0), SizeBytes: 1, SHA256: "s"}},
+		Now:     time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if why, _ := c.rehomeJoinGate(&protocol.JoinRequest{NodeID: "reader-9", Capabilities: rhList}); why == "" {
+		t.Fatal("a new node out of scope joined mid-job")
+	}
+	c.rehomeGate.mu.TryLock()
+	c.rehomeGate.mu.Unlock()
+	if resp := deliverJoin(t, c, ccJoin("reader-1", rhList)); resp == nil || !resp.Success {
+		t.Fatalf("a member's join was refused: %+v", resp)
+	}
+	waitFSM(t, func() bool { return strings.Contains(c.raftNode.FSM().RehomeOutOfScope(), "reader-1") })
 }
