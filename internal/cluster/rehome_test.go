@@ -416,6 +416,20 @@ func TestRehomeJoinGateLetsAMemberRefreshItsRecord(t *testing.T) {
 func TestBeginBackupMark(t *testing.T) {
 	c := originRig(t, "writer-1", RoleWriter)
 	src := c.RehomeSource()
+	// Re-home off: nothing is recorded (an older leader would refuse it).
+	off, err := src.BeginBackupMark(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	off()
+	if len(c.raftNode.FSM().BackupMarks()) != 0 {
+		t.Fatal("a mark recorded with re-home off")
+	}
+	capNodes(t, c, map[string][]string{"raft-1": rhList, "writer-1": rhList, "writer-2": rhList, "reader-1": rhList})
+	c.maybeEnableCompactionCommit()
+	waitFSM(t, c.CompactionCommitActive)
+	c.maybeEnableRehome()
+	waitFSM(t, c.raftNode.FSM().RehomeEnabled)
 	release, err := src.BeginBackupMark(context.Background())
 	if err != nil {
 		t.Fatal(err)

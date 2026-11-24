@@ -2,6 +2,7 @@ package raft
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -28,13 +29,20 @@ type BackupMark struct {
 	RenewedAt time.Time `json:"renewed_at"`
 }
 
-// BackupMarkPayload begins or renews (End false) or ends a mark.
+// BackupMarkPayload begins, renews (Renew) or ends (End) a mark. A renew of a
+// mark that is gone or lapsed is refused: the backup has not been protected
+// throughout, and a mark must not come back to life over a job staged
+// meanwhile.
 type BackupMarkPayload struct {
-	ID   string    `json:"id"`
-	Node string    `json:"node"`
-	Now  time.Time `json:"now"`
-	End  bool      `json:"end,omitempty"`
+	ID    string    `json:"id"`
+	Node  string    `json:"node"`
+	Now   time.Time `json:"now"`
+	Renew bool      `json:"renew,omitempty"`
+	End   bool      `json:"end,omitempty"`
 }
+
+// ErrBackupMarkLapsed: a renew found its mark gone or lapsed.
+var ErrBackupMarkLapsed = errors.New("backup mark lapsed")
 
 func (f *ClusterFSM) applyBackupMark(payload []byte) interface{} {
 	var p BackupMarkPayload
@@ -46,12 +54,33 @@ func (f *ClusterFSM) applyBackupMark(payload []byte) interface{} {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if !p.End {
+		// Lapsed marks go (the proposer's clock, as every check of them).
+		for k, m := range f.backupMarks {
+			if p.Now.Sub(m.RenewedAt) >= BackupMarkLease {
+				delete(f.backupMarks, k)
+			}
+		}
+	}
 	if p.End {
-		delete(f.backupMarks, p.ID)
+		if m, ok := f.backupMarks[p.ID]; ok && m.Node == p.Node {
+			delete(f.backupMarks, p.ID)
+		}
 		return nil
 	}
 	if _, known := f.nodes[p.Node]; !known {
 		return fmt.Errorf("backup mark: %q is not a member", p.Node)
+	}
+	if p.Renew {
+		m, ok := f.backupMarks[p.ID]
+		if !ok || m.Node != p.Node {
+			return fmt.Errorf("%w: %s", ErrBackupMarkLapsed, p.ID)
+		}
+		m.RenewedAt = p.Now
+		return nil
+	}
+	if _, exists := f.backupMarks[p.ID]; exists {
+		return fmt.Errorf("backup mark %s exists", p.ID)
 	}
 	f.backupMarks[p.ID] = &BackupMark{ID: p.ID, Node: p.Node, RenewedAt: p.Now}
 	return nil

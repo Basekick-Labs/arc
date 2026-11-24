@@ -101,18 +101,22 @@ query: in a test against a local SeaweedFS, about 7 ms more per small query (a q
 query that reads many rows.
 ## Fix: on a cluster, a re-home job does not start under a backup running on another node ([#1857](https://github.com/Basekick-Labs/arc/issues/1857))
 
-**Who is affected:** clusters sharing one object store that run re-home jobs (#1825).
+**Who is affected:** clusters sharing one object store with re-home enabled (#1825): every backup,
+restore and backup deletion there.
 
 A backup or restore kept re-home jobs out only on the node it ran on. After a failover, a job the
 new primary writer started could move a file the backup on the former one was copying, leaving the
-backup with the file and the files replacing it, or neither. A backup or restore now records itself
-in the cluster (renewed while it runs, ignored 90 seconds after its node stops renewing it), and a
-job is not staged while one runs anywhere; a backup still refuses to start while a job runs. A
-backup that cannot record itself (no cluster leader) is refused.
+backup with the file and the files replacing it, or neither. A backup, a restore and a backup
+deletion now record themselves in the cluster (renewed every 30 seconds, ignored 90 seconds after
+the last renewal; `GET /api/v1/cluster` lists them under `rehome.backups`), and a job is not staged
+while one is recorded anywhere; a backup still refuses to start while a job runs. One that cannot
+record itself (no cluster leader) is refused. The renewals compare clocks of different nodes: keep
+them in sync.
 
 Also: a DELETE that started on a former primary cannot register its rewrite of a file a job is
 moving (the cluster refuses it), but could leave the rewrite's object in storage, read beside the
-job's new files. The job now removes such an object before it removes the file.
+job's new files. The job now removes such objects before it removes the file and again before it
+ends; one that lands later is removed by that DELETE's own cleanup.
 
 ## Fix: on a cluster sharing one object store, a query no longer counts a compaction's rows twice ([#1852](https://github.com/Basekick-Labs/arc/issues/1852))
 
@@ -224,6 +228,10 @@ Not handled in this version:
   marks itself in the cluster, and no job is staged while one runs on any node; a DELETE rewrite of
   the file that a former primary started, which the cluster refuses to register, has its leftover
   object removed before the file is.)
+- A backup on a node cut off from the cluster leader for longer than 90 seconds loses its mark
+  ([#1857](https://github.com/Basekick-Labs/arc/issues/1857)): a job may then start under it. The
+  node logs an Error saying so; take that backup again. Retention and DELETE started on a former
+  primary fail safe: the cluster refuses their change to the job's file.
 - An Arrow IPC stream, and the arcx engine's streamed or shadowed reads, can still be reading
   after their request's handler returned, and an ack does not wait for them: such a read fails if
   its file is deleted, it does not return wrong rows. Schema reads (`getMeasurementSchema`) are not

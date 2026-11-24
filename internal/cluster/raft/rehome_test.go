@@ -2,6 +2,7 @@ package raft
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"reflect"
 	"testing"
@@ -714,4 +715,22 @@ func TestBackupMarkEndAndNodeRemoval(t *testing.T) {
 		t.Fatal("a removed node's mark is kept")
 	}
 	x.refused(CommandBackupMark, BackupMarkPayload{ID: "b3", Node: "nobody", Now: t0})
+}
+
+// A renew of a lapsed mark is refused: it does not come back over a job
+// staged meanwhile.
+func TestBackupMarkRenewAfterLapse(t *testing.T) {
+	x := rhFSM(t)
+	x.ok(CommandBackupMark, BackupMarkPayload{ID: "b1", Node: "w2", Now: t0})
+	x.ok(CommandBackupMark, BackupMarkPayload{ID: "b1", Node: "w2", Now: t0.Add(BackupMarkLease / 3), Renew: true})
+	late := t0.Add(BackupMarkLease/3 + BackupMarkLease)
+	stage := rhStage("j1")
+	stage.Now = late
+	x.ok(CommandStageRehome, stage)
+	res := x.apply(CommandBackupMark, BackupMarkPayload{ID: "b1", Node: "w2", Now: late, Renew: true})
+	if err, _ := res.(error); err == nil || !errors.Is(err, ErrBackupMarkLapsed) {
+		t.Fatalf("renew after lapse: %v", res)
+	}
+	// Another node cannot end it, and a begin is not a renew.
+	x.refused(CommandBackupMark, BackupMarkPayload{ID: "b2", Node: "w2", Now: late, Renew: true})
 }

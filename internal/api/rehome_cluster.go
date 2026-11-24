@@ -464,6 +464,12 @@ func (h *RehomeHandler) driveCluster(ctx context.Context, id string, files map[s
 				err = werr
 				break
 			}
+			// Again, for a rewrite from a former primary that landed after
+			// the sweep at latched (#1857).
+			if derr := h.removeUnregisteredRewrites(bg, j.Source.Path); derr != nil {
+				err = derr
+				break
+			}
 			err = h.clusterErr(c.RehomeEnd(bg, id))
 			if err == nil {
 				h.forgetDropped(id)

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -256,6 +257,9 @@ type RehomeStatus struct {
 	Enabled  bool              `json:"enabled"`
 	Jobs     []RehomeJobStatus `json:"jobs,omitempty"`
 	Blocking []string          `json:"blocking_nodes,omitempty"`
+	// Backups: backups or restores running on any node (#1857); no job is
+	// staged while one is renewed within raft.BackupMarkLease.
+	Backups []raft.BackupMark `json:"backups,omitempty"`
 }
 
 // RehomeJobStatus is one job in the status view.
@@ -281,6 +285,7 @@ func (c *Coordinator) RehomeStatus() RehomeStatus {
 		return st
 	}
 	st.Enabled = fsm.RehomeEnabled()
+	st.Backups = fsm.BackupMarks()
 	for _, j := range fsm.RehomeJobs() {
 		st.Jobs = append(st.Jobs, RehomeJobStatus{
 			ID: j.ID, Source: j.Source.Path, State: j.State, Outputs: len(j.Outputs),
@@ -321,36 +326,62 @@ func (c *Coordinator) isMember(id string) bool {
 // BeginBackupMark records in the cluster that a backup or restore runs here
 // (#1857): no re-home job is staged while it does, on any node. The mark is
 // renewed until release, which ends it. An error: the mark could not be
-// recorded, and the caller should not start.
+// recorded, and the caller should not start. Nothing is recorded while
+// re-home is off (no job can be staged; and an older leader would refuse the
+// command).
 func (s *RehomeSource) BeginBackupMark(ctx context.Context) (release func(), err error) {
 	if s == nil || s.c == nil || s.c.raftNode == nil {
 		return func() {}, nil
 	}
 	c := s.c
+	if fsm := c.raftNode.FSM(); fsm == nil || !fsm.RehomeEnabled() {
+		return func() {}, nil
+	}
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return nil, err
 	}
 	id := hex.EncodeToString(b[:])
-	propose := func(ctx context.Context, end bool) error {
-		raw, err := json.Marshal(raft.BackupMarkPayload{ID: id, Node: c.LocalNodeID(), Now: time.Now().UTC(), End: end})
+	propose := func(ctx context.Context, renew, end bool) error {
+		raw, err := json.Marshal(raft.BackupMarkPayload{ID: id, Node: c.LocalNodeID(), Now: time.Now().UTC(), Renew: renew, End: end})
 		if err != nil {
 			return err
 		}
 		return c.applyOrForward(ctx, &raft.Command{Type: raft.CommandBackupMark, Payload: raw})
 	}
-	if err := propose(ctx, false); err != nil {
+	if err := propose(ctx, false, false); err != nil {
 		return nil, fmt.Errorf("record the backup in the cluster: %w", err)
 	}
 	// This node's record catches up past the mark, so the caller's check
 	// for jobs (after this) sees any job staged before the mark: a job and a
 	// backup each record themselves, then look for the other.
 	if err := c.SyncManifest(ctx); err != nil {
-		_ = propose(context.WithoutCancel(ctx), true)
+		_ = propose(context.WithoutCancel(ctx), false, true)
 		return nil, fmt.Errorf("sync with the cluster after recording the backup: %w", err)
 	}
-	stop := make(chan struct{})
+	renew := func() bool {
+		rctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		err := propose(rctx, true, false)
+		if err == nil {
+			return true
+		}
+		if strings.Contains(err.Error(), raft.ErrBackupMarkLapsed.Error()) {
+			c.logger.Error().Str("mark", id).
+				Msg("This node's backup mark lapsed while the backup ran (the node lost the cluster for longer than its lease): a re-home job may have moved files under it; check the backup, or take it again")
+			return false
+		}
+		c.logger.Warn().Err(err).Str("mark", id).Msg("Renewing this node's backup mark failed; retrying")
+		return true
+	}
+	// Once now: the sync may have taken a good part of the lease.
+	alive := renew()
+	stop, stopped := make(chan struct{}), make(chan struct{})
 	go func() {
+		defer close(stopped)
+		if !alive {
+			return
+		}
 		t := time.NewTicker(raft.BackupMarkLease / 3)
 		defer t.Stop()
 		for {
@@ -358,11 +389,9 @@ func (s *RehomeSource) BeginBackupMark(ctx context.Context) (release func(), err
 			case <-stop:
 				return
 			case <-t.C:
-				rctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				if err := propose(rctx, false); err != nil {
-					c.logger.Warn().Err(err).Str("mark", id).Msg("Renewing this node's backup mark failed; re-home jobs may start if it lapses")
+				if !renew() {
+					return
 				}
-				cancel()
 			}
 		}
 	}()
@@ -370,9 +399,10 @@ func (s *RehomeSource) BeginBackupMark(ctx context.Context) (release func(), err
 	return func() {
 		once.Do(func() {
 			close(stop)
+			<-stopped // no renew lands after the end
 			rctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			if err := propose(rctx, true); err != nil {
+			if err := propose(rctx, false, true); err != nil {
 				c.logger.Warn().Err(err).Str("mark", id).Msg("Ending this node's backup mark failed; it lapses on its own")
 			}
 		})

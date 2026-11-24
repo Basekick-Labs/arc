@@ -601,3 +601,22 @@ func TestClusterRemovesAnUnregisteredRewrite1857(t *testing.T) {
 	}
 	r.requireOnce("after the swap")
 }
+
+// A registered sibling of the source is not touched by the sweep.
+func TestClusterKeepsARegisteredSibling1857(t *testing.T) {
+	r := newClusterRig(t)
+	h := &RehomeHandler{storage: r.store, logger: r.h.logger, swap: r.swap}
+	sib := strings.TrimSuffix(r.key, ".parquet") + "_rewrite_2.parquet"
+	if err := r.store.WriteReader(context.Background(), sib, strings.NewReader("kept"), 4); err != nil {
+		t.Fatal(err)
+	}
+	r.c.must(raft.CommandRegisterFile, raft.RegisterFilePayload{File: raft.FileEntry{
+		Path: sib, SHA256: "s", SizeBytes: 4, Database: "db", Measurement: "cpu",
+		PartitionTime: time.Date(2026, 11, 18, 23, 0, 0, 0, time.UTC), OriginNodeID: "w1", Tier: "hot", CreatedAt: time.Now()}})
+	if err := h.removeUnregisteredRewrites(context.Background(), r.key); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := r.store.StatFile(context.Background(), sib); n != 4 {
+		t.Fatal("a registered sibling was removed")
+	}
+}
