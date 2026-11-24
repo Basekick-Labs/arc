@@ -1574,11 +1574,11 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	// are in memory (internal/readgate). A job that swaps files waits for
 	// it: a run that bound after the swap with the exclusions from before it
 	// would aggregate without the swapped rows and write that back for good.
-	leaveRead := h.reads.Enter()
+	entered, leaveRead := h.reads.EnterAt()
 	defer leaveRead()
 	// Stopped if this node loses its cluster read lease (readgate.Bind).
 	ctx, cancelRead := context.WithCancel(ctx)
-	defer h.reads.Bind(cancelRead)()
+	defer h.reads.Bind(entered, ctx, cancelRead)()
 	wrappedQuery := wrapSourceMeasurement(query, cq.Database, cq.SourceMeasurement, h.sourceRead(ctx, cq, measurementPath))
 
 	h.logger.Debug().Str("query", sqlutil.ForLog(wrappedQuery)).Msg("Executing wrapped query")

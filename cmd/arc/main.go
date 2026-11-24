@@ -4705,6 +4705,43 @@ func main() {
 		}
 		rehomeLeaseLost.Store(&stopReads)
 		rehomeLeaseSynced.Store(&resumeReads)
+		// Staged compaction's read fences (#1852): this node's part of a
+		// fence (drop the caches a phase needs, wait for the reads from
+		// before, drop again), and the pruner's caches bumped the first
+		// time a read here sees a job switched to its output.
+		dropFor := func(outputs []clusterraft.FileEntry) {
+			if len(outputs) == 0 {
+				return
+			}
+			measurements := map[[2]string]bool{}
+			for _, o := range outputs {
+				queryHandler.FilePublished(o.Database, o.Measurement, o.PartitionTime)
+				measurements[[2]string{o.Database, o.Measurement}] = true
+			}
+			for m := range measurements {
+				// An hour that is never the current one moves the
+				// measurement's stamp, as re-home does.
+				queryHandler.FilePublished(m[0], m[1], time.Unix(0, 0).UTC())
+			}
+			db.ClearHTTPCache()
+			queryHandler.InvalidateCaches()
+		}
+		clusterCoordinator.SetReadFenceFunc(func(ctx context.Context, outputs []clusterraft.FileEntry) error {
+			dropFor(outputs)
+			reads := queryHandler.Reads()
+			if err := reads.Wait(ctx, reads.Flip()); err != nil {
+				return err
+			}
+			if n := reads.Hung(); n > 0 {
+				log.Error().Int("hung_reads", n).
+					Msg("Queries on this node outlived their deadline by more than 30 s inside the query engine; compaction no longer waits for them. They fail if a file they read was removed")
+			}
+			dropFor(outputs)
+			return nil
+		})
+		clusterCoordinator.SetOnCompactionSwitched(func(o clusterraft.FileEntry) {
+			queryHandler.FilePublished(o.Database, o.Measurement, o.PartitionTime)
+		})
 	}
 	if rehomeClusterInScope {
 		// The driver, on the primary writer.

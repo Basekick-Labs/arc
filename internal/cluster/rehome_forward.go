@@ -60,3 +60,33 @@ func rehomeCommandSpeaksFor(cmd *clusterraft.Command, nodeID string) error {
 	}
 	return nil
 }
+
+// fenceCommandSpeaksFor checks a forwarded fence command names the requesting
+// node: a fence's node (never a waiver: only the leader waives, on its own
+// log), an advance's by.
+func fenceCommandSpeaksFor(cmd *clusterraft.Command, nodeID string) error {
+	switch cmd.Type {
+	case clusterraft.CommandReadFence:
+		var p clusterraft.ReadFencePayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.Waived {
+			return fmt.Errorf("a waived read fence is never forwarded")
+		}
+		if p.Node == "" || p.Node != nodeID {
+			return fmt.Errorf("read fence for %q, not the requesting node", p.Node)
+		}
+	case clusterraft.CommandAdvanceCompaction:
+		var p clusterraft.AdvanceCompactionPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return err
+		}
+		if p.By == "" || p.By != nodeID {
+			return fmt.Errorf("compaction advance by %q, not the requesting node", p.By)
+		}
+	default:
+		return fmt.Errorf("command %d is not a read fence command", cmd.Type)
+	}
+	return nil
+}

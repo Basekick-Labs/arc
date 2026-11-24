@@ -120,9 +120,9 @@ func TestConcurrentReads(t *testing.T) {
 func TestCancelAllCancelsBoundReads(t *testing.T) {
 	var g Gate
 	ctx1, cancel1 := context.WithCancel(context.Background())
-	done1 := g.Bind(cancel1)
+	done1 := g.Bind(Entry{}, nil, cancel1)
 	ctx2, cancel2 := context.WithCancel(context.Background())
-	done2 := g.Bind(cancel2)
+	done2 := g.Bind(Entry{}, nil, cancel2)
 	done2() // finished before the cancel: unbound
 	g.CancelAll()
 	select {
@@ -136,7 +136,7 @@ func TestCancelAllCancelsBoundReads(t *testing.T) {
 	}
 	// Bound while closed: cancelled at once.
 	ctxC, cancelC := context.WithCancel(context.Background())
-	doneC := g.Bind(cancelC)
+	doneC := g.Bind(Entry{Epoch: 1}, nil, cancelC)
 	if ctxC.Err() == nil {
 		t.Fatal("a read bound after CancelAll and before Reopen ran")
 	}
@@ -144,7 +144,7 @@ func TestCancelAllCancelsBoundReads(t *testing.T) {
 	g.Reopen()
 	// Bound after the reopen: not cancelled by the earlier call.
 	ctx3, cancel3 := context.WithCancel(context.Background())
-	done3 := g.Bind(cancel3)
+	done3 := g.Bind(Entry{Epoch: 2}, nil, cancel3)
 	defer done3()
 	time.Sleep(10 * time.Millisecond)
 	if ctx3.Err() != nil {
@@ -157,8 +157,60 @@ func TestCancelAllCancelsBoundReads(t *testing.T) {
 		t.Fatal("a second CancelAll did not cancel")
 	}
 	var nilGate *Gate
-	if nilGate.Bind(nil) != nil {
+	if nilGate.Bind(Entry{}, nil, nil) != nil {
 		t.Fatal("nil cancel bound")
 	}
 	nilGate.CancelAll()
+}
+
+// A read that entered before CancelAll stays cancelled at its Bind, even
+// after Reopen: its exclusions are from before what the node missed.
+func TestReadFromBeforeCancelAllStaysCancelled(t *testing.T) {
+	var g Gate
+	old, leave := g.EnterAt()
+	defer leave()
+	g.CancelAll()
+	g.Reopen()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := g.Bind(old, ctx, cancel)
+	defer done()
+	if ctx.Err() == nil {
+		t.Fatal("a read from before CancelAll ran after Reopen")
+	}
+	fresh, leave2 := g.EnterAt()
+	defer leave2()
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	done2 := g.Bind(fresh, ctx2, cancel2)
+	defer done2()
+	if ctx2.Err() != nil {
+		t.Fatal("a read from after the reopen was cancelled")
+	}
+}
+
+// A read whose context ended HungAfter ago and that has not left no longer
+// holds a Wait; one still within its deadline does.
+func TestWaitSkipsHungReads(t *testing.T) {
+	old := HungAfter
+	HungAfter = 50 * time.Millisecond
+	defer func() { HungAfter = old }()
+	var g Gate
+	e, leave := g.EnterAt()
+	defer leave()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := g.Bind(e, ctx, cancel)
+	defer done()
+	ended := g.Flip()
+	wctx, wcancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	if err := g.Wait(wctx, ended); err == nil {
+		t.Fatal("a live read did not hold the wait")
+	}
+	wcancel()
+	done() // cancelled through the gate (a client that went away); it does not leave
+	start := time.Now()
+	if err := g.Wait(context.Background(), ended); err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) > 3*time.Second || g.Hung() != 1 {
+		t.Fatalf("waited %v, hung %d", time.Since(start), g.Hung())
+	}
 }

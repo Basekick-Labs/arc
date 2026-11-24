@@ -140,7 +140,7 @@ var errSourceRetired = errors.New("source file was retired by a concurrent delet
 // publish a replacement the job knows nothing of, beside the files the job
 // writes. The file is left as it is and the response says so; the DELETE can
 // be sent again once the job has ended.
-var errFileBeingRehomed = errors.New("the file is being re-homed; retry once that job has ended")
+var errFileBeingRehomed = errors.New("the file is being re-homed or compacted; retry once that job has ended")
 
 // parquetRowGroupSize is the row group size used for Parquet rewrites during delete operations.
 // Matches compaction's row group size to limit DuckDB's internal write buffer per group.

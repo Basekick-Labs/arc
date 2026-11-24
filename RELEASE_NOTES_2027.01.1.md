@@ -64,6 +64,48 @@ outage too.
 Clusters on local storage (which replicate files and have their own opt-in gate,
 `cluster.query_gate_on_catchup`) and standalone nodes are unchanged.
 
+## Fix: on a cluster sharing one object store, a query no longer counts a compaction's rows twice ([#1852](https://github.com/Basekick-Labs/arc/issues/1852))
+
+**Who is affected:** clusters whose primary storage is S3, Azure or GCS, with compaction on.
+
+When a compaction finished on such a cluster, it copied its output into place and deleted its
+inputs without waiting for queries on other nodes. A query that started just before could read
+the inputs and the output together, counting those rows twice, or fail on an input deleted
+under it. Reproduced on a 5-node SeaweedFS cluster: during 10 hourly compactions, every query node
+returned wrong totals at least once, and a node that had just restarted did so 66 times.
+
+Each step of a compaction now waits until every node has finished the queries that started under
+the previous step, and has dropped the caches that may remember the old files, so no query counts a
+compaction's rows twice or misses them (a query still running when the inputs are deleted can still
+fail and ask to be retried):
+
+1. the output is copied into place while every node still reads the inputs and leaves the output
+   out;
+2. every node drops its caches; then queries switch to the output and leave the inputs out;
+3. the input objects are deleted; every node drops its caches; then the job ends.
+
+- **A node that is down does not hold compaction up.** A node the leader has not heard from for
+  30 seconds is skipped: it has lost its read lease, which cancels its queries, and it re-syncs
+  and drops its caches before it serves queries again. A node that is skipped while it was in fact
+  reading cancels its queries and re-syncs as if it had lost its lease.
+- **What waits:** a compaction now takes at least as long as the longest query running on any
+  node while it finishes. While it finishes, a DELETE of its files and a database delete are
+  refused (retry once it ends), retention leaves its files for its next run, and a backup or a
+  restore is refused. A query stuck inside the query engine more than 30 seconds past its own
+  deadline is not waited for (it is logged; it fails if its files are removed).
+- **Queries cancelled by a lease loss stay cancelled** after the lease is retaken, so a query that
+  started before a node lost contact never reads with what it knew before.
+- **With `query.enable_s3_cache` on:** clearing DuckDB's HTTP cache while queries read it makes some
+  of them fail with an internal error, or hang inside DuckDB; this happens without this change too
+  ([#1861](https://github.com/Basekick-Labs/arc/issues/1861)). Totals stay right; a hung query
+  delays compaction until 30 seconds after its own deadline, or for as long as it hangs with
+  `query.timeout = 0` and a client that stays connected.
+- **What shows it:** `GET /api/v1/cluster`, `compaction_commit.read_fences_enabled` and, while a
+  compaction waits, `read_fences_behind` (the nodes it waits for).
+- **Rolling upgrade:** the change turns on once every node runs this release, like compaction
+  commit; a node on an older release is then refused at join. Compactions that were finishing when
+  it turned on finish the earlier way.
+
 ## New: moving a misfiled file's rows on a cluster whose nodes share one object store ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
 
 **Who is affected:** clusters whose primary storage is S3, Azure or GCS, with tiered storage,

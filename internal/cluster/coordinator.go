@@ -171,6 +171,10 @@ type Coordinator struct {
 	rehomePart   atomic.Pointer[RehomeParticipantFunc]
 	rehomeNotify chan struct{}
 	rehomeSteps  rehomeSteps
+	// Compaction read fences (#1852, compaction_fences.go): the flag's join
+	// gate and this node's part of a fence.
+	fencesGate compactionFencesGate
+	fenceFn    atomic.Pointer[ReadFenceFunc]
 	// Read lease hooks (SetReadLeaseHooks).
 	onReadLeaseLost atomic.Pointer[func()]
 	onReadSynced    atomic.Pointer[func()]
@@ -886,6 +890,7 @@ func (c *Coordinator) Start() error {
 		go c.coldMarkLoop(c.ctx)
 		go c.rehomeEnableLoop(c.ctx)
 		c.startRehomeParticipant(c.ctx)
+		c.startCompactionFences(c.ctx)
 	}
 	// The staged compaction commit on an object store (#1207 d2a2b): the
 	// leader aborts jobs of a compactor that is gone, and committed jobs are
@@ -2426,10 +2431,23 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 			c.sendJoinError(conn, req, rhWhy)
 			return
 		}
+		cfWhy, cfRelease := c.compactionFencesJoinGate(req)
+		if cfWhy != "" {
+			rhRelease()
+			cmRelease()
+			cpRelease()
+			ccRelease()
+			release()
+			c.logger.Error().Str("node_id", req.NodeID).Str("role", req.Role).Str("reason", cfWhy).
+				Msg("Join refused: the node does not support compaction read fences")
+			c.sendJoinError(conn, req, cfWhy)
+			return
+		}
 		joinGateReleased := false
 		releaseGate := func() {
 			if !joinGateReleased {
 				joinGateReleased = true
+				cfRelease()
 				rhRelease()
 				cmRelease()
 				cpRelease()

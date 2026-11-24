@@ -41,6 +41,9 @@ func (c *Coordinator) localCapabilities() []string {
 	// Re-home (#1825) applies its rules in every build; whether this node's
 	// configuration lets a job run is its own capability.
 	caps = append(caps, raft.CapabilityRehome)
+	// Compaction read fences (#1852): every build applies and keeps them,
+	// whatever the node's role.
+	caps = append(caps, raft.CapabilityCompactionFences)
 	if c.rehomeInScope.Load() {
 		caps = append(caps, raft.CapabilityRehomeInScope)
 	}

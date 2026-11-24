@@ -290,3 +290,24 @@ func TestStartReadLeaseOnASharedStore1852(t *testing.T) {
 		t.Fatalf("%v %q", ok, why)
 	}
 }
+
+// A drop while a sync runs: the sync grants nothing, and the next step syncs
+// again (its hook reopens the gate the drop closed).
+func TestReadLeaseDropDuringSync1852(t *testing.T) {
+	var l *readLease
+	syncs := 0
+	l = newReadLease(func() bool { return true }, func() time.Time { return time.Now() }, func() string { return "self" },
+		func(context.Context) error {
+			syncs++
+			if syncs == 1 {
+				l.drop("waived")
+			}
+			return nil
+		})
+	if l.step(context.Background()) {
+		t.Fatal("granted by a sync a drop overlapped")
+	}
+	if !l.step(context.Background()) || syncs != 2 {
+		t.Fatalf("not granted on the next sync (syncs %d)", syncs)
+	}
+}

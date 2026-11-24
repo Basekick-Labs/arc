@@ -824,7 +824,7 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		release, ok := h.rehomeBlock(name + "/")
 		if !ok {
 			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
-				"error": "A re-home job is in flight on a file of database '" + name + "' (GET /api/v1/rehome); retry once it has ended",
+				"error": "A re-home job, or a compaction being finished on the cluster, is in flight on a file of database '" + name + "' (GET /api/v1/rehome, GET /api/v1/cluster); retry once it has ended",
 			})
 		}
 		defer release()
