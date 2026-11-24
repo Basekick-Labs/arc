@@ -90,7 +90,9 @@ func (c *Coordinator) deferRehomeUnlink(item deleteRequest) bool {
 // shared store the source is one object the job's driver removes. Called on
 // the apply goroutine: a queue append only.
 func (c *Coordinator) rehomeEndedUnlink(j raft.RehomeJob) {
-	if c.storage == nil || c.storage.Type() != "local" || j.Source.Path == "" {
+	// The delete workers run, with their check that the manifest no longer
+	// lists the path, only where local copies are kept (replication on).
+	if c.storage == nil || c.storage.Type() != "local" || j.Source.Path == "" || c.deleteManifestRelisted == nil {
 		return
 	}
 	c.enqueueLocalDelete(j.Source.Path, "rehome-ended:"+j.ID)
