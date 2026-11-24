@@ -612,3 +612,24 @@ func TestRehomeBeforePullRecordsTheJob1860(t *testing.T) {
 		t.Fatalf("not recorded before an output landed (%v)", err)
 	}
 }
+
+// #1763: a file this node gains from another reaches its query caches, named
+// by its manifest entry.
+func TestFilePublishedReportsAPulledFile(t *testing.T) {
+	c := originRig(t, "writer-1", RoleWriter)
+	in := makeFileEntry("testdb/cpu/2026/10/12/10/x.parquet", []byte("x"), "writer-2")
+	in.CreatedAt = time.Now()
+	if err := c.raftNode.RegisterFile(in, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	c.SetFilePublished(func(db, m string, at time.Time) { got = append(got, db+"/"+m+"@"+at.UTC().Format("2006-01-02T15")) })
+	c.recordPulledFileInTiering(in.Path, in.SizeBytes)
+	if len(got) != 1 || got[0] != "testdb/cpu@"+in.PartitionTime.UTC().Format("2006-01-02T15") {
+		t.Fatalf("reported %v", got)
+	}
+	c.recordPulledFileInTiering("testdb/cpu/2026/10/12/10/not-registered.parquet", 1)
+	if len(got) != 1 {
+		t.Fatal("reported a file the manifest does not list")
+	}
+}

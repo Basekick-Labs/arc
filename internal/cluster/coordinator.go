@@ -171,6 +171,9 @@ type Coordinator struct {
 	rehomePart   atomic.Pointer[RehomeParticipantFunc]
 	rehomeNotify chan struct{}
 	rehomeSteps  rehomeSteps
+	// filePublished tells this node's query caches about a file it gained
+	// (SetFilePublished, #1763).
+	filePublished atomic.Pointer[func(database, measurement string, partitionTime time.Time)]
 	// rehomeLocalExclusions: re-home exclusions come from this node's own
 	// records only (SetRehomeLocalExclusions, #1860).
 	rehomeLocalExclusions atomic.Bool
@@ -1345,6 +1348,10 @@ func (c *Coordinator) tierRecorderSnapshot() TierRecorder {
 // tiering, so this return value is what distinguishes the two.
 func (c *Coordinator) recordPulledFileInTiering(path string, sizeBytes int64) bool {
 	c.noteLocalRegistered(path)
+	// A file that landed here, readable from now: this node's query caches
+	// must not keep an answer made without it (#1763), whether or not this
+	// node keeps tier metadata.
+	c.reportFilePublished(path)
 	// A DELETE rewrite landing lets its old file's unlink go ahead.
 	c.wakeDeferredFamily(path)
 	// And lets the export drop the original in favour of it (#1728). Asked
@@ -1430,8 +1437,11 @@ func (c *Coordinator) startSharedManifestCallbacks() {
 		return
 	}
 	// A path the manifest lists again is no longer a pending delete here.
+	// And a registered file is readable here at once (the writer stored it
+	// before registering): this node's query caches learn of it (#1763).
 	fsm.SetFileCallbacks(func(entry *raft.FileEntry) {
 		c.forgetLocalDeleted(entry.Path)
+		c.reportFilePublishedEntry(entry)
 	}, c.observeSharedManifestDelete)
 	c.logger.Info().Str("backend", c.storage.Type()).
 		Msg("Shared-storage manifest delete callback registered (no peer puller)")
@@ -5952,4 +5962,38 @@ func (c *Coordinator) GetFileManifestByDatabase(database string) []*raft.FileEnt
 		return nil
 	}
 	return fsm.GetFilesByDatabase(database)
+}
+
+// SetFilePublished sets what tells this node's query caches about a file it
+// gained from another node (QueryHandler.FilePublished, #1763): one a peer
+// registered on a shared store, one this node's puller landed on local
+// storage. The writer's own flush reports its files itself (#1757). Called
+// on the Raft apply goroutine and from snapshot restore: fn must be O(1) and
+// never block.
+func (c *Coordinator) SetFilePublished(fn func(database, measurement string, partitionTime time.Time)) {
+	if c != nil && fn != nil {
+		c.filePublished.Store(&fn)
+	}
+}
+
+// reportFilePublished reports the file at path, named by its manifest entry.
+func (c *Coordinator) reportFilePublished(path string) {
+	if c.filePublished.Load() == nil || c.raftNode == nil {
+		return
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return
+	}
+	if e, ok := fsm.GetFile(path); ok {
+		c.reportFilePublishedEntry(e)
+	}
+}
+
+func (c *Coordinator) reportFilePublishedEntry(e *raft.FileEntry) {
+	p := c.filePublished.Load()
+	if p == nil || e == nil || e.Database == "" || e.Measurement == "" {
+		return
+	}
+	(*p)(e.Database, e.Measurement, e.PartitionTime)
 }
