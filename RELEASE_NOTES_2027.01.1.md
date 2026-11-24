@@ -10,8 +10,9 @@
 for that measurement, so its own queries read the row at once. Other nodes kept answering without it
 for up to 30 seconds (any query) or 60 seconds (a repeated query text). Each node now does the same
 when it gains a file from another node: when its puller lands it (local storage), or when the cluster
-registers it (shared object store). Measured on a reader of a three-node cluster with local storage:
-a late row read 25–85 seconds after its flush before, 0.1 seconds after.
+registers it (shared object store). Compaction outputs and DELETE rewrites are not reported: they
+replace files of an hour that already had some. Measured on a reader of a three-node cluster with
+local storage: a late row read 25–85 seconds after its flush before, 0.1 seconds after.
 
 ## Change: a re-home dry run runs while a re-home job waits for the Iceberg export ([#1845](https://github.com/Basekick-Labs/arc/issues/1845))
 

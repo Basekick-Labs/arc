@@ -5995,5 +5995,12 @@ func (c *Coordinator) reportFilePublishedEntry(e *raft.FileEntry) {
 	if p == nil || e == nil || e.Database == "" || e.Measurement == "" {
 		return
 	}
+	// A compaction output or a DELETE rewrite replaces files of an hour that
+	// already had some: no cached "this hour is empty" answer can be wrong
+	// for it, and reporting it would cost every node its cached answers for
+	// the measurement on every compaction.
+	if e.CompactionJob != "" || rewriteStamp(e.Path) > 0 {
+		return
+	}
 	(*p)(e.Database, e.Measurement, e.PartitionTime)
 }
