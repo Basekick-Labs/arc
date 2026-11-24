@@ -515,7 +515,7 @@ var errRehomeAckTimeout = errors.New("not every node acked the job's state in ti
 func (h *RehomeHandler) waitClusterAcks(ctx context.Context, j raft.RehomeJob, limit time.Duration) error {
 	c := h.swap.Cluster
 	start := time.Now()
-	logged := time.Time{}
+	logged := start // the first warning after a minute of waiting
 	for {
 		cur, ok := c.RehomeJob(j.ID)
 		if !ok || cur.StateIndex != j.StateIndex {

@@ -64,6 +64,52 @@ outage too.
 Clusters on local storage (which replicate files and have their own opt-in gate,
 `cluster.query_gate_on_catchup`) and standalone nodes are unchanged.
 
+## New: moving a misfiled file's rows on a cluster whose nodes share one object store ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
+
+**Who is affected:** clusters whose primary storage is S3, Azure or GCS, with tiered storage,
+the Iceberg export and edge sync off on every node and stream takeover off. `POST
+/api/v1/rehome` (not a dry run) now runs there, on the primary writer; elsewhere on a cluster it
+is refused with the reason, as before.
+
+Every node reads the same bucket, so every node must agree, at every moment, on which side of the
+move its reads leave out. The job's steps are entries in the cluster's replicated state, and a step
+that changes what reads leave out waits for **every node to acknowledge** it has ended the reads
+that started before:
+
+1. The job is recorded (the outputs' keys, sizes and checksums). Nothing is written yet.
+2. Every node leaves the outputs out of reads and acks; the primary writer then uploads the
+   outputs to their final keys.
+3. Every node drops its query caches and acks.
+4. One entry registers the outputs and removes the file's manifest entry; every node leaves the
+   file out and reads the outputs, and acks.
+5. The file's object is deleted; every node drops its caches and acks. The job ends.
+
+At no step does a query on any node count a row twice or miss one.
+
+- **A node that stops answering** holds the job at its step. Before the outputs are in use, the
+  job reverts after 15 minutes. After, it waits; `GET /api/v1/cluster` (`rehome.jobs`) names the
+  nodes it waits for. Removing a node that is gone for good from the cluster lets the job go on
+  30 seconds later.
+- **A node that loses its read lease now cancels its queries in flight** (they fail as cancelled),
+  besides refusing new ones. That is what lets a job stop waiting for a removed node after a fixed
+  time. It applies on every node that takes part in jobs, whether or not one is running. Each
+  node also drops its query caches whenever it re-syncs with the leader.
+- **Failover.** A job whose driver stopped is taken up by the primary writer once its 5-minute
+  lease lapses (at once on the same node after a restart). Taken up before its outputs are in use,
+  it is reverted: only the node that split the file writes them. A reverted job keeps its output
+  keys out of reads for 20 minutes, in case a former driver's upload was still in flight.
+- **Refusals.** A job is refused while any node does not take part (an older release, or tiered
+  storage, the Iceberg export or edge sync on there), with stream takeover on, or for a file on
+  the cold tier; and a node that does not take part cannot join while a job is running. While a
+  job runs, a DELETE, retention, a database delete, a backup or a compaction of its files is
+  refused or leaves them alone, on any node.
+
+Not handled in this version: a backup still running on a former primary writer after a failover
+does not see a job the new one starts; an Arrow IPC stream can still be sending rows after its
+request's handler returned, and an ack does not wait for it (such a stream fails if its file is
+deleted, it does not return wrong rows); a cluster whose Raft leader is not a writer runs no
+job (reads stay right, the job waits).
+
 ## Change: a cluster records re-home jobs in its replicated state; an older build cannot join once every node supports it ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
 
 **Who is affected:** clusters. Standalone nodes are not. No job runs on a cluster yet (a
