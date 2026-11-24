@@ -17,26 +17,31 @@ import (
 // steps are Raft entries, and a step that changes what a node's reads must
 // leave out waits for every node to say it has drained the reads from before:
 //
-//	staged     the record: the source as the manifest has it, the outputs
-//	           uploaded under the staging root. Reads change nothing.
+//	staged     the record: the source as the manifest has it, the
+//	           outputs' keys, sizes and checksums (nothing is written yet). Reads
+//	           change nothing.
 //	committed  reads leave every output out by name and read the source.
 //	           Each node acks once its reads from before the apply ended.
-//	published  the outputs are at their final keys (the finisher copied
-//	           them); reads still leave them out. Each node acks once it has
+//	published  the outputs are at their final keys (the driver uploaded them
+//	           once every node acked committed); reads still leave them out. Each node acks once it has
 //	           dropped its query caches, which may remember their directories
 //	           as empty.
 //	latched    one entry: the outputs are registered, the source's entry is
 //	           deleted (reason rehome:<job>), and reads leave the source out
 //	           and read the outputs. Each node acks once its reads from before
-//	           ended. Then the source's object can go, and the job ends.
+//	           ended. Then the source's object can go.
+//	removed    the source's object is deleted; reads still leave it out. Each
+//	           node acks once it has dropped its caches (which may still name
+//	           the object) and its reads from before ended. Then the job ends.
 //	reverting  from staged, committed or published, before any storage is
 //	           deleted: reads go on leaving the outputs out while the finisher
 //	           deletes them.
 //	reverted   the outputs are deleted. Reads still leave them out, and their
-//	           keys stay owned, for RehomeRevertedGrace more: a copy by a
+//	           keys stay owned, for RehomeRevertedGrace more: an upload by a
 //	           finisher that lost its lease and did not know it can still land
-//	           in that time. Then the finisher deletes the keys again and ends
-//	           it.
+//	           in that time. Each node acks once it has dropped its caches and
+//	           its reads from before ended. Then the finisher deletes the keys
+//	           again and ends it.
 //
 // The FSM refuses an advance until every node the step waits for has acked
 // the current state, and refuses any manifest change to a path a job owns
@@ -69,6 +74,7 @@ const (
 	RehomeLatched   = "latched"
 	RehomeReverting = "reverting"
 	RehomeReverted  = "reverted"
+	RehomeRemoved   = "removed"
 )
 
 // Bounds on the replicated re-home state.
@@ -78,14 +84,14 @@ const (
 	// MaxRehomeOutputs bounds the outputs of one job, so its stage entry
 	// stays far under the forward frame.
 	MaxRehomeOutputs = 500
-	// RehomeStagedRoot is the reserved storage root of a job's uploaded
-	// outputs before they are copied to their final keys.
+	// RehomeStagedRoot names an output's StagedKey: reserved, never
+	// written (outputs are uploaded straight to their final keys).
 	RehomeStagedRoot = "_rehome_staged"
 	// maxRehomeStageBytes bounds a stage entry's encoded size, well under
 	// the forward frame (file_registrar.go).
 	maxRehomeStageBytes = 128 << 10
-	// RehomeCopyTimeout bounds one copy of an output to its final key: a
-	// driver must give up on a copy it began by then.
+	// RehomeCopyTimeout bounds one upload of an output to its final key: a
+	// driver gives up on an upload it began by then.
 	RehomeCopyTimeout = 10 * time.Minute
 	// RehomeRevertedGrace is how long a reverted job keeps its output keys
 	// owned and left out of reads: a driver that lost its lease without
@@ -177,9 +183,11 @@ type RehomeJob struct {
 	// FinisherNode holds the job's lease since ClaimedAt (proposer clock).
 	FinisherNode string    `json:"finisher_node,omitempty"`
 	ClaimedAt    time.Time `json:"claimed_at,omitempty"`
-	// Dropped is the nodes removed from the cluster while the current state
-	// waited for their ack. The driver waits for such a node to have stopped
-	// reading (the read lease, cluster/read_lease.go) before it goes on.
+	// Dropped is the nodes removed from the cluster, since the job was
+	// staged, while a state waited for their ack. Kept for the job's life:
+	// the driver waits for such a node to have stopped reading (it cancels
+	// its reads when it loses the read lease, cluster/read_lease.go) before
+	// any step after its removal.
 	Dropped []string `json:"dropped,omitempty"`
 	// RevertedAt is when a reverting job's outputs were deleted (the
 	// proposer's clock).
@@ -260,9 +268,9 @@ type ClaimRehomeFinisherPayload struct {
 	Now time.Time `json:"now"`
 }
 
-// EndRehomePayload ends a latched job (its source object and staged objects
-// deleted); moves a reverting one to reverted (its outputs and staged objects
-// deleted); and ends a reverted one RehomeRevertedGrace after that (its
+// EndRehomePayload ends a removed job (its source object deleted, every node
+// acked); moves a reverting one to reverted (its outputs deleted); and ends a
+// reverted one RehomeRevertedGrace after that, once every node acked (its
 // output keys deleted again).
 type EndRehomePayload struct {
 	Job string    `json:"job"`
@@ -278,7 +286,7 @@ type rehomeState struct {
 	Gen uint64 `json:"gen,omitempty"`
 }
 
-// RehomeStagedKey is where an output waits for its copy to its final key.
+// RehomeStagedKey is an output's reserved StagedKey (never written).
 func RehomeStagedKey(job string, i int) string {
 	return fmt.Sprintf("%s/%s/%06d.parquet", RehomeStagedRoot, job, i)
 }
@@ -288,12 +296,13 @@ var rehomeTransitions = map[string][]string{
 	RehomeStaged:    {RehomeCommitted, RehomeReverting},
 	RehomeCommitted: {RehomePublished, RehomeReverting},
 	RehomePublished: {RehomeLatched, RehomeReverting},
+	RehomeLatched:   {RehomeRemoved},
 }
 
 // rehomeNeedsAcks reports whether leaving state to to waits for every node's
 // ack of state. A revert does not: reads leave the outputs out throughout.
 func rehomeNeedsAcks(state, to string) bool {
-	return to != RehomeReverting && (state == RehomeCommitted || state == RehomePublished)
+	return to != RehomeReverting && (state == RehomeCommitted || state == RehomePublished || state == RehomeLatched)
 }
 
 func (f *ClusterFSM) applyEnableRehome(payload []byte, logIndex uint64) interface{} {
@@ -472,7 +481,13 @@ func (f *ClusterFSM) applyAdvanceRehome(payload []byte, logIndex uint64) interfa
 		f.mu.Unlock()
 		return &RehomeConflictError{Job: p.Job, Reason: RehomeWrongState}
 	}
-	if p.To != RehomeReverting {
+	if p.To == RehomeRemoved && f.compactionPause.Active && p.Now.Before(f.compactionPause.ExpiresAt) {
+		// The source's manifest entry is gone already: only its object is
+		// left to delete, which waits out a restore but not a past one.
+		f.mu.Unlock()
+		return &RehomeConflictError{Job: p.Job, Reason: RehomePaused}
+	}
+	if p.To != RehomeReverting && p.To != RehomeRemoved {
 		if f.compactionPause.Generation != j.PauseGen || (f.compactionPause.Active && p.Now.Before(f.compactionPause.ExpiresAt)) {
 			f.mu.Unlock()
 			return &RehomeConflictError{Job: p.Job, Reason: RehomePaused}
@@ -523,12 +538,9 @@ func (f *ClusterFSM) applyAdvanceRehome(payload []byte, logIndex uint64) interfa
 		}
 	}
 	j.State, j.StateIndex = p.To, logIndex
-	j.Acks, j.AckWanted, j.Dropped = nil, nil, nil
+	j.Acks, j.AckWanted = nil, nil
 	if p.To != RehomeReverting {
-		for id := range f.nodes {
-			j.AckWanted = append(j.AckWanted, id)
-		}
-		sort.Strings(j.AckWanted)
+		f.rehomeWaitForAllLocked(j)
 	}
 	f.rehomeChangedLocked(j, logIndex, true)
 	f.mu.Unlock()
@@ -618,7 +630,7 @@ func (f *ClusterFSM) applyEndRehome(payload []byte, logIndex uint64) interface{}
 		return &RehomeConflictError{Job: p.Job, Reason: RehomeNotFinisher}
 	}
 	switch j.State {
-	case RehomeLatched:
+	case RehomeRemoved:
 		if len(j.MissingAcks()) > 0 {
 			return &RehomeConflictError{Job: p.Job, Reason: RehomeAcksMissing}
 		}
@@ -627,11 +639,16 @@ func (f *ClusterFSM) applyEndRehome(payload []byte, logIndex uint64) interface{}
 			return errors.New("end re-home: now is required")
 		}
 		j.State, j.StateIndex, j.RevertedAt = RehomeReverted, logIndex, p.Now
+		j.Acks, j.AckWanted = nil, nil
+		f.rehomeWaitForAllLocked(j)
 		f.rehomeChangedLocked(j, logIndex, true)
 		return nil
 	case RehomeReverted:
 		if p.Now.Sub(j.RevertedAt) < RehomeRevertedGrace {
 			return &RehomeConflictError{Job: p.Job, Reason: RehomeTooSoon}
+		}
+		if len(j.MissingAcks()) > 0 {
+			return &RehomeConflictError{Job: p.Job, Reason: RehomeAcksMissing}
 		}
 	default:
 		return &RehomeConflictError{Job: p.Job, Reason: RehomeWrongState}
@@ -648,6 +665,15 @@ func (f *ClusterFSM) applyEndRehome(payload []byte, logIndex uint64) interface{}
 		f.pendingEvents = append(f.pendingEvents, func() { cb(c) })
 	}
 	return nil
+}
+
+// rehomeWaitForAllLocked makes the job's current state wait for every node
+// in the table.
+func (f *ClusterFSM) rehomeWaitForAllLocked(j *RehomeJob) {
+	for id := range f.nodes {
+		j.AckWanted = append(j.AckWanted, id)
+	}
+	sort.Strings(j.AckWanted)
 }
 
 // rehomeOutOfScopeLocked reports whether a job may not go on: stream
@@ -721,7 +747,7 @@ func (f *ClusterFSM) rehomeNodeRemovedLocked(id string, logIndex uint64) {
 			continue
 		}
 		j.AckWanted = kept
-		if !j.Acks[id] {
+		if !j.Acks[id] && !containsString(j.Dropped, id) {
 			j.Dropped = append(j.Dropped, id)
 		}
 		delete(j.Acks, id)
@@ -849,7 +875,7 @@ func (f *ClusterFSM) RehomeExcludedFor(prefix string) (keys []string, gen uint64
 			for _, o := range j.Outputs {
 				keys = append(keys, o.Key)
 			}
-		case RehomeLatched:
+		case RehomeLatched, RehomeRemoved:
 			keys = append(keys, j.Source.Path)
 		}
 	}
@@ -868,6 +894,41 @@ func (f *ClusterFSM) RehomeOpen(prefix string) bool {
 		}
 	}
 	return false
+}
+
+// RehomeOwnsUnder reports whether a job owns a path under prefix.
+func (f *ClusterFSM) RehomeOwnsUnder(prefix string) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if !f.rehomeEnabled {
+		return false
+	}
+	for p := range f.rehomePaths {
+		if strings.HasPrefix(p, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// RehomeOutOfScope returns why no job can go forward now, or "".
+func (f *ClusterFSM) RehomeOutOfScope() string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.streamClaims {
+		return "stream takeover is on in this cluster; moving a file's rows is not available with it in this version"
+	}
+	var out []string
+	for id, n := range f.nodes {
+		if !containsString(n.Capabilities, CapabilityRehomeInScope) {
+			out = append(out, id)
+		}
+	}
+	if len(out) > 0 {
+		sort.Strings(out)
+		return fmt.Sprintf("nodes %v do not take part in moving a file's rows (a release without it, or tiered storage, the Iceberg export or edge sync on there); not available until each does", out)
+	}
+	return ""
 }
 
 // RehomeJobsInFlight reports whether any job is in flight.

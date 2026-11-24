@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -28,14 +29,16 @@ import (
 // lease; a sync comes before reads resume. A new leader is synced with too,
 // while the node keeps serving: it was in contact throughout.
 //
-// What the lease does not bound: a read that passed the gate before the lease
-// ended runs on with the exclusions it read, for as long as the query runs;
-// and a node in contact may still be applying entries the leader has
+// A read that passed the gate before the lease ended: on a node wired for
+// re-home (every node of a cluster sharing an object store), losing the lease
+// cancels it, and any read that binds before the lease is taken again
+// (SetReadLeaseHooks, readgate.CancelAll). Elsewhere it runs on with the
+// exclusions it read, for as long as the query runs. What the lease does not
+// bound: a node in contact may still be applying entries the leader has
 // committed (the sync is a barrier when the lease is taken, not on every
-// read). A job that must know a lost node has stopped reading needs both
-// bounds: readLeaseTimeout plus the leader's own step-down time
-// (LeaderLeaseTimeout) plus readLeaseTick, and then the longest a read may
-// run.
+// read). A job that must know a lost node has stopped reading waits
+// readLeaseTimeout plus the leader's own step-down time (LeaderLeaseTimeout)
+// plus readLeaseTick, and the time a cancelled read takes to stop.
 //
 // A cluster on local storage replicates files instead, and has its own gate
 // (cluster.query_gate_on_catchup); standalone nodes have neither.
@@ -200,6 +203,53 @@ func (l *readLease) run(ctx context.Context) {
 	}
 }
 
+// runSyncedHook runs the synced hook until ctx ends. One run at a time: a
+// run that outlived its sync is waited for by the next.
+func (c *Coordinator) runSyncedHook(ctx context.Context, fn func()) error {
+	c.syncedHookMu.Lock()
+	prev := c.syncedHookDone
+	if prev == nil {
+		prev = make(chan struct{})
+		close(prev)
+	}
+	c.syncedHookMu.Unlock()
+	select {
+	case <-prev:
+	case <-ctx.Done():
+		return fmt.Errorf("dropping the query caches before taking the read lease: %w", ctx.Err())
+	}
+	done := make(chan struct{})
+	c.syncedHookMu.Lock()
+	c.syncedHookDone = done
+	c.syncedHookMu.Unlock()
+	go func() {
+		defer close(done)
+		fn()
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("dropping the query caches before taking the read lease: %w", ctx.Err())
+	}
+}
+
+// SetReadLeaseHooks sets what runs when this node loses its read lease
+// (lost: stop the reads in flight) and each time it has synced with the
+// leader, before it takes the lease (synced: drop its query caches). Both
+// must be quick. Call before Start.
+func (c *Coordinator) SetReadLeaseHooks(lost, synced func()) {
+	if c == nil {
+		return
+	}
+	if lost != nil {
+		c.onReadLeaseLost.Store(&lost)
+	}
+	if synced != nil {
+		c.onReadSynced.Store(&synced)
+	}
+}
+
 // ReadReady reports whether this node may serve reads, and if not, why
 // (read_lease.go). Always true where the lease does not apply: no Raft, or
 // storage that is not a shared object store.
@@ -218,7 +268,17 @@ func (c *Coordinator) startReadLease(ctx context.Context) {
 	}
 	rn := c.raftNode
 	l := newReadLease(rn.IsLeader, rn.LastContact, rn.LeaderID, func(ctx context.Context) error {
-		return c.waitForManifestSync(ctx, rn, readLeaseSyncTimeout)
+		if err := c.waitForManifestSync(ctx, rn, readLeaseSyncTimeout); err != nil {
+			return err
+		}
+		// Before the lease is taken: caches filled while this node was
+		// behind or cut off may name files the cluster has removed since
+		// (#1825). Bounded by the sync's deadline: the hook may wait for a
+		// pooled connection, and the lease loop must not stall on it.
+		if fn := c.onReadSynced.Load(); fn != nil {
+			return c.runSyncedHook(ctx, *fn)
+		}
+		return nil
 	})
 	l.onChange = func(held bool, why string) {
 		if held {
@@ -226,6 +286,12 @@ func (c *Coordinator) startReadLease(ctx context.Context) {
 			return
 		}
 		c.logger.Warn().Str("why", why).Msg("Read lease lost: this node refuses reads (503) until it has synced with the cluster leader again")
+		// And stops the reads in flight: a job that waits for this node
+		// once it is removed relies on it reading nothing within a fixed
+		// time of losing the leader (#1825).
+		if fn := c.onReadLeaseLost.Load(); fn != nil {
+			(*fn)()
+		}
 	}
 	c.readLease = l
 	go l.run(ctx)

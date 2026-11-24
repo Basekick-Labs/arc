@@ -34,6 +34,8 @@ func flightBenchDirect(ctx context.Context, s *flightSQLService, sql, database s
 	}
 	h := s.queryHandler
 	defer h.reads.Enter()()
+	ctx, cancel := context.WithCancel(ctx)
+	defer h.reads.Bind(cancel)()
 	converted, _, _, err := h.getTransformedSQLWithRefs(ctx, sql, database)
 	if err != nil {
 		return nil, nil, true, status.Error(codes.InvalidArgument, err.Error())

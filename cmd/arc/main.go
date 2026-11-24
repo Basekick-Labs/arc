@@ -1078,6 +1078,49 @@ func main() {
 		}
 		log.Warn().Err(seedErr).Int("try", try+1).Msg("Could not read the re-home job journal; trying again")
 	}
+	// On a cluster whose nodes share one object store, jobs run through the
+	// cluster record (#1825 slice 4b). Every such node reads what the record
+	// says to leave out, keeps off the files it owns and acks its states,
+	// whatever its configuration: a node restarted with tiering on stays in
+	// the Raft configuration, and must not read both sides of a job in flight.
+	// A node advertises that it can run under a job (rehomeCfgInScope) only
+	// with tiered storage, the Iceberg export and edge sync off.
+	rehomeSharedCluster := cfg.Cluster.Enabled && cluster.IsSharedObjectStore(storageBackend)
+	rehomeCfgInScope := rehomeSharedCluster &&
+		!cfg.TieredStorage.Enabled && !cfg.Iceberg.Enabled &&
+		!(cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Active() || cfg.EdgeSync.Spoke.Active())
+	// The cluster's side of ownership, bound once the coordinator runs:
+	// compaction is wired before it exists.
+	var rehomeClusterSrc atomic.Pointer[cluster.RehomeSource]
+	rehomeOwns := func(key string) bool {
+		if rehomeRegistry.Owns(key) {
+			return true
+		}
+		s := rehomeClusterSrc.Load()
+		return s != nil && s.Owns(key)
+	}
+	rehomeClaim := func(key string) (func(), bool) {
+		release, ok := rehomeRegistry.Claim(key)
+		if !ok {
+			return release, false
+		}
+		if s := rehomeClusterSrc.Load(); s != nil && s.Owns(key) {
+			release()
+			return func() {}, false
+		}
+		return release, true
+	}
+	rehomeBlock := func(prefix string) (func(), bool) {
+		release, ok := rehomeRegistry.Block(prefix)
+		if !ok {
+			return release, false
+		}
+		if s := rehomeClusterSrc.Load(); s != nil && s.OwnsUnder(prefix) {
+			release()
+			return func() {}, false
+		}
+		return release, true
+	}
 	if seedErr != nil {
 		log.Fatal().Err(seedErr).Msg("Could not read the re-home job journal")
 	}
@@ -2092,7 +2135,7 @@ func main() {
 		// subdirectory so a crash that left pending completion manifests on
 		// disk doesn't silently lose them on restart.
 		// Files a re-home job in flight owns stay out of compaction (#1825).
-		compactionManager.SetOwnedFilter(rehomeRegistry.Owns)
+		compactionManager.SetOwnedFilter(rehomeOwns)
 		if err := compactionManager.CleanupOrphanedTempDirs(); err != nil {
 			log.Warn().Err(err).Msg("Failed to cleanup orphaned compaction temp directories")
 		}
@@ -2217,6 +2260,9 @@ func main() {
 	// Initialize Cluster Coordinator (Enterprise feature)
 	// Clustering enables role-based node separation: writer, reader, compactor
 	var clusterCoordinator *cluster.Coordinator
+	// What losing and retaking the cluster read lease do on a node that
+	// takes part in re-home jobs, bound once the query handler exists.
+	var rehomeLeaseLost, rehomeLeaseSynced atomic.Pointer[func()]
 	// completionWatcher is the Phase 4 completion watcher, built BEFORE the
 	// coordinator starts (inside the cluster block below) so the compaction
 	// pause quiescer (#1087) can see the pending commits on disk from the
@@ -2464,6 +2510,22 @@ func main() {
 					// buffered rows of the scope first (#1265). Before Start, so
 					// no request finds the node without its buffer.
 					clusterCoordinator.SetDeleteScopeFlusher(deleteFlusher(arrowBuffer, walWriter))
+					// Re-home (#1825): whether this node takes part in jobs,
+					// advertised at join; and, when it does, what losing and
+					// retaking the read lease do to its reads and caches
+					// (bound to the query handler once it exists).
+					clusterCoordinator.SetRehomeInScope(rehomeCfgInScope)
+					if rehomeSharedCluster {
+						clusterCoordinator.SetReadLeaseHooks(func() {
+							if fn := rehomeLeaseLost.Load(); fn != nil {
+								(*fn)()
+							}
+						}, func() {
+							if fn := rehomeLeaseSynced.Load(); fn != nil {
+								(*fn)()
+							}
+						})
+					}
 					if err := clusterCoordinator.Start(); err != nil {
 						log.Error().Err(err).Msg("Failed to start cluster coordinator - running in standalone mode")
 						arrowBuffer.SetIngestGate(nil)
@@ -4199,7 +4261,18 @@ func main() {
 	// What every source other than a re-home job leaves out of reads: a job
 	// checks its file against it before it starts (#1825).
 	otherExclusions := api.CombineOpenCompactions(compactionJobs, clusterOpen, retiredOpen)
-	openCompactions := api.CombineOpenCompactions(compactionJobs, clusterOpen, retiredOpen, rehomeRegistry)
+	// Re-home on the cluster (#1825 slice 4b): the cluster record is the
+	// fourth source of exclusions, and of ownership from here on.
+	rehomeClusterOn := rehomeSharedCluster && clusterCoordinator != nil
+	rehomeClusterInScope := rehomeCfgInScope && clusterCoordinator != nil
+	var rehomeClusterOpen api.OpenCompactions
+	if rehomeClusterOn {
+		if src := clusterCoordinator.RehomeSource(); src != nil {
+			rehomeClusterSrc.Store(src)
+			rehomeClusterOpen = src
+		}
+	}
+	openCompactions := api.CombineOpenCompactions(compactionJobs, clusterOpen, retiredOpen, rehomeRegistry, rehomeClusterOpen)
 	queryHandler.SetOpenCompactions(openCompactions)
 	queryHandler.RegisterRoutes(server.GetApp())
 	// Start the handler's background workers (currently the partition
@@ -4561,7 +4634,7 @@ func main() {
 	// seeded above, not by this order. A job found part way has its file
 	// removed without waiting for reads, because none from before the stop
 	// is alive.
-	deleteHandler.SetRehomeOwns(rehomeRegistry.Owns)
+	deleteHandler.SetRehomeOwns(rehomeOwns)
 	rehomeHandler.SetSwap(&api.RehomeSwap{
 		Registry: rehomeRegistry,
 		Reads:    queryHandler.Reads(),
@@ -4580,8 +4653,8 @@ func main() {
 		ColdFileNames: api.ColdFileNamesFromEngine(db.DB()),
 		Refusal: func() string {
 			switch {
-			case cfg.Cluster.Enabled:
-				return "moving a file's rows is not available on a cluster in this version"
+			case cfg.Cluster.Enabled && !rehomeClusterInScope:
+				return "moving a file's rows on a cluster needs a shared object store (S3, Azure or GCS) as primary storage, and tiered storage, the Iceberg export and edge sync off, in this version"
 			case cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Active() || cfg.EdgeSync.Spoke.Active():
 				return "moving a file's rows is not available with edge sync in this version"
 			}
@@ -4606,6 +4679,10 @@ func main() {
 		},
 		FilePublished:    queryHandler.FilePublished,
 		InvalidateCaches: invalidateQueryCaches,
+		InvalidateLocalCaches: func() {
+			db.ClearHTTPCache()
+			queryHandler.InvalidateCaches()
+		},
 		ClearMisfiled: func(path string) {
 			if compactionManager != nil {
 				compactionManager.ClearMisfiled("", path)
@@ -4614,6 +4691,25 @@ func main() {
 	})
 	if err := rehomeHandler.Recover(context.Background()); err != nil {
 		log.Fatal().Err(err).Msg("Could not take up the re-home jobs found at start")
+	}
+	if rehomeClusterOn {
+		// Every node's part of a job's states, and what the read lease does
+		// to reads and caches: losing it stops the reads in flight and those
+		// that have not bound yet; retaking it drops the caches first.
+		clusterCoordinator.SetRehomeParticipant(rehomeHandler.ParticipateCluster)
+		stopReads := func() { queryHandler.StopReads("this node lost its cluster read lease") }
+		resumeReads := func() {
+			db.ClearHTTPCache()
+			queryHandler.InvalidateCaches()
+			queryHandler.ResumeReads()
+		}
+		rehomeLeaseLost.Store(&stopReads)
+		rehomeLeaseSynced.Store(&resumeReads)
+	}
+	if rehomeClusterInScope {
+		// The driver, on the primary writer.
+		rehomeHandler.SetCluster(clusterCoordinator, clusterCoordinator.ReadReady)
+		rehomeHandler.StartClusterTakeover()
 	}
 	deleteHandler.StartRetiredDrainer(retiredCtx)
 	if cfg.Delete.Enabled {
@@ -4630,7 +4726,7 @@ func main() {
 	databasesHandler := api.NewDatabasesHandler(storageBackend, &cfg.Delete, authManager, logger.Get("databases"))
 	// A database delete and a re-home job on one of its files keep each
 	// other out (#1825).
-	databasesHandler.SetRehomeBlock(rehomeRegistry.Block)
+	databasesHandler.SetRehomeBlock(rehomeBlock)
 	if hubNamespaceRemover != nil {
 		databasesHandler.SetOnSpokeNamespaceRemoved(hubNamespaceRemover)
 	}
@@ -4680,7 +4776,7 @@ func main() {
 		retentionHandler.SetOnFilesRemoved(invalidateQueryCaches)
 		// Retention claims a file before deleting it, against the re-home
 		// jobs in flight (#1825).
-		retentionHandler.SetRehomeClaim(rehomeRegistry.Claim)
+		retentionHandler.SetRehomeClaim(rehomeClaim)
 		retentionHandler.SetOnPathsChanged(notifyIcebergPaths)
 		if hubRemovalMarker != nil {
 			retentionHandler.SetOnSpokeFilesRemoved(hubRemovalMarker)
@@ -5221,8 +5317,13 @@ func main() {
 		if err == nil {
 			// A committed compaction output moving into place here is not an
 			// orphan entry (#1207 d2a2a).
-			reconciler.SetHeldFilter(clusterCoordinator.CompactionOutputHeld)
-			reconciler.SetCompactionOwnedFilter(clusterCoordinator.CompactionOwns)
+			reconciler.SetHeldFilter(func(p string) bool {
+				return clusterCoordinator.CompactionOutputHeld(p) || clusterCoordinator.RehomeOwnsPath(p)
+			})
+			// And the files a re-home job owns (#1825).
+			reconciler.SetCompactionOwnedFilter(func(p string) bool {
+				return clusterCoordinator.CompactionOwns(p) || clusterCoordinator.RehomeOwnsPath(p)
+			})
 			// On a shared object store the sweep runs on the active
 			// compactor, which has no outbox: what the writers have pending,
 			// asked of each and read from their published lists, is not an
@@ -5499,7 +5600,7 @@ func main() {
 					// #1825: a re-home job's files stay on the hot tier while
 					// it runs. Before Start, so the startup scan and the first
 					// cycle already see a job found at start.
-					tieringManager.SetOwnedFilter(rehomeRegistry.Owns)
+					tieringManager.SetOwnedFilter(rehomeOwns)
 					// /health "tiering": cold rows whose object is gone (#1551).
 					// ColdMissingObjects is nil until a cold sync has checked.
 					server.SetColdMissingObjects(tieringManager.ColdMissingObjects)
@@ -6009,7 +6110,7 @@ func main() {
 			backupHandler := api.NewBackupHandler(backupManager, authManager, cfg.Backup.OperationTimeout, logger.Get("backup-api"))
 			// A backup or restore and a re-home job keep each other out
 			// (#1825).
-			backupHandler.SetRehomeBlock(rehomeRegistry.Block)
+			backupHandler.SetRehomeBlock(rehomeBlock)
 			backupRunning := func() bool {
 				p := backupManager.GetProgress()
 				return p != nil && p.Status == "running"

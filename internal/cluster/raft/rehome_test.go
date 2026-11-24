@@ -342,10 +342,23 @@ func TestRehomeLifecycle(t *testing.T) {
 	if r := x.rhConflict(CommandAdvanceRehome, AdvanceRehomePayload{Job: "j1", By: "w1", To: RehomeReverting, Now: t0}); r != RehomeWrongState {
 		t.Fatalf("revert after latch: %q", r)
 	}
+	if r := x.rhConflict(CommandEndRehome, EndRehomePayload{Job: "j1", By: "w1", Now: t0}); r != RehomeWrongState {
+		t.Fatalf("end while latched: %q", r)
+	}
+	if r := x.rhConflict(CommandAdvanceRehome, AdvanceRehomePayload{Job: "j1", By: "w1", To: RehomeRemoved, Now: t0}); r != RehomeAcksMissing {
+		t.Fatalf("removed before acks: %q", r)
+	}
+	x.rhAckAll("j1", RehomeLatched)
+	if res := x.rhAdvance("j1", RehomeRemoved, t0); res != nil {
+		t.Fatal(res)
+	}
+	if keys, _ := x.f.RehomeExcludedFor(rhPrefix); !reflect.DeepEqual(keys, []string{src}) {
+		t.Fatalf("removed leaves out %v", keys)
+	}
 	if r := x.rhConflict(CommandEndRehome, EndRehomePayload{Job: "j1", By: "w1", Now: t0}); r != RehomeAcksMissing {
 		t.Fatalf("end before acks: %q", r)
 	}
-	x.rhAckAll("j1", RehomeLatched)
+	x.rhAckAll("j1", RehomeRemoved)
 	if r := x.rhConflict(CommandEndRehome, EndRehomePayload{Job: "j1", By: "w2", Now: t0}); r != RehomeNotFinisher {
 		t.Fatalf("end by another: %q", r)
 	}
@@ -431,6 +444,10 @@ func TestRehomeRevert(t *testing.T) {
 	if r := x.rhConflict(CommandEndRehome, EndRehomePayload{Job: "j1", By: "w1", Now: revertedAt.Add(RehomeRevertedGrace - time.Second)}); r != RehomeTooSoon {
 		t.Fatalf("end within the grace: %q", r)
 	}
+	if r := x.rhConflict(CommandEndRehome, EndRehomePayload{Job: "j1", By: "w1", Now: revertedAt.Add(RehomeRevertedGrace)}); r != RehomeAcksMissing {
+		t.Fatalf("end before every node dropped its caches: %q", r)
+	}
+	x.rhAckAll("j1", RehomeReverted)
 	x.ok(CommandEndRehome, EndRehomePayload{Job: "j1", By: "w1", Now: revertedAt.Add(RehomeRevertedGrace)})
 	if _, ok := x.f.RehomeJob("j1"); ok {
 		t.Fatal("job outlived its end")
@@ -491,9 +508,32 @@ func TestRehomeNodeRemoval(t *testing.T) {
 	}
 	x.ok(CommandAdvanceRehome, AdvanceRehomePayload{Job: "j1", By: "w1", To: RehomePublished, Now: t0})
 	j, _ = x.f.RehomeJob("j1")
-	if len(j.Dropped) != 0 || !reflect.DeepEqual(j.AckWanted, []string{"w1"}) {
-		t.Fatalf("a new state kept the last one's dropped nodes: %+v", j)
+	if !reflect.DeepEqual(j.Dropped, []string{"r1"}) || !reflect.DeepEqual(j.AckWanted, []string{"w1"}) {
+		t.Fatalf("a new state lost the dropped nodes: %+v", j)
 	}
+}
+
+// A job latched before a restore pause is not wedged by it: removing the
+// source's object waits out a pause in force, not one that ended.
+func TestRehomeRemovedAfterAPause(t *testing.T) {
+	x := rhFSM(t)
+	x.ok(CommandStageRehome, rhStage("j1"))
+	for _, s := range []string{RehomeCommitted, RehomePublished, RehomeLatched} {
+		x.ok(CommandAdvanceRehome, AdvanceRehomePayload{Job: "j1", By: "w1", To: s, Now: t0})
+		x.rhAckAll("j1", s)
+	}
+	x.ok(CommandSetCompactionPause, SetCompactionPausePayload{Paused: true, Generation: 1, RequestedBy: "w1",
+		Reason: "restore b1", Now: t0, ExpiresAt: t0.Add(time.Hour)})
+	if r := x.rhConflict(CommandAdvanceRehome, AdvanceRehomePayload{Job: "j1", By: "w1", To: RehomeRemoved, Now: t0}); r != RehomePaused {
+		t.Fatalf("removed while paused: %q", r)
+	}
+	x.ok(CommandSetCompactionPause, SetCompactionPausePayload{Paused: false, Generation: 1, RequestedBy: "w1", Now: t0.Add(time.Minute)})
+	x.ok(CommandAdvanceRehome, AdvanceRehomePayload{Job: "j1", By: "w1", To: RehomeRemoved, Now: t0.Add(time.Minute)})
+	// And out of scope does not hold it either: the source's entry is gone.
+	x.ok(CommandAddNode, AddNodePayload{Node: NodeInfo{ID: "r9", Role: "reader", State: "healthy", Capabilities: []string{CapabilityRehome}}})
+	x.rhAckAll("j1", RehomeRemoved)
+	x.ok(CommandAckRehome, AckRehomePayload{Job: "j1", Node: "r9", State: RehomeRemoved})
+	x.ok(CommandEndRehome, EndRehomePayload{Job: "j1", By: "w1", Now: t0})
 }
 
 func TestRehomeSnapshotRoundTrip(t *testing.T) {

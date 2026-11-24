@@ -166,9 +166,28 @@ func (s *RehomeSource) Owns(key string) bool {
 		return false
 	}
 	if !s.synced() {
-		return true
+		// Behind the leader, this node cannot tell which files jobs own:
+		// all of them, once re-home is on (its FSM refuses a change to an
+		// owned file in any case).
+		return f.RehomeEnabled()
 	}
 	return f.RehomeOwns(key)
+}
+
+// OwnsUnder reports whether a job owns a file under prefix ("" is every
+// file). True while not synced.
+func (s *RehomeSource) OwnsUnder(prefix string) bool {
+	f := s.fsm()
+	if f == nil {
+		return false
+	}
+	if !s.synced() {
+		// Behind the leader, this node cannot tell which files jobs own:
+		// all of them, once re-home is on (its FSM refuses a change to an
+		// owned file in any case).
+		return f.RehomeEnabled()
+	}
+	return f.RehomeOwnsUnder(prefix)
 }
 
 // Active reports whether any job is in flight. True while not synced.
@@ -177,7 +196,7 @@ func (s *RehomeSource) Active() bool {
 	if f == nil {
 		return false
 	}
-	return !s.synced() || len(f.RehomeJobs()) > 0
+	return (!s.synced() && f.RehomeEnabled()) || len(f.RehomeJobs()) > 0
 }
 
 // Open reports whether a job under prefix may leave files out of reads.
