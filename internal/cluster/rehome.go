@@ -39,8 +39,9 @@ type rehomeGate struct {
 }
 
 // SetRehomeInScope records whether this node's configuration is one a
-// re-home job can run under: no tiered storage, no Iceberg export, no edge
-// sync. Advertised at the next join; call before Start.
+// re-home job can run under: no Iceberg export, no edge sync (tiered storage
+// since #1869, with its cold tier running). Advertised at the next join, and
+// by the self-record refresh when it changes after Start.
 func (c *Coordinator) SetRehomeInScope(ok bool) {
 	if c != nil {
 		c.rehomeInScope.Store(ok)
@@ -264,8 +265,9 @@ func (c *Coordinator) SetRehomeLocalExclusions() {
 }
 
 // ExcludedTiered is ExcludedFor in the registry's tiered shape. A cluster
-// job's source is always hot (tiering is out of scope), so coldKeys is
-// empty.
+// job's source is always hot (a cold source is refused, and every node checks
+// before it acks published that cold storage holds no copy, #1869), so
+// coldKeys is empty.
 func (s *RehomeSource) ExcludedTiered(ctx context.Context, prefix string) (keys, coldKeys []string) {
 	return s.ExcludedFor(ctx, prefix), nil
 }

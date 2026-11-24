@@ -6072,6 +6072,15 @@ func main() {
 		rehomeHandler.SetTiering(tieringManager)
 	}
 	rehomeHandler.Wired()
+	// A node whose cold tier is configured and not running (no licence, or
+	// cold storage unreachable at start) would refuse every job's published
+	// step, holding each for 15 minutes before it reverts (#1869): it does not
+	// take part, so the cluster refuses jobs up front.
+	if clusterCoordinator != nil && rehomeCfgInScope && cfg.TieredStorage.Enabled && cfg.TieredStorage.Cold.Enabled &&
+		(tieringManager == nil || tieringManager.ColdTierMissing()) {
+		clusterCoordinator.SetRehomeInScope(false)
+		log.Warn().Msg("Re-home: this node's cold tier is configured but not running (no licence, or cold storage unreachable at start), so it does not take part in moving a file's rows, and no such job starts on the cluster until it does (restart once the cold tier is reachable)")
+	}
 
 	// Initialize Backup/Restore (OSS feature — no license required)
 	if cfg.Backup.Enabled {

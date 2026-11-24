@@ -233,13 +233,21 @@ func (h *RehomeHandler) clusterTierStep(ctx context.Context, j raft.RehomeJob, a
 			}
 		}
 		return h.clusterRecordTier(ctx, j)
-	case raft.RehomeLatched:
-		return h.clusterRecordTier(ctx, j)
-	case raft.RehomeRemoved:
+	case raft.RehomeLatched, raft.RehomeRemoved:
+		// Again for a node that joined since published. A write that fails
+		// here is logged, not retried into a stall: the job waits for every
+		// node from latched on, and published wrote the rows on a node that
+		// took part.
 		if err := h.clusterRecordTier(ctx, j); err != nil {
-			return err
+			if rerr := h.clusterTieringReady(); rerr != nil {
+				return rerr
+			}
+			h.logger.Warn().Err(err).Str("job", j.ID).Str("state", j.State).Msg("Re-home: could not record the outputs' tier rows; a later tiering scan records them")
 		}
-		return h.clusterForgetSourceTier(ctx, j)
+		if j.State == raft.RehomeRemoved {
+			return h.clusterForgetSourceTier(ctx, j)
+		}
+		return nil
 	case raft.RehomeReverted:
 		return h.clusterForgetOutputsTier(ctx, j)
 	}

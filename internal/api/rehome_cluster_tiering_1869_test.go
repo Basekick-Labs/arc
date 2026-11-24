@@ -5,6 +5,7 @@ package api
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/tiering"
@@ -78,5 +79,74 @@ func TestLocalParticipantRevertForgetsTierRows1869(t *testing.T) {
 	}
 	if !ft.rows[lrSource] {
 		t.Fatal("reverted: the source lost its row")
+	}
+}
+
+// #1869: the shared-store participant keeps this node's tier rows: its check
+// and the outputs' rows at published, the source's row forgotten at removed,
+// the outputs' rows forgotten at reverted.
+func TestClusterParticipantKeepsTierRows1869(t *testing.T) {
+	r := newClusterRig(t)
+	ft := &fakeTiering1825{rows: map[string]bool{r.key: true}}
+	r.swap.TieringExpected = true
+	r.h.SetTiering(ft)
+	r.h.Wired()
+	out := raft.RehomeOutput{Key: "db/cpu/2026/11/19/05/o.parquet", SizeBytes: 10, SHA256: "s"}
+	j := raft.RehomeJob{ID: "ab12", Database: "db", Measurement: "cpu", Source: raft.FileEntry{Path: r.key}, Outputs: []raft.RehomeOutput{out}}
+	ctx := context.Background()
+	j.State, j.StateIndex = raft.RehomePublished, 1
+	ft.checkErr = tiering.ErrRehomeColdCopy
+	if err := r.h.ParticipateCluster(ctx, j, true); err == nil || ft.rows[out.Key] {
+		t.Fatalf("published with a cold copy: err %v, row %v", err, ft.rows[out.Key])
+	}
+	ft.checkErr = nil
+	if err := r.h.ParticipateCluster(ctx, j, true); err != nil || !ft.rows[out.Key] {
+		t.Fatalf("published: err %v, row %v", err, ft.rows[out.Key])
+	}
+	j.State, j.StateIndex = raft.RehomeRemoved, 3
+	if err := r.h.ParticipateCluster(ctx, j, true); err != nil || ft.rows[r.key] || !ft.rows[out.Key] {
+		t.Fatalf("removed: err %v, source row %v, output row %v", err, ft.rows[r.key], ft.rows[out.Key])
+	}
+	j.State, j.StateIndex = raft.RehomeReverted, 4
+	if err := r.h.ParticipateCluster(ctx, j, false); err != nil || ft.rows[out.Key] {
+		t.Fatalf("reverted: err %v, output row %v", err, ft.rows[out.Key])
+	}
+}
+
+// Not wired yet: every tier step fails (and is retried).
+func TestClusterTierStepWaitsForWiring1869(t *testing.T) {
+	r := newClusterRig(t)
+	r.swap.TieringExpected = true
+	j := raft.RehomeJob{ID: "ab12", State: raft.RehomePublished, Source: raft.FileEntry{Path: r.key}}
+	if err := r.h.ParticipateCluster(context.Background(), j, true); err == nil {
+		t.Fatal("acked published before tiering was wired")
+	}
+}
+
+// A missed end settled with tiering: rows follow what the manifest lists.
+func TestLocalSweepSettlesTierRows1869(t *testing.T) {
+	r := newLocalRig(t)
+	ft := &fakeTiering1825{rows: map[string]bool{lrSource: true}}
+	r.h.swap.TieringExpected = true
+	r.h.SetTiering(ft)
+	r.h.Wired()
+	r.advance(raft.RehomeCommitted)
+	r.advance(raft.RehomePublished)
+	ctx := context.Background()
+	if err := r.c.RehomeClaim(ctx, "ab12"); err != nil {
+		t.Fatal(err)
+	}
+	for _, to := range []string{raft.RehomeLatched, raft.RehomeRemoved} {
+		for r.c.RehomeAdvance(ctx, "ab12", to) != nil {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	delete(ft.rows, r.job.Outputs[0].Key) // as if never recorded here
+	r.end()
+	if err := r.h.SweepLocal(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if ft.rows[lrSource] || !ft.rows[r.job.Outputs[0].Key] {
+		t.Fatalf("rows after the settle: %v", ft.rows)
 	}
 }

@@ -204,13 +204,17 @@ Each node keeps its own record of which files are hot and cold, so each node's p
 it: before it acks the step that publishes the outputs, it checks that its tiering has the file on
 the hot tier and that cold storage holds no copy of it, and records the outputs as hot files; once
 the file is gone it removes the file's row; a reverted job removes the outputs' rows. A file a
-migration to cold had copied before a node saw the job makes that node refuse the step, and the job
-reverts after 15 minutes rather than leave a cold copy read beside the outputs. The primary writer
-checks the file the same way before it starts the job.
+migration to cold had copied before a node saw the job makes that node hold the step until the
+migration has given the file back to the hot tier (it does, once it sees the job), or the job
+reverts after 15 minutes, rather than leave a cold copy read beside the outputs. The primary writer
+checks the file the same way before it starts the job. A node whose cold tier is configured and not
+running (no licence, cold storage unreachable at start) does not take part, so no such job starts
+on the cluster until it does.
 
 Also: a migration to cold whose batch the cluster refused because a compaction or a re-home job took
 one of its files since the migration checked it now drops that file and proposes the rest again,
-instead of keeping every file of the batch hot until the next pass.
+instead of stopping with the rest of the batch recorded cold and their hot copies kept until
+reconciliation.
 
 A node on an earlier release with tiered storage on does not take part, so no job starts until every
 node runs this one.

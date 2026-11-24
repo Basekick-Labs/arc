@@ -225,8 +225,11 @@ func (h *RehomeHandler) latchLocal(ctx context.Context, store rehomeStore, j raf
 				if err := h.clusterRecordTier(ctx, j); err != nil {
 					return err
 				}
-				return h.clusterForgetSourceTier(ctx, j)
+				if err := h.clusterForgetSourceTier(ctx, j); err != nil {
+					return err
+				}
 			}
+			h.dropLocalCaches(j)
 			return nil
 		}
 	}
