@@ -8,8 +8,9 @@
 
 A job holds its slot while it waits for the export to stop naming the old file, which can take a
 long time, and every other request, dry runs included, was refused with 409 meanwhile. A dry run
-changes nothing, so it now has its own slot: one dry run and one job can run at once. A second job,
-or a second dry run, is still refused.
+changes nothing, so it now has its own slot: one dry run and one job can run at once. A second job
+(or taking one up again with `/resume`), or a second dry run, is still refused. A job in progress is
+no longer dropped from `GET /api/v1/rehome` by newer ones. Jobs on a cluster never held this slot.
 
 ## Fix: deleting a backup answers 404 for an unknown id and 503 for an unreachable destination ([#1122](https://github.com/Basekick-Labs/arc/issues/1122))
 
