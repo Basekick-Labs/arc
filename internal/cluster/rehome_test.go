@@ -392,7 +392,19 @@ func TestRehomeJoinGateLetsAMemberRefreshItsRecord(t *testing.T) {
 	if why, _ := c.rehomeJoinGate(&protocol.JoinRequest{NodeID: "reader-9", Capabilities: rhList}); why == "" {
 		t.Fatal("a new node out of scope joined mid-job")
 	}
-	c.rehomeGate.mu.TryLock()
+	// In the Raft configuration but not the node table (a leave half done):
+	// a member, admitted.
+	if err := c.raftNode.AddNonvoter("ghost-1", "127.0.0.1:1", 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	why, release := c.rehomeJoinGate(&protocol.JoinRequest{NodeID: "ghost-1", Capabilities: rhList})
+	if why != "" {
+		t.Fatalf("a Raft member refused: %s", why)
+	}
+	release()
+	if !c.rehomeGate.mu.TryLock() {
+		t.Fatal("a refusal left the gate locked")
+	}
 	c.rehomeGate.mu.Unlock()
 	if resp := deliverJoin(t, c, ccJoin("reader-1", rhList)); resp == nil || !resp.Success {
 		t.Fatalf("a member's join was refused: %+v", resp)

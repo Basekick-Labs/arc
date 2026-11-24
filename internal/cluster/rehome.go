@@ -57,11 +57,12 @@ func (c *Coordinator) rehomeJoinGate(req interface {
 		// staged on the leader's log and a join is handled on the leader,
 		// so its FSM is current here; the FSM also refuses every step but a
 		// revert once such a node is a member.
-		// A member (a node that restarted without leaving) is let through:
-		// refusing it would not keep it out (it is in the Raft configuration
-		// and applies the log), only keep its old capabilities in its record,
-		// and the cluster would count it in scope (#1859). Its join rewrites
-		// the record; the FSM then refuses every step but a revert.
+		// A member (a node that came back without leaving) is let through
+		// (#1859). One still in the Raft configuration applies the log
+		// whatever the gate says, and refusing either kind only keeps its
+		// old capabilities in its record, so the cluster would count it in
+		// scope. Its join rewrites the record; the FSM then refuses every
+		// step but a revert.
 		if !hasCapability(req.GetCapabilities(), raft.CapabilityRehomeInScope) && fsm != nil && fsm.RehomeJobsInFlight() &&
 			!c.isMember(req.GetNodeID()) {
 			g.mu.Unlock()

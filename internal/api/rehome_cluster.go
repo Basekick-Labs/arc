@@ -514,11 +514,10 @@ func (h *RehomeHandler) driveCluster(ctx context.Context, id string, files map[s
 		// allowed from here, which only a job before latched has.
 		if raft.RehomeConflictReason(err) == raft.RehomeOutOfScope {
 			if cur, ok := c.RehomeJob(id); ok && (cur.State == raft.RehomeStaged || cur.State == raft.RehomeCommitted || cur.State == raft.RehomePublished) {
-				if rerr := revert("a node no longer takes part in re-home jobs: " + err.Error()); rerr != nil {
-					return rerr
+				if err = revert("the cluster no longer allows re-home steps: " + err.Error()); err == nil {
+					failures = 0
+					continue
 				}
-				failures = 0
-				continue
 			}
 		}
 		// Transient (a leader election, a storage error): the state is in
