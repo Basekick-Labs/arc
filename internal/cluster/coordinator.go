@@ -353,7 +353,10 @@ type Coordinator struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	stopCh   chan struct{}
-	mu       sync.RWMutex
+	// readLease decides whether this node may serve reads, on a cluster
+	// whose nodes share one object store (read_lease.go); nil elsewhere.
+	readLease *readLease
+	mu        sync.RWMutex
 
 	logger zerolog.Logger
 }
@@ -816,6 +819,10 @@ func (c *Coordinator) Start() error {
 		// fires no callback (#1087); quiesce and ack it once a leader is
 		// known. Idempotent with the callback path.
 		go c.ackCompactionPauseIfActive()
+
+		// On a shared object store, no reads until this node has synced
+		// with the leader, and none while it is cut off from it.
+		c.startReadLease(c.ctx)
 	}
 
 	// Wire what this node does on manifest changes: the peer file
@@ -3248,6 +3255,15 @@ func (c *Coordinator) Status() map[string]interface{} {
 		"writers":       summary["writers"],
 		"readers":       summary["readers"],
 		"compactors":    summary["compactors"],
+	}
+	// On a shared object store: whether this node serves reads now
+	// (read_lease.go).
+	if c.readLease != nil {
+		ready, why := c.readLease.Ready()
+		status["read_ready"] = ready
+		if !ready {
+			status["read_not_ready_reason"] = why
+		}
 	}
 	if puller != nil {
 		status["replication_catchup_status"] = puller.CatchUpStatus()

@@ -61,6 +61,8 @@ type Server struct {
 	// mayAcceptIngest backs /ready/write. Nil means "this node takes writes
 	// whenever it is ready", which is right for a single-node deployment.
 	mayAcceptIngest func() bool
+	// mayServeReads is the predicate behind /ready/read (SetReadReadiness).
+	mayServeReads func() (bool, string)
 
 	// dbStats supplies the DuckDB connection-pool snapshot for the metrics
 	// endpoints (#809). Nil when no database is wired, e.g. a test server or
@@ -243,6 +245,7 @@ func (s *Server) RegisterRoutes() {
 	// Readiness check (for Kubernetes)
 	s.app.Get("/ready", s.readyHandler)
 	s.app.Get("/ready/write", s.readyWriteHandler)
+	s.app.Get("/ready/read", s.readyReadHandler)
 
 	// NOTE: the metrics endpoints are not registered here either; see
 	// RegisterMetricsRoutes.
@@ -346,6 +349,51 @@ func (s *Server) readyWriteHandler(c *fiber.Ctx) error {
 		"status": "ready",
 		"time":   time.Now().UTC().Format(time.RFC3339),
 	})
+}
+
+// readyReadHandler answers whether a load balancer should route READS to this
+// node. Like /ready/write it is strictly narrower than /ready. On a cluster
+// whose nodes share one object store, a node that holds no read lease refuses
+// every read (cluster/read_lease.go): it is ready, and not a read target.
+//
+// Unauthenticated, like the other probes, so the reason is a fixed sentence:
+// the lease's own reason can carry addresses from a failed sync.
+func (s *Server) readyReadHandler(c *fiber.Ctx) error {
+	if problem := s.readinessProblem(); problem != nil {
+		body := fiber.Map{
+			"status": "not_ready",
+			"time":   time.Now().UTC().Format(time.RFC3339),
+			"reason": problem.reason,
+		}
+		if problem.tier != "" {
+			body["tier"] = problem.tier
+		}
+		return c.Status(fiber.StatusServiceUnavailable).JSON(body)
+	}
+	if s.mayServeReads != nil {
+		if ok, _ := s.mayServeReads(); !ok {
+			// An expected state, logged when the lease is lost: a load
+			// balancer polling this would otherwise add an Error line per
+			// poll.
+			c.Locals(ingestRefusedLocal, true)
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"status": "not_read_target",
+				"time":   time.Now().UTC().Format(time.RFC3339),
+				"reason": "this node's cluster state is not synced with the leader; route reads to another node",
+			})
+		}
+	}
+	return c.JSON(fiber.Map{
+		"status": "ready",
+		"time":   time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// SetReadReadiness wires the predicate behind /ready/read: whether reads
+// should be routed to this node. Left unset (OSS, a node outside a cluster)
+// the node serves reads whenever it is ready at all.
+func (s *Server) SetReadReadiness(fn func() (bool, string)) {
+	s.mayServeReads = fn
 }
 
 // SetWriteReadiness wires the predicate behind /ready/write: whether writes

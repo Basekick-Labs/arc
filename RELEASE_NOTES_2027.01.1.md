@@ -2,6 +2,68 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Change: on a cluster that shares one object store, a node serves no reads while its cluster state may be behind ([#1852](https://github.com/Basekick-Labs/arc/issues/1852), [#1825](https://github.com/Basekick-Labs/arc/issues/1825))
+
+On a cluster whose nodes share one bucket (S3, Azure or GCS as primary storage), every node
+reads the same files, and what a read leaves out of them comes from the node's own copy of
+the cluster state: the inputs of a compaction whose output is in place, a file a DELETE
+replaced. A node whose copy is behind the leader's leaves the wrong files out and can count
+rows twice. Two ordinary situations put a node there:
+
+- **A restart.** A node applies its local snapshot and served queries before it had
+  replayed what the cluster committed since. A graceful restart also removes the node from
+  the cluster until it rejoins, so nothing waited for it.
+- **A node cut off from the leader**, which kept answering queries with whatever state it
+  had, for as long as the partition lasted.
+
+Such a node now answers reads with **503**, `"error": "cluster_state_not_synced"`, a
+`Retry-After` header and the reason, until it holds a **read lease**: it has synced with the
+current leader since it last lost contact or saw the leader change, it has heard from the
+leader within the last 5 seconds, and it has known who the leader is within the last 5
+seconds. The sync is a barrier when the lease is taken; the lease says the node was caught
+up then and is in contact now, not that it has applied every entry at every moment.
+
+- **What is gated:** the query API in all its formats, Flight SQL, the measurement and schema
+  listings, and continuous queries (a run is skipped before it reads, with no execution row
+  and its window kept; a manual run answers 503). A node that only forwards a query to a peer
+  (a compactor) passes it on, and the peer answers for itself. Writes are not affected.
+- **What shows it:** `GET /api/v1/cluster` has `read_ready` and, when false,
+  `read_not_ready_reason`. A new probe, `GET /ready/read` (unauthenticated, like `/ready` and
+  `/ready/write`), answers 503 `not_read_target` while the node holds no lease, so a load
+  balancer can take it out of the read pool. Taking and losing the lease are logged, and
+  refused reads are logged at most once a second, not once per request.
+
+Measured on SeaweedFS:
+
+| Cluster | Event | The reader |
+|---|---|---|
+| One writer, one reader | The reader restarted | 503 four times, then 200, 0.5 s after it started |
+| One writer, one reader | The writer (the leader) killed | 200 until 5.3 s later, then 503 |
+| One writer, one reader | The writer back | 200 again 1.5 s after it started |
+| Three writers, one reader | The leader killed | 200 throughout: 60 of 60 queries over 15 s |
+| Three writers, one reader | A second writer killed (quorum lost) | 503 5.9 s later; `/ready/read` 503, `/ready` 200 |
+| Three writers, one reader | Both writers back | 200 again 1.4 s after they started |
+
+**What this costs.** Only writers vote in Raft elections. So:
+
+- **With one writer** (one writer and any number of readers), every time that writer stops,
+  crashes or is upgraded, every node stops serving reads 5 seconds later, until the writer is
+  back and each node has synced with it. That is the "leader killed" row above.
+- **With two writers**, a crash (not a graceful leave) of either loses the quorum, with the
+  same effect.
+- **Any node** that cannot reach the leader serves no reads after 5 seconds.
+
+In those cases nothing can commit, so a node's state is not getting further behind; the
+refusal holds anyway, because the node cannot tell how far behind it already is. Before, it
+went on answering, possibly wrong. Run three writers or more to keep reads through a writer
+restart, point clients at more than one node and retry on 503, or route reads with
+`/ready/read`. Raft timings raised far above their defaults (`cluster.raft_heartbeat_timeout`,
+`cluster.raft_election_timeout`) make every failover longer than 5 seconds, and so a read
+outage too.
+
+Clusters on local storage (which replicate files and have their own opt-in gate,
+`cluster.query_gate_on_catchup`) and standalone nodes are unchanged.
+
 ## Fix: at shutdown, a connection that never sent a request no longer holds the HTTP drain or is reported as a cancelled query ([#1840](https://github.com/Basekick-Labs/arc/issues/1840))
 
 **Who is affected:** any node stopped while a client holds a connection it has not used yet: a load balancer or Kubernetes TCP check, a client pool that opens connections ahead of use, a port scan. Builds of `main` only: no released version has this. The TLS wait came with the newer fasthttp this release uses, which gives a new connection its 5 s from the end of the TLS handshake where the older one counted from accept; the false warnings came with the staged drain (#1644).

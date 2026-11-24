@@ -889,6 +889,10 @@ type QueryHandler struct {
 	// query handler's Stats endpoint and as a Prometheus counter so operators
 	// can alert on a non-zero rate without inferring from HTTP error logs.
 	gate503Total atomic.Int64
+	// readLease503Total counts reads refused while this node held no read
+	// lease (refuseRead); readLease503LogLastNano samples its log line.
+	readLease503Total       atomic.Int64
+	readLease503LogLastNano atomic.Int64
 
 	// Tiering support for multi-tier query routing (hot/cold)
 	tieringManager *tiering.Manager
@@ -1323,6 +1327,42 @@ func (h *QueryHandler) SetRouter(router *cluster.Router) {
 	h.router = router
 }
 
+// readLeaseReadiness is a coordinator that can say whether this node may
+// serve reads at all (cluster.Coordinator.ReadReady).
+type readLeaseReadiness interface {
+	ReadReady() (bool, string)
+}
+
+// The gate must not silently turn off: a coordinator that stopped
+// satisfying the interface would pass every read.
+var _ readLeaseReadiness = (*cluster.Coordinator)(nil)
+
+// forwardsOnly reports a request this node sends to a peer instead of reading
+// itself (a compactor forwards queries): the peer applies its own gate.
+func (h *QueryHandler) forwardsOnly(c *fiber.Ctx) bool {
+	return h.router != nil && QueryForwardDecision(h.router, c) == ForwardToPeer
+}
+
+// refuseRead answers a read with 503 while this node may not serve reads.
+func (h *QueryHandler) refuseRead(c *fiber.Ctx, why string) error {
+	total := h.readLease503Total.Add(1)
+	now := time.Now().UnixNano()
+	last := h.readLease503LogLastNano.Load()
+	if now-last >= gate503LogIntervalNanos && h.readLease503LogLastNano.CompareAndSwap(last, now) {
+		h.logger.Warn().Int64("refused_total", total).Str("path", c.Path()).Str("why", why).
+			Msg("Read refused: this node's cluster state may be behind the leader's (sampled at 1Hz)")
+	}
+	c.Set("Retry-After", "1")
+	// Logged above, sampled: a node cut off from its leader refuses every
+	// read, and one Error line per query would bury everything else.
+	c.Locals(ingestRefusedLocal, true)
+	return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+		"success": false,
+		"error":   "cluster_state_not_synced",
+		"message": "This node cannot serve reads now: " + why + ". Retry shortly, or send the query to another node.",
+	})
+}
+
 // replicationReadiness is the subset of cluster.Coordinator the query gate
 // consumes. Defining the interface here (rather than depending on the
 // concrete *cluster.Coordinator) keeps the gate independently testable —
@@ -1334,10 +1374,11 @@ type replicationReadiness interface {
 }
 
 // SetCluster wires the cluster coordinator and the query-gate-on-catchup
-// behavior flag into the query handler. Consulted by checkReplicationReady
-// to short-circuit queries with 503 while peer file replication is still
-// draining (#392). Both arguments are optional — nil coordinator OR
-// gate=false makes the gate a no-op.
+// behavior flag into the query handler. Consulted by checkReplicationReady,
+// which refuses reads with 503 while this node holds no read lease on a
+// shared-object-store cluster (always), and while peer file replication is
+// still draining (only with queryGateOnCatchup, #392). A nil coordinator
+// makes both no-ops.
 //
 // Initialization-only: must be called once during process startup before
 // the HTTP server starts accepting requests. Order relative to
@@ -1371,22 +1412,30 @@ const gate503RetryAfterSeconds = "5"
 // second to prevent log floods during sustained catch-up.
 const gate503LogIntervalNanos = int64(time.Second)
 
-// checkReplicationReady is Fiber middleware that short-circuits user-facing
-// read endpoints with 503 when peer file replication is still draining and
-// the operator has opted into the gate via cluster.query_gate_on_catchup.
+// checkReplicationReady is Fiber middleware in front of every user-facing read
+// endpoint. It answers 503 in two cases:
 //
-// Returns c.Next() (no-op pass-through) when:
-//   - the gate is disabled (queryGateOnCatchup=false), OR
-//   - the coordinator is nil (OSS / standalone), OR
-//   - Coordinator.ReplicationReady() reports the puller is fully drained.
+//   - always, on a cluster whose nodes share one object store, while this
+//     node holds no read lease: its cluster state may be behind the leader's,
+//     and it would leave the wrong files out of the read
+//     (cluster/read_lease.go, #1852). A request this node only forwards to a
+//     peer is not refused here: the peer answers for itself;
+//   - when the operator opted into the catch-up gate
+//     (cluster.query_gate_on_catchup) and peer file replication is still
+//     draining (#392). The body then carries the puller's catch-up status.
 //
-// Returns 503 with a structured body and Retry-After header otherwise. The
-// body includes the puller's catch-up status so clients can implement
-// bounded retry without scraping logs or polling /api/v1/cluster separately.
-// Each gated 503 increments gate503Total and emits at most one sampled Warn
-// per second so operators can alert on a non-zero rate. See #392.
+// Otherwise, and always with no coordinator (OSS, standalone), it passes the
+// request on. Each refusal is counted and logged at most once a second.
 func (h *QueryHandler) checkReplicationReady(c *fiber.Ctx) error {
-	if !h.queryGateOnCatchup || h.coordinator == nil {
+	if h.coordinator == nil {
+		return c.Next()
+	}
+	if rr, ok := h.coordinator.(readLeaseReadiness); ok && !h.forwardsOnly(c) {
+		if ready, why := rr.ReadReady(); !ready {
+			return h.refuseRead(c, why)
+		}
+	}
+	if !h.queryGateOnCatchup {
 		return c.Next()
 	}
 	if h.coordinator.ReplicationReady() {
@@ -2398,8 +2447,10 @@ func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
 	// route-level middleware. The read-auth middleware admits a token that
 	// holds read on anything (not just any valid token); each handler then
 	// checks every table it reads (checkQueryPermissions and friends). The
-	// catch-up gate is a no-op unless cluster.query_gate_on_catchup is true
-	// AND the coordinator reports peer file replication is still drifting.
+	// gate (checkReplicationReady) refuses reads on a shared-object-store
+	// cluster node that holds no read lease, and, only with
+	// cluster.query_gate_on_catchup, while peer file replication is still
+	// drifting.
 	//
 	// withAnyResourceReadAuth resolves to auth.RequireAnyResourcePermission,
 	// which asks RBAC when it is wired, or a no-op passthrough when auth is

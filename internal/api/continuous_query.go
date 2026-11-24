@@ -55,7 +55,9 @@ type ContinuousQueryHandler struct {
 	arrowBuffer *ingest.ArrowBuffer
 	// lastSkipLogNano samples logSkippedRun (#676).
 	lastSkipLogNano atomic.Int64
-	fieldSchema     *fieldschema.Registry // optional, #914
+	// lastReadSkipLogNano samples logSkippedRead.
+	lastReadSkipLogNano atomic.Int64
+	fieldSchema         *fieldschema.Registry // optional, #914
 	// openCompactions: compaction jobs whose output and inputs can both be in
 	// storage (optional; see wrapOpenCompactions).
 	openCompactions OpenCompactions
@@ -83,6 +85,15 @@ type ContinuousQueryHandler struct {
 
 // aggregate runs a CQ's aggregation (executeAggregation, or the test hook).
 func (h *ContinuousQueryHandler) aggregate(ctx context.Context, cq *ContinuousQuery, query string, start, end time.Time) (int64, error) {
+	// On a cluster whose nodes share one object store, not while this
+	// node's cluster state may be behind the leader's: it would leave the
+	// wrong files out, and the run writes what it read back for good
+	// (cluster/read_lease.go). The run is skipped and its window kept.
+	if rr, ok := h.coordinator.(readLeaseReadiness); ok {
+		if ready, why := rr.ReadReady(); !ready {
+			return 0, fmt.Errorf("%w: %s", ErrNoReadLease, why)
+		}
+	}
 	if h.aggregateHook != nil {
 		return h.aggregateHook(ctx, cq, query, start)
 	}
@@ -905,6 +916,14 @@ func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (
 
 	// Execute the aggregation query using DuckDB
 	recordsWritten, err := h.aggregate(ctx, cq, executedQuery, startTime, endTime)
+	if err != nil && errors.Is(err, ErrNoReadLease) {
+		// This node may not read now (read_lease.go): skipped, not failed,
+		// as for refused writes. No execution row, the window stays, and
+		// the log line is sampled: it holds for every run of every query
+		// until the node has synced again.
+		h.logSkippedRead(cq.Name, err)
+		return nil, fmt.Errorf("execution skipped: %w", err)
+	}
 	if err != nil && ingest.IsWriteRefusal(err) {
 		// Writes are refused (fenced, or WAL volume disk pressure, #676): the
 		// run is skipped, not failed. No execution row, which would be one
@@ -1128,6 +1147,16 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(c.Context(), 10*time.Minute)
 	defer cancel()
 	recordsWritten, err := h.aggregate(ctx, cq, executedQuery, startTime, endTime)
+	if err != nil && errors.Is(err, ErrNoReadLease) {
+		// Nothing was read or written: refused, 503 and retryable.
+		h.logSkippedRead(cq.Name, err)
+		c.Set("Retry-After", "1")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "cluster_state_not_synced",
+			"message": "This node cannot run a query now: " + strings.TrimPrefix(err.Error(), ErrNoReadLease.Error()+": ") +
+				". Retry shortly.",
+		})
+	}
 	if err != nil {
 		executionDuration := time.Since(start).Seconds()
 
@@ -1695,6 +1724,23 @@ const cqSkipLogEvery = time.Minute
 
 // logSkippedRun logs a run skipped because writes are refused, at most once
 // every cqSkipLogEvery across all continuous queries.
+// ErrNoReadLease is a run refused because this node may not read now: on a
+// cluster whose nodes share one object store, its cluster state may be behind
+// the leader's (cluster/read_lease.go). Retryable; the window is kept.
+var ErrNoReadLease = errors.New("this node cannot read now")
+
+// logSkippedRead logs runs skipped for want of a read lease, at most once a
+// minute.
+func (h *ContinuousQueryHandler) logSkippedRead(name string, err error) {
+	now := time.Now().UnixNano()
+	last := h.lastReadSkipLogNano.Load()
+	if now-last < int64(cqSkipLogEvery) || !h.lastReadSkipLogNano.CompareAndSwap(last, now) {
+		return
+	}
+	h.logger.Warn().Err(err).Str("query_name", name).
+		Msg("Continuous query runs skipped: this node's cluster state may be behind the leader's (retryable); the next run covers the window (sampled: at most one line a minute)")
+}
+
 func (h *ContinuousQueryHandler) logSkippedRun(name string, err error) {
 	now := time.Now().UnixNano()
 	last := h.lastSkipLogNano.Load()

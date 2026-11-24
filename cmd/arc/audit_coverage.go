@@ -44,7 +44,7 @@ func authPublicPaths(metricsPublic bool) (routes, prefixes []string) {
 	// call it without an auth token after compaction. Access is gated by
 	// HMAC-SHA256 validation in the handler (see handleCacheInvalidate); the
 	// receiver refuses every request when cluster.shared_secret is empty.
-	routes = append(cfg.PublicRoutes, "/health", "/ready", "/ready/write", "/api/v1/auth/verify", api.CacheInvalidatePath)
+	routes = append(cfg.PublicRoutes, "/health", "/ready", "/ready/write", "/ready/read", "/api/v1/auth/verify", api.CacheInvalidatePath)
 	// /debug/pprof is intentionally NOT here: pprof is no longer mounted on
 	// the public Fiber app (internal/api/server.go). The opt-in localhost
 	// pprof listener runs on a separate port; see startDebugPprofIfEnabled.

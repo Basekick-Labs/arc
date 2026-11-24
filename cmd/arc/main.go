@@ -5283,6 +5283,7 @@ func main() {
 	// (accept whenever ready) is already right and nothing is wired.
 	if clusterCoordinator != nil {
 		server.SetWriteReadiness(clusterCoordinator.MayAcceptIngest)
+		server.SetReadReadiness(clusterCoordinator.ReadReady)
 	}
 
 	// MQTT API handlers are registered unconditionally. Both MQTTHandler
