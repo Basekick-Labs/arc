@@ -221,21 +221,10 @@ At no step does a query on any node count a row twice or miss one.
   alone, on any node; so is any of them on a node that has not synced with the leader yet.
 
 Not handled in this version:
-- A backup, a DELETE or retention still running on a former primary writer after a failover does
-  not see a job the new one starts (a DELETE rewrite that lands before the switch-over makes the
-  job revert; one that lands after is not caught).
-- (Handled since [#1857](https://github.com/Basekick-Labs/arc/issues/1857): a backup or restore
-  marks itself in the cluster, and no job is staged while one runs on any node; a DELETE rewrite of
-  the file that a former primary started, which the cluster refuses to register, has its leftover
-  object removed before the file is.)
 - A backup on a node cut off from the cluster leader for longer than 90 seconds loses its mark
   ([#1857](https://github.com/Basekick-Labs/arc/issues/1857)): a job may then start under it. The
   node logs an Error saying so; take that backup again. Retention and DELETE started on a former
   primary fail safe: the cluster refuses their change to the job's file.
-- An Arrow IPC stream, and the arcx engine's streamed or shadowed reads, can still be reading
-  after their request's handler returned, and an ack does not wait for them: such a read fails if
-  its file is deleted, it does not return wrong rows. Schema reads (`getMeasurementSchema`) are not
-  counted either.
 - A new job is started on the primary writer only.
 
 ## Change: a cluster records re-home jobs in its replicated state; an older build cannot join once every node supports it ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
