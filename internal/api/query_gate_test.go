@@ -2,9 +2,12 @@ package api
 
 import (
 	"encoding/json"
+	"github.com/basekick-labs/arc/internal/cluster"
+	"github.com/rs/zerolog"
 	"io"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 )
@@ -252,5 +255,88 @@ func TestCheckReplicationReady_GatesWithoutStatus(t *testing.T) {
 	}
 	if _, hasStatus := got["catchup_status"]; hasStatus {
 		t.Errorf("catchup_status: present, want absent when ReplicationCatchUpStatus returns nil")
+	}
+}
+
+// fakeReadLease is a coordinator with a read lease (cluster/read_lease.go).
+type fakeReadLease struct {
+	fakeReplicationReadiness
+	readReady bool
+	why       string
+}
+
+func (f *fakeReadLease) ReadReady() (bool, string) { return f.readReady, f.why }
+
+// #1825, #1852: on a cluster whose nodes share one object store, a node whose
+// cluster state may be behind the leader's serves no reads. Not opt-in: the
+// catch-up gate's flag does not apply.
+func TestCheckReplicationReady_ReadLease1825(t *testing.T) {
+	for _, flag := range []bool{false, true} {
+		lease := &fakeReadLease{fakeReplicationReadiness: fakeReplicationReadiness{ready: true}, why: "this node has not yet synced"}
+		h := &QueryHandler{queryGateOnCatchup: flag, coordinator: lease}
+		app := fiber.New()
+		var quiet bool
+		app.Use(func(c *fiber.Ctx) error {
+			err := c.Next()
+			quiet, _ = c.Locals(ingestRefusedLocal).(bool)
+			return err
+		})
+		app.Get("/test", h.checkReplicationReady, func(c *fiber.Ctx) error { return c.SendString("served") })
+
+		resp, err := app.Test(httptest.NewRequest("GET", "/test", nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != fiber.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" {
+			t.Fatalf("flag %v, no lease: %d %s", flag, resp.StatusCode, body)
+		}
+		var out map[string]interface{}
+		if err := json.Unmarshal(body, &out); err != nil || out["error"] != "cluster_state_not_synced" {
+			t.Fatalf("flag %v: body %s", flag, body)
+		}
+		if h.readLease503Total.Load() != 1 {
+			t.Fatalf("refusals counted: %d", h.readLease503Total.Load())
+		}
+		if !quiet {
+			t.Fatal("a refused read is logged once per request at Error by the request logger")
+		}
+
+		lease.readReady = true
+		resp, err = app.Test(httptest.NewRequest("GET", "/test", nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 || string(body) != "served" {
+			t.Fatalf("flag %v, lease held: %d %s", flag, resp.StatusCode, body)
+		}
+	}
+}
+
+// A compactor forwards queries to a reader or writer: it is not refused for
+// a lease it does not need, the peer answers for itself. A node that reads
+// locally is refused.
+func TestCheckReplicationReady_ForwardingNodeIsNotRefused1852(t *testing.T) {
+	for _, tc := range []struct {
+		role cluster.NodeRole
+		want int
+	}{{cluster.RoleCompactor, 200}, {cluster.RoleReader, 503}} {
+		local := cluster.NewNode("local", "Local", tc.role, "test-cluster")
+		registry := cluster.NewRegistry(&cluster.RegistryConfig{LocalNode: local, Logger: zerolog.Nop()})
+		router := cluster.NewRouter(&cluster.RouterConfig{Timeout: time.Second, Registry: registry, LocalNode: local, Logger: zerolog.Nop()})
+		h := &QueryHandler{router: router, coordinator: &fakeReadLease{fakeReplicationReadiness: fakeReplicationReadiness{ready: true}, why: "not synced"}}
+		app := fiber.New()
+		app.Get("/test", h.checkReplicationReady, func(c *fiber.Ctx) error { return c.SendString("passed on") })
+		resp, err := app.Test(httptest.NewRequest("GET", "/test", nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != tc.want {
+			t.Fatalf("%s with no read lease: %d, want %d", tc.role, resp.StatusCode, tc.want)
+		}
 	}
 }

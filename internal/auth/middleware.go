@@ -43,6 +43,8 @@ func DefaultMiddlewareConfig() MiddlewareConfig {
 			// The write-pool health check, for the same reason as /ready: a
 			// load balancer cannot authenticate.
 			"/ready/write",
+			// The read-pool health check (#1852), for the same reason.
+			"/ready/read",
 			"/api/v1/auth/verify",
 		},
 		// /metrics is public only with auth.metrics_public (authPublicPaths,

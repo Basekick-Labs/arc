@@ -7,8 +7,11 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
+	"github.com/gofiber/fiber/v2"
 	"io"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -94,5 +97,58 @@ func TestReadyWrite_IsNarrowerThanReady(t *testing.T) {
 func TestReadyWrite_IsUnauthenticated(t *testing.T) {
 	if !isUnauthenticatedRoute("/ready/write") {
 		t.Error("/ready/write is not in the client-identity public list")
+	}
+}
+
+// /ready/read (#1852): a node with no read lease is ready and not a read
+// target; its reason is a fixed sentence, never the lease's own (it can carry
+// addresses from a failed sync, and the probe is unauthenticated).
+func TestReadyRead1852(t *testing.T) {
+	s := readyWriteRig(t, true, nil)
+	if code, body := getStatus(t, s, "/ready/read"); code != 200 || body["status"] != "ready" {
+		t.Fatalf("unwired: %d %v", code, body)
+	}
+	ok, why := false, "could not sync: dial tcp 10.0.0.7:7946: connection refused"
+	s.SetReadReadiness(func() (bool, string) { return ok, why })
+	code, body := getStatus(t, s, "/ready/read")
+	if code != 503 || body["status"] != "not_read_target" {
+		t.Fatalf("no lease: %d %v", code, body)
+	}
+	if r := fmt.Sprint(body["reason"]); strings.Contains(r, "10.0.0.7") {
+		t.Fatalf("the probe gave out the lease's own reason: %q", r)
+	}
+	if code, _ := getStatus(t, s, "/ready"); code != 200 {
+		t.Fatalf("/ready answered %d: a node with no read lease is still ready", code)
+	}
+	ok = true
+	if code, _ := getStatus(t, s, "/ready/read"); code != 200 {
+		t.Fatalf("lease held: %d", code)
+	}
+	s.ready.Store(false)
+	if code, body := getStatus(t, s, "/ready/read"); code != 503 || body["status"] != "not_ready" {
+		t.Fatalf("not ready at all: %d %v", code, body)
+	}
+}
+
+// The probe's 503 is an expected state: it does not add an Error line per
+// poll.
+func TestReadyReadRefusalIsQuiet1852(t *testing.T) {
+	s := readyWriteRig(t, true, nil)
+	s.SetReadReadiness(func() (bool, string) { return false, "x" })
+	var quiet bool
+	app := fiber.New()
+	app.Use(func(c *fiber.Ctx) error {
+		err := c.Next()
+		quiet, _ = c.Locals(ingestRefusedLocal).(bool)
+		return err
+	})
+	app.Get("/ready/read", s.readyReadHandler)
+	resp, err := app.Test(httptest.NewRequest("GET", "/ready/read", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 503 || !quiet {
+		t.Fatalf("%d, quiet %v", resp.StatusCode, quiet)
 	}
 }

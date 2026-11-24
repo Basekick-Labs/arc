@@ -596,7 +596,8 @@ const IngestFencedHeader = "X-Arc-Ingest-Fenced"
 const IngestRefusedHeader = "X-Arc-Ingest-Refused"
 
 // ingestRefusedLocal is the request flag the request logger reads to skip its
-// per-request line for a WriteRefusal (#676).
+// per-request line for a WriteRefusal (#676), and for a read refused while the
+// node holds no read lease (refuseRead), which logs its own sampled line.
 const ingestRefusedLocal = "arc.ingest_refused"
 
 // forwardedRefusalReason is the log reason for a refusal a peer sent in
