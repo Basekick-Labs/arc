@@ -4004,8 +4004,9 @@ func (h *QueryHandler) getTransformedSQLWithRefs(ctx context.Context, sql, heade
 			stamps = append(stamps, pathFailure.stamps[ref])
 		}
 		pruner := h.pruner
+		coldOnly := pathFailure.coldOnly
 		h.queryCache.SetWithMetadataCheck(cacheKey, transformed, encodeStoragePathReferences(refs),
-			func() bool { return !pruner.StampsCurrent(stamps) })
+			func() bool { return !pruner.StampsCurrent(stamps) || h.gainedHotTier(coldOnly) })
 	}
 	return transformed, false, refs, nil
 }
@@ -4354,6 +4355,11 @@ type storagePathFailure struct {
 	// recorded, which is before any of its files are listed (#1757).
 	stampOf func(database, measurement string) pruning.PublishStamp
 	stamps  map[TableReference]pruning.PublishStamp
+	// coldOnly: measurements this transform read with the hot tier left
+	// out, because no tier row said hot, with each one's tier version as read
+	// before that lookup (#1765). The cached SQL goes stale once a version
+	// moves.
+	coldOnly []coldOnlyRef
 }
 
 // errColdTierUnavailable refuses a read that needs the cold tier on a node
@@ -4564,6 +4570,28 @@ func reservedPlaceholderInTransform(ctx context.Context, masked string) bool {
 func recordStoragePathFailure(ctx context.Context, err error) {
 	if f, ok := ctx.Value(storagePathCtxKey{}).(*storagePathFailure); ok && f.err == nil {
 		f.err = err
+	}
+}
+
+// coldOnlyRef is a measurement read without its hot tier, and its tier
+// version as read before the tier lookup that decided it.
+type coldOnlyRef struct {
+	ref     TableReference
+	version uint64
+}
+
+// recordColdOnly notes a measurement the transform read without its hot tier.
+// The first version kept, as for publish stamps: a change between two uses of
+// one table must still make the SQL stale.
+func recordColdOnly(ctx context.Context, database, measurement string, version uint64) {
+	if f, ok := ctx.Value(storagePathCtxKey{}).(*storagePathFailure); ok {
+		ref := TableReference{Database: database, Measurement: measurement}
+		for _, r := range f.coldOnly {
+			if r.ref == ref {
+				return
+			}
+		}
+		f.coldOnly = append(f.coldOnly, coldOnlyRef{ref: ref, version: version})
 	}
 }
 
@@ -5034,6 +5062,11 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 
 	// Query metadata to find which tiers actually have data for this measurement
 	tiers := h.multiTierView()
+	// Read before the lookup: a change after it moves this (#1765).
+	var tierVersion uint64
+	if vv, ok := tiers.(tierVersionView); ok {
+		tierVersion = vv.TierVersion(database, measurement)
+	}
 	actualTiers, err := tiers.TiersForMeasurement(ctx, database, measurement)
 	if err != nil {
 		h.logger.Warn().Err(err).
@@ -5103,7 +5136,10 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 		// replication drainer drops the query caches for a measurement whose
 		// tier rows it changes, so a node that acquires hot rows for a
 		// measurement it is only receiving does not keep serving a cold-only
-		// read.
+		// read. And the cached transform goes stale once the measurement has
+		// a hot row (#1765): its first hot file, written on this node, is
+		// otherwise left out of a repeated query for up to the cache TTL.
+		recordColdOnly(ctx, database, measurement, tierVersion)
 		h.logger.Debug().
 			Str("database", database).
 			Str("measurement", measurement).
@@ -7109,4 +7145,38 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		}
 	})
 	return nil
+}
+
+// gainedHotTier reports whether a measurement a cached transform read with
+// its hot tier left out may have changed tiers since (#1765). It runs on every
+// hit of such a transform, under the transform cache's lock, so it reads
+// memory only: the measurement's tier version, which moves whenever its tier
+// rows may have changed (a recorded file, a migration).
+func (h *QueryHandler) gainedHotTier(coldOnly []coldOnlyRef) bool {
+	if len(coldOnly) == 0 {
+		return false
+	}
+	view, ok := h.multiTierView().(tierVersionView)
+	if !ok {
+		return false
+	}
+	for _, c := range coldOnly {
+		if view.TierVersion(c.ref.Database, c.ref.Measurement) != c.version {
+			return true
+		}
+	}
+	return false
+}
+
+// tierVersionView is a tier view whose per-measurement version can be read
+// without I/O.
+type tierVersionView interface {
+	TierVersion(database, measurement string) uint64
+}
+
+func (v tieringTierView) TierVersion(database, measurement string) uint64 {
+	if v.m == nil || v.m.GetMetadata() == nil {
+		return 0
+	}
+	return v.m.GetMetadata().TierVersion(database, measurement)
 }

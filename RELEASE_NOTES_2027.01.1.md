@@ -11,6 +11,15 @@ long time, and every other request, dry runs included, was refused with 409 mean
 changes nothing, so it now has its own slot: one dry run and one job can run at once. A second job
 (or taking one up again with `/resume`), or a second dry run, is still refused. A job in progress is
 no longer dropped from `GET /api/v1/rehome` by newer ones. Jobs on a cluster never held this slot.
+## Fix: a measurement whose rows were all cold reads its first hot file at once ([#1765](https://github.com/Basekick-Labs/arc/issues/1765))
+
+**Who is affected:** nodes with tiered storage on.
+
+When no tier row of a measurement says hot, a query reads only its cold tier, and that query's SQL
+is cached. A flush reports a new file to the query layer before it records the file's tier row, so
+a repeated query run between the two could cache SQL without the hot tier, and keep leaving the new
+file out for up to the cache's lifetime (60 seconds). Such cached SQL now goes stale as soon as the
+measurement's tier rows change (a per-measurement counter checked in memory on each use).
 
 ## Fix: deleting a backup answers 404 for an unknown id and 503 for an unreachable destination ([#1122](https://github.com/Basekick-Labs/arc/issues/1122))
 

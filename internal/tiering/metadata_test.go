@@ -689,3 +689,21 @@ func TestMetadataStore_CleanupOldMigrations_BatchLoop(t *testing.T) {
 		t.Errorf("After full cleanup, %d records remain, want 0", len(remaining))
 	}
 }
+
+// #1765: recording a file moves its measurement's tier version, and only its.
+func TestTierVersionMovesOnARecordedFile(t *testing.T) {
+	store, cleanup := setupTestMetadataStore(t)
+	defer cleanup()
+	ctx := context.Background()
+	a, b := store.TierVersion("db", "cpu"), store.TierVersion("db", "mem")
+	if err := store.RecordFile(ctx, &FileMetadata{Path: "db/cpu/2026/11/10/10/x.parquet", Database: "db", Measurement: "cpu",
+		PartitionTime: time.Date(2026, 11, 10, 10, 0, 0, 0, time.UTC), Tier: TierHot, SizeBytes: 1, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if store.TierVersion("db", "cpu") == a {
+		t.Fatal("version did not move")
+	}
+	if store.TierVersion("db", "mem") != b {
+		t.Fatal("another measurement's version moved")
+	}
+}
