@@ -99,6 +99,27 @@ listing cache is now off; the data and metadata caches stay. The cost is an S3 L
 query: in a test against a local SeaweedFS, about 7 ms more per small query (a query loop answered
 3,110 queries in two minutes instead of 3,776); more against a remote bucket, and little next to a
 query that reads many rows.
+## Fix: on a cluster, a re-home job does not start under a backup running on another node ([#1857](https://github.com/Basekick-Labs/arc/issues/1857))
+
+**Who is affected:** clusters sharing one object store with re-home enabled (#1825): every backup,
+restore and backup deletion there.
+
+A backup or restore kept re-home jobs out only on the node it ran on. After a failover, a job the
+new primary writer started could move a file the backup on the former one was copying, leaving the
+backup with the file and the files replacing it, or neither. A backup, a restore and a backup
+deletion now record themselves in the cluster (renewed every 30 seconds, ignored 90 seconds after
+the last renewal; `GET /api/v1/cluster` lists them under `rehome.backups`), and a job is not staged
+while one is recorded anywhere; a backup still refuses to start while a job runs. One that cannot
+record itself (no cluster leader) is refused. The renewals compare clocks of different nodes: keep
+them in sync. Nothing is recorded while re-home is off (an older leader would refuse it), so a
+backup that started before the cluster turned re-home on is not protected by a mark.
+
+Also: a DELETE that started on a former primary cannot register its rewrite of a file a job is
+moving (the cluster refuses it), but could leave the rewrite's object in storage, read beside the
+job's new files. The job now removes such objects before it removes the file and again before it
+ends, and that DELETE's registration then settles as gone; one that lands later is removed by the
+DELETE's own cleanup. Either way the rows that DELETE removed are back (they are in the job's new
+files): run it again.
 
 ## Fix: on a cluster sharing one object store, a query no longer counts a compaction's rows twice ([#1852](https://github.com/Basekick-Labs/arc/issues/1852))
 
@@ -203,9 +224,10 @@ At no step does a query on any node count a row twice or miss one.
   alone, on any node; so is any of them on a node that has not synced with the leader yet.
 
 Not handled in this version:
-- A backup, a DELETE or retention still running on a former primary writer after a failover does
-  not see a job the new one starts (a DELETE rewrite that lands before the switch-over makes the
-  job revert; one that lands after is not caught).
+- A backup on a node cut off from the cluster leader for longer than 90 seconds loses its mark
+  ([#1857](https://github.com/Basekick-Labs/arc/issues/1857)): a job may then start under it. The
+  node logs an Error saying so; take that backup again. Retention and DELETE started on a former
+  primary fail safe: the cluster refuses their change to the job's file.
 - A new job is started on the primary writer only.
 
 ## Change: a cluster records re-home jobs in its replicated state; an older build cannot join once every node supports it ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))

@@ -684,6 +684,17 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 	// readers included); the finisher advances a job (compaction roles). A
 	// waived fence is the leader's own and never forwarded; enable is
 	// leader-only.
+	// A backup mark (#1857): the node running a backup or restore, any role;
+	// it must name the requesting node.
+	isBackupMark := cmd.Type == clusterraft.CommandBackupMark
+	if isBackupMark {
+		var p clusterraft.BackupMarkPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil || p.Node != req.NodeID {
+			c.logger.Warn().Str("requesting_node", req.NodeID).Msg("ForwardApply rejected: backup mark names another node")
+			c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "backup mark must name the requesting node")
+			return
+		}
+	}
 	isFence := cmd.Type == clusterraft.CommandReadFence
 	isAdvanceCompaction := cmd.Type == clusterraft.CommandAdvanceCompaction
 	if isFence || isAdvanceCompaction {
@@ -787,7 +798,7 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 			return
 		}
 	}
-	if !isManifest && !isAuth && !isRBAC && !isBarrier && !isPauseSet && !isPauseAck && !isTakeOver && !isCompaction && !isCompactionHeld && !isPolicy && !isWatermark && !isColdMark && !isColdMarkAck && !isIcebergNotice && !isRehome && !isRehomeAck && !isFence && !isAdvanceCompaction {
+	if !isManifest && !isAuth && !isRBAC && !isBarrier && !isPauseSet && !isPauseAck && !isTakeOver && !isCompaction && !isCompactionHeld && !isPolicy && !isWatermark && !isColdMark && !isColdMarkAck && !isIcebergNotice && !isRehome && !isRehomeAck && !isFence && !isAdvanceCompaction && !isBackupMark {
 		c.logger.Warn().
 			Str("requesting_node", req.NodeID).
 			Int("cmd_type", int(cmd.Type)).

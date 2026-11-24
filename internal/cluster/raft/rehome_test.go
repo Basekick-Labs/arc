@@ -2,6 +2,7 @@ package raft
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"reflect"
 	"testing"
@@ -668,5 +669,86 @@ func TestUnknownCommandTypeChangesNothing(t *testing.T) {
 	}
 	if x.f.RehomeGeneration() != before || len(x.f.RehomeJobs()) != 0 {
 		t.Fatal("an unknown command changed state")
+	}
+}
+
+// #1857: no job is staged while a backup mark is live; a lapsed or ended
+// mark, or a removed node's, does not hold it.
+func TestStageRehomeRefusedWhileABackupRuns(t *testing.T) {
+	x := rhFSM(t)
+	x.ok(CommandBackupMark, BackupMarkPayload{ID: "b1", Node: "w2", Now: t0})
+	if r := x.rhConflict(CommandStageRehome, rhStage("j1")); r != RehomeBackupRunning {
+		t.Fatalf("reason %q", r)
+	}
+	late := rhStage("j1")
+	late.Now = t0.Add(BackupMarkLease)
+	x.ok(CommandStageRehome, late) // the mark lapsed
+}
+
+func TestBackupMarkEndAndNodeRemoval(t *testing.T) {
+	x := rhFSM(t)
+	x.ok(CommandBackupMark, BackupMarkPayload{ID: "b1", Node: "w2", Now: t0})
+	x.ok(CommandBackupMark, BackupMarkPayload{ID: "b1", Node: "w2", End: true})
+	x.ok(CommandStageRehome, rhStage("j1"))
+	x.ok(CommandBackupMark, BackupMarkPayload{ID: "b2", Node: "r1", Now: t0})
+	if !x.f.ReferencesNode("r1") || len(x.f.BackupMarks()) != 1 {
+		t.Fatal("mark not recorded")
+	}
+	// Snapshot round trip keeps it.
+	snap, err := x.f.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := snap.Persist(&testSnapshotSink{Writer: &buf}); err != nil {
+		t.Fatal(err)
+	}
+	f2 := newTestFSM()
+	if err := f2.Restore(io.NopCloser(bytes.NewReader(buf.Bytes()))); err != nil {
+		t.Fatal(err)
+	}
+	if m := f2.BackupMarks(); len(m) != 1 || m[0].Node != "r1" {
+		t.Fatalf("restored marks %v", m)
+	}
+	x.ok(CommandRemoveNode, RemoveNodePayload{NodeID: "r1"})
+	if len(x.f.BackupMarks()) != 0 {
+		t.Fatal("a removed node's mark is kept")
+	}
+	x.refused(CommandBackupMark, BackupMarkPayload{ID: "b3", Node: "nobody", Now: t0})
+}
+
+// A renew of a lapsed mark is refused: it does not come back over a job
+// staged meanwhile.
+func TestBackupMarkRenewAfterLapse(t *testing.T) {
+	x := rhFSM(t)
+	x.ok(CommandBackupMark, BackupMarkPayload{ID: "b1", Node: "w2", Now: t0})
+	x.ok(CommandBackupMark, BackupMarkPayload{ID: "b1", Node: "w2", Now: t0.Add(BackupMarkLease / 3), Renew: true})
+	late := t0.Add(BackupMarkLease/3 + BackupMarkLease)
+	stage := rhStage("j1")
+	stage.Now = late
+	x.ok(CommandStageRehome, stage)
+	res := x.apply(CommandBackupMark, BackupMarkPayload{ID: "b1", Node: "w2", Now: late, Renew: true})
+	if err, _ := res.(error); err == nil || !errors.Is(err, ErrBackupMarkLapsed) {
+		t.Fatalf("renew after lapse: %v", res)
+	}
+	// Another node cannot end it, and a begin is not a renew.
+	x.refused(CommandBackupMark, BackupMarkPayload{ID: "b2", Node: "w2", Now: late, Renew: true})
+}
+
+// A node's clock running ahead does not end another node's live mark.
+func TestBackupMarkPruneOwnOnly(t *testing.T) {
+	x := rhFSM(t)
+	x.ok(CommandBackupMark, BackupMarkPayload{ID: "b1", Node: "w2", Now: t0})
+	x.ok(CommandBackupMark, BackupMarkPayload{ID: "b2", Node: "r1", Now: t0.Add(2 * BackupMarkLease)})
+	x.ok(CommandBackupMark, BackupMarkPayload{ID: "b1", Node: "w2", Now: t0.Add(BackupMarkLease / 3), Renew: true})
+	if len(x.f.BackupMarks()) != 2 {
+		t.Fatalf("marks %v", x.f.BackupMarks())
+	}
+	// w2's own lapsed mark goes at its next begin.
+	x.ok(CommandBackupMark, BackupMarkPayload{ID: "b3", Node: "w2", Now: t0.Add(3 * BackupMarkLease)})
+	for _, m := range x.f.BackupMarks() {
+		if m.ID == "b1" {
+			t.Fatal("w2's lapsed mark kept")
+		}
 	}
 }

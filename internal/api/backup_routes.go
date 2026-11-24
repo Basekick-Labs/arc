@@ -791,7 +791,7 @@ func (h *BackupHandler) acquireOperation(c *fiber.Ctx, operation string) (bool, 
 		if !ok {
 			h.activeOperation.Store(nil)
 			return false, c.Status(fiber.StatusConflict).JSON(fiber.Map{
-				"error":  "A re-home job, or a compaction being finished on the cluster, is in flight (GET /api/v1/rehome, GET /api/v1/cluster); a backup or restore started now could copy a file and the files replacing it, or neither. Retry once the job has ended",
+				"error":  "A re-home job, or a compaction being finished on the cluster, is in flight (GET /api/v1/rehome, GET /api/v1/cluster), or this node could not record the backup in the cluster (the server log says which); a backup or restore started now could copy a file and the files replacing it, or neither. Retry once the job has ended",
 				"status": "refused",
 			})
 		}

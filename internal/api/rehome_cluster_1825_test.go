@@ -579,3 +579,44 @@ func TestClusterNodeOutOfScopeReverts1859(t *testing.T) {
 	}
 	r.requireOnce("after the revert")
 }
+
+// #1857: a DELETE rewrite of the source that the cluster never registered (a
+// DELETE that started on a former primary) is removed before the source.
+func TestClusterRemovesAnUnregisteredRewrite1857(t *testing.T) {
+	r := newClusterRig(t)
+	rewrite := strings.TrimSuffix(r.key, ".parquet") + "_rewrite_1.parquet"
+	r.h.afterStep = func(s string) {
+		if s == "latched" {
+			if err := r.store.WriteReader(context.Background(), rewrite, strings.NewReader("stale rows"), 10); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	id, _, _ := r.start()
+	if job := r.wait(id); job["state"] != "done" {
+		t.Fatalf("job: %v", job)
+	}
+	if n, _ := r.store.StatFile(context.Background(), rewrite); n >= 0 {
+		t.Fatal("the unregistered rewrite is still in the bucket")
+	}
+	r.requireOnce("after the swap")
+}
+
+// A registered sibling of the source is not touched by the sweep.
+func TestClusterKeepsARegisteredSibling1857(t *testing.T) {
+	r := newClusterRig(t)
+	h := &RehomeHandler{storage: r.store, logger: r.h.logger, swap: r.swap}
+	sib := strings.TrimSuffix(r.key, ".parquet") + "_rewrite_2.parquet"
+	if err := r.store.WriteReader(context.Background(), sib, strings.NewReader("kept"), 4); err != nil {
+		t.Fatal(err)
+	}
+	r.c.must(raft.CommandRegisterFile, raft.RegisterFilePayload{File: raft.FileEntry{
+		Path: sib, SHA256: "s", SizeBytes: 4, Database: "db", Measurement: "cpu",
+		PartitionTime: time.Date(2026, 11, 18, 23, 0, 0, 0, time.UTC), OriginNodeID: "w1", Tier: "hot", CreatedAt: time.Now()}})
+	if err := h.removeUnregisteredRewrites(context.Background(), r.key); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := r.store.StatFile(context.Background(), sib); n != 4 {
+		t.Fatal("a registered sibling was removed")
+	}
+}

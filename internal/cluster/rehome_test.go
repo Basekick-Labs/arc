@@ -411,3 +411,102 @@ func TestRehomeJoinGateLetsAMemberRefreshItsRecord(t *testing.T) {
 	}
 	waitFSM(t, func() bool { return strings.Contains(c.raftNode.FSM().RehomeOutOfScope(), "reader-1") })
 }
+
+// #1857: a backup marks itself in the cluster while it runs; release ends it.
+func TestBeginBackupMark(t *testing.T) {
+	c := originRig(t, "writer-1", RoleWriter)
+	src := c.RehomeSource()
+	// Re-home off: nothing is recorded (an older leader would refuse it).
+	off, err := src.BeginBackupMark(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	off()
+	if len(c.raftNode.FSM().BackupMarks()) != 0 {
+		t.Fatal("a mark recorded with re-home off")
+	}
+	capNodes(t, c, map[string][]string{"raft-1": rhList, "writer-1": rhList, "writer-2": rhList, "reader-1": rhList})
+	c.maybeEnableCompactionCommit()
+	waitFSM(t, c.CompactionCommitActive)
+	c.maybeEnableRehome()
+	waitFSM(t, c.raftNode.FSM().RehomeEnabled)
+	release, err := src.BeginBackupMark(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFSM(t, func() bool { return len(c.raftNode.FSM().BackupMarks()) == 1 })
+	if m := c.raftNode.FSM().BackupMarks()[0]; m.Node != c.LocalNodeID() {
+		t.Fatalf("mark %+v", m)
+	}
+	release()
+	release() // once
+	waitFSM(t, func() bool { return len(c.raftNode.FSM().BackupMarks()) == 0 })
+}
+
+// #1857 through the real forward handler: any role may record its own mark,
+// none another's; a renew of a lapsed mark keeps its reason in the text.
+func TestForwardApplyBackupMark(t *testing.T) {
+	c := originRig(t, "writer-1", RoleWriter)
+	c.raftFSM = c.raftNode.FSM()
+	capNodes(t, c, map[string][]string{"raft-1": rhList, "writer-1": rhList, "writer-2": rhList, "reader-1": rhList})
+	mark := func(node string, renew bool) *raft.Command {
+		raw, _ := json.Marshal(raft.BackupMarkPayload{ID: "m-" + node, Node: node, Now: time.Now().UTC(), Renew: renew})
+		return &raft.Command{Type: raft.CommandBackupMark, Payload: raw}
+	}
+	if a := forwardOnce(t, c, "reader-1", mark("writer-2", false)); a.Status == "ok" || a.Code != protocol.ForwardCodeAuth {
+		t.Fatalf("mark for another node: %+v", a)
+	}
+	if a := forwardOnce(t, c, "reader-1", mark("reader-1", true)); a.Status == "ok" ||
+		!strings.Contains((&ForwardRejectedError{Code: a.Code, Message: a.Error}).Error(), raft.ErrBackupMarkLapsed.Error()) {
+		t.Fatalf("renew of no mark: %+v", a)
+	}
+	if a := forwardOnce(t, c, "writer-2", mark("writer-2", false)); a.Status != "ok" {
+		t.Fatalf("mark: %+v", a)
+	}
+	if m := c.raftNode.FSM().BackupMarks(); len(m) != 1 || m[0].Node != "writer-2" {
+		t.Fatalf("marks %v", m)
+	}
+}
+
+// rehomingManifestVar is rehomingManifest with an owned path that changes
+// while the outbox reads it.
+type rehomingManifestVar struct {
+	*fakeOutboxManifest
+	owned atomic.Value // string
+}
+
+func (m *rehomingManifestVar) RehomeOwnsPath(path string) bool {
+	owned, _ := m.owned.Load().(string)
+	return path == owned
+}
+
+// #1857: a DELETE rewrite of a job's source, held while the job runs, is
+// checked in storage before it registers: the job removed its object, so it
+// settles as gone however recently it was flushed.
+func TestOutboxChecksARewriteHeldByAJob(t *testing.T) {
+	r := newTestOutbox(t, t.TempDir())
+	register(r, outPathA, 10)
+	if outcome, _, err := r.ReplacePending(context.Background(), outPathA, outPathB, 7, "new"); err != nil || outcome != ReplaceSwapped {
+		t.Fatalf("outcome %v err %v", outcome, err)
+	}
+	m := &rehomingManifestVar{fakeOutboxManifest: newFakeOutboxManifest()}
+	m.owned.Store(outPathA)
+	store := &fakeOutboxStorage{sizes: map[string]int64{outPathB: 7}}
+	r.HandOff(m, store, "writer-1")
+	time.Sleep(200 * time.Millisecond)
+	if m.isRegistered(outPathB) {
+		t.Fatal("registered while the job owns its source")
+	}
+	store.remove(outPathB) // the job's sweep
+	m.owned.Store("")      // the job ended
+	waitOutbox(t, "settled", func() bool { return r.Pending() == 0 })
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, b := range m.batches {
+		for _, p := range b {
+			if p == outPathB {
+				t.Fatal("sent a rewrite whose object the job removed")
+			}
+		}
+	}
+}

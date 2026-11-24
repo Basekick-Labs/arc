@@ -280,6 +280,9 @@ const (
 	CommandEnableCompactionFences
 	CommandReadFence
 	CommandAdvanceCompaction
+	// CommandBackupMark: a backup or restore running on a node (#1857), see
+	// rehome_backup.go.
+	CommandBackupMark
 )
 
 // Command represents a command to be applied to the FSM.
@@ -903,6 +906,7 @@ type ClusterFSM struct {
 	rehomeJobs    map[string]*RehomeJob
 	rehomePaths   map[string]string
 	rehomeGen     uint64
+	backupMarks   map[string]*BackupMark
 	// Compaction read fences (#1852), under mu; see compaction_fences.go.
 	compactionFences bool
 	readFences       map[string]uint64
@@ -1035,6 +1039,7 @@ func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 		staged:                  map[string]*StagedCompaction{},
 		stagedPaths:             map[string]string{},
 		rehomeJobs:              map[string]*RehomeJob{},
+		backupMarks:             map[string]*BackupMark{},
 		readFences:              map[string]uint64{},
 		rehomePaths:             map[string]string{},
 		policiesSeeded:          map[string]bool{},
@@ -1586,6 +1591,8 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.applyReadFence(cmd.Payload, log.Index)
 	case CommandAdvanceCompaction:
 		return f.applyAdvanceCompaction(cmd.Payload, log.Index)
+	case CommandBackupMark:
+		return f.applyBackupMark(cmd.Payload)
 
 	default:
 		return fmt.Errorf("unknown command type: %d", cmd.Type)
@@ -1835,6 +1842,7 @@ func (f *ClusterFSM) applyRemoveNode(payload []byte) interface{} {
 	delete(f.nodes, p.NodeID)
 	f.compactionNodeRemovedLocked(p.NodeID)
 	f.rehomeNodeRemovedLocked(p.NodeID, f.applyStarted.Load())
+	f.backupMarksNodeRemovedLocked(p.NodeID)
 	delete(f.readFences, p.NodeID)
 	// A removed node no longer holds the cold mark fence or counts toward
 	// its liveness (#1552).
@@ -1916,6 +1924,12 @@ func (f *ClusterFSM) ReferencesNode(id string) bool {
 	// rehomeNodeRemovedLocked
 	if f.rehomeReferencesLocked(id) {
 		return true
+	}
+	// backupMarksNodeRemovedLocked
+	for _, m := range f.backupMarks {
+		if m.Node == id {
+			return true
+		}
 	}
 	// readFences (applyRemoveNode)
 	if _, ok := f.readFences[id]; ok {
