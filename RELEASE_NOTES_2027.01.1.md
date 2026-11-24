@@ -209,10 +209,11 @@ wrong rows.
 - **A node that joins mid-job** fetches the outputs itself, or records the job before its puller
   brings them, so it reads the old file until every output is there.
 - No read lease is added on local storage: queries are served as before throughout.
-- A node that stopped before the outputs were published, and rejoins after the job ended with no
-  record of it, removes the old file and pulls the outputs independently: for that moment its
-  queries may see both or neither. Every other node, and that node once the pull lands, reads each
-  row once.
+- A node that rejoins with no record of a job (it stopped before the outputs were published, or
+  joins fresh) while the job runs or after it ended brings the old file and the outputs in through
+  its file puller, independently: for a moment its queries may see both or neither (one wrong total
+  in about 2,600 queries on such a node in testing). Every other node, and that node once its pulls
+  land, reads each row once.
 
 ## New: moving a misfiled file's rows on a cluster whose nodes share one object store ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
 

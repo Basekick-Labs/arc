@@ -27,18 +27,45 @@ func (c *Coordinator) FetchRehomeStaged(ctx context.Context, j raft.RehomeJob, o
 		return errors.New("no fetch client")
 	}
 	entry := raft.FileEntry{Path: out.StagedKey, SHA256: out.SHA256, SizeBytes: out.SizeBytes}
-	order := []string{j.Origin}
+	// Addresses from the cluster's record, which every member holds, and
+	// from this node's registry for a node it knows of only there: a node
+	// that left and rejoined can be missing from the registry (#1860).
+	addrs := map[string]string{}
+	var order []string
+	add := func(id, addr string) {
+		if id == "" || addr == "" || id == c.localNode.ID {
+			return
+		}
+		if _, seen := addrs[id]; !seen {
+			order = append(order, id)
+		}
+		addrs[id] = addr
+	}
+	var fsm *raft.ClusterFSM
+	if c.raftNode != nil {
+		fsm = c.raftNode.FSM()
+	}
+	if fsm != nil {
+		if n, ok := fsm.GetNode(j.Origin); ok {
+			add(n.ID, n.Address)
+		}
+	}
+	if n, ok := c.registry.Get(j.Origin); ok {
+		add(n.ID, n.Address)
+	}
+	if fsm != nil {
+		for _, n := range fsm.GetAllNodes() {
+			add(n.ID, n.Address)
+		}
+	}
 	for _, n := range c.registry.GetAll() {
-		if n.ID != j.Origin {
-			order = append(order, n.ID)
+		if _, seen := addrs[n.ID]; !seen {
+			add(n.ID, n.Address)
 		}
 	}
 	var lastErr error
 	for _, id := range order {
-		n, ok := c.registry.Get(id)
-		if !ok || n.Address == "" || id == c.localNode.ID {
-			continue
-		}
+		addr := addrs[id]
 		fctx, cancel := context.WithTimeout(ctx, stagedFetchTimeout)
 		pr, pw := io.Pipe()
 		done := make(chan error, 1)
@@ -49,7 +76,7 @@ func (c *Coordinator) FetchRehomeStaged(ctx context.Context, j raft.RehomeJob, o
 			pr.CloseWithError(err)
 			done <- err
 		}()
-		_, ferr := c.fetcher.Fetch(fctx, n.Address, &entry, pw, 0, nil)
+		_, ferr := c.fetcher.Fetch(fctx, addr, &entry, pw, 0, nil)
 		pw.CloseWithError(ferr)
 		werr := <-done
 		cancel()
