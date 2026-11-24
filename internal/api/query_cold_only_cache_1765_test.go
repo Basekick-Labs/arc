@@ -14,20 +14,22 @@ func TestColdOnlyTransformGoesStaleOnTheFirstHotRow(t *testing.T) {
 	e := unlistedEnv(t)
 	cold := unreachableCold(t)
 	tiers := map[tiering.Tier]bool{tiering.TierCold: true}
-	e.h.tierView = fakeTierView{tiers: tiers, cold: cold}
+	version := new(uint64)
+	e.h.tierView = versionedFakeTierView{fakeTierView{tiers: tiers, cold: cold}, version}
 	ctx, f := withStoragePathFailure(context.Background())
 	paths := map[tiering.Tier]string{
 		tiering.TierHot:  e.h.getStoragePath(ctx, "sch", "m"),
 		tiering.TierCold: e.h.storagePathForBackend(ctx, cold, "sch", "m"),
 	}
 	_ = e.h.buildMultiTierReadParquet(ctx, "sch", "m", hotRangeSQL, paths, "FROM")
-	if len(f.coldOnly) != 1 || f.coldOnly[0] != (TableReference{Database: "sch", Measurement: "m"}) {
+	if len(f.coldOnly) != 1 || f.coldOnly[0].ref != (TableReference{Database: "sch", Measurement: "m"}) {
 		t.Fatalf("cold-only measurements %v, want sch.m", f.coldOnly)
 	}
 	if e.h.gainedHotTier(f.coldOnly) {
 		t.Fatal("stale while the measurement is still cold-only")
 	}
 	tiers[tiering.TierHot] = true // the first hot file is recorded
+	*version++                    // which invalidates the measurement's tier cache
 	if !e.h.gainedHotTier(f.coldOnly) {
 		t.Fatal("not stale once the measurement has a hot row")
 	}
@@ -45,3 +47,11 @@ func TestHotTransformIsNotTrackedAsColdOnly(t *testing.T) {
 		t.Fatalf("tracked %v", f.coldOnly)
 	}
 }
+
+// versionedFakeTierView is fakeTierView with a tier version.
+type versionedFakeTierView struct {
+	fakeTierView
+	version *uint64
+}
+
+func (v versionedFakeTierView) TierVersion(string, string) uint64 { return *v.version }

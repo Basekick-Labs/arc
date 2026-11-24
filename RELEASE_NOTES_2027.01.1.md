@@ -19,8 +19,7 @@ When no tier row of a measurement says hot, a query reads only its cold tier, an
 is cached. A flush reports a new file to the query layer before it records the file's tier row, so
 a repeated query run between the two could cache SQL without the hot tier, and keep leaving the new
 file out for up to the cache's lifetime (60 seconds). Such cached SQL now goes stale as soon as the
-measurement has a hot row. Files in the current hour, and the common case of a query that runs
-after the row is recorded, were already read at once.
+measurement's tier rows change (a per-measurement counter checked in memory on each use).
 
 ## Fix: deleting a backup answers 404 for an unknown id and 503 for an unreachable destination ([#1122](https://github.com/Basekick-Labs/arc/issues/1122))
 

@@ -42,7 +42,10 @@ type MetadataStore struct {
 	logger zerolog.Logger
 
 	// Cache for GetTiersForMeasurement - keyed by "database/measurement"
-	tierCache    map[string]*tierCacheEntry
+	tierCache map[string]*tierCacheEntry
+	// tierVersions moves per measurement on every invalidateTierCache
+	// (TierVersion, #1765); entries are never removed (one per measurement).
+	tierVersions map[string]uint64
 	tierCacheGen uint64
 	tierCacheMu  sync.RWMutex
 }
@@ -50,9 +53,10 @@ type MetadataStore struct {
 // NewMetadataStore creates a new metadata store using the provided SQLite connection
 func NewMetadataStore(db *sql.DB, logger zerolog.Logger) (*MetadataStore, error) {
 	store := &MetadataStore{
-		db:        db,
-		logger:    logger.With().Str("component", "tiering-metadata").Logger(),
-		tierCache: make(map[string]*tierCacheEntry),
+		db:           db,
+		logger:       logger.With().Str("component", "tiering-metadata").Logger(),
+		tierCache:    make(map[string]*tierCacheEntry),
+		tierVersions: make(map[string]uint64),
 	}
 
 	if err := store.initSchema(); err != nil {
@@ -155,6 +159,7 @@ func (s *MetadataStore) invalidateTierCache(database, measurement string) {
 	s.tierCacheMu.Lock()
 	delete(s.tierCache, cacheKey)
 	s.tierCacheGen++
+	s.tierVersions[cacheKey]++
 	s.tierCacheMu.Unlock()
 }
 
@@ -1584,6 +1589,16 @@ func (s *MetadataStore) GetTiersForMeasurement(ctx context.Context, database, me
 		result[tier] = true
 	}
 	return result, nil
+}
+
+// TierVersion is a counter that moves whenever the tier rows of the
+// measurement may have changed (invalidateTierCache), read from memory only.
+// A caller that must not do I/O, such as the SQL transform cache's staleness
+// check, which runs under the cache's lock, compares two readings (#1765).
+func (s *MetadataStore) TierVersion(database, measurement string) uint64 {
+	s.tierCacheMu.RLock()
+	defer s.tierCacheMu.RUnlock()
+	return s.tierVersions[database+"/"+measurement]
 }
 
 // readTierSet is GetTiersForMeasurement without the cache: the tiers that have
