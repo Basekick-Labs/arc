@@ -451,3 +451,27 @@ func TestMirrorClusterJob(t *testing.T) {
 		t.Fatalf("end: %v", err)
 	}
 }
+
+// #1860 5b: DropOwn keeps a cluster job's record; ClusterSource names only a
+// recorded cluster job's source.
+func TestDropOwnAndClusterSource(t *testing.T) {
+	r := seeded(t, testStore(t))
+	j := &Job{ID: "ab12", Database: "db", Measurement: "cpu", State: StateCommitted,
+		Source:  FileRef{Key: "db/cpu/2026/11/18/23/x.parquet", Size: 10, SHA256: "s"},
+		Outputs: []FileRef{{Key: "db/cpu/2026/11/18/22/o.parquet", Staged: StagedDir("ab12") + "/000000.parquet", Size: 5, SHA256: "o"}}}
+	if err := r.Mirror(context.Background(), j); err != nil {
+		t.Fatal(err)
+	}
+	if !r.ClusterSource(j.Source.Key) || r.ClusterSource(j.Outputs[0].Key) {
+		t.Fatal("ClusterSource")
+	}
+	gen := r.Generation()
+	r.DropOwn("ab12")
+	if !r.HasCluster("ab12") || r.Generation() != gen {
+		t.Fatal("DropOwn removed a cluster record")
+	}
+	r.Drop("ab12")
+	if r.HasCluster("ab12") || r.Generation() == gen {
+		t.Fatal("Drop kept the record or left the generation")
+	}
+}

@@ -1086,7 +1086,10 @@ func main() {
 	// A node advertises that it can run under a job (rehomeCfgInScope) only
 	// with tiered storage, the Iceberg export and edge sync off.
 	rehomeSharedCluster := cfg.Cluster.Enabled && cluster.IsSharedObjectStore(storageBackend)
-	rehomeCfgInScope := rehomeSharedCluster &&
+	// A cluster on local storage with replication on (#1860): every node
+	// holds its own copy of each file and does each step of a job on it.
+	rehomeLocalCluster := cfg.Cluster.Enabled && storageBackend != nil && storageBackend.Type() == "local" && cfg.Cluster.ReplicationEnabled
+	rehomeCfgInScope := (rehomeSharedCluster || rehomeLocalCluster) &&
 		!cfg.TieredStorage.Enabled && !cfg.Iceberg.Enabled &&
 		!(cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Active() || cfg.EdgeSync.Spoke.Active())
 	// The cluster's side of ownership, bound once the coordinator runs:
@@ -2534,6 +2537,13 @@ func main() {
 					// retaking the read lease do to its reads and caches
 					// (bound to the query handler once it exists).
 					clusterCoordinator.SetRehomeInScope(rehomeCfgInScope)
+					if rehomeLocalCluster {
+						// Before Start: a delete replayed from the log at start
+						// must leave the source of a job this node records to
+						// the job (#1860).
+						clusterCoordinator.SetRehomeLocalRecords(rehomeRegistry.HasCluster)
+						clusterCoordinator.SetRehomeLocalSources(rehomeRegistry.ClusterSource)
+					}
 					if rehomeSharedCluster {
 						clusterCoordinator.SetReadLeaseHooks(func() {
 							if fn := rehomeLeaseLost.Load(); fn != nil {
@@ -4283,9 +4293,15 @@ func main() {
 	// Re-home on the cluster (#1825 slice 4b): the cluster record is the
 	// fourth source of exclusions, and of ownership from here on.
 	rehomeClusterOn := rehomeSharedCluster && clusterCoordinator != nil
+	rehomeLocalOn := rehomeLocalCluster && clusterCoordinator != nil
 	rehomeClusterInScope := rehomeCfgInScope && clusterCoordinator != nil
 	var rehomeClusterOpen api.OpenCompactions
-	if rehomeClusterOn {
+	if rehomeClusterOn || rehomeLocalOn {
+		if rehomeLocalOn {
+			// Each node's own job records (rehomeRegistry) say what its
+			// reads leave out; the cluster's record answers ownership.
+			clusterCoordinator.SetRehomeLocalExclusions()
+		}
 		if src := clusterCoordinator.RehomeSource(); src != nil {
 			rehomeClusterSrc.Store(src)
 			rehomeClusterOpen = src
@@ -4655,8 +4671,9 @@ func main() {
 	// is alive.
 	deleteHandler.SetRehomeOwns(rehomeOwns)
 	rehomeHandler.SetSwap(&api.RehomeSwap{
-		Registry: rehomeRegistry,
-		Reads:    queryHandler.Reads(),
+		LocalCluster: rehomeLocalOn,
+		Registry:     rehomeRegistry,
+		Reads:        queryHandler.Reads(),
 		// The export itself is bound once its scheduler exists (SetExport,
 		// below); from the configuration alone a job found at start knows
 		// to wait for it.
@@ -4673,7 +4690,7 @@ func main() {
 		Refusal: func() string {
 			switch {
 			case cfg.Cluster.Enabled && !rehomeClusterInScope:
-				return "moving a file's rows on a cluster needs a shared object store (S3, Azure or GCS) as primary storage, and tiered storage, the Iceberg export and edge sync off, in this version"
+				return "moving a file's rows on a cluster needs a shared object store (S3, Azure or GCS) as primary storage or local storage with cluster.replication_enabled, and tiered storage, the Iceberg export and edge sync off, in this version"
 			case cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Active() || cfg.EdgeSync.Spoke.Active():
 				return "moving a file's rows is not available with edge sync in this version"
 			}
@@ -4708,8 +4725,22 @@ func main() {
 			}
 		},
 	})
+	if rehomeLocalOn {
+		// Before Recover: on a cluster node, staged directories are this
+		// node's part of cluster jobs, settled by SweepLocal once synced, and
+		// a job journaled before it was one is undone. Every member, in
+		// scope or not: a node out of scope still does its part of a job
+		// in flight (#1859).
+		rehomeHandler.SetCluster(clusterCoordinator, clusterCoordinator.ReadReady)
+	}
 	if err := rehomeHandler.Recover(context.Background()); err != nil {
 		log.Fatal().Err(err).Msg("Could not take up the re-home jobs found at start")
+	}
+	if rehomeLocalOn {
+		// Every node's part of a job on its own disk (#1860); the puller
+		// records a job here before an output of it lands.
+		clusterCoordinator.SetRehomeParticipant(rehomeHandler.ParticipateLocal)
+		clusterCoordinator.SetRehomeLocalRecorder(rehomeHandler.RecordLocal)
 	}
 	if rehomeClusterOn {
 		// Every node's part of a job's states, and what the read lease does
@@ -4766,6 +4797,9 @@ func main() {
 		// The driver, on the primary writer.
 		rehomeHandler.SetCluster(clusterCoordinator, clusterCoordinator.ReadReady)
 		rehomeHandler.StartClusterTakeover()
+	}
+	if rehomeLocalOn {
+		rehomeHandler.StartLocalSweep()
 	}
 	deleteHandler.StartRetiredDrainer(retiredCtx)
 	if cfg.Delete.Enabled {

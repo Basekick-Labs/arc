@@ -82,6 +82,9 @@ type RehomeSwap struct {
 	// Cluster: jobs run through the cluster record (rehome_cluster.go). Set
 	// only on a cluster node whose configuration takes part in jobs.
 	Cluster RehomeCluster
+	// LocalCluster: that cluster keeps its files on each node's local disk,
+	// replicated (#1860).
+	LocalCluster bool
 	// ReadReady reports whether this node holds its cluster read lease.
 	ReadReady func() (bool, string)
 	// InvalidateLocalCaches drops this node's query caches and the query
@@ -750,6 +753,11 @@ func (h *RehomeHandler) Recover(ctx context.Context) error {
 	refused := ""
 	if h.swap.Refusal != nil {
 		refused = h.swap.Refusal()
+	}
+	if refused == "" && h.swap.Cluster != nil {
+		// A job of this node's own from before it was a cluster node: the
+		// cluster's manifest knows nothing of its files (#1860).
+		refused = "this node is a cluster node now"
 	}
 	var later []*rehome.Job
 	for _, job := range jobs {

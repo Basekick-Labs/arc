@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -112,13 +114,39 @@ func (h *RehomeHandler) clusterMode() bool {
 // clusterRefusal is why a job cannot start on this node of the cluster, or "".
 func (h *RehomeHandler) clusterRefusal() string {
 	c := h.swap.Cluster
-	if _, ok := h.storage.(storage.ObjectCopier); !ok || !h.sharedStore() {
-		return "moving a file's rows on a cluster needs a shared object store (S3, Azure or GCS) as primary storage in this version"
+	_, copier := h.storage.(storage.ObjectCopier)
+	if !(copier && h.sharedStore()) && !h.localCluster() {
+		return "moving a file's rows on a cluster needs a shared object store (S3, Azure or GCS) as primary storage, or local storage with replication on, in this version"
 	}
 	if !c.IsPrimaryWriter() {
 		return "moving a file's rows on a cluster runs on the primary writer; send the request there"
 	}
 	return c.RehomeRunnable()
+}
+
+// localCluster: a cluster on local storage with replication on (#1860):
+// every node holds its own copy, and does each step on its own disk
+// (rehome_cluster_local.go); the driver writes nothing but its staged copies.
+func (h *RehomeHandler) localCluster() bool {
+	_, ok := h.mover()
+	return ok && h.swap != nil && h.swap.LocalCluster
+}
+
+// objectSHA is an object's size (-1 when absent) and SHA-256, from the
+// object store's own record on a shared store, by reading it on local disk.
+func (h *RehomeHandler) objectSHA(ctx context.Context, key string) (int64, string, error) {
+	if c, ok := h.storage.(storage.ObjectCopier); ok && h.sharedStore() {
+		return c.ObjectSHA(ctx, key)
+	}
+	n, err := h.storage.StatFile(ctx, key)
+	if err != nil || n < 0 {
+		return n, "", err
+	}
+	sum := sha256.New()
+	if err := h.storage.ReadTo(ctx, key, sum); err != nil {
+		return 0, "", err
+	}
+	return n, hex.EncodeToString(sum.Sum(nil)), nil
 }
 
 func (h *RehomeHandler) sharedStore() bool {
@@ -156,7 +184,7 @@ func (h *RehomeHandler) runClusterSwap(ctx context.Context, job *rehomeJob) (sta
 	if err := reg.Begin(rec); err != nil {
 		return refuse(fmt.Sprintf("%s cannot be moved now: %v", src.Key, err))
 	}
-	defer reg.Drop(job.ID)
+	defer reg.DropOwn(job.ID) // never this node's record of the cluster job
 
 	entry, ok := c.ManifestFile(src.Key)
 	if !ok {
@@ -238,7 +266,6 @@ func (h *RehomeHandler) runClusterSwap(ctx context.Context, job *rehomeJob) (sta
 
 	// 2. Stage. Each final key must be free in storage now; the cluster
 	// record owns it from the stage on.
-	copier := h.storage.(storage.ObjectCopier)
 	payload := raft.StageRehomePayload{Job: job.ID, Database: src.Database, Measurement: src.Measurement,
 		Source: raft.CompactionInput{Path: src.Key, SizeBytes: entry.SizeBytes, SHA256: entry.SHA256}, Now: time.Now().UTC()}
 	files := map[string]string{}
@@ -248,7 +275,7 @@ func (h *RehomeHandler) runClusterSwap(ctx context.Context, job *rehomeJob) (sta
 			return fail("staging the split", err)
 		}
 		key := o.Dir + "/" + outputName(src, storage.NameTime(time.Now()))
-		if n, _, err := copier.ObjectSHA(ctx, key); err != nil || n >= 0 {
+		if n, _, err := h.objectSHA(ctx, key); err != nil || n >= 0 {
 			return fail("staging the split", fmt.Errorf("the output key %s is taken (size %d, err %v)", key, n, err))
 		}
 		payload.Outputs = append(payload.Outputs, raft.RehomeOutput{Key: key, StagedKey: raft.RehomeStagedKey(job.ID, i),
@@ -277,7 +304,7 @@ func (h *RehomeHandler) runClusterSwap(ctx context.Context, job *rehomeJob) (sta
 	if err := h.waitLocalJob(ctx, job.ID); err != nil {
 		return fail("recording the job in the cluster", err)
 	}
-	reg.Drop(job.ID)
+	reg.DropOwn(job.ID)
 	h.hook("staged")
 
 	err = h.driveCluster(ctx, job.ID, files)
@@ -390,6 +417,15 @@ func (h *RehomeHandler) driveCluster(ctx context.Context, id string, files map[s
 				err = revert("taken up before its outputs were written; only the node that split the file writes them")
 				break
 			}
+			if h.localCluster() {
+				// The staged copies every node fetches from, written once
+				// the stage applied here (the sweep of staged directories
+				// keeps only those of jobs in the record).
+				if werr := h.writeStagedLocal(bg, j, files); werr != nil {
+					err = revert("writing the staged outputs failed: " + werr.Error())
+					break
+				}
+			}
 			err = h.clusterErr(c.RehomeAdvance(bg, id, raft.RehomeCommitted))
 		case raft.RehomeCommitted:
 			if files == nil {
@@ -402,6 +438,11 @@ func (h *RehomeHandler) driveCluster(ctx context.Context, id string, files map[s
 					break
 				}
 				err = werr
+				break
+			}
+			if h.localCluster() {
+				// Every node, this one too, holds them staged (its ack).
+				err = h.clusterErr(c.RehomeAdvance(bg, id, raft.RehomePublished))
 				break
 			}
 			if uerr := h.uploadOutputs(ctx, j, files); uerr != nil {
@@ -449,13 +490,17 @@ func (h *RehomeHandler) driveCluster(ctx context.Context, id string, files map[s
 			// refuses it), but its new object may be in storage: read beside
 			// the outputs it would count rows twice (#1857). It is no file's
 			// record, so it goes.
-			if derr := h.removeUnregisteredRewrites(bg, j.Source.Path); derr != nil {
-				err = derr
-				break
-			}
-			if derr := storage.DeleteWithRetry(bg, h.storage, j.Source.Path); derr != nil && !storage.IsNotFound(derr) {
-				err = fmt.Errorf("remove %s: %w", j.Source.Path, derr)
-				break
+			// On local storage each node removed its own copy (and its
+			// stale rewrites) before it acked.
+			if !h.localCluster() {
+				if derr := h.removeUnregisteredRewrites(bg, j.Source.Path); derr != nil {
+					err = derr
+					break
+				}
+				if derr := storage.DeleteWithRetry(bg, h.storage, j.Source.Path); derr != nil && !storage.IsNotFound(derr) {
+					err = fmt.Errorf("remove %s: %w", j.Source.Path, derr)
+					break
+				}
 			}
 			h.hook("removed")
 			err = h.clusterErr(c.RehomeAdvance(bg, id, raft.RehomeRemoved))
@@ -466,9 +511,11 @@ func (h *RehomeHandler) driveCluster(ctx context.Context, id string, files map[s
 			}
 			// Again, for a rewrite from a former primary that landed after
 			// the sweep at latched (#1857).
-			if derr := h.removeUnregisteredRewrites(bg, j.Source.Path); derr != nil {
-				err = derr
-				break
+			if !h.localCluster() {
+				if derr := h.removeUnregisteredRewrites(bg, j.Source.Path); derr != nil {
+					err = derr
+					break
+				}
 			}
 			err = h.clusterErr(c.RehomeEnd(bg, id))
 			if err == nil {
@@ -479,6 +526,7 @@ func (h *RehomeHandler) driveCluster(ctx context.Context, id string, files map[s
 				return nil
 			}
 		case raft.RehomeReverting:
+			// On local storage each node removes its own copies (reverted).
 			if derr := h.deleteOutputs(bg, j); derr != nil {
 				err = derr
 				break
@@ -506,9 +554,11 @@ func (h *RehomeHandler) driveCluster(ctx context.Context, id string, files map[s
 			}
 			// Again: an upload by a driver that had lost the job may have
 			// landed during the grace.
-			if derr := h.deleteOutputs(bg, j); derr != nil {
-				err = derr
-				break
+			if !h.localCluster() {
+				if derr := h.deleteOutputs(bg, j); derr != nil {
+					err = derr
+					break
+				}
 			}
 			err = h.clusterErr(c.RehomeEnd(bg, id))
 			if err == nil {
@@ -723,9 +773,8 @@ func (h *RehomeHandler) uploadOne(ctx context.Context, copier storage.ObjectCopi
 // outputsInPlace returns why an output is not at its final key as the job
 // recorded it, or "".
 func (h *RehomeHandler) outputsInPlace(ctx context.Context, j raft.RehomeJob) string {
-	copier := h.storage.(storage.ObjectCopier)
 	for _, o := range j.Outputs {
-		n, sha, err := copier.ObjectSHA(ctx, o.Key)
+		n, sha, err := h.objectSHA(ctx, o.Key)
 		if err != nil {
 			return fmt.Sprintf("could not check the output %s: %v", o.Key, err)
 		}
@@ -738,9 +787,11 @@ func (h *RehomeHandler) outputsInPlace(ctx context.Context, j raft.RehomeJob) st
 
 // deleteOutputs deletes each output key that holds the job's output.
 func (h *RehomeHandler) deleteOutputs(ctx context.Context, j raft.RehomeJob) error {
-	copier := h.storage.(storage.ObjectCopier)
+	if h.localCluster() {
+		return nil // each node removes its own copies (rehome_cluster_local.go)
+	}
 	for _, o := range j.Outputs {
-		n, sha, err := copier.ObjectSHA(ctx, o.Key)
+		n, sha, err := h.objectSHA(ctx, o.Key)
 		if err != nil {
 			return fmt.Errorf("stat %s: %w", o.Key, err)
 		}
@@ -803,6 +854,15 @@ func (h *RehomeHandler) StartClusterTakeover() {
 
 func (h *RehomeHandler) takeOverOnce(ctx context.Context) {
 	c := h.swap.Cluster
+	if h.localCluster() {
+		// No read lease on local storage: a node just restarted may hold a
+		// state the job left; caught up first.
+		if lc, ok := c.(rehomeLocalCluster); ok {
+			if err := lc.SyncManifest(ctx); err != nil {
+				return
+			}
+		}
+	}
 	if !c.IsPrimaryWriter() && !c.IsLeader() {
 		return
 	}
@@ -940,6 +1000,37 @@ func (h *RehomeHandler) removeUnregisteredRewrites(ctx context.Context, key stri
 			Msg("Re-home: removing a DELETE rewrite of the file being moved that the cluster never registered (a DELETE that started on a former primary)")
 		if err := storage.DeleteWithRetry(ctx, h.storage, k); err != nil && !storage.IsNotFound(err) {
 			return fmt.Errorf("remove %s: %w", k, err)
+		}
+	}
+	return nil
+}
+
+// writeStagedLocal writes the split's files to their staged keys on this
+// node's disk, durably: the copies every other node fetches (#1860).
+func (h *RehomeHandler) writeStagedLocal(ctx context.Context, j raft.RehomeJob, files map[string]string) error {
+	store, ok := h.mover()
+	if !ok {
+		return errors.New("not local storage")
+	}
+	for _, o := range j.Outputs {
+		if placed, err := h.outputInPlace(ctx, store, rehome.FileRef{Key: o.StagedKey, Size: o.SizeBytes, SHA256: o.SHA256}); err == nil && placed {
+			continue
+		}
+		local, ok := files[o.Key]
+		if !ok {
+			return fmt.Errorf("the local copy of %s is missing", o.Key)
+		}
+		f, err := os.Open(local)
+		if err != nil {
+			return err
+		}
+		err = store.WriteReader(ctx, o.StagedKey, f, o.SizeBytes)
+		f.Close()
+		if err != nil {
+			return fmt.Errorf("write %s: %w", o.StagedKey, err)
+		}
+		if err := store.Sync(ctx, o.StagedKey); err != nil {
+			return err
 		}
 	}
 	return nil

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"sync"
 	"testing"
 	"time"
 
@@ -399,5 +400,68 @@ func TestLocalParticipantRemovedLatchesFirst1860(t *testing.T) {
 	}
 	if r.has(lrSource) || r.reg.Active() {
 		t.Fatalf("source here %v, record %v", r.has(lrSource), r.reg.Active())
+	}
+}
+
+// The driver on local storage, end to end on one node (#1860 5b): this node
+// does its own part of each state (as the participant loop would) and acks
+// it; every other node acks. A read sees every row once at every step.
+func TestLocalClusterSwapMovesTheRows1860(t *testing.T) {
+	r := newSwapRig(t)
+	fake := &localFake{fakeCluster: newFakeCluster(t), peer: r.backend.(*storage.LocalBackend), local: r.backend.(*storage.LocalBackend)}
+	fake.skipSelf.Store(true)
+	r.swap.LocalCluster = true
+	r.h.SetCluster(fake, func() (bool, string) { return true, "" })
+	raw, err := r.backend.Read(context.Background(), r.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.must(raft.CommandRegisterFile, raft.RegisterFilePayload{File: raft.FileEntry{
+		Path: r.key, SHA256: shaOf(raw), SizeBytes: int64(len(raw)), Database: "db", Measurement: "cpu",
+		PartitionTime: time.Date(2026, 11, 18, 23, 0, 0, 0, time.UTC), OriginNodeID: "w1", Tier: "hot", CreatedAt: time.Now()}})
+	r.h.afterStep = func(s string) { r.requireOnce("after driver step " + s) }
+	stop := make(chan struct{})
+	var parts sync.WaitGroup
+	parts.Add(1)
+	go func() {
+		defer parts.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+			for _, j := range fake.RehomeJobs() {
+				missing := false
+				for _, n := range j.MissingAcks() {
+					missing = missing || n == "w1"
+				}
+				if !missing {
+					continue
+				}
+				if err := r.h.ParticipateLocal(context.Background(), j, true); err != nil {
+					continue
+				}
+				r.requireOnce("after this node's " + j.State)
+				_ = fake.apply(raft.CommandAckRehome, raft.AckRehomePayload{Job: j.ID, Node: "w1", State: j.State})
+			}
+		}
+	}()
+	id, code, reason := r.start()
+	if code != 202 {
+		t.Fatalf("start: %d %s", code, reason)
+	}
+	job := r.wait(id)
+	close(stop)
+	parts.Wait()
+	if job["state"] != "done" {
+		t.Fatalf("job: %v", job)
+	}
+	r.requireOnce("after the job")
+	if n, _ := r.backend.StatFile(context.Background(), r.key); n >= 0 {
+		t.Fatal("the source is still here")
+	}
+	if r.reg.Active() {
+		t.Fatal("a record is left")
 	}
 }

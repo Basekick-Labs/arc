@@ -241,6 +241,17 @@ func (c *Coordinator) SetRehomeLocalRecords(fn func(id string) bool) {
 	}
 }
 
+// SetRehomeLocalSources names the files that are the source of a job this
+// node records (rehome.Registry.ClusterSource): the delete workers never
+// unlink one; this node's part of the job, or SweepLocal, does, once the
+// outputs are in place (#1860). Set before Start: a delete replayed from the
+// log at start must see it.
+func (c *Coordinator) SetRehomeLocalSources(fn func(path string) bool) {
+	if c != nil && fn != nil {
+		c.rehomeLocalSources.Store(&fn)
+	}
+}
+
 // SetRehomeLocalExclusions makes this node's own job records (rehome.Registry)
 // the only source of what its reads leave out for re-home jobs, on local
 // storage (#1860): every node places and removes its own copies, and its

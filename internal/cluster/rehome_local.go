@@ -27,18 +27,45 @@ func (c *Coordinator) FetchRehomeStaged(ctx context.Context, j raft.RehomeJob, o
 		return errors.New("no fetch client")
 	}
 	entry := raft.FileEntry{Path: out.StagedKey, SHA256: out.SHA256, SizeBytes: out.SizeBytes}
-	order := []string{j.Origin}
+	// Addresses from the cluster's record, which every member holds, and
+	// from this node's registry for a node it knows of only there: a node
+	// that left and rejoined can be missing from the registry (#1860).
+	addrs := map[string]string{}
+	var order []string
+	add := func(id, addr string) {
+		if id == "" || addr == "" || id == c.localNode.ID {
+			return
+		}
+		if _, seen := addrs[id]; !seen {
+			order = append(order, id)
+		}
+		addrs[id] = addr
+	}
+	var fsm *raft.ClusterFSM
+	if c.raftNode != nil {
+		fsm = c.raftNode.FSM()
+	}
+	if fsm != nil {
+		if n, ok := fsm.GetNode(j.Origin); ok {
+			add(n.ID, n.Address)
+		}
+	}
+	if n, ok := c.registry.Get(j.Origin); ok {
+		add(n.ID, n.Address)
+	}
+	if fsm != nil {
+		for _, n := range fsm.GetAllNodes() {
+			add(n.ID, n.Address)
+		}
+	}
 	for _, n := range c.registry.GetAll() {
-		if n.ID != j.Origin {
-			order = append(order, n.ID)
+		if _, seen := addrs[n.ID]; !seen {
+			add(n.ID, n.Address)
 		}
 	}
 	var lastErr error
 	for _, id := range order {
-		n, ok := c.registry.Get(id)
-		if !ok || n.Address == "" || id == c.localNode.ID {
-			continue
-		}
+		addr := addrs[id]
 		fctx, cancel := context.WithTimeout(ctx, stagedFetchTimeout)
 		pr, pw := io.Pipe()
 		done := make(chan error, 1)
@@ -49,7 +76,7 @@ func (c *Coordinator) FetchRehomeStaged(ctx context.Context, j raft.RehomeJob, o
 			pr.CloseWithError(err)
 			done <- err
 		}()
-		_, ferr := c.fetcher.Fetch(fctx, n.Address, &entry, pw, 0, nil)
+		_, ferr := c.fetcher.Fetch(fctx, addr, &entry, pw, 0, nil)
 		pw.CloseWithError(ferr)
 		werr := <-done
 		cancel()
@@ -74,6 +101,13 @@ func (c *Coordinator) FetchRehomeStaged(ctx context.Context, j raft.RehomeJob, o
 // latch ended; a node that does not take part (it joined later) unlinks it
 // when the job ends (rehomeEndedUnlink).
 func (c *Coordinator) deferRehomeUnlink(item deleteRequest) bool {
+	// The source of a job this node records, whatever the reason (a delete
+	// replayed after the job ended, a snapshot install): its record decides
+	// what reads see here, and SweepLocal removes the source only once the
+	// outputs are in place.
+	if p := c.rehomeLocalSources.Load(); p != nil && (*p)(item.path) {
+		return true
+	}
 	id, ok := strings.CutPrefix(item.reason, rehomeDeleteReasonPrefix)
 	if !ok || c.raftNode == nil {
 		return false
@@ -107,6 +141,9 @@ func (c *Coordinator) rehomeEndedUnlink(j raft.RehomeJob) {
 	if p := c.rehomeLocalRecords.Load(); p != nil && (*p)(j.ID) {
 		return // this node records the job: SweepLocal settles it, outputs first
 	}
+	if p := c.rehomeLocalSources.Load(); p != nil && (*p)(j.Source.Path) {
+		return
+	}
 	c.enqueueLocalDelete(j.Source.Path, "rehome-ended:"+j.ID)
 }
 
@@ -118,4 +155,55 @@ func (c *Coordinator) rehomeOwnsLocal(path string) bool {
 	}
 	fsm := c.raftNode.FSM()
 	return fsm != nil && fsm.RehomeOwns(path)
+}
+
+// RecordRehomeOutputs notes the content of a job's outputs on this node, as
+// placed and verified by its part of the job, so the stale-local walks do not
+// hash them again.
+func (c *Coordinator) RecordRehomeOutputs(j raft.RehomeJob) {
+	if c.raftNode == nil {
+		return
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return
+	}
+	for _, o := range j.Outputs {
+		if e, ok := fsm.GetFile(o.Key); ok {
+			c.recordLocalContent(e, "", o.SHA256)
+		}
+	}
+}
+
+// SetRehomeLocalRecorder sets how this node records a job before an output of
+// it lands here (rehome.Registry.Mirror, committed): see rehomeBeforePull.
+func (c *Coordinator) SetRehomeLocalRecorder(fn func(ctx context.Context, j raft.RehomeJob) error) {
+	if c != nil && fn != nil {
+		c.rehomeLocalRecorder.Store(&fn)
+	}
+}
+
+// rehomeBeforePull is the puller's BeforePull. An output of a live re-home job
+// that this node has no record of, while this node still has the job's
+// source (it joined after the job was published): the job is recorded here
+// first, so the output is left out of reads as it lands and the source is
+// read until every output is here (#1860).
+func (c *Coordinator) rehomeBeforePull(ctx context.Context, entry *raft.FileEntry) error {
+	rec := c.rehomeLocalRecorder.Load()
+	has := c.rehomeLocalRecords.Load()
+	if rec == nil || has == nil || c.raftNode == nil || entry == nil {
+		return nil
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return nil
+	}
+	j, ok := fsm.RehomeJobOfOutput(entry.Path)
+	if !ok || (*has)(j.ID) {
+		return nil
+	}
+	if n, err := c.storage.StatFile(ctx, j.Source.Path); err != nil || n < 0 {
+		return nil // no source here: nothing is read twice
+	}
+	return (*rec)(ctx, j)
 }
