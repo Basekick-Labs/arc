@@ -466,7 +466,7 @@ func (h *QueryHandler) serveArcxArrowIPCResult(
 	trailers := newResponseTrailers()
 
 	var streamW *bufio.Writer
-	h.setDirectBodyStream(fctx, cancel, trailers, "arcx_serve_arrow_ipc", func() {
+	h.setReadingBodyStream(fctx, cancel, trailers, "arcx_serve_arrow_ipc", func() {
 		poisonArrowStream(streamW, h.logger)
 		trailers.setIfAbsent(arrowStreamTruncatedTrailer, "stream writer panicked")
 		trailers.setIfAbsent(
@@ -699,7 +699,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	transformCtx, cancelTransform := transformContext(c.Context(), deadline)
 	// A read in flight until its statement is bound (internal/readgate).
 	entered, leave := h.reads.EnterAt()
-	// Held until a streamed response ends, when there is one (#1858).
+	// Held until an arcx-served stream ends, when there is one (#1858).
 	defer holdRead(c.Context(), leave)()
 	convertedSQL, _, emittedRefs, err := h.getTransformedSQLWithRefs(transformCtx, req.SQL, headerDB)
 	cancelTransform()

@@ -14,13 +14,13 @@
 // A read enters before its SQL is built and leaves no earlier than its
 // statement is bound. In practice it leaves once the statement has executed:
 // the DuckDB driver runs a query to completion inside the call that starts
-// it, and the callers leave when their handler returns, or, for a response
-// streamed after the handler returned, when the stream ends (#1858). So a
-// wait lasts as
-// long as the longest read in flight, which is bounded by that read's own
-// deadline (the query timeout, a governance policy's, ten minutes for a
-// continuous query). A job that waits needs its own deadline and a way to
-// give up.
+// it, and the callers leave when their handler returns; an arcx-served
+// result reads its files as it streams, after the handler returned, and its
+// read leaves when the stream ends (#1858). So a wait lasts as long as the
+// longest read in flight, which is bounded by that read's own deadline (the
+// query timeout, a governance policy's, ten minutes for a continuous query)
+// and, for an arcx stream, the server's write timeout. A job that waits
+// needs its own deadline and a way to give up.
 //
 // The job changes its state, then calls Flip and waits for every read that
 // entered before the flip to leave.

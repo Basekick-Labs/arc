@@ -24,9 +24,22 @@ func TestStreamedResponseHoldsItsRead(t *testing.T) {
 	app.Get("/stream", func(c *fiber.Ctx) error {
 		_, leave := gate.EnterAt()
 		defer holdRead(c.Context(), leave)()
-		h.setDirectBodyStream(c.Context(), nil, nil, "test", nil, func(w *bufio.Writer) {
+		h.setReadingBodyStream(c.Context(), nil, nil, "test", nil, func(w *bufio.Writer) {
 			close(streaming)
 			<-release
+			_, _ = w.WriteString("done")
+		})
+		return nil
+	})
+	app.Get("/direct", func(c *fiber.Ctx) error {
+		_, leave := gate.EnterAt()
+		defer holdRead(c.Context(), leave)()
+		// A DuckDB result: complete before the handler returns, so the
+		// stream does not hold the read.
+		h.setDirectBodyStream(c.Context(), nil, nil, "test", nil, func(w *bufio.Writer) {
+			if n := gate.InFlight(); n != 0 {
+				t.Errorf("a direct stream held its read (%d in the gate)", n)
+			}
 			_, _ = w.WriteString("done")
 		})
 		return nil
@@ -58,6 +71,11 @@ func TestStreamedResponseHoldsItsRead(t *testing.T) {
 	if n := gate.InFlight(); n != 0 {
 		t.Fatalf("after the stream: %d reads in the gate", n)
 	}
+	dresp, err := app.Test(httptest.NewRequest("GET", "/direct", nil), -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dresp.Body.Close()
 	resp, err := app.Test(httptest.NewRequest("GET", "/plain", nil), -1)
 	if err != nil {
 		t.Fatal(err)

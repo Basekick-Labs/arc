@@ -2714,7 +2714,7 @@ localProcessing:
 	// A read in flight, from before its SQL is built until its statement is
 	// bound (internal/readgate): a job that swaps files waits for it.
 	entered, leave := h.reads.EnterAt()
-	// Held until a streamed response ends, when there is one (#1858).
+	// Held until an arcx-served stream ends, when there is one (#1858).
 	defer holdRead(c.Context(), leave)()
 	// Convert SQL to storage paths
 	transformCtx, cancelTransform := transformContext(c.Context(), deadline)
@@ -6218,8 +6218,7 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	// A read in flight, from before its SQL is built until its statement is
 	// bound (internal/readgate): a job that swaps files waits for it.
 	entered, leave := h.reads.EnterAt()
-	// Held until a streamed response ends, when there is one (#1858).
-	defer holdRead(c.Context(), leave)()
+	defer leave()
 	// Convert SQL to storage paths (with caching)
 	transformCtx, cancelTransform := transformContext(c.Context(), deadline)
 	convertedSQL, _, emittedRefs, err := h.getTransformedSQLWithRefs(transformCtx, req.SQL, headerDB)
@@ -6830,8 +6829,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	// A read in flight, from before its SQL is built until its statement is
 	// bound (internal/readgate): a job that swaps files waits for it.
 	entered, leave := h.reads.EnterAt()
-	// Held until a streamed response ends, when there is one (#1858).
-	defer holdRead(c.Context(), leave)()
+	defer leave()
 	// Convert SQL to storage paths (with caching)
 	// Note: This endpoint builds its own db.measurement SQL, so no header optimization
 	transformCtx, cancelTransform := transformContext(c.Context(), deadline)

@@ -64,16 +64,16 @@ outage too.
 Clusters on local storage (which replicate files and have their own opt-in gate,
 `cluster.query_gate_on_catchup`) and standalone nodes are unchanged.
 
-## Fix: a streamed query response is waited for until it ends, not only until its handler returns ([#1858](https://github.com/Basekick-Labs/arc/issues/1858))
+## Fix: a re-home job waits for an arcx-served result to finish streaming ([#1858](https://github.com/Basekick-Labs/arc/issues/1858))
 
-**Who is affected:** deployments that move files under running queries: re-home jobs, and
-compactions on a cluster sharing one object store.
+**Who is affected:** standalone nodes using the arcx engine, during a re-home job (#1825).
 
-Query responses (JSON, Arrow IPC, the per-measurement endpoint, the arcx engine's served queries)
-stream their rows after the request's handler returns. Those jobs waited for queries only until the
-handler returned, so a large response could still be reading a file when the job deleted it, and
-the query failed part way. They now wait until the stream has been sent. Results were never wrong;
-this removes the failure.
+A result the arcx engine serves reads its Parquet files as it streams, after the request's handler
+has returned. A re-home job waited for queries only until the handler returned, so it could
+remove a file such a stream was still reading, and the query failed part way. It now waits until
+the stream ends. Results were never wrong. DuckDB-served results (JSON, Arrow IPC, the
+per-measurement endpoint) are complete before the handler returns and are unchanged; arcx does not
+serve on a cluster sharing an object store, so compactions there are unaffected.
 
 ## Fix: on a cluster sharing one object store, a query no longer counts a compaction's rows twice ([#1852](https://github.com/Basekick-Labs/arc/issues/1852))
 
