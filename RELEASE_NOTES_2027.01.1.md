@@ -2,6 +2,17 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: on a cluster, a late row is read at once on every node, not only on the one that wrote it ([#1763](https://github.com/Basekick-Labs/arc/issues/1763))
+
+**Who is affected:** clusters that receive rows stamped outside the current hour (late or future data).
+
+#1757 made a node that flushes a file outside the current hour stop using what its query caches held
+for that measurement, so its own queries read the row at once. Other nodes kept answering without it
+for up to 30 seconds (any query) or 60 seconds (a repeated query text). Each node now does the same
+when it gains a file from another node: when its puller lands it (local storage), or when the cluster
+registers it (shared object store). Measured on a reader of a three-node cluster with local storage:
+a late row read 25–85 seconds after its flush before, 0.1 seconds after.
+
 ## Change: a re-home dry run runs while a re-home job waits for the Iceberg export ([#1845](https://github.com/Basekick-Labs/arc/issues/1845))
 
 **Who is affected:** standalone nodes with the Iceberg export on that run re-home jobs (#1825).
