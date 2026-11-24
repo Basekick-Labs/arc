@@ -162,6 +162,10 @@ type Coordinator struct {
 	streamClaimsBlockers atomic.Pointer[[]string]
 	// compactionCommit: the #1207 d2 flag's join gate and blockers.
 	compactionCommit compactionCommitGate
+	// Re-home (#1825): the flag's join gate, and whether this node's
+	// configuration is in a job's scope (SetRehomeInScope).
+	rehomeGate    rehomeGate
+	rehomeInScope atomic.Bool
 	// coldMarkGate / coldWriteMu: the #1552 cold mark's join gate and write
 	// fence (cold_mark.go).
 	coldMarkGate coldMarkGate
@@ -869,6 +873,7 @@ func (c *Coordinator) Start() error {
 		go c.compactionCommitEnableLoop(c.ctx)
 		go c.clusterPoliciesEnableLoop(c.ctx)
 		go c.coldMarkLoop(c.ctx)
+		go c.rehomeEnableLoop(c.ctx)
 	}
 	// The staged compaction commit on an object store (#1207 d2a2b): the
 	// leader aborts jobs of a compactor that is gone, and committed jobs are
@@ -2398,10 +2403,22 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 			c.sendJoinError(conn, req, cmWhy)
 			return
 		}
+		rhWhy, rhRelease := c.rehomeJoinGate(req)
+		if rhWhy != "" {
+			cmRelease()
+			cpRelease()
+			ccRelease()
+			release()
+			c.logger.Error().Str("node_id", req.NodeID).Str("role", req.Role).Str("reason", rhWhy).
+				Msg("Join refused: the node does not support re-home")
+			c.sendJoinError(conn, req, rhWhy)
+			return
+		}
 		joinGateReleased := false
 		releaseGate := func() {
 			if !joinGateReleased {
 				joinGateReleased = true
+				rhRelease()
 				cmRelease()
 				cpRelease()
 				ccRelease()
@@ -3312,6 +3329,7 @@ func (c *Coordinator) Status() map[string]interface{} {
 		trusted, why := c.ColdMarkTrusted(time.Now(), raft.ColdMarkAliveMaxAge, c.ColdMarkIdentity())
 		status["cold_mark"] = map[string]any{"state": cm, "blocking_nodes": blocking, "trusted": trusted, "untrusted_reason": why}
 		status["cluster_policies"] = c.ClusterPoliciesStatus()
+		status["rehome"] = c.RehomeStatus()
 	}
 	// The stale-local sweep's last pass (#1071), where it runs.
 	if st := c.StaleLocalStatus(); st != nil {

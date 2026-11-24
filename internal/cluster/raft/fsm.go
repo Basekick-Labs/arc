@@ -266,6 +266,15 @@ const (
 	// DELETE completed, so every node with a node-local Iceberg warehouse
 	// drops its own tables of it (#1731). No state; see iceberg_notice.go.
 	CommandIcebergDatabaseDropped
+	// Re-home on a shared object store (#1825), see rehome.go.
+	// CommandEnableRehome turns it on once every node supports it and
+	// compaction commit is on; the others drive one job.
+	CommandEnableRehome
+	CommandStageRehome
+	CommandAdvanceRehome
+	CommandAckRehome
+	CommandClaimRehomeFinisher
+	CommandEndRehome
 )
 
 // Command represents a command to be applied to the FSM.
@@ -657,6 +666,9 @@ type FSMSnapshot struct {
 	ClusterPolicies *clusterPoliciesState `json:"cluster_policies,omitempty"`
 	// ColdMark: the #1552 cold mark. nil in an older snapshot.
 	ColdMark *coldMarkState `json:"cold_mark,omitempty"`
+	// Rehome: the #1825 flag and jobs. nil in an older snapshot, or before
+	// the flag was applied.
+	Rehome *rehomeState `json:"rehome,omitempty"`
 }
 
 // ClusterFSM implements the raft.FSM interface for cluster state management.
@@ -876,6 +888,13 @@ type ClusterFSM struct {
 	staged           map[string]*StagedCompaction
 	// stagedPaths: input and output paths of staged jobs -> job (derived).
 	stagedPaths map[string]string
+	// Re-home (#1825), under mu; see rehome.go. rehomePaths: source and
+	// output paths of jobs -> job (derived); rehomeGen: the log index of the
+	// last re-home change.
+	rehomeEnabled bool
+	rehomeJobs    map[string]*RehomeJob
+	rehomePaths   map[string]string
+	rehomeGen     uint64
 	// clusterPolicies is the #1324 flag; policiesSeeded the kinds whose
 	// policies live here; tieringPolicies by database. See
 	// cluster_policies.go.
@@ -915,6 +934,8 @@ type ClusterFSM struct {
 	onCompactionStaged    func(StagedCompaction)
 	onCompactionGone      func(StagedCompaction)
 	onCompactionCommitted func(job string, output FileEntry)
+	onRehomeChanged       func(RehomeJob)
+	onRehomeEnded         func(RehomeJob)
 	pendingEvents         []func()
 
 	// Callbacks for state changes
@@ -1000,6 +1021,8 @@ func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 		takeover:                newTakeoverState(),
 		staged:                  map[string]*StagedCompaction{},
 		stagedPaths:             map[string]string{},
+		rehomeJobs:              map[string]*RehomeJob{},
+		rehomePaths:             map[string]string{},
 		policiesSeeded:          map[string]bool{},
 		tieringPolicies:         map[string]*TieringPolicyEntry{},
 		policyCollecting:        map[string]*PolicyCollect{},
@@ -1525,6 +1548,23 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.applySetCompactionPause(cmd.Payload)
 	case CommandAckCompactionPause:
 		return f.applyAckCompactionPause(cmd.Payload)
+	case CommandEnableRehome:
+		return f.applyEnableRehome(cmd.Payload, log.Index)
+	case CommandStageRehome:
+		defer f.deliverCompactionEvents()
+		return f.applyStageRehome(cmd.Payload, log.Index)
+	case CommandAdvanceRehome:
+		defer f.deliverCompactionEvents()
+		return f.applyAdvanceRehome(cmd.Payload, log.Index)
+	case CommandAckRehome:
+		defer f.deliverCompactionEvents()
+		return f.applyAckRehome(cmd.Payload, log.Index)
+	case CommandClaimRehomeFinisher:
+		defer f.deliverCompactionEvents()
+		return f.applyClaimRehomeFinisher(cmd.Payload, log.Index)
+	case CommandEndRehome:
+		defer f.deliverCompactionEvents()
+		return f.applyEndRehome(cmd.Payload, log.Index)
 
 	default:
 		return fmt.Errorf("unknown command type: %d", cmd.Type)
@@ -1773,6 +1813,7 @@ func (f *ClusterFSM) applyRemoveNode(payload []byte) interface{} {
 	removed := f.nodes[p.NodeID]
 	delete(f.nodes, p.NodeID)
 	f.compactionNodeRemovedLocked(p.NodeID)
+	f.rehomeNodeRemovedLocked(p.NodeID, f.applyStarted.Load())
 	// A removed node no longer holds the cold mark fence or counts toward
 	// its liveness (#1552).
 	f.coldMarkNodeRemovedLocked(p.NodeID)
@@ -1848,6 +1889,10 @@ func (f *ClusterFSM) ReferencesNode(id string) bool {
 		return true
 	}
 	if _, ok := f.compactionPause.Acks[id]; ok {
+		return true
+	}
+	// rehomeNodeRemovedLocked
+	if f.rehomeReferencesLocked(id) {
 		return true
 	}
 	// compactionNodeRemovedLocked
@@ -2084,7 +2129,7 @@ func (f *ClusterFSM) applyRegisterFileStruct(p RegisterFilePayload, logIndex uin
 	}
 
 	f.mu.Lock()
-	if f.adoptRefusedLocked(p) {
+	if f.adoptRefusedLocked(p) || f.rehomeOwnsLocked(p.File.Path) {
 		f.mu.Unlock()
 		return &ManifestChangedError{Paths: []string{p.File.Path}}
 	}
@@ -2181,7 +2226,7 @@ func (f *ClusterFSM) applyDeleteFileStruct(p DeleteFilePayload) interface{} {
 	}
 
 	f.mu.Lock()
-	if p.ExpectSHA != "" && f.compactionCommit && !f.registeredAtLocked(p.Path, p.ExpectSHA) {
+	if (p.ExpectSHA != "" && f.compactionCommit && !f.registeredAtLocked(p.Path, p.ExpectSHA)) || f.rehomeOwnsLocked(p.Path) {
 		f.mu.Unlock()
 		return &ManifestChangedError{Paths: []string{p.Path}}
 	}
@@ -2275,7 +2320,7 @@ func (f *ClusterFSM) applyUpdateFileStruct(p UpdateFilePayload, logIndex uint64)
 	}
 
 	f.mu.Lock()
-	if f.updateRefusedLocked(p) {
+	if f.updateRefusedLocked(p) || f.rehomeOwnsLocked(p.File.Path) {
 		f.mu.Unlock()
 		return &ManifestChangedError{Paths: []string{p.File.Path}}
 	}
@@ -3138,6 +3183,7 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 
 	return &fsmSnapshot{
 		compactionCommit: f.snapshotCompactionCommitLocked(),
+		rehome:           f.snapshotRehomeLocked(),
 		clusterPolicies:  f.snapshotClusterPoliciesLocked(),
 		coldMark:         f.snapshotColdMarkLocked(),
 		streamClaims:     claimsState,
@@ -3504,6 +3550,7 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	f.takeover.gen = prevGen + 1
 	f.refreshUnackedDeletesLocked()
 	f.restoreCompactionCommitLocked(snapshot.CompactionCommit)
+	f.restoreRehomeLocked(snapshot.Rehome)
 	f.restoreClusterPoliciesLocked(snapshot.ClusterPolicies)
 	f.restoreColdMarkLocked(snapshot.ColdMark)
 	onCompactionPauseChanged := f.onCompactionPauseChanged
@@ -4040,6 +4087,7 @@ type fsmSnapshot struct {
 	appliedIndex           uint64
 	streamClaims           *streamClaimsState
 	compactionCommit       *compactionCommitState
+	rehome                 *rehomeState
 	clusterPolicies        *clusterPoliciesState
 	coldMark               *coldMarkState
 }
@@ -4062,6 +4110,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 		AppliedIndex:           s.appliedIndex,
 		StreamClaims:           s.streamClaims,
 		CompactionCommit:       s.compactionCommit,
+		Rehome:                 s.rehome,
 		ClusterPolicies:        s.clusterPolicies,
 		ColdMark:               s.coldMark,
 	}

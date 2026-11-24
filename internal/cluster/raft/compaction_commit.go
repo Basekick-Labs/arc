@@ -535,11 +535,13 @@ func (f *ClusterFSM) applyStageCompaction(payload []byte, logIndex uint64) inter
 	}
 	// Two staged jobs over one file could both stage; only one could commit,
 	// and the other would have made every node pull its output for nothing.
-	if _, taken := f.stagedPaths[p.Output.Path]; taken {
+	if _, taken := f.stagedPaths[p.Output.Path]; taken || f.rehomeOwnsLocked(p.Output.Path) {
 		return &CompactionConflictError{Job: p.Job, Reason: CompactionInputStaged}
 	}
 	for _, in := range p.Inputs {
-		if _, taken := f.stagedPaths[in.Path]; taken {
+		// A re-home job's source or output: the job would replace what
+		// the compaction merges (#1825).
+		if _, taken := f.stagedPaths[in.Path]; taken || f.rehomeOwnsLocked(in.Path) {
 			return &CompactionConflictError{Job: p.Job, Reason: CompactionInputStaged}
 		}
 	}
@@ -917,6 +919,13 @@ func (f *ClusterFSM) manifestCASRefusalsLocked(ops []BatchFileOp, decoded []any)
 	}
 	var refused []string
 	for i, op := range ops {
+		// A path a re-home job owns changes only by the job's own latch
+		// (rehome.go): a DELETE, retention or repair that read it before
+		// the job began is refused, as for content that changed.
+		if p := batchOpPath(op.Type, decoded[i]); p != "" && f.rehomeOwnsLocked(p) {
+			refused = append(refused, p)
+			continue
+		}
 		switch op.Type {
 		case CommandRegisterFile:
 			rp := decoded[i].(RegisterFilePayload)
@@ -938,6 +947,19 @@ func (f *ClusterFSM) manifestCASRefusalsLocked(ops []BatchFileOp, decoded []any)
 		}
 	}
 	return refused
+}
+
+// batchOpPath is the path a batch op changes.
+func batchOpPath(t CommandType, decoded any) string {
+	switch t {
+	case CommandRegisterFile:
+		return decoded.(RegisterFilePayload).File.Path
+	case CommandDeleteFile:
+		return decoded.(DeleteFilePayload).Path
+	case CommandUpdateFile:
+		return decoded.(UpdateFilePayload).File.Path
+	}
+	return ""
 }
 
 // registeredAtLocked reports whether path is registered, at sha when sha is
