@@ -105,6 +105,16 @@ fail and ask to be retried):
 - **Rolling upgrade:** the change turns on once every node runs this release, like compaction
   commit; a node on an older release is then refused at join. Compactions that were finishing when
   it turned on finish the earlier way.
+## Fix: a node restarted with tiering, the Iceberg export or edge sync on no longer counts as taking part in a re-home job ([#1859](https://github.com/Basekick-Labs/arc/issues/1859))
+
+**Who is affected:** clusters sharing one object store, while a re-home job runs.
+
+A node that came back (after a crash or a kill, without leaving the cluster) with one of those
+turned on was refused at join while a job ran, and so kept its old record, which said it could take
+part. The job went on as if the node were in scope. Its join is now accepted: its record says it is
+out of scope, and a job that has not yet switched reads to its new files is reverted by its driver;
+one that has finishes. A node joining for the first time, or one that left the cluster on a clean
+shutdown (a clean shutdown leaves), is still refused while a job runs.
 
 ## New: moving a misfiled file's rows on a cluster whose nodes share one object store ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
 
@@ -148,9 +158,12 @@ At no step does a query on any node count a row twice or miss one.
 - **Refusals.** A job is refused while any node does not take part (an older release, or tiered
   storage, the Iceberg export or edge sync on there), with stream takeover on, or for a file on
   the cold tier; and a node that does not take part cannot join while a job is running. A node
-  that restarts with one of those turned on while a job runs does not re-join, so it is not
-  refused: it still reads what the job leaves out, keeps tiering and compaction off the job's
-  files, and acks. While a job runs, a DELETE,
+  that crashes and comes back with one of those turned on while a job runs is let back in (it never
+  left): its record says it is out of scope, and a job not yet switched to its new files is
+  reverted, one already switched finishes
+  ([#1859](https://github.com/Basekick-Labs/arc/issues/1859)); after a clean shutdown it rejoins
+  once the job has ended. Meanwhile it reads what the job
+  leaves out, keeps tiering and compaction off the job's files, and acks. While a job runs, a DELETE,
   retention, a database delete, a backup or a compaction of its files is refused or leaves them
   alone, on any node; so is any of them on a node that has not synced with the leader yet.
 
