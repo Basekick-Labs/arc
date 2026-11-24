@@ -1468,9 +1468,17 @@ func (m *Manager) DeleteBackup(ctx context.Context, backupID string) error {
 			deleted += len(files)
 			continue
 		}
+		failed := false
 		for _, f := range files {
 			if err := t.backend.Delete(ctx, f); err != nil {
 				m.logger.Warn().Str("path", f).Str("target", t.name).Err(err).Msg("Failed to delete backup file")
+				if !failed {
+					failed = true
+					unreachable = append(unreachable, t.name)
+					if firstErr == nil {
+						firstErr = fmt.Errorf("failed to delete a file of backup %s from %s: %w", backupID, t.describe(), err)
+					}
+				}
 				continue
 			}
 			deleted++
@@ -1491,9 +1499,9 @@ func (m *Manager) DeleteBackup(ctx context.Context, backupID string) error {
 	return nil
 }
 
-// TargetsUnreachableError: a delete removed the backup where it could, and
-// these targets could not be reached (#1122). Running the delete again
-// finishes it.
+// TargetsUnreachableError is a delete that removed the backup where it could
+// while these targets could not be reached or did not delete every file
+// (#1122). Running the delete again finishes it.
 type TargetsUnreachableError struct {
 	BackupID string
 	Targets  []string

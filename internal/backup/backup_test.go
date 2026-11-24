@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -815,4 +816,32 @@ func (b *hookAfterFirstPage) WriteReader(ctx context.Context, path string, reade
 	}
 	b.hook()
 	return b.Backend.WriteReader(ctx, path, io.MultiReader(bytes.NewReader(first[:n]), reader), size)
+}
+
+// noBatchFailingDelete hides the local backend's DeleteBatch (through the
+// interface) and fails every Delete.
+type noBatchFailingDelete struct{ storage.Backend }
+
+func (b noBatchFailingDelete) Delete(context.Context, string) error {
+	return fmt.Errorf("simulated delete failure")
+}
+
+// #1122: a target that does not delete every file of a backup makes the delete
+// fail naming it, not succeed with the file left behind.
+func TestDeleteBackupReportsAFileItCouldNotDelete(t *testing.T) {
+	ctx := context.Background()
+	logger := zerolog.Nop()
+	local := mustLocalBackend(t, t.TempDir(), logger)
+	if err := local.Write(ctx, "backup-20261007-120000-abcdef01/data/x.parquet", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{dataStorage: local, backupStorage: noBatchFailingDelete{local}, logger: logger}
+	err := m.DeleteBackup(ctx, "backup-20261007-120000-abcdef01")
+	var unreachable *TargetsUnreachableError
+	if !errors.As(err, &unreachable) || len(unreachable.Targets) != 1 {
+		t.Fatalf("err = %v, want a TargetsUnreachableError naming the target", err)
+	}
+	if errors.Is(err, ErrBackupNotFound) {
+		t.Fatal("reported as not found")
+	}
 }

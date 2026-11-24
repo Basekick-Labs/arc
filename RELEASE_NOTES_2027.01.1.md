@@ -8,8 +8,9 @@
 
 It answered 500 for both, so an operator could not tell a wrong id from a destination that is down.
 It now answers as `GET /api/v1/backup/:id` does: **404** when no configured target holds the backup,
-and **503** naming the target(s) that could not be reached (in `target` and `targets`) when one could
-not be — what could be reached was deleted, and running the delete again finishes it. A client that
+and **503** naming the target(s) that could not be reached or did not delete every file (in `target`
+and `targets`) — the backup is removed from every target that could be, and running the delete again
+finishes it. A file a target failed to delete was only logged before, and the delete answered 200. A client that
 treated any 5xx as "retry" keeps working; one that checked for exactly 500 should check for 503.
 
 ## Change: on a cluster that shares one object store, a node serves no reads while its cluster state may be behind ([#1852](https://github.com/Basekick-Labs/arc/issues/1852), [#1825](https://github.com/Basekick-Labs/arc/issues/1825))

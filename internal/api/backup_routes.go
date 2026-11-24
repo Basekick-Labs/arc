@@ -550,7 +550,7 @@ func (h *BackupHandler) DeleteBackup(c *fiber.Ctx) error {
 			target = targets[0]
 		}
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-			"error":   fmt.Sprintf("could not delete backup %s: %s is unreachable; what could be reached was deleted, run the delete again", id, describeTargets(targets)),
+			"error":   fmt.Sprintf("could not delete backup %s from %s (unreachable, or a file could not be deleted); run the delete again", id, describeTargets(targets)),
 			"target":  target,
 			"targets": targets,
 		})
