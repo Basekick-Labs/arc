@@ -1468,9 +1468,17 @@ func (m *Manager) DeleteBackup(ctx context.Context, backupID string) error {
 			deleted += len(files)
 			continue
 		}
+		failed := false
 		for _, f := range files {
 			if err := t.backend.Delete(ctx, f); err != nil {
 				m.logger.Warn().Str("path", f).Str("target", t.name).Err(err).Msg("Failed to delete backup file")
+				if !failed {
+					failed = true
+					unreachable = append(unreachable, t.name)
+					if firstErr == nil {
+						firstErr = fmt.Errorf("failed to delete a file of backup %s from %s: %w", backupID, t.describe(), err)
+					}
+				}
 				continue
 			}
 			deleted++
@@ -1481,8 +1489,7 @@ func (m *Manager) DeleteBackup(ctx context.Context, backupID string) error {
 		// Having deleted what it could: the error names the targets that still
 		// hold objects so a re-run finishes the job, and "not found" is never
 		// the answer when a target might still hold the backup.
-		return fmt.Errorf("backup %s was deleted where it could be reached, but these backup targets could not be: %s; run the delete again: %w",
-			backupID, strings.Join(unreachable, ", "), firstErr)
+		return &TargetsUnreachableError{BackupID: backupID, Targets: unreachable, Err: firstErr}
 	}
 	if held == 0 {
 		return fmt.Errorf("%w: %s", ErrBackupNotFound, backupID)
@@ -1491,3 +1498,19 @@ func (m *Manager) DeleteBackup(ctx context.Context, backupID string) error {
 	m.logger.Info().Str("backup_id", backupID).Int("files_deleted", deleted).Int("targets", held).Msg("Backup deleted")
 	return nil
 }
+
+// TargetsUnreachableError is a delete that removed the backup where it could
+// while these targets could not be reached or did not delete every file
+// (#1122). Running the delete again finishes it.
+type TargetsUnreachableError struct {
+	BackupID string
+	Targets  []string
+	Err      error
+}
+
+func (e *TargetsUnreachableError) Error() string {
+	return fmt.Sprintf("backup %s was deleted where it could be reached, but these backup targets could not be: %s; run the delete again: %v",
+		e.BackupID, strings.Join(e.Targets, ", "), e.Err)
+}
+
+func (e *TargetsUnreachableError) Unwrap() error { return e.Err }
