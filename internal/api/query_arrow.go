@@ -466,7 +466,8 @@ func (h *QueryHandler) serveArcxArrowIPCResult(
 	trailers := newResponseTrailers()
 
 	var streamW *bufio.Writer
-	h.setReadingBodyStream(fctx, cancel, trailers, "arcx_serve_arrow_ipc", func() {
+	streamReadsFiles(fctx)
+	h.setDirectBodyStream(fctx, cancel, trailers, "arcx_serve_arrow_ipc", func() {
 		poisonArrowStream(streamW, h.logger)
 		trailers.setIfAbsent(arrowStreamTruncatedTrailer, "stream writer panicked")
 		trailers.setIfAbsent(

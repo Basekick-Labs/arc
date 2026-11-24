@@ -24,7 +24,8 @@ func TestStreamedResponseHoldsItsRead(t *testing.T) {
 	app.Get("/stream", func(c *fiber.Ctx) error {
 		_, leave := gate.EnterAt()
 		defer holdRead(c.Context(), leave)()
-		h.setReadingBodyStream(c.Context(), nil, nil, "test", nil, func(w *bufio.Writer) {
+		streamReadsFiles(c.Context())
+		h.setDirectBodyStream(c.Context(), nil, nil, "test", nil, func(w *bufio.Writer) {
 			close(streaming)
 			<-release
 			_, _ = w.WriteString("done")

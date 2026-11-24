@@ -297,7 +297,8 @@ func (h *QueryHandler) serveArcxResult(
 	// the row count; we check reader.Err() after it to catch a mid-stream engine error
 	// (else a truncated result serves as success — gotcha #4).
 	c.Set("Content-Type", "application/json")
-	h.setReadingBodyStream(c.Context(), cancel, nil, "arcx_serve_json", func() {
+	streamReadsFiles(c.Context())
+	h.setDirectBodyStream(c.Context(), cancel, nil, "arcx_serve_json", func() {
 		// A panic skips the dispositions below, leaving the query registered
 		// as running forever (#717).
 		if onFail != nil {

@@ -184,15 +184,19 @@ func (refusingWriter) Write([]byte) (int, error) { return 0, errResponseBodyNotS
 // each call is on one line with safeStream so the CI panic-safety guard can
 // see both.
 func (h *QueryHandler) setDirectBodyStream(fctx *fasthttp.RequestCtx, cancel func(), trailers *responseTrailers, stream string, onPanic func(), sw func(*bufio.Writer)) {
+	sw = takeHeldRead(fctx, sw)
 	fctx.Response.SetBodyStream(&directBodyStream{sw: h.safeStream(stream, onPanic, sw), cancel: cancel, trailers: trailers, header: &fctx.Response.Header}, -1)
 }
 
-// setReadingBodyStream is setDirectBodyStream for a writer that still reads
-// data files while it streams (an arcx-served result, which scans Parquet as
-// it goes; a DuckDB result is complete before its handler returns): the
-// request's held read, if any, leaves when the writer returns (#1858).
-func (h *QueryHandler) setReadingBodyStream(fctx *fasthttp.RequestCtx, cancel func(), trailers *responseTrailers, stream string, onPanic func(), sw func(*bufio.Writer)) {
-	h.setDirectBodyStream(fctx, cancel, trailers, stream, onPanic, takeHeldRead(fctx, sw))
+// streamReadsFiles marks the request's next direct stream as one that still
+// reads data files while it streams (an arcx-served result, which scans
+// Parquet as it goes; a DuckDB result is complete before its handler
+// returns): the request's held read, if any, leaves when that stream's writer
+// returns (#1858).
+func streamReadsFiles(fctx *fasthttp.RequestCtx) {
+	if hr, _ := fctx.UserValue(heldReadKey).(*heldRead); hr != nil {
+		hr.forStream.Store(true)
+	}
 }
 
 // setAbortableBodyStream is setDirectBodyStream for a writer that may end
@@ -206,12 +210,13 @@ func (h *QueryHandler) setAbortableBodyStream(fctx *fasthttp.RequestCtx, cancel 
 const heldReadKey = "arc.heldRead"
 
 // heldRead is a read in the gate that a streamed response which still reads
-// files takes over (setReadingBodyStream): the read then leaves when the
+// files takes over (streamReadsFiles, then setDirectBodyStream): the read then leaves when the
 // stream ends, not when the handler returns, so a job that waits for reads
 // does not remove a file the stream still reads (#1858).
 type heldRead struct {
-	leave func()
-	taken atomic.Bool
+	leave     func()
+	taken     atomic.Bool
+	forStream atomic.Bool // streamReadsFiles
 }
 
 // holdRead parks leave on the request and returns what the handler defers:
@@ -231,7 +236,7 @@ func holdRead(fctx *fasthttp.RequestCtx, leave func()) (release func()) {
 // (directBodyStream), so the read always leaves.
 func takeHeldRead(fctx *fasthttp.RequestCtx, sw func(*bufio.Writer)) func(*bufio.Writer) {
 	hr, _ := fctx.UserValue(heldReadKey).(*heldRead)
-	if hr == nil || !hr.taken.CompareAndSwap(false, true) {
+	if hr == nil || !hr.forStream.Load() || !hr.taken.CompareAndSwap(false, true) {
 		return sw
 	}
 	return func(w *bufio.Writer) {
