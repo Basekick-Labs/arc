@@ -1294,13 +1294,15 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 			if _, err := db.Exec("SET GLOBAL cache_httpfs_type='in_mem'"); err != nil {
 				logger.Warn().Err(err).Msg("Failed to set cache_httpfs_type to in_mem")
 			}
-			// No file-handle cache (#1861): clearing the cache
-			// (cache_httpfs_clear_cache, which Arc runs whenever files are
-			// replaced) destroys cached handles that running queries still
-			// use, and those queries fail with an internal error or hang.
-			// The data blocks, glob and metadata caches stay.
+			// No file-handle cache (#1861): cache_httpfs_clear_cache (which
+			// Arc runs whenever files are replaced) resets the file-handle
+			// cache and its in-use counter without a lock while other threads
+			// open files through them (cache_httpfs 0.14.x), so a concurrent
+			// open throws "Attempted to dereference shared_ptr that is NULL"
+			// or hangs. The data blocks, glob and metadata caches stay; their
+			// clears are locked.
 			if _, err := db.Exec("SET GLOBAL cache_httpfs_enable_file_handle_cache=false"); err != nil {
-				logger.Warn().Err(err).Msg("Failed to turn off cache_httpfs's file handle cache")
+				logger.Error().Err(err).Msg("Could not turn off cache_httpfs's file handle cache: queries can fail or hang while the cache is cleared (#1861)")
 			}
 			// Calculate max blocks from cache size (each block is 512KB)
 			if cfg.S3CacheSize > 0 {
@@ -1345,6 +1347,7 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 			logger.Info().
 				Int64("cache_size_bytes", cfg.S3CacheSize).
 				Int("ttl_seconds", cfg.S3CacheTTLSeconds).
+				Bool("file_handle_cache", false).
 				Msg("cache_httpfs extension loaded with in_mem mode")
 		}
 	}
