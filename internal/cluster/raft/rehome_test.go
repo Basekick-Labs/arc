@@ -670,3 +670,48 @@ func TestUnknownCommandTypeChangesNothing(t *testing.T) {
 		t.Fatal("an unknown command changed state")
 	}
 }
+
+// #1857: no job is staged while a backup mark is live; a lapsed or ended
+// mark, or a removed node's, does not hold it.
+func TestStageRehomeRefusedWhileABackupRuns(t *testing.T) {
+	x := rhFSM(t)
+	x.ok(CommandBackupMark, BackupMarkPayload{ID: "b1", Node: "w2", Now: t0})
+	if r := x.rhConflict(CommandStageRehome, rhStage("j1")); r != RehomeBackupRunning {
+		t.Fatalf("reason %q", r)
+	}
+	late := rhStage("j1")
+	late.Now = t0.Add(BackupMarkLease)
+	x.ok(CommandStageRehome, late) // the mark lapsed
+}
+
+func TestBackupMarkEndAndNodeRemoval(t *testing.T) {
+	x := rhFSM(t)
+	x.ok(CommandBackupMark, BackupMarkPayload{ID: "b1", Node: "w2", Now: t0})
+	x.ok(CommandBackupMark, BackupMarkPayload{ID: "b1", Node: "w2", End: true})
+	x.ok(CommandStageRehome, rhStage("j1"))
+	x.ok(CommandBackupMark, BackupMarkPayload{ID: "b2", Node: "r1", Now: t0})
+	if !x.f.ReferencesNode("r1") || len(x.f.BackupMarks()) != 1 {
+		t.Fatal("mark not recorded")
+	}
+	// Snapshot round trip keeps it.
+	snap, err := x.f.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := snap.Persist(&testSnapshotSink{Writer: &buf}); err != nil {
+		t.Fatal(err)
+	}
+	f2 := newTestFSM()
+	if err := f2.Restore(io.NopCloser(bytes.NewReader(buf.Bytes()))); err != nil {
+		t.Fatal(err)
+	}
+	if m := f2.BackupMarks(); len(m) != 1 || m[0].Node != "r1" {
+		t.Fatalf("restored marks %v", m)
+	}
+	x.ok(CommandRemoveNode, RemoveNodePayload{NodeID: "r1"})
+	if len(x.f.BackupMarks()) != 0 {
+		t.Fatal("a removed node's mark is kept")
+	}
+	x.refused(CommandBackupMark, BackupMarkPayload{ID: "b3", Node: "nobody", Now: t0})
+}

@@ -282,6 +282,8 @@ type EndRehomePayload struct {
 type rehomeState struct {
 	Enabled bool         `json:"enabled"`
 	Jobs    []*RehomeJob `json:"jobs,omitempty"`
+	// Backups: the backup marks (#1857, rehome_backup.go).
+	Backups []*BackupMark `json:"backups,omitempty"`
 	// Gen is the log index of the last change to what jobs leave out.
 	Gen uint64 `json:"gen,omitempty"`
 }
@@ -397,6 +399,9 @@ func (f *ClusterFSM) applyStageRehome(payload []byte, logIndex uint64) interface
 	}
 	if f.compactionPause.Active && p.Now.Before(f.compactionPause.ExpiresAt) {
 		return &RehomeConflictError{Job: p.Job, Reason: RehomePaused}
+	}
+	if f.backupRunningLocked(p.Now) {
+		return &RehomeConflictError{Job: p.Job, Reason: RehomeBackupRunning}
 	}
 	if f.rehomeOutOfScopeLocked() {
 		return &RehomeConflictError{Job: p.Job, Reason: RehomeOutOfScope}
@@ -769,10 +774,15 @@ func (f *ClusterFSM) rehomeReferencesLocked(id string) bool {
 }
 
 func (f *ClusterFSM) snapshotRehomeLocked() *rehomeState {
-	if !f.rehomeEnabled && len(f.rehomeJobs) == 0 {
+	if !f.rehomeEnabled && len(f.rehomeJobs) == 0 && len(f.backupMarks) == 0 {
 		return nil
 	}
 	st := &rehomeState{Enabled: f.rehomeEnabled, Gen: f.rehomeGen}
+	for _, m := range f.backupMarks {
+		c := *m
+		st.Backups = append(st.Backups, &c)
+	}
+	sort.Slice(st.Backups, func(a, b int) bool { return st.Backups[a].ID < st.Backups[b].ID })
 	for _, j := range f.rehomeJobs {
 		c := j.Copy()
 		st.Jobs = append(st.Jobs, &c)
@@ -785,8 +795,15 @@ func (f *ClusterFSM) restoreRehomeLocked(st *rehomeState) {
 	prev := f.rehomeJobs
 	f.rehomeEnabled, f.rehomeGen = false, 0
 	f.rehomeJobs, f.rehomePaths = map[string]*RehomeJob{}, map[string]string{}
+	f.backupMarks = map[string]*BackupMark{}
 	if st != nil {
 		f.rehomeEnabled, f.rehomeGen = st.Enabled, st.Gen
+		for _, m := range st.Backups {
+			if m != nil && m.ID != "" {
+				c := *m
+				f.backupMarks[m.ID] = &c
+			}
+		}
 		for _, j := range st.Jobs {
 			if j != nil && j.ID != "" {
 				c := j.Copy()

@@ -99,6 +99,20 @@ listing cache is now off; the data and metadata caches stay. The cost is an S3 L
 query: in a test against a local SeaweedFS, about 7 ms more per small query (a query loop answered
 3,110 queries in two minutes instead of 3,776); more against a remote bucket, and little next to a
 query that reads many rows.
+## Fix: on a cluster, a re-home job does not start under a backup running on another node ([#1857](https://github.com/Basekick-Labs/arc/issues/1857))
+
+**Who is affected:** clusters sharing one object store that run re-home jobs (#1825).
+
+A backup or restore kept re-home jobs out only on the node it ran on. After a failover, a job the
+new primary writer started could move a file the backup on the former one was copying, leaving the
+backup with the file and the files replacing it, or neither. A backup or restore now records itself
+in the cluster (renewed while it runs, ignored 90 seconds after its node stops renewing it), and a
+job is not staged while one runs anywhere; a backup still refuses to start while a job runs. A
+backup that cannot record itself (no cluster leader) is refused.
+
+Also: a DELETE that started on a former primary cannot register its rewrite of a file a job is
+moving (the cluster refuses it), but could leave the rewrite's object in storage, read beside the
+job's new files. The job now removes such an object before it removes the file.
 
 ## Fix: on a cluster sharing one object store, a query no longer counts a compaction's rows twice ([#1852](https://github.com/Basekick-Labs/arc/issues/1852))
 
@@ -206,6 +220,14 @@ Not handled in this version:
 - A backup, a DELETE or retention still running on a former primary writer after a failover does
   not see a job the new one starts (a DELETE rewrite that lands before the switch-over makes the
   job revert; one that lands after is not caught).
+- (Handled since [#1857](https://github.com/Basekick-Labs/arc/issues/1857): a backup or restore
+  marks itself in the cluster, and no job is staged while one runs on any node; a DELETE rewrite of
+  the file that a former primary started, which the cluster refuses to register, has its leftover
+  object removed before the file is.)
+- An Arrow IPC stream, and the arcx engine's streamed or shadowed reads, can still be reading
+  after their request's handler returned, and an ack does not wait for them: such a read fails if
+  its file is deleted, it does not return wrong rows. Schema reads (`getMeasurementSchema`) are not
+  counted either.
 - A new job is started on the primary writer only.
 
 ## Change: a cluster records re-home jobs in its replicated state; an older build cannot join once every node supports it ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))

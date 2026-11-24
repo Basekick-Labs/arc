@@ -579,3 +579,25 @@ func TestClusterNodeOutOfScopeReverts1859(t *testing.T) {
 	}
 	r.requireOnce("after the revert")
 }
+
+// #1857: a DELETE rewrite of the source that the cluster never registered (a
+// DELETE that started on a former primary) is removed before the source.
+func TestClusterRemovesAnUnregisteredRewrite1857(t *testing.T) {
+	r := newClusterRig(t)
+	rewrite := strings.TrimSuffix(r.key, ".parquet") + "_rewrite_1.parquet"
+	r.h.afterStep = func(s string) {
+		if s == "latched" {
+			if err := r.store.WriteReader(context.Background(), rewrite, strings.NewReader("stale rows"), 10); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	id, _, _ := r.start()
+	if job := r.wait(id); job["state"] != "done" {
+		t.Fatalf("job: %v", job)
+	}
+	if n, _ := r.store.StatFile(context.Background(), rewrite); n >= 0 {
+		t.Fatal("the unregistered rewrite is still in the bucket")
+	}
+	r.requireOnce("after the swap")
+}

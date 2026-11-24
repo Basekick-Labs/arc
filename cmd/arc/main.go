@@ -1115,7 +1115,26 @@ func main() {
 		if !ok {
 			return release, false
 		}
-		if s := rehomeClusterSrc.Load(); s != nil && s.OwnsUnder(prefix) {
+		s := rehomeClusterSrc.Load()
+		if s != nil && prefix == "" {
+			// A backup or a restore (#1857): recorded in the cluster first,
+			// so a job is not staged under it on any node, then checked
+			// against the jobs already staged.
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			endMark, err := s.BeginBackupMark(ctx)
+			cancel()
+			if err != nil {
+				log.Warn().Err(err).Msg("A backup or restore could not record itself in the cluster; it is refused")
+				release()
+				return func() {}, false
+			}
+			local := release
+			release = func() {
+				endMark()
+				local()
+			}
+		}
+		if s != nil && s.OwnsUnder(prefix) {
 			release()
 			return func() {}, false
 		}

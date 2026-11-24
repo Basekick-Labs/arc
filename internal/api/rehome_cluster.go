@@ -444,6 +444,15 @@ func (h *RehomeHandler) driveCluster(ctx context.Context, id string, files map[s
 				err = werr
 				break
 			}
+			// A DELETE rewrite of the source that started on a former primary
+			// cannot register while the job owns the source (the cluster
+			// refuses it), but its new object may be in storage: read beside
+			// the outputs it would count rows twice (#1857). It is no file's
+			// record, so it goes.
+			if derr := h.removeUnregisteredRewrites(bg, j.Source.Path); derr != nil {
+				err = derr
+				break
+			}
 			if derr := storage.DeleteWithRetry(bg, h.storage, j.Source.Path); derr != nil && !storage.IsNotFound(derr) {
 				err = fmt.Errorf("remove %s: %w", j.Source.Path, derr)
 				break
@@ -894,3 +903,28 @@ func (h *RehomeHandler) dropLocalCaches(j raft.RehomeJob) {
 
 // The coordinator is the cluster the driver runs against.
 var _ RehomeCluster = (*cluster.Coordinator)(nil)
+
+// removeUnregisteredRewrites deletes the objects of key's DELETE-rewrite
+// family in its directory that the cluster's manifest does not list, other
+// than key itself.
+func (h *RehomeHandler) removeUnregisteredRewrites(ctx context.Context, key string) error {
+	siblings, err := h.storage.List(ctx, dirOf(key)+"/")
+	if err != nil {
+		return err
+	}
+	family := storage.RewriteFamily(key)
+	for _, k := range siblings {
+		if k == key || storage.RewriteFamily(k) != family {
+			continue
+		}
+		if _, registered := h.swap.Cluster.ManifestFile(k); registered {
+			continue
+		}
+		h.logger.Warn().Str("source", key).Str("rewrite", k).
+			Msg("Re-home: removing a DELETE rewrite of the file being moved that the cluster never registered (a DELETE that started on a former primary)")
+		if err := storage.DeleteWithRetry(ctx, h.storage, k); err != nil && !storage.IsNotFound(err) {
+			return fmt.Errorf("remove %s: %w", k, err)
+		}
+	}
+	return nil
+}

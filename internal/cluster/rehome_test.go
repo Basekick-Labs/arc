@@ -411,3 +411,20 @@ func TestRehomeJoinGateLetsAMemberRefreshItsRecord(t *testing.T) {
 	}
 	waitFSM(t, func() bool { return strings.Contains(c.raftNode.FSM().RehomeOutOfScope(), "reader-1") })
 }
+
+// #1857: a backup marks itself in the cluster while it runs; release ends it.
+func TestBeginBackupMark(t *testing.T) {
+	c := originRig(t, "writer-1", RoleWriter)
+	src := c.RehomeSource()
+	release, err := src.BeginBackupMark(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFSM(t, func() bool { return len(c.raftNode.FSM().BackupMarks()) == 1 })
+	if m := c.raftNode.FSM().BackupMarks()[0]; m.Node != c.LocalNodeID() {
+		t.Fatalf("mark %+v", m)
+	}
+	release()
+	release() // once
+	waitFSM(t, func() bool { return len(c.raftNode.FSM().BackupMarks()) == 0 })
+}

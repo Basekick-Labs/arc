@@ -2,8 +2,11 @@ package cluster
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -313,4 +316,65 @@ func (c *Coordinator) isMember(id string) bool {
 		}
 	}
 	return false
+}
+
+// BeginBackupMark records in the cluster that a backup or restore runs here
+// (#1857): no re-home job is staged while it does, on any node. The mark is
+// renewed until release, which ends it. An error: the mark could not be
+// recorded, and the caller should not start.
+func (s *RehomeSource) BeginBackupMark(ctx context.Context) (release func(), err error) {
+	if s == nil || s.c == nil || s.c.raftNode == nil {
+		return func() {}, nil
+	}
+	c := s.c
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return nil, err
+	}
+	id := hex.EncodeToString(b[:])
+	propose := func(ctx context.Context, end bool) error {
+		raw, err := json.Marshal(raft.BackupMarkPayload{ID: id, Node: c.LocalNodeID(), Now: time.Now().UTC(), End: end})
+		if err != nil {
+			return err
+		}
+		return c.applyOrForward(ctx, &raft.Command{Type: raft.CommandBackupMark, Payload: raw})
+	}
+	if err := propose(ctx, false); err != nil {
+		return nil, fmt.Errorf("record the backup in the cluster: %w", err)
+	}
+	// This node's record catches up past the mark, so the caller's check
+	// for jobs (after this) sees any job staged before the mark: a job and a
+	// backup each record themselves, then look for the other.
+	if err := c.SyncManifest(ctx); err != nil {
+		_ = propose(context.WithoutCancel(ctx), true)
+		return nil, fmt.Errorf("sync with the cluster after recording the backup: %w", err)
+	}
+	stop := make(chan struct{})
+	go func() {
+		t := time.NewTicker(raft.BackupMarkLease / 3)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				rctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				if err := propose(rctx, false); err != nil {
+					c.logger.Warn().Err(err).Str("mark", id).Msg("Renewing this node's backup mark failed; re-home jobs may start if it lapses")
+				}
+				cancel()
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(stop)
+			rctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := propose(rctx, true); err != nil {
+				c.logger.Warn().Err(err).Str("mark", id).Msg("Ending this node's backup mark failed; it lapses on its own")
+			}
+		})
+	}, nil
 }
