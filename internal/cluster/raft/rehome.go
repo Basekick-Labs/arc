@@ -507,10 +507,10 @@ func (f *ClusterFSM) applyAdvanceRehome(payload []byte, logIndex uint64) interfa
 			f.mu.Unlock()
 			return &RehomeConflictError{Job: p.Job, Reason: RehomePaused}
 		}
-		// Scope is checked at every step, not only at the stage: stream
-		// claims turned on, or a node without the capability that joined
-		// (one that does not leave the outputs out), leave the job only
-		// its revert.
+		// Scope is checked at every step, not only at the stage: a node
+		// without the capability that joined (one that does not leave the
+		// outputs out), or stream claims turned on while a node lacks the
+		// #1872 rule, leave the job only its revert.
 		if f.rehomeOutOfScopeLocked(j.Source.Path) {
 			f.mu.Unlock()
 			return &RehomeConflictError{Job: p.Job, Reason: RehomeOutOfScope}
@@ -691,10 +691,8 @@ func (f *ClusterFSM) rehomeWaitForAllLocked(j *RehomeJob) {
 	sort.Strings(j.AckWanted)
 }
 
-// rehomeOutOfScopeLocked reports whether a job may not go on: stream
-// takeover is on (it settles files by their coverage, and the latch replaces
-// a covered file with uncovered ones), or a node lacks
-// CapabilityRehomeInScope.
+// rehomeOutOfScopeLocked reports whether a job on source may not go on (see
+// rehomeOutOfScopeWhyLocked).
 func (f *ClusterFSM) rehomeOutOfScopeLocked(source string) bool {
 	return f.rehomeOutOfScopeWhyLocked(source) != ""
 }

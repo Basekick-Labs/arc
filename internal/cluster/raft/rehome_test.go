@@ -134,6 +134,8 @@ func TestStageRehomeRefusedWhileANodeIsOutOfScope(t *testing.T) {
 	x.ok(CommandStageRehome, rhStage("j1"))
 }
 
+// A node without the #1872 rule (rhFSM's nodes lack it): with stream claims
+// on, every job is refused.
 func TestStageRehomeRefusedWithStreamClaims(t *testing.T) {
 	x := rhFSM(t)
 	x.ok(CommandEnableStreamClaims, EnableStreamClaimsPayload{Nodes: rhNodes, Now: t0})
@@ -618,7 +620,7 @@ func TestRehomeAdvanceRefusedWhenScopeChangesMidJob(t *testing.T) {
 			x.ok(CommandAddNode, AddNodePayload{Node: NodeInfo{ID: "r2", Role: "reader", State: "healthy",
 				Capabilities: []string{CapabilityRehome}}})
 		},
-		"stream claims on": func(x *tkFSM) {
+		"stream claims on with a node lacking the #1872 rule": func(x *tkFSM) {
 			x.ok(CommandEnableStreamClaims, EnableStreamClaimsPayload{Nodes: rhNodes, Now: t0})
 		},
 	} {
@@ -801,12 +803,27 @@ func rhFSMStreamClaims(t *testing.T) *tkFSM {
 }
 
 // #1872: with stream takeover on and every node on a release with the rule,
-// a source without coverage is moved as with takeover off; one with coverage
-// is refused, at the stage and at every step.
+// a source without coverage is moved as with takeover off (through its
+// latch: the outputs carry no coverage); one with coverage is refused at the
+// stage.
 func TestStageRehomeWithStreamClaims1872(t *testing.T) {
 	x := rhFSMStreamClaims(t)
 	x.ok(CommandStageRehome, rhStage("j1"))
-	x.ok(CommandAdvanceRehome, AdvanceRehomePayload{Job: "j1", By: "w1", To: RehomeCommitted, Now: t0})
+	for _, to := range []string{RehomeCommitted, RehomePublished, RehomeLatched} {
+		x.ok(CommandAdvanceRehome, AdvanceRehomePayload{Job: "j1", By: "w1", To: to, Now: t0})
+		if to != RehomeLatched {
+			x.rhAckAll("j1", to)
+		}
+	}
+	for _, o := range rhOutputs("j1") {
+		e, ok := x.f.GetFile(o.Key)
+		if !ok || len(e.Coverage) != 0 {
+			t.Fatalf("output %s after the latch: registered %v, coverage %v", o.Key, ok, e)
+		}
+	}
+	if _, ok := x.f.GetFile(rhSource().Path); ok {
+		t.Fatal("the source is still registered after the latch")
+	}
 
 	y := rhFSMStreamClaims(t)
 	y.f.mu.Lock()
@@ -821,4 +838,23 @@ func TestStageRehomeWithStreamClaims1872(t *testing.T) {
 	if why := y.f.RehomeOutOfScope(); why != "" {
 		t.Fatalf("the cluster-wide check refused: %s", why)
 	}
+}
+
+// #1872: stream claims turned on mid-job, every node with the rule: an
+// uncovered source's job goes on.
+func TestRehomeGoesOnWhenStreamClaimsTurnOnMidJob1872(t *testing.T) {
+	x := &tkFSM{t: t, f: NewClusterFSM(zerolog.Nop())}
+	for _, n := range rhNodes {
+		x.ok(CommandAddNode, AddNodePayload{Node: NodeInfo{ID: n, Role: "writer", State: "healthy",
+			Capabilities: []string{CapabilityRehome, CapabilityRehomeInScope, CapabilityRehomeStreamClaims}}})
+	}
+	x.ok(CommandPromoteWriter, PromoteWriterPayload{NodeID: "w1"})
+	x.ok(CommandEnableCompactionCommit, EnableCompactionCommitPayload{Nodes: rhNodes, Now: t0})
+	x.ok(CommandEnableRehome, EnableRehomePayload{Nodes: rhNodes, Now: t0})
+	x.ok(CommandRegisterFile, RegisterFilePayload{File: ccFile("x.parquet", "sx", 100)})
+	x.ok(CommandStageRehome, rhStage("j1"))
+	x.ok(CommandAdvanceRehome, AdvanceRehomePayload{Job: "j1", By: "w1", To: RehomeCommitted, Now: t0})
+	x.rhAckAll("j1", RehomeCommitted)
+	x.ok(CommandEnableStreamClaims, EnableStreamClaimsPayload{Nodes: rhNodes, Now: t0})
+	x.ok(CommandAdvanceRehome, AdvanceRehomePayload{Job: "j1", By: "w1", To: RehomePublished, Now: t0})
 }

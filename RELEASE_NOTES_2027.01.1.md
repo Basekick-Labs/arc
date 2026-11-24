@@ -370,9 +370,10 @@ At no step does a query on any node count a row twice or miss one.
   flight. A step that fails for a passing reason (a leader election, a storage error) is retried
   where it is.
 - **Refusals.** A job is refused while any node does not take part (an older release, or tiered
-  storage, the Iceberg export or edge sync on there), with stream takeover on (since
-  [#1872](https://github.com/Basekick-Labs/arc/issues/1872): only for a file that carries stream
-  coverage, or while a node runs an earlier release), or for a file on
+  storage, the Iceberg export or edge sync on there), with stream takeover on for a file that
+  carries stream coverage (its rows settle a writer's batches, which a move cannot divide among
+  the new files; a file without coverage is moved as with takeover off,
+  [#1872](https://github.com/Basekick-Labs/arc/issues/1872)), or for a file on
   the cold tier; and a node that does not take part cannot join while a job is running. A node
   that crashes and comes back with one of those turned on while a job runs is let back in (it never
   left): its record says it is out of scope, and a job not yet switched to its new files is
