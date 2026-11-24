@@ -38,6 +38,12 @@ func (c *Coordinator) localCapabilities() []string {
 	// that applies its rules advertises it.
 	// Cluster policies (#1324) likewise.
 	caps := []string{raft.CapabilityCompactionCommit, CapabilityForwardIdentity, CapabilityForwardReadQueries, CapabilityForwardDatabaseCreate, raft.CapabilityClusterPolicies, raft.CapabilityClusterRetention, raft.CapabilityClusterCQ, raft.CapabilityClusterGovernance, raft.CapabilityColdMark, raft.CapabilityIcebergNotice, raft.CapabilityIcebergDatabaseDropped}
+	// Re-home (#1825) applies its rules in every build; whether this node's
+	// configuration lets a job run is its own capability.
+	caps = append(caps, raft.CapabilityRehome)
+	if c.rehomeInScope.Load() {
+		caps = append(caps, raft.CapabilityRehomeInScope)
+	}
 	if c.keepsLocalReplicas() {
 		caps = append(caps, CapabilityLocalReplica)
 	}
