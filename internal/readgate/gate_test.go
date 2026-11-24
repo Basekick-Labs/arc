@@ -116,3 +116,41 @@ func TestConcurrentReads(t *testing.T) {
 		t.Fatalf("in flight = %d, err = %v", g.InFlight(), err)
 	}
 }
+
+func TestCancelAllCancelsBoundReads(t *testing.T) {
+	var g Gate
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	done1 := g.Bind(cancel1)
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	done2 := g.Bind(cancel2)
+	done2() // finished before the cancel: unbound
+	g.CancelAll()
+	select {
+	case <-ctx1.Done():
+	case <-time.After(time.Second):
+		t.Fatal("a bound read was not cancelled")
+	}
+	done1()
+	if ctx2.Err() == nil {
+		t.Fatal("unreachable: done2 cancels its own context")
+	}
+	// Bound after: not cancelled by the earlier call.
+	ctx3, cancel3 := context.WithCancel(context.Background())
+	done3 := g.Bind(cancel3)
+	defer done3()
+	time.Sleep(10 * time.Millisecond)
+	if ctx3.Err() != nil {
+		t.Fatal("a read bound after CancelAll was cancelled")
+	}
+	g.CancelAll()
+	select {
+	case <-ctx3.Done():
+	case <-time.After(time.Second):
+		t.Fatal("a second CancelAll did not cancel")
+	}
+	var nilGate *Gate
+	if nilGate.Bind(nil) != nil {
+		t.Fatal("nil cancel bound")
+	}
+	nilGate.CancelAll()
+}

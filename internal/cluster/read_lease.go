@@ -200,6 +200,22 @@ func (l *readLease) run(ctx context.Context) {
 	}
 }
 
+// SetReadLeaseHooks sets what runs when this node loses its read lease
+// (lost: stop the reads in flight) and each time it has synced with the
+// leader, before it takes the lease (synced: drop its query caches). Both
+// must be quick. Call before Start.
+func (c *Coordinator) SetReadLeaseHooks(lost, synced func()) {
+	if c == nil {
+		return
+	}
+	if lost != nil {
+		c.onReadLeaseLost.Store(&lost)
+	}
+	if synced != nil {
+		c.onReadSynced.Store(&synced)
+	}
+}
+
 // ReadReady reports whether this node may serve reads, and if not, why
 // (read_lease.go). Always true where the lease does not apply: no Raft, or
 // storage that is not a shared object store.
@@ -218,7 +234,16 @@ func (c *Coordinator) startReadLease(ctx context.Context) {
 	}
 	rn := c.raftNode
 	l := newReadLease(rn.IsLeader, rn.LastContact, rn.LeaderID, func(ctx context.Context) error {
-		return c.waitForManifestSync(ctx, rn, readLeaseSyncTimeout)
+		if err := c.waitForManifestSync(ctx, rn, readLeaseSyncTimeout); err != nil {
+			return err
+		}
+		// Before the lease is taken: caches filled while this node was
+		// behind or cut off may name files the cluster has removed since
+		// (#1825).
+		if fn := c.onReadSynced.Load(); fn != nil {
+			(*fn)()
+		}
+		return nil
 	})
 	l.onChange = func(held bool, why string) {
 		if held {
@@ -226,6 +251,12 @@ func (c *Coordinator) startReadLease(ctx context.Context) {
 			return
 		}
 		c.logger.Warn().Str("why", why).Msg("Read lease lost: this node refuses reads (503) until it has synced with the cluster leader again")
+		// And stops the reads in flight: a job that waits for this node
+		// once it is removed relies on it reading nothing within a fixed
+		// time of losing the leader (#1825).
+		if fn := c.onReadLeaseLost.Load(); fn != nil {
+			(*fn)()
+		}
 	}
 	c.readLease = l
 	go l.run(ctx)

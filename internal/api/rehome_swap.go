@@ -79,6 +79,14 @@ type RehomeSwap struct {
 	// files a glob in cold storage matches (rehome_cold.go). It runs on the
 	// engine's own connection, which has the cold store's credentials.
 	ColdFileNames func(ctx context.Context, glob string) ([]string, error)
+	// Cluster: jobs run through the cluster record (rehome_cluster.go). Set
+	// only on a cluster node whose configuration takes part in jobs.
+	Cluster RehomeCluster
+	// ReadReady reports whether this node holds its cluster read lease.
+	ReadReady func() (bool, string)
+	// InvalidateLocalCaches drops this node's query caches and the query
+	// engine's HTTP cache, without telling other nodes.
+	InvalidateLocalCaches func()
 }
 
 const (
@@ -108,6 +116,20 @@ func (h *RehomeHandler) mover() (rehomeStore, bool) {
 func (h *RehomeHandler) swapRefusal() string {
 	if h.swap == nil || h.swap.Registry == nil {
 		return "moving a file's rows is not available on this node; send \"dry_run\": true to see where they belong"
+	}
+	if h.swap.Refusal != nil {
+		if why := h.swap.Refusal(); why != "" {
+			return why
+		}
+	}
+	if h.clusterMode() {
+		if why := h.clusterRefusal(); why != "" {
+			return why
+		}
+		if h.swap.BackupRunning != nil && h.swap.BackupRunning() {
+			return "a backup or a restore is running; retry once it has ended"
+		}
+		return ""
 	}
 	if _, ok := h.mover(); !ok {
 		return "moving a file's rows needs local storage in this version; this node's storage is " + h.storage.Type()
@@ -163,6 +185,9 @@ func (h *RehomeHandler) waitReads(ctx context.Context) error {
 
 // runSwap is a job's work for a real swap.
 func (h *RehomeHandler) runSwap(ctx context.Context, job *rehomeJob) (state, reason string, report *rehomeReport) {
+	if h.clusterMode() {
+		return h.runClusterSwap(ctx, job)
+	}
 	reg := h.swap.Registry
 	store, _ := h.mover()
 	fail := func(step string, err error) (string, string, *rehomeReport) {

@@ -96,6 +96,9 @@ type RehomeHandler struct {
 	tiering   RehomeTiering
 	wired     chan struct{}
 	wiredOnce sync.Once
+
+	// cluster is the cluster driver's memory (rehome_cluster.go).
+	cluster rehomeClusterState
 }
 
 // rehomeJob is one request and its report.

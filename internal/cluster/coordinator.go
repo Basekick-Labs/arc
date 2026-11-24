@@ -166,6 +166,14 @@ type Coordinator struct {
 	// configuration is in a job's scope (SetRehomeInScope).
 	rehomeGate    rehomeGate
 	rehomeInScope atomic.Bool
+	// Re-home participant (rehome_job.go): this node's part of a job's
+	// states, a nudge from the FSM callbacks, and what it has done.
+	rehomePart   atomic.Pointer[RehomeParticipantFunc]
+	rehomeNotify chan struct{}
+	rehomeSteps  rehomeSteps
+	// Read lease hooks (SetReadLeaseHooks).
+	onReadLeaseLost atomic.Pointer[func()]
+	onReadSynced    atomic.Pointer[func()]
 	// coldMarkGate / coldWriteMu: the #1552 cold mark's join gate and write
 	// fence (cold_mark.go).
 	coldMarkGate coldMarkGate
@@ -499,6 +507,7 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	}
 
 	c := &Coordinator{
+		rehomeNotify:  make(chan struct{}, 1),
 		cfg:           cfg.Config,
 		licenseClient: cfg.LicenseClient,
 		registry:      registry,
@@ -874,6 +883,7 @@ func (c *Coordinator) Start() error {
 		go c.clusterPoliciesEnableLoop(c.ctx)
 		go c.coldMarkLoop(c.ctx)
 		go c.rehomeEnableLoop(c.ctx)
+		c.startRehomeParticipant(c.ctx)
 	}
 	// The staged compaction commit on an object store (#1207 d2a2b): the
 	// leader aborts jobs of a compactor that is gone, and committed jobs are

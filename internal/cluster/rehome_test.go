@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"encoding/json"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -274,5 +275,83 @@ func TestRehomeStatusSaysWhyWhileCompactionCommitIsOff(t *testing.T) {
 	c.maybeEnableRehome()
 	if st := c.RehomeStatus(); st.Enabled || len(st.Blocking) != 1 || st.Blocking[0] != "(compaction commit is off)" {
 		t.Fatalf("status = %+v", st)
+	}
+}
+
+// rehomingManifest is the outbox's manifest with a re-home job that owns one
+// path.
+type rehomingManifest struct {
+	*fakeOutboxManifest
+	owned string
+}
+
+func (m *rehomingManifest) RehomeOwnsPath(path string) bool { return path == m.owned }
+
+// #1825 4b: a pending registration of a path a re-home job owns is settled,
+// not sent: the job registered it (or removed it), and the cluster would
+// refuse the whole batch it rode in.
+func TestOutboxSettlesARehomeOwnedPath(t *testing.T) {
+	r := loadPending(t, t.TempDir(), map[string]int64{outPathA: 10, outPathB: 20})
+	m := &rehomingManifest{fakeOutboxManifest: newFakeOutboxManifest(), owned: outPathA}
+	r.HandOff(m, &fakeOutboxStorage{sizes: map[string]int64{outPathA: 10, outPathB: 20}}, "writer-1")
+	waitOutbox(t, "both settled", func() bool { return r.Pending() == 0 })
+	if m.isRegistered(outPathA) {
+		t.Fatal("an owned path was registered again")
+	}
+	if !m.isRegistered(outPathB) {
+		t.Fatal("an unrelated file was not registered")
+	}
+}
+
+// The participant: this node acks a state it is waited for once its part is
+// done, and only while it holds the read lease.
+func TestRehomeParticipantAcks(t *testing.T) {
+	c := originRig(t, "writer-1", RoleWriter)
+	inScope := append([]string{raft.CapabilityRehomeInScope}, rhList...)
+	capNodes(t, c, map[string][]string{"raft-1": inScope, "writer-1": inScope, "writer-2": inScope, "reader-1": inScope})
+	c.maybeEnableCompactionCommit()
+	waitFSM(t, c.CompactionCommitActive)
+	c.maybeEnableRehome()
+	waitFSM(t, c.raftNode.FSM().RehomeEnabled)
+	in := makeFileEntry("testdb/cpu/2026/10/12/10/x.parquet", []byte("x"), "writer-1")
+	in.CreatedAt = time.Now()
+	if err := c.raftNode.RegisterFile(in, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := c.RehomeStage(ctx, raft.StageRehomePayload{Job: "j1", Database: "testdb", Measurement: "cpu",
+		Source:  raft.CompactionInput{Path: in.Path, SizeBytes: in.SizeBytes, SHA256: in.SHA256},
+		Outputs: []raft.RehomeOutput{{Key: "testdb/cpu/2026/10/11/10/o.parquet", StagedKey: raft.RehomeStagedKey("j1", 0), SizeBytes: 1, SHA256: "s"}},
+		Now:     time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RehomeAdvance(ctx, "j1", raft.RehomeCommitted); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	c.readLease = &readLease{why: "not synced"}
+	c.SetRehomeParticipant(func(context.Context, raft.RehomeJob, bool) error {
+		calls.Add(1)
+		return nil
+	})
+	c.rehomeParticipantPass(ctx)
+	time.Sleep(100 * time.Millisecond)
+	if calls.Load() != 0 {
+		t.Fatal("took part without the read lease")
+	}
+	c.readLease = nil
+	c.rehomeParticipantPass(ctx)
+	waitFSM(t, func() bool {
+		j, _ := c.RehomeJob("j1")
+		return j.Acks[c.LocalNodeID()]
+	})
+	if calls.Load() != 1 {
+		t.Fatalf("part run %d times", calls.Load())
+	}
+	// Acked: not run again.
+	c.rehomeParticipantPass(ctx)
+	time.Sleep(50 * time.Millisecond)
+	if calls.Load() != 1 {
+		t.Fatalf("part run %d times after the ack", calls.Load())
 	}
 }
