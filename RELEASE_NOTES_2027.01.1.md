@@ -215,6 +215,30 @@ out of scope, and a job that has not yet switched reads to its new files is reve
 one that has finishes. A node joining for the first time, or one that left the cluster on a clean
 shutdown (a clean shutdown leaves), is still refused while a job runs.
 
+## New: moving a misfiled file's rows on a cluster with the Iceberg export on ([#1870](https://github.com/Basekick-Labs/arc/issues/1870))
+
+**Who is affected:** clusters with the Iceberg export on and compactor failover running
+(`cluster.failover_enabled = true` with a licence that includes it): the export follows the
+compactor lease, so one node exports. `POST /api/v1/rehome` was refused on a cluster with the export
+on; it now runs there, as it does on a standalone node (#1844). Without compactor failover, a cluster
+with the export on still refuses it.
+
+Each node with the export on does the export's part of the job on its own acknowledgement of each
+step, which the job waits for:
+
+- Before the outputs are published, the node that exports checks the table can be published; every
+  other node checks that some node exports. Otherwise the job reverts after 15 minutes.
+- Once reads use the outputs, the old file is removed only when the published table no longer names
+  it. The export removes it in the same commit that adds the files replacing it. On a shared object
+  store every node with the export on waits for that same published table, whichever node exports and
+  however the compactor lease moves. On local storage the node that exports waits for its own table
+  (each node publishes its own warehouse; only the exporting node's is current, #1756).
+- This wait has no time limit: while it lasts the job's files stay out of compaction, DELETE and
+  retention, and backups wait. `POST /api/v1/rehome/<id>/resume {"skip_export_wait": true}` ends one
+  node's wait (send it to each node `GET /api/v1/cluster` lists as missing for the job): the old file is
+  then removed while the table still names it, and readers of the table fail on it until the export's
+  next commit.
+
 ## New: moving a misfiled file's rows on a cluster with tiered storage on, for a file on the hot tier ([#1869](https://github.com/Basekick-Labs/arc/issues/1869))
 
 **Who is affected:** clusters with tiered storage (shared object store, or local storage with

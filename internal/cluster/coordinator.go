@@ -166,6 +166,9 @@ type Coordinator struct {
 	// configuration is in a job's scope (SetRehomeInScope).
 	rehomeGate    rehomeGate
 	rehomeInScope atomic.Bool
+	// icebergOn: this node runs the Iceberg export when it holds the
+	// compactor lease (SetIcebergOn, #1870).
+	icebergOn atomic.Bool
 	// Re-home participant (rehome_job.go): this node's part of a job's
 	// states, a nudge from the FSM callbacks, and what it has done.
 	rehomePart   atomic.Pointer[RehomeParticipantFunc]

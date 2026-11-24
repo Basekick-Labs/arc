@@ -675,3 +675,45 @@ func TestFilePublishedReportsASharedRegistration(t *testing.T) {
 		}
 	}
 }
+
+// #1870: a node that runs the Iceberg export advertises it; an exporter is
+// present only while the compactor lease is held by such a node.
+func TestIcebergExporterPresent1870(t *testing.T) {
+	c := originRig(t, "writer-1", RoleWriter)
+	c.SetIcebergOn(true)
+	found := false
+	for _, cp := range c.localCapabilities() {
+		found = found || cp == CapabilityIcebergExport
+	}
+	if !found {
+		t.Fatal("the capability is not advertised")
+	}
+	if c.IcebergExporterPresent() {
+		t.Fatal("present with no compactor lease")
+	}
+}
+
+// #1870: a job past its latch names its source's replacements for the export.
+func TestRehomeSourceReplaced1870(t *testing.T) {
+	c := originRig(t, "writer-1", RoleWriter)
+	inScope := append([]string{raft.CapabilityRehomeInScope}, rhList...)
+	capNodes(t, c, map[string][]string{"raft-1": inScope, "writer-1": inScope, "writer-2": inScope, "reader-1": inScope})
+	c.maybeEnableCompactionCommit()
+	waitFSM(t, c.CompactionCommitActive)
+	c.maybeEnableRehome()
+	waitFSM(t, c.raftNode.FSM().RehomeEnabled)
+	in := makeFileEntry("testdb/cpu/2026/10/12/10/x.parquet", []byte("x"), "writer-1")
+	in.CreatedAt = time.Now()
+	if err := c.raftNode.RegisterFile(in, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RehomeStage(context.Background(), raft.StageRehomePayload{Job: "ab12", Database: "testdb", Measurement: "cpu",
+		Source:  raft.CompactionInput{Path: in.Path, SizeBytes: in.SizeBytes, SHA256: in.SHA256},
+		Outputs: []raft.RehomeOutput{{Key: "testdb/cpu/2026/10/11/10/o.parquet", StagedKey: raft.RehomeStagedKey("ab12", 0), SizeBytes: 1, SHA256: "s"}},
+		Now:     time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.RehomeSource().Replaced("testdb/cpu/"); len(got) != 0 {
+		t.Fatalf("staged job replaced %v", got)
+	}
+}

@@ -20,6 +20,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/basekick-labs/arc/internal/auth"
+	"github.com/basekick-labs/arc/internal/cluster/raft"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/rehome"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -86,6 +87,7 @@ type RehomeHandler struct {
 	// is closed once it is set. waitingExport is the id of the job waiting
 	// for the export, skipExport that its wait was waived, skipCh wakes it.
 	export        RehomeExportFunc
+	exportCheck   RehomeExportCheckFunc
 	exportBound   chan struct{}
 	waitingExport string
 	skipExport    bool
@@ -105,6 +107,9 @@ type RehomeHandler struct {
 	cluster rehomeClusterState
 	// localLocks orders a job's steps on this node on local storage (#1860).
 	localLocks rehomeLocalLocks
+	// clusterExport is this node's Iceberg export holds and waivers for
+	// cluster jobs (#1870).
+	clusterExport clusterExportState
 }
 
 // rehomeJob is one request and its report.
@@ -406,10 +411,35 @@ func (h *RehomeHandler) resumeJob(c *fiber.Ctx) error {
 	if h.swap == nil || h.swap.Registry == nil {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "moving a file's rows is not available on this node"})
 	}
+	id := strings.Clone(c.Params("id"))
+	// A cluster job's export wait is waived on the node that holds it
+	// (#1870): the job is the cluster's, the hold is this node's.
+	if _, live := h.clusterJob(id); live {
+		var body struct {
+			SkipExportWait bool `json:"skip_export_wait"`
+		}
+		if len(c.Body()) > 0 {
+			if err := json.Unmarshal(c.Body(), &body); err != nil {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "the body is not JSON"})
+			}
+		}
+		if !body.SkipExportWait {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "the cluster drives this job; it is not taken up from this node (skip_export_wait waives this node's wait for the Iceberg export)"})
+		}
+		ok, held := h.waiveClusterExport(id)
+		if !ok {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "that job is not in the cluster's record"})
+		}
+		h.logger.Warn().Str("job", id).Bool("was_waiting", held).Msg("Re-home: asked to end this node's wait for the Iceberg export of a cluster job")
+		note := "this node was waiting for the Iceberg export; it goes on at its next step"
+		if !held {
+			note = "this node was not waiting for the Iceberg export for that job (GET /api/v1/cluster names the nodes a job waits for); it will not wait for it"
+		}
+		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{"id": id, "waived": true, "was_waiting": held, "note": note})
+	}
 	if why := h.swapRefusal(); why != "" {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": why})
 	}
-	id := strings.Clone(c.Params("id"))
 	rec, ok := h.swap.Registry.Get(id)
 	if ok && rec.Cluster {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "the cluster drives this job; it is not taken up from this node"})
@@ -636,4 +666,12 @@ func (h *RehomeHandler) trimJobsLocked() {
 		delete(h.jobs, h.order[i])
 		h.order = append(h.order[:i], h.order[i+1:]...)
 	}
+}
+
+// clusterJob returns a job in the cluster's record, on a cluster node.
+func (h *RehomeHandler) clusterJob(id string) (raft.RehomeJob, bool) {
+	if h.swap == nil || h.swap.Cluster == nil {
+		return raft.RehomeJob{}, false
+	}
+	return h.swap.Cluster.RehomeJob(id)
 }

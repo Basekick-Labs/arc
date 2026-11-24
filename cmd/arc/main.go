@@ -1084,14 +1084,17 @@ func main() {
 	// whatever its configuration: a node restarted with the Iceberg export on
 	// stays in the Raft configuration, and must not read both sides of a job
 	// in flight. A node advertises that it can run under a job
-	// (rehomeCfgInScope) only with the Iceberg export and edge sync off;
-	// tiered storage is in scope for a file on the hot tier (#1869).
+	// (rehomeCfgInScope) only with edge sync off and the Iceberg export off or
+	// following the compactor lease (cluster.failover_enabled, #1870); tiered
+	// storage is in scope for a file on the hot tier (#1869).
 	rehomeSharedCluster := cfg.Cluster.Enabled && cluster.IsSharedObjectStore(storageBackend)
 	// A cluster on local storage with replication on (#1860): every node
 	// holds its own copy of each file and does each step of a job on it.
 	rehomeLocalCluster := cfg.Cluster.Enabled && storageBackend != nil && storageBackend.Type() == "local" && cfg.Cluster.ReplicationEnabled
 	rehomeCfgInScope := (rehomeSharedCluster || rehomeLocalCluster) &&
-		!cfg.Iceberg.Enabled &&
+		// The Iceberg export (#1870): with the compactor lease, so one node
+		// exports and the export follows it.
+		(!cfg.Iceberg.Enabled || cfg.Cluster.FailoverEnabled) &&
 		!(cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Active() || cfg.EdgeSync.Spoke.Active())
 	// The cluster's side of ownership, bound once the coordinator runs:
 	// compaction is wired before it exists.
@@ -2537,7 +2540,13 @@ func main() {
 					// advertised at join; and, when it does, what losing and
 					// retaking the read lease do to its reads and caches
 					// (bound to the query handler once it exists).
-					clusterCoordinator.SetRehomeInScope(rehomeCfgInScope)
+					// With the Iceberg export on, only where it follows the
+					// compactor lease (the failover manager runs: a licence
+					// with writer failover, #1870).
+					clusterCoordinator.SetRehomeInScope(rehomeCfgInScope && (!cfg.Iceberg.Enabled || clusterCoordinator.HasCompactorFailover()))
+					// Whether this node exports to Iceberg when it holds the
+					// compactor lease: re-home jobs check an exporter exists.
+					clusterCoordinator.SetIcebergOn(cfg.Iceberg.Enabled)
 					if rehomeLocalCluster {
 						// Before Start: a delete replayed from the log at start
 						// must leave the source of a job this node records to
@@ -4295,7 +4304,8 @@ func main() {
 	// fourth source of exclusions, and of ownership from here on.
 	rehomeClusterOn := rehomeSharedCluster && clusterCoordinator != nil
 	rehomeLocalOn := rehomeLocalCluster && clusterCoordinator != nil
-	rehomeClusterInScope := rehomeCfgInScope && clusterCoordinator != nil
+	rehomeClusterInScope := rehomeCfgInScope && clusterCoordinator != nil &&
+		(!cfg.Iceberg.Enabled || clusterCoordinator.HasCompactorFailover())
 	var rehomeClusterOpen api.OpenCompactions
 	if rehomeClusterOn || rehomeLocalOn {
 		if rehomeLocalOn {
@@ -4696,7 +4706,7 @@ func main() {
 		Refusal: func() string {
 			switch {
 			case cfg.Cluster.Enabled && !rehomeClusterInScope:
-				return "moving a file's rows on a cluster needs a shared object store (S3, Azure or GCS) as primary storage or local storage with cluster.replication_enabled, and the Iceberg export and edge sync off, in this version"
+				return "moving a file's rows on a cluster needs a shared object store (S3, Azure or GCS) as primary storage or local storage with cluster.replication_enabled, and edge sync off; with the Iceberg export on, it also needs compactor failover (cluster.failover_enabled, with a licence that includes it), in this version"
 			case cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Active() || cfg.EdgeSync.Spoke.Active():
 				return "moving a file's rows is not available with edge sync in this version"
 			}
@@ -5031,7 +5041,13 @@ func main() {
 		// On a local-storage cluster a delete reaches this disk after the
 		// manifest; files the cluster deleted stay out of the table meanwhile.
 		if clusterCoordinator != nil && storageBackend.Type() == "local" {
-			icebergSource.SetDeletedHere(clusterCoordinator.LocalCopyDeleted)
+			// Not the source of a re-home job this node records (#1870): from
+			// the latch until its own step records the job latched, its
+			// record still leaves the outputs out, and reading the source as
+			// deleted would publish neither.
+			icebergSource.SetDeletedHere(func(p string) bool {
+				return clusterCoordinator.LocalCopyDeleted(p) && !rehomeRegistry.ClusterSource(p)
+			})
 			if !clusterCoordinator.TracksLocalCopies() {
 				log.Warn().Msg("Iceberg export on a local-storage cluster without local copy tracking (cluster.replication_enabled, cluster.replication_catchup_enabled and cluster.raft_data_dir): a pass that runs between a compaction, DELETE or retention removing a file from the manifest and this node unlinking it publishes the deleted file next to the one holding its rows, so external readers can see those rows twice")
 			}
@@ -5106,7 +5122,21 @@ func main() {
 		// table does not name it, and the export commits that file's removal
 		// with the files that replace it.
 		exporter.SetReplaced(func(database, measurement string) map[string][]string {
-			return rehomeRegistry.Replaced(database + "/" + measurement + "/")
+			prefix := database + "/" + measurement + "/"
+			out := rehomeRegistry.Replaced(prefix)
+			// Cluster jobs past their latch (#1870): on a shared store this
+			// node keeps no record of them.
+			if src := rehomeClusterSrc.Load(); src != nil {
+				for k, v := range src.Replaced(prefix) {
+					if out == nil {
+						out = map[string][]string{}
+					}
+					if _, ok := out[k]; !ok {
+						out[k] = v
+					}
+				}
+			}
+			return out
 		})
 		rehomeHandler.SetExport(func(ctx context.Context, database, measurement, fileKey string) (api.RehomeExportAnswer, error) {
 			a, err := icebergScheduler.ReconcileAndConfirm(ctx, database, measurement, fileKey)
@@ -5114,7 +5144,19 @@ func main() {
 				return api.RehomeExportAnswer{}, err
 			}
 			clear, why := a.Verdict(fileKey != "")
-			return api.RehomeExportAnswer{Clear: clear, Why: why}, nil
+			return api.RehomeExportAnswer{Clear: clear, Why: why, NotExporter: a.Blocked == iceberg.NotExportingReason}, nil
+		})
+		// The published table read without a pass, whichever node exports
+		// (#1870): on a shared warehouse every node waits for the same table.
+		rehomeHandler.SetExportCheck(func(ctx context.Context, database, measurement, fileKey string) (bool, bool, error) {
+			a, err := icebergScheduler.CheckPublished(ctx, database, measurement, fileKey)
+			if err != nil {
+				return false, false, err
+			}
+			if a.Blocked != "" {
+				return false, false, errors.New(a.Blocked)
+			}
+			return a.Published, a.Named, a.Err
 		})
 		// #1731: with node-local warehouses (not icebergTopo.barrier, which is a shared bucket or
 		// shared_storage_mode), a database DELETE on the writer drops only the writer's tables.

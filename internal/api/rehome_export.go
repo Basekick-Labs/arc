@@ -33,6 +33,9 @@ type RehomeExportAnswer struct {
 	Clear bool
 	// Why says what is in the way when Clear is false.
 	Why string
+	// NotExporter: this node does not export; another node does, or none
+	// (#1870).
+	NotExporter bool
 }
 
 // RehomeExportFunc runs one pass of the measurement's table, started after

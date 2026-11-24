@@ -53,6 +53,9 @@ func (c *Coordinator) localCapabilities() []string {
 	if c.keepsLocalReplicas() {
 		caps = append(caps, CapabilityLocalReplica)
 	}
+	if c.icebergOn.Load() {
+		caps = append(caps, CapabilityIcebergExport)
+	}
 	if c.streamClaimsCapable() {
 		caps = append(caps, raft.CapabilityStreamClaims)
 	}

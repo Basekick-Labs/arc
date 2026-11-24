@@ -117,6 +117,9 @@ func (h *RehomeHandler) ParticipateLocal(ctx context.Context, j raft.RehomeJob, 
 			if err := h.waitClusterStepReads(ctx, j); err != nil {
 				return err
 			}
+			if err := h.clusterExportReady(ctx, j); err != nil {
+				return err
+			}
 		}
 		return h.holdStaged(ctx, store, lc, j)
 	case raft.RehomePublished:
@@ -176,6 +179,7 @@ func (h *RehomeHandler) ParticipateLocal(ctx context.Context, j raft.RehomeJob, 
 			return err
 		}
 		h.localLocks.forget(j.ID)
+		h.clusterExport.forget(j.ID)
 		return nil
 	case raft.RehomeReverted:
 		if err := h.removeLocalOutputs(ctx, store, j); err != nil {
@@ -189,6 +193,7 @@ func (h *RehomeHandler) ParticipateLocal(ctx context.Context, j raft.RehomeJob, 
 		}
 		h.dropLocalCaches(j)
 		h.localLocks.forget(j.ID)
+		h.clusterExport.forget(j.ID)
 		return nil
 	}
 	return nil
@@ -241,6 +246,11 @@ func (h *RehomeHandler) latchLocal(ctx context.Context, store rehomeStore, j raf
 	}
 	if err := reg.Mirror(ctx, localRecord(j, rehome.StateLatched)); err != nil {
 		return fmt.Errorf("record the job latched on this node: %w", err)
+	}
+	// The exporting node keeps the source until the published table no
+	// longer names it (#1870).
+	if err := h.clusterExportHold(ctx, j); err != nil {
+		return err
 	}
 	// Waited for whether or not the job waits for this node: the unlink
 	// must not pull a file from under a read.

@@ -944,6 +944,19 @@ func (h *RehomeHandler) ParticipateCluster(ctx context.Context, j raft.RehomeJob
 	if !acked {
 		return nil
 	}
+	// The Iceberg export's part (#1870), on this node's ack.
+	switch j.State {
+	case raft.RehomeCommitted:
+		if err := h.clusterExportReady(ctx, j); err != nil {
+			return err
+		}
+	case raft.RehomeLatched:
+		if err := h.clusterExportHold(ctx, j); err != nil {
+			return err
+		}
+	case raft.RehomeRemoved, raft.RehomeReverted:
+		h.clusterExport.forget(j.ID)
+	}
 	if err := h.waitClusterStepReads(ctx, j); err != nil {
 		return err
 	}
