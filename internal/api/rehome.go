@@ -99,6 +99,8 @@ type RehomeHandler struct {
 
 	// cluster is the cluster driver's memory (rehome_cluster.go).
 	cluster rehomeClusterState
+	// localLocks orders a job's steps on this node on local storage (#1860).
+	localLocks rehomeLocalLocks
 }
 
 // rehomeJob is one request and its report.
@@ -360,7 +362,7 @@ func (h *RehomeHandler) list(c *fiber.Ctx) error {
 	// and not finished.
 	if h.swap != nil && h.swap.Registry != nil {
 		for _, j := range h.swap.Registry.Jobs() {
-			if !known[j.ID] {
+			if !known[j.ID] && !j.Cluster {
 				out = append(out, rehomeJob{ID: j.ID, Path: j.Source.Key, State: "stuck", StartedAt: j.CreatedAt,
 					Reason: "found at start in state " + string(j.State) + " and could not be taken up; the server log has the reason"})
 			}

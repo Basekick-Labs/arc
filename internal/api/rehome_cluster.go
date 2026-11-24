@@ -866,6 +866,21 @@ func (h *RehomeHandler) ParticipateCluster(ctx context.Context, j raft.RehomeJob
 	if !acked {
 		return nil
 	}
+	if err := h.waitClusterStepReads(ctx, j); err != nil {
+		return err
+	}
+	if caches {
+		// Again: a read that ended during the wait may have filled them
+		// from what it saw before the state.
+		h.dropLocalCaches(j)
+	}
+	return nil
+}
+
+// waitClusterStepReads waits for this node's reads from before it saw j's
+// state: the epoch is flipped once per (job, state), so a retry waits for the
+// same reads rather than for later ones too.
+func (h *RehomeHandler) waitClusterStepReads(ctx context.Context, j raft.RehomeJob) error {
 	if h.swap.Reads != nil {
 		key := fmt.Sprintf("%s@%d", j.ID, j.StateIndex)
 		s := &h.cluster
@@ -883,11 +898,6 @@ func (h *RehomeHandler) ParticipateCluster(ctx context.Context, j raft.RehomeJob
 		if err := h.swap.Reads.Wait(ctx, epoch); err != nil {
 			return err
 		}
-	}
-	if caches {
-		// Again: a read that ended during the wait may have filled them
-		// from what it saw before the state.
-		h.dropLocalCaches(j)
 	}
 	return nil
 }

@@ -858,6 +858,28 @@ func (f *ClusterFSM) RehomeJobs() []RehomeJob {
 }
 
 // RehomeJob returns a copy of one job.
+// RehomeStagedOutput returns the output a staged key names, while its job is
+// committed or published: the states in which nodes fetch outputs from each
+// other on local storage (#1860).
+func (f *ClusterFSM) RehomeStagedOutput(key string) (RehomeOutput, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if !f.rehomeEnabled || !strings.HasPrefix(key, RehomeStagedRoot+"/") {
+		return RehomeOutput{}, false
+	}
+	for _, j := range f.rehomeJobs {
+		if j.State != RehomeCommitted && j.State != RehomePublished {
+			continue
+		}
+		for _, o := range j.Outputs {
+			if o.StagedKey == key {
+				return o, true
+			}
+		}
+	}
+	return RehomeOutput{}, false
+}
+
 func (f *ClusterFSM) RehomeJob(id string) (RehomeJob, bool) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()

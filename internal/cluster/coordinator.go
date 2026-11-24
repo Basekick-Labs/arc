@@ -1536,6 +1536,11 @@ func (c *Coordinator) unlinkOne(item deleteRequest, relisted func(string) (bool,
 	if c.deferRewriteUnlink(context.Background(), item) {
 		return
 	}
+	// A re-home job's source: unlinked by this node's part of the job,
+	// after its reads (rehome_local.go, #1860).
+	if c.deferRehomeUnlink(item) {
+		return
+	}
 	// A compaction input stays readable until this node's staged copy of
 	// the output is in place (#1207 d2a2a; bounded).
 	// The wait can last seconds: a path registered again meanwhile keeps its
@@ -2862,6 +2867,10 @@ func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequ
 		if st, staged := fsm.StagedCompactionByKey(sanitized); staged {
 			sanitized = raft.StagedCompactionKey(st.Job, st.Output.Path)
 			entry, ok = &raft.FileEntry{Path: sanitized, SHA256: st.Output.SHA256, SizeBytes: st.Output.SizeBytes}, true
+		} else if out, rehomed := fsm.RehomeStagedOutput(sanitized); rehomed {
+			// A re-home job's staged output on local storage (#1860), while
+			// its job is committed or published, with its checksum and size.
+			entry, ok = &raft.FileEntry{Path: out.StagedKey, SHA256: out.SHA256, SizeBytes: out.SizeBytes}, true
 		}
 	}
 	if !ok {

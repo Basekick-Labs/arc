@@ -724,7 +724,12 @@ func (h *RehomeHandler) Recover(ctx context.Context) error {
 	}
 	reg := h.swap.Registry
 	store, ok := h.mover()
-	jobs := reg.Jobs()
+	var jobs []*rehome.Job
+	for _, j := range reg.Jobs() {
+		if !j.Cluster { // the cluster participant ends those (#1860)
+			jobs = append(jobs, j)
+		}
+	}
 	if len(jobs) > 0 && !ok {
 		return fmt.Errorf("%d re-home job(s) are recorded under %s/ and this node's storage is not local: they cannot be taken up", len(jobs), rehome.JournalRoot)
 	}

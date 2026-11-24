@@ -510,3 +510,35 @@ func TestOutboxChecksARewriteHeldByAJob(t *testing.T) {
 		}
 	}
 }
+
+// #1860: the delete workers leave a re-home job's source to its participant
+// while the job exists; once it ended, an unlink goes ahead.
+func TestDeferRehomeUnlink1860(t *testing.T) {
+	c := originRig(t, "writer-1", RoleWriter)
+	inScope := append([]string{raft.CapabilityRehomeInScope}, rhList...)
+	capNodes(t, c, map[string][]string{"raft-1": inScope, "writer-1": inScope, "writer-2": inScope, "reader-1": inScope})
+	c.maybeEnableCompactionCommit()
+	waitFSM(t, c.CompactionCommitActive)
+	c.maybeEnableRehome()
+	waitFSM(t, c.raftNode.FSM().RehomeEnabled)
+	in := makeFileEntry("testdb/cpu/2026/10/12/10/x.parquet", []byte("x"), "writer-1")
+	in.CreatedAt = time.Now()
+	if err := c.raftNode.RegisterFile(in, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RehomeStage(context.Background(), raft.StageRehomePayload{Job: "ab12", Database: "testdb", Measurement: "cpu",
+		Source:  raft.CompactionInput{Path: in.Path, SizeBytes: in.SizeBytes, SHA256: in.SHA256},
+		Outputs: []raft.RehomeOutput{{Key: "testdb/cpu/2026/10/11/10/o.parquet", StagedKey: raft.RehomeStagedKey("ab12", 0), SizeBytes: 1, SHA256: "s"}},
+		Now:     time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if !c.deferRehomeUnlink(deleteRequest{path: in.Path, reason: "rehome:ab12"}) {
+		t.Fatal("a live job's source was not left to its participant")
+	}
+	if c.deferRehomeUnlink(deleteRequest{path: in.Path, reason: "rehome:ffff"}) {
+		t.Fatal("an ended job's source was deferred")
+	}
+	if c.deferRehomeUnlink(deleteRequest{path: in.Path, reason: "delete"}) {
+		t.Fatal("another reason was deferred")
+	}
+}
