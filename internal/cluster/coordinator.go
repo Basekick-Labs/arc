@@ -176,6 +176,8 @@ type Coordinator struct {
 	rehomeLocalExclusions atomic.Bool
 	// rehomeLocalRecords: jobs this node records (SetRehomeLocalRecords).
 	rehomeLocalRecords atomic.Pointer[func(string) bool]
+	// rehomeLocalRecorder: records a job on this node (SetRehomeLocalRecorder).
+	rehomeLocalRecorder atomic.Pointer[func(context.Context, raft.RehomeJob) error]
 	// Compaction read fences (#1852, compaction_fences.go): the flag's join
 	// gate and this node's part of a fence.
 	fencesGate compactionFencesGate
@@ -4816,6 +4818,7 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// A committed compaction output this node holds staged is moved
 		// into place instead of pulled (#1207 d2a2a).
 		AdoptStaged: c.adoptStagedForPull,
+		BeforePull:  c.rehomeBeforePull,
 		// Lets the puller stop pulling, and stop counting against the query
 		// gate, an entry that left the manifest while its pull was queued or
 		// in flight (#759, #795), while also identifying superseding versions.

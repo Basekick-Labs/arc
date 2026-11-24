@@ -226,8 +226,16 @@ func (h *RehomeHandler) latchLocal(ctx context.Context, store rehomeStore, j raf
 		return ctx.Err()
 	case <-time.After(rehomeLocalUnlinkGrace):
 	}
+	// A DELETE rewrite of the source that the cluster refused (one from a
+	// former primary) may have left its file here (#1857).
+	if err := h.removeUnregisteredRewrites(ctx, j.Source.Path); err != nil {
+		return err
+	}
 	if err := h.unlinkLocalSource(ctx, store, j); err != nil {
 		return err
+	}
+	if rc, ok := h.swap.Cluster.(interface{ RecordRehomeOutputs(raft.RehomeJob) }); ok {
+		rc.RecordRehomeOutputs(j) // the outputs' content is known: not hashed again
 	}
 	h.dropLocalCaches(j)
 	return nil
@@ -432,4 +440,45 @@ func (h *RehomeHandler) settleEndedLocal(ctx context.Context, store rehomeStore,
 		Msg("Re-home: settled a job this node missed the end of, by what the manifest lists now")
 	h.dropLocalCaches(j)
 	return nil
+}
+
+// RecordLocal records a cluster job on this node as committed (its outputs
+// left out of reads) unless it already has a record: the puller calls it
+// before an output of the job lands here (cluster.SetRehomeLocalRecorder).
+func (h *RehomeHandler) RecordLocal(ctx context.Context, j raft.RehomeJob) error {
+	if h.swap == nil || h.swap.Registry == nil {
+		return nil
+	}
+	if _, had := h.swap.Registry.Get(j.ID); had {
+		return nil
+	}
+	return h.swap.Registry.Mirror(ctx, localRecord(j, rehome.StateCommitted))
+}
+
+// rehomeLocalSweepEvery is how often SweepLocal runs.
+const rehomeLocalSweepEvery = time.Minute
+
+// StartLocalSweep runs SweepLocal now and every rehomeLocalSweepEvery, on a
+// cluster with local storage.
+func (h *RehomeHandler) StartLocalSweep() {
+	if !h.clusterMode() || !h.localCluster() {
+		return
+	}
+	ctx := h.ctx
+	h.done.Add(1)
+	go func() {
+		defer h.done.Done()
+		t := time.NewTicker(rehomeLocalSweepEvery)
+		defer t.Stop()
+		for {
+			if err := h.SweepLocal(ctx); err != nil && ctx.Err() == nil {
+				h.logger.Warn().Err(err).Msg("Re-home: settling what ended jobs left on this node failed; retrying")
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+		}
+	}()
 }

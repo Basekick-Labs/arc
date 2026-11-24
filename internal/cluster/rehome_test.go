@@ -3,6 +3,8 @@ package cluster
 import (
 	"context"
 	"encoding/json"
+	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/rs/zerolog"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -556,5 +558,49 @@ func TestDeferRehomeUnlink1860(t *testing.T) {
 	}
 	if !src.Owns(in.Path) {
 		t.Fatal("the source is not owned")
+	}
+}
+
+// #1860 5b: before an output of a live job lands on a node that has no record
+// of the job and still has its source, the job is recorded there first.
+func TestRehomeBeforePullRecordsTheJob1860(t *testing.T) {
+	c := originRig(t, "writer-1", RoleWriter)
+	store, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.storage = store
+	inScope := append([]string{raft.CapabilityRehomeInScope}, rhList...)
+	capNodes(t, c, map[string][]string{"raft-1": inScope, "writer-1": inScope, "writer-2": inScope, "reader-1": inScope})
+	c.maybeEnableCompactionCommit()
+	waitFSM(t, c.CompactionCommitActive)
+	c.maybeEnableRehome()
+	waitFSM(t, c.raftNode.FSM().RehomeEnabled)
+	in := makeFileEntry("testdb/cpu/2026/10/12/10/x.parquet", []byte("x"), "writer-1")
+	in.CreatedAt = time.Now()
+	if err := c.raftNode.RegisterFile(in, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	out := raft.RehomeOutput{Key: "testdb/cpu/2026/10/11/10/o.parquet", StagedKey: raft.RehomeStagedKey("ab12", 0), SizeBytes: 1, SHA256: "s"}
+	if err := c.RehomeStage(context.Background(), raft.StageRehomePayload{Job: "ab12", Database: "testdb", Measurement: "cpu",
+		Source: raft.CompactionInput{Path: in.Path, SizeBytes: in.SizeBytes, SHA256: in.SHA256}, Outputs: []raft.RehomeOutput{out}, Now: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	recorded := map[string]bool{}
+	c.SetRehomeLocalRecords(func(id string) bool { return recorded[id] })
+	c.SetRehomeLocalRecorder(func(_ context.Context, j raft.RehomeJob) error { recorded[j.ID] = true; return nil })
+	entry := &raft.FileEntry{Path: out.Key}
+	// No source here: nothing to record.
+	if err := c.rehomeBeforePull(context.Background(), entry); err != nil || recorded["ab12"] {
+		t.Fatalf("recorded without the source here (%v)", err)
+	}
+	if err := store.Write(context.Background(), in.Path, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.rehomeBeforePull(context.Background(), &raft.FileEntry{Path: in.Path}); err != nil || recorded["ab12"] {
+		t.Fatal("recorded for the job's source")
+	}
+	if err := c.rehomeBeforePull(context.Background(), entry); err != nil || !recorded["ab12"] {
+		t.Fatalf("not recorded before an output landed (%v)", err)
 	}
 }

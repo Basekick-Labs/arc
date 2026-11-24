@@ -880,6 +880,21 @@ func (f *ClusterFSM) RehomeStagedOutput(key string) (RehomeOutput, bool) {
 }
 
 // RehomeJob returns a copy of one job.
+// RehomeJobOfOutput returns the job one of whose outputs is at path.
+func (f *ClusterFSM) RehomeJobOfOutput(path string) (RehomeJob, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	id, ok := f.rehomePaths[path]
+	if !ok {
+		return RehomeJob{}, false
+	}
+	j, ok := f.rehomeJobs[id]
+	if !ok || j.Source.Path == path {
+		return RehomeJob{}, false
+	}
+	return j.Copy(), true
+}
+
 func (f *ClusterFSM) RehomeJob(id string) (RehomeJob, bool) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()

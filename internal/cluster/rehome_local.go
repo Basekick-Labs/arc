@@ -119,3 +119,54 @@ func (c *Coordinator) rehomeOwnsLocal(path string) bool {
 	fsm := c.raftNode.FSM()
 	return fsm != nil && fsm.RehomeOwns(path)
 }
+
+// RecordRehomeOutputs notes the content of a job's outputs on this node, as
+// placed and verified by its part of the job, so the stale-local walks do not
+// hash them again.
+func (c *Coordinator) RecordRehomeOutputs(j raft.RehomeJob) {
+	if c.raftNode == nil {
+		return
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return
+	}
+	for _, o := range j.Outputs {
+		if e, ok := fsm.GetFile(o.Key); ok {
+			c.recordLocalContent(e, "", o.SHA256)
+		}
+	}
+}
+
+// SetRehomeLocalRecorder sets how this node records a job before an output of
+// it lands here (rehome.Registry.Mirror, committed): see rehomeBeforePull.
+func (c *Coordinator) SetRehomeLocalRecorder(fn func(ctx context.Context, j raft.RehomeJob) error) {
+	if c != nil && fn != nil {
+		c.rehomeLocalRecorder.Store(&fn)
+	}
+}
+
+// rehomeBeforePull is the puller's BeforePull. An output of a live re-home job
+// that this node has no record of, while this node still has the job's
+// source (it joined after the job was published): the job is recorded here
+// first, so the output is left out of reads as it lands and the source is
+// read until every output is here (#1860).
+func (c *Coordinator) rehomeBeforePull(ctx context.Context, entry *raft.FileEntry) error {
+	rec := c.rehomeLocalRecorder.Load()
+	has := c.rehomeLocalRecords.Load()
+	if rec == nil || has == nil || c.raftNode == nil || entry == nil {
+		return nil
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return nil
+	}
+	j, ok := fsm.RehomeJobOfOutput(entry.Path)
+	if !ok || (*has)(j.ID) {
+		return nil
+	}
+	if n, err := c.storage.StatFile(ctx, j.Source.Path); err != nil || n < 0 {
+		return nil // no source here: nothing is read twice
+	}
+	return (*rec)(ctx, j)
+}

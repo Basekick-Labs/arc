@@ -74,6 +74,8 @@ type fakeCluster struct {
 	// acking: the other nodes (and this one) ack every state they are
 	// waited for.
 	acking atomic.Bool
+	// skipSelf: w1 (this node) is not acked by the fake; a test acks it.
+	skipSelf atomic.Bool
 	// stopAt: the driver's proposals of this state fail (a stand-in for a
 	// driver that stopped).
 	stopAt atomic.Value
@@ -110,6 +112,9 @@ func newFakeCluster(t *testing.T) *fakeCluster {
 			}
 			for _, j := range c.f.RehomeJobs() {
 				for _, n := range j.MissingAcks() {
+					if n == "w1" && c.skipSelf.Load() {
+						continue
+					}
 					_ = c.apply(raft.CommandAckRehome, raft.AckRehomePayload{Job: j.ID, Node: n, State: j.State})
 				}
 			}

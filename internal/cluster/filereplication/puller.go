@@ -284,6 +284,12 @@ type Config struct {
 	// with a CompactionJob.
 	AdoptStaged func(ctx context.Context, entry *raft.FileEntry) (bool, error)
 
+	// BeforePull, when set, runs before a file is fetched from a peer. An
+	// error defers the pull: it is retried after the attempt's backoff, as
+	// when no peer is available. Re-home on local storage (#1860) uses it to
+	// record a job on this node before its outputs land here.
+	BeforePull func(ctx context.Context, entry *raft.FileEntry) error
+
 	// Logger receives structured log output.
 	Logger zerolog.Logger
 }
@@ -1751,6 +1757,14 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 		if p.adoptStaged(log, entry) {
 			succeeded = true
 			return
+		}
+
+		if p.cfg.BeforePull != nil {
+			if err := p.cfg.BeforePull(p.ctx, entry); err != nil {
+				log.Debug().Err(err).Str("path", entry.Path).Int("attempt", attempt).Msg("Pull deferred")
+				p.sleepBackoff(attempt)
+				continue
+			}
 		}
 
 		// Resolve candidate peers fresh on each attempt so topology changes
