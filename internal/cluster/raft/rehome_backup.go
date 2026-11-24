@@ -55,9 +55,11 @@ func (f *ClusterFSM) applyBackupMark(payload []byte) interface{} {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if !p.End {
-		// Lapsed marks go (the proposer's clock, as every check of them).
+		// The proposer's own lapsed marks go (its own clock: another node's
+		// clock running ahead must not end a live mark). Others' lapsed
+		// marks are ignored by every check and go with their node.
 		for k, m := range f.backupMarks {
-			if p.Now.Sub(m.RenewedAt) >= BackupMarkLease {
+			if m.Node == p.Node && p.Now.Sub(m.RenewedAt) >= BackupMarkLease {
 				delete(f.backupMarks, k)
 			}
 		}

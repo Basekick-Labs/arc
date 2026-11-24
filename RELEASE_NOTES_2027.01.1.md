@@ -111,12 +111,15 @@ deletion now record themselves in the cluster (renewed every 30 seconds, ignored
 the last renewal; `GET /api/v1/cluster` lists them under `rehome.backups`), and a job is not staged
 while one is recorded anywhere; a backup still refuses to start while a job runs. One that cannot
 record itself (no cluster leader) is refused. The renewals compare clocks of different nodes: keep
-them in sync.
+them in sync. Nothing is recorded while re-home is off (an older leader would refuse it), so a
+backup that started before the cluster turned re-home on is not protected by a mark.
 
 Also: a DELETE that started on a former primary cannot register its rewrite of a file a job is
 moving (the cluster refuses it), but could leave the rewrite's object in storage, read beside the
 job's new files. The job now removes such objects before it removes the file and again before it
-ends; one that lands later is removed by that DELETE's own cleanup.
+ends, and that DELETE's registration then settles as gone; one that lands later is removed by the
+DELETE's own cleanup. Either way the rows that DELETE removed are back (they are in the job's new
+files): run it again.
 
 ## Fix: on a cluster sharing one object store, a query no longer counts a compaction's rows twice ([#1852](https://github.com/Basekick-Labs/arc/issues/1852))
 

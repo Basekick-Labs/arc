@@ -734,3 +734,21 @@ func TestBackupMarkRenewAfterLapse(t *testing.T) {
 	// Another node cannot end it, and a begin is not a renew.
 	x.refused(CommandBackupMark, BackupMarkPayload{ID: "b2", Node: "w2", Now: late, Renew: true})
 }
+
+// A node's clock running ahead does not end another node's live mark.
+func TestBackupMarkPruneOwnOnly(t *testing.T) {
+	x := rhFSM(t)
+	x.ok(CommandBackupMark, BackupMarkPayload{ID: "b1", Node: "w2", Now: t0})
+	x.ok(CommandBackupMark, BackupMarkPayload{ID: "b2", Node: "r1", Now: t0.Add(2 * BackupMarkLease)})
+	x.ok(CommandBackupMark, BackupMarkPayload{ID: "b1", Node: "w2", Now: t0.Add(BackupMarkLease / 3), Renew: true})
+	if len(x.f.BackupMarks()) != 2 {
+		t.Fatalf("marks %v", x.f.BackupMarks())
+	}
+	// w2's own lapsed mark goes at its next begin.
+	x.ok(CommandBackupMark, BackupMarkPayload{ID: "b3", Node: "w2", Now: t0.Add(3 * BackupMarkLease)})
+	for _, m := range x.f.BackupMarks() {
+		if m.ID == "b1" {
+			t.Fatal("w2's lapsed mark kept")
+		}
+	}
+}
