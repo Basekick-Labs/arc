@@ -193,6 +193,28 @@ out of scope, and a job that has not yet switched reads to its new files is reve
 one that has finishes. A node joining for the first time, or one that left the cluster on a clean
 shutdown (a clean shutdown leaves), is still refused while a job runs.
 
+## New: moving a misfiled file's rows on a cluster with tiered storage on, for a file on the hot tier ([#1869](https://github.com/Basekick-Labs/arc/issues/1869))
+
+**Who is affected:** clusters with tiered storage (shared object store, or local storage with
+replication). `POST /api/v1/rehome` was refused on a cluster with tiered storage on; it now runs
+there for a file on the hot tier, as it does on a standalone node (#1847). A file on the cold tier
+is still refused on a cluster.
+
+Each node keeps its own record of which files are hot and cold, so each node's part of a job keeps
+it: before it acks the step that publishes the outputs, it checks that its tiering has the file on
+the hot tier and that cold storage holds no copy of it, and records the outputs as hot files; once
+the file is gone it removes the file's row; a reverted job removes the outputs' rows. A file a
+migration to cold had copied before a node saw the job makes that node refuse the step, and the job
+reverts after 15 minutes rather than leave a cold copy read beside the outputs. The primary writer
+checks the file the same way before it starts the job.
+
+Also: a migration to cold whose batch the cluster refused because a compaction or a re-home job took
+one of its files since the migration checked it now drops that file and proposes the rest again,
+instead of keeping every file of the batch hot until the next pass.
+
+A node on an earlier release with tiered storage on does not take part, so no job starts until every
+node runs this one.
+
 ## New: moving a misfiled file's rows on a cluster with local storage ([#1860](https://github.com/Basekick-Labs/arc/issues/1860))
 
 **Who is affected:** clusters on local storage with `cluster.replication_enabled = true` (a node
