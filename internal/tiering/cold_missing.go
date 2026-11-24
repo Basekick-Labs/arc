@@ -78,7 +78,25 @@ func (m *Manager) EndColdRemoval() {
 		return
 	}
 	m.coldRemovalGen.Add(1)
+	m.coldRemovalEndedAt.Store(time.Now().UnixNano())
 	m.coldRemovals.Add(-1)
+}
+
+// ColdRemovalRecent reports that Arc is removing cold objects now, or
+// finished doing so less than window ago. A read whose cold glob matches
+// nothing in that time was most likely planned while the last cold file of
+// its measurement was still there: the files that replace it are in the
+// read's other paths, but DuckDB fails the whole read on an empty glob, and
+// "the measurement is empty" would be the wrong answer. Nil-receiver safe.
+func (m *Manager) ColdRemovalRecent(window time.Duration) bool {
+	if m == nil {
+		return false
+	}
+	if m.coldRemovals.Load() > 0 {
+		return true
+	}
+	ended := m.coldRemovalEndedAt.Load()
+	return ended != 0 && time.Since(time.Unix(0, ended)) < window
 }
 
 // ColdMissingObjects returns the last check, or nil when this node has not

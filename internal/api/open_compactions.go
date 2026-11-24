@@ -52,6 +52,21 @@ func (c combinedOpenCompactions) Generation() uint64 {
 	return g
 }
 
+// ExcludedTiered unions the members' answers, each asked once: a member that
+// knows which of its files are in cold storage says so in the same call.
+func (c combinedOpenCompactions) ExcludedTiered(ctx context.Context, prefix string) (keys, coldKeys []string) {
+	for _, s := range c {
+		if te, ok := s.(TieredExcluder); ok {
+			k, cold := te.ExcludedTiered(ctx, prefix)
+			keys = append(keys, k...)
+			coldKeys = append(coldKeys, cold...)
+			continue
+		}
+		keys = append(keys, s.ExcludedFor(ctx, prefix)...)
+	}
+	return keys, coldKeys
+}
+
 // StrictExcluder is an OpenCompactions source that can answer for a reader
 // that must not guess (the Iceberg export): an error where ExcludedFor would
 // count a file next to its replacement.

@@ -43,9 +43,9 @@ func (f *fakeExport1825) questions() []string {
 
 func withExport1825(t *testing.T, r *swapRig, answer func(n int, fileKey string) (RehomeExportAnswer, error)) *fakeExport1825 {
 	t.Helper()
-	old, oldMax := rehomeExportRetry, rehomeExportRetryMax
-	rehomeExportRetry, rehomeExportRetryMax = 5*time.Millisecond, 5*time.Millisecond
-	t.Cleanup(func() { rehomeExportRetry, rehomeExportRetryMax = old, oldMax })
+	old, oldMax, oldReady := rehomeExportRetry, rehomeExportRetryMax, rehomeExportReadyRetry
+	rehomeExportRetry, rehomeExportRetryMax, rehomeExportReadyRetry = 5*time.Millisecond, 5*time.Millisecond, 5*time.Millisecond
+	t.Cleanup(func() { rehomeExportRetry, rehomeExportRetryMax, rehomeExportReadyRetry = old, oldMax, oldReady })
 	f := &fakeExport1825{answer: answer}
 	r.swap.ExportExpected = true
 	r.h.SetExport(f.ask)
@@ -409,5 +409,33 @@ func TestSwapExportWaitWaivedWithoutAContentType1825(t *testing.T) {
 	}
 	if job := r.wait(id); job["state"] != "done" {
 		t.Fatalf("job: %v", job)
+	}
+}
+
+// A pass that fails once before a job starts does not refuse it: the export
+// is asked again. Twice, and the job is refused.
+func TestSwapAsksTheExportTwiceBeforeRefusing1825(t *testing.T) {
+	for failures, want := range map[int]string{1: "done", 2: "refused"} {
+		r := newSwapRig(t)
+		f := withExport1825(t, r, nil)
+		f.answer = func(n int, fileKey string) (RehomeExportAnswer, error) {
+			if fileKey == "" && n <= failures {
+				return RehomeExportAnswer{Why: "the last pass of the table failed: context canceled"}, nil
+			}
+			return RehomeExportAnswer{Clear: true}, nil
+		}
+		id, _, _ := r.start()
+		if job := r.wait(id); job["state"] != want {
+			t.Fatalf("with %d failed pass(es) before the job: %v, want %s", failures, job, want)
+		}
+		asked := 0
+		for _, k := range f.questions() {
+			if k == "" {
+				asked++
+			}
+		}
+		if asked != 2 {
+			t.Fatalf("with %d failed pass(es): asked %d time(s) before the job, want 2", failures, asked)
+		}
 	}
 }

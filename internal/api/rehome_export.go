@@ -55,6 +55,9 @@ const (
 var (
 	rehomeExportRetry    = time.Second
 	rehomeExportRetryMax = 30 * time.Second
+	// rehomeExportReadyRetry is the pause before the question a job puts
+	// before it starts is asked a second time.
+	rehomeExportReadyRetry = 2 * time.Second
 )
 
 // SetExport binds the Iceberg export. Call it once the export's scheduler
@@ -95,18 +98,33 @@ func (h *RehomeHandler) exportReady(ctx context.Context, job *rehome.Job) string
 	if why := h.exportNotStarted(); why != "" {
 		return why
 	}
-	actx, cancel := context.WithTimeout(ctx, rehomeExportAsk)
-	defer cancel()
-	ans, err := export(actx, job.Database, job.Measurement, "")
-	switch {
-	case ctx.Err() != nil:
-		return "the server is stopping"
-	case err != nil:
-		return fmt.Sprintf("the Iceberg export did not answer within %s", rehomeExportAsk)
-	case !ans.Clear:
-		return ans.Why
+	// Asked twice before refusing: a pass can fail once for a reason that is
+	// gone by the next one (a file another operation removed while the pass
+	// read it, as a job that has just ended does with its old file).
+	why := ""
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(rehomeExportReadyRetry):
+			case <-ctx.Done():
+				return "the server is stopping"
+			}
+		}
+		actx, cancel := context.WithTimeout(ctx, rehomeExportAsk)
+		ans, err := export(actx, job.Database, job.Measurement, "")
+		cancel()
+		switch {
+		case ctx.Err() != nil:
+			return "the server is stopping"
+		case err != nil:
+			why = fmt.Sprintf("the Iceberg export did not answer within %s", rehomeExportAsk)
+		case !ans.Clear:
+			why = ans.Why
+		default:
+			return ""
+		}
 	}
-	return ""
+	return why
 }
 
 // waitExport returns once the published table does not name the job's old
@@ -221,7 +239,7 @@ func (h *RehomeHandler) recoverLater(jobs []*rehome.Job) {
 	h.running = true
 	for _, rec := range jobs {
 		if _, known := h.jobs[rec.ID]; !known {
-			h.jobs[rec.ID] = &rehomeJob{ID: rec.ID, Path: rec.Source.Key, State: "running", StartedAt: rec.CreatedAt}
+			h.jobs[rec.ID] = &rehomeJob{ID: rec.ID, Path: rec.Source.Key, Tier: rec.Source.Tier, State: "running", StartedAt: rec.CreatedAt}
 			h.order = append(h.order, rec.ID)
 		}
 	}
@@ -259,7 +277,7 @@ func (h *RehomeHandler) recoverLater(jobs []*rehome.Job) {
 				// A latched job is finished whatever tiering holds of its
 				// old file: reads already use the new files. Say what that
 				// leaves. (A committed job is asked about in recoverJob.)
-				if rec.State == rehome.StateLatched {
+				if rec.State == rehome.StateLatched && !rec.Source.Cold() {
 					if cerr, known := h.tieringSource(ctx, rec.Source.Key); cerr != nil && known {
 						log.Error().Str("why", cerr.Error()).Msg("Re-home: a job found at start had switched reads to its new files, and tiered storage now holds its old file or a copy of it. The job is finished; the copy in cold storage holds the same rows as the new files and must be removed by hand, or they are read twice")
 					} else if cerr != nil {

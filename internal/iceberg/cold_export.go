@@ -29,9 +29,11 @@ type coldExport struct {
 	cfg   *aws.Config
 	props iceberg.Properties
 
-	once sync.Once
-	io   iceio.IO
-	err  error
+	// io is the FileIO of the pass whose context is builtFor (fileIOFor).
+	mu       sync.Mutex
+	builtFor context.Context
+	io       iceio.IO
+	err      error
 }
 
 // SetColdTier tells the exporter where the cold tier's files live, so their DataFiles can be
@@ -54,9 +56,19 @@ func (e *Exporter) SetColdTier(cold storage.Backend) error {
 // table's.
 func (e *Exporter) fileIOFor(ctx context.Context, tbl *icetable.Table, uri string) (iceio.IO, error) {
 	if c := e.cold; c != nil && strings.HasPrefix(uri, c.root+"/") {
-		c.once.Do(func() {
+		// One FileIO per pass, built with that pass's context: iceberg-go's
+		// S3 FileIO issues every request under the context it was built
+		// with. Kept across passes, it answered "context canceled" to every
+		// read after the pass that built it had ended (#1825): a cold file
+		// read on every pass, such as one left out of the table, wedged its
+		// table from the second pass on. Built per pass, a read is still
+		// bounded by the pass's deadline and ends with it at shutdown.
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.io == nil || c.builtFor != ctx {
 			c.io, c.err = iceio.LoadFS(utils.WithAwsConfig(ctx, c.cfg), c.props, c.root)
-		})
+			c.builtFor = ctx
+		}
 		if c.err != nil {
 			return nil, fmt.Errorf("open the cold tier's filesystem: %w", c.err)
 		}

@@ -5,6 +5,9 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/basekick-labs/arc/internal/storage"
 )
 
 // #1825: a re-home job owns the file it replaces and the files replacing it.
@@ -254,5 +257,219 @@ func TestRehome1825_NilManager(t *testing.T) {
 	m.SetOwnedFilter(func(string) bool { return true })
 	if m.CheckRehomeSource(ctx, "a") != nil || m.CanRecord("a") != nil || m.RecordRehomedFiles(ctx, nil) != nil || m.ForgetRehomedFiles(ctx, nil) != nil {
 		t.Fatal("a nil manager refused something")
+	}
+}
+
+// coldRig1825 has gateDailyA in cold storage only, with a cold row.
+func coldRig1825(t *testing.T) (*Manager, *hookHot, *hookCold) {
+	t.Helper()
+	m, hot, cold, _ := standaloneRig1825(t, gateDailyA)
+	ctx := context.Background()
+	mustWrite(t, cold.mockBackend, gateDailyA)
+	if err := hot.mockBackend.Delete(ctx, gateDailyA); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.metadata.UpdateTier(ctx, gateDailyA, TierCold); err != nil {
+		t.Fatal(err)
+	}
+	return m, hot, cold
+}
+
+func TestCheckRehomeColdSource1825(t *testing.T) {
+	ctx := context.Background()
+	const rewrite = "db1/cpu/2024/03/15/cpu_20240315_daily_rewrite_1795000000000000000.parquet"
+
+	t.Run("a file in cold storage only", func(t *testing.T) {
+		m, _, _ := coldRig1825(t)
+		size, store, err := m.CheckRehomeColdSource(ctx, gateDailyA)
+		if err != nil || size != 7 || store == "" || store != m.ColdBackendIdentity() {
+			t.Fatalf("size %d, store %q, err %v", size, store, err)
+		}
+	})
+	for name, tc := range map[string]struct {
+		break_ func(t *testing.T, m *Manager, hot *hookHot, cold *hookCold)
+		want   error
+	}{
+		"no tier row": {func(t *testing.T, m *Manager, _ *hookHot, _ *hookCold) {
+			if err := m.metadata.DeleteFile(ctx, gateDailyA); err != nil {
+				t.Fatal(err)
+			}
+		}, ErrRehomeNotCold},
+		"a row that says hot": {func(t *testing.T, m *Manager, _ *hookHot, _ *hookCold) {
+			if err := m.metadata.UpdateTier(ctx, gateDailyA, TierHot); err != nil {
+				t.Fatal(err)
+			}
+		}, ErrRehomeNotCold},
+		"on both tiers": {func(t *testing.T, _ *Manager, hot *hookHot, _ *hookCold) {
+			mustWrite(t, hot.mockBackend, gateDailyA)
+		}, ErrRehomeNotCold},
+		"a row with no object": {func(t *testing.T, _ *Manager, _ *hookHot, cold *hookCold) {
+			if err := cold.mockBackend.Delete(ctx, gateDailyA); err != nil {
+				t.Fatal(err)
+			}
+		}, ErrRehomeNotCold},
+		"a DELETE rewrite beside it in cold storage": {func(t *testing.T, _ *Manager, _ *hookHot, cold *hookCold) {
+			mustWrite(t, cold.mockBackend, rewrite)
+		}, ErrRehomeNotCold},
+		"a DELETE rewrite of it on the hot tier": {func(t *testing.T, _ *Manager, hot *hookHot, _ *hookCold) {
+			mustWrite(t, hot.mockBackend, rewrite)
+		}, ErrRehomeNotCold},
+		"cold storage cannot be asked": {func(_ *testing.T, _ *Manager, _ *hookHot, cold *hookCold) {
+			cold.statErr = errors.New("cold unreachable")
+		}, ErrColdCheckFailed},
+		"no cold tier": {func(_ *testing.T, m *Manager, _ *hookHot, _ *hookCold) {
+			m.coldBackend = nil
+		}, ErrColdCheckFailed},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m, hot, cold := coldRig1825(t)
+			if storage.RewriteFamily(rewrite) != storage.RewriteFamily(gateDailyA) {
+				t.Fatal("the test's rewrite name is not of the file's family")
+			}
+			tc.break_(t, m, hot, cold)
+			if _, _, err := m.CheckRehomeColdSource(ctx, gateDailyA); !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestRemoveRehomedColdFile1825(t *testing.T) {
+	ctx := context.Background()
+	t.Run("the object, then the row, then the caches", func(t *testing.T) {
+		m, _, cold := coldRig1825(t)
+		store := m.ColdBackendIdentity()
+		var notified, stale int
+		m.SetOnMigrationComplete(func() { notified++ })
+		m.SetOnReadCachesStale(func() {
+			if stale++; stale == 1 && !coldHas(t, cold, gateDailyA) {
+				t.Error("the read caches were first dropped after the object went, not before")
+			}
+		})
+		if m.ColdRemovalRecent(time.Minute) {
+			t.Fatal("a removal is reported before any ran")
+		}
+		if err := m.RemoveRehomedColdFile(ctx, gateDailyA, store); err != nil {
+			t.Fatal(err)
+		}
+		if coldHas(t, cold, gateDailyA) {
+			t.Fatal("the object is still in cold storage")
+		}
+		if row, _ := m.metadata.GetFile(ctx, gateDailyA); row != nil {
+			t.Fatalf("the cold row was kept: %+v", row)
+		}
+		if notified != 1 || stale < 1 {
+			t.Fatalf("notified %d, read caches dropped %d; want once, and at least once", notified, stale)
+		}
+		if !m.ColdRemovalRecent(time.Minute) || m.ColdRemovalRecent(0) {
+			t.Fatal("a removal that just ended is not reported as recent, or is reported with no window")
+		}
+		// Safe to repeat: the object and the row are gone.
+		if err := m.RemoveRehomedColdFile(ctx, gateDailyA, store); err != nil {
+			t.Fatalf("a second removal: %v", err)
+		}
+	})
+	t.Run("the object already gone: the row is still retired", func(t *testing.T) {
+		m, _, cold := coldRig1825(t)
+		if err := cold.mockBackend.Delete(ctx, gateDailyA); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.RemoveRehomedColdFile(ctx, gateDailyA, m.ColdBackendIdentity()); err != nil {
+			t.Fatal(err)
+		}
+		if row, _ := m.metadata.GetFile(ctx, gateDailyA); row != nil {
+			t.Fatal("the row of an object that was already gone was kept")
+		}
+	})
+	t.Run("another cold store than the one recorded: nothing is touched", func(t *testing.T) {
+		m, _, cold := coldRig1825(t)
+		err := m.RemoveRehomedColdFile(ctx, gateDailyA, "s3://another-bucket/")
+		if !errors.Is(err, ErrColdStoreChanged) {
+			t.Fatalf("err = %v, want ErrColdStoreChanged", err)
+		}
+		if !coldHas(t, cold, gateDailyA) || fileMeta(t, m, gateDailyA).Tier != TierCold {
+			t.Fatal("the file or its row was touched")
+		}
+		if _, err := m.ColdSourceStat(ctx, gateDailyA, "s3://another-bucket/"); !errors.Is(err, ErrColdStoreChanged) {
+			t.Fatalf("ColdSourceStat err = %v, want ErrColdStoreChanged", err)
+		}
+	})
+	t.Run("cold storage cannot confirm: the row is kept", func(t *testing.T) {
+		m, _, cold := coldRig1825(t)
+		cold.statErr = errors.New("cold unreachable")
+		if err := m.RemoveRehomedColdFile(ctx, gateDailyA, m.ColdBackendIdentity()); err == nil {
+			t.Fatal("a removal cold storage could not confirm was reported done")
+		}
+		if fileMeta(t, m, gateDailyA).Tier != TierCold {
+			t.Fatal("the row was retired though cold storage could not say the object is gone")
+		}
+	})
+}
+
+// stickyCold is a cold store that says a delete worked and keeps the object.
+type stickyCold struct{ *hookCold }
+
+func (s stickyCold) Delete(context.Context, string) error { return nil }
+
+// A removal is done when cold storage says the object is gone, not when the
+// delete returned: a surviving object is recorded again by the next cold
+// sync, and its rows are read beside the files that replaced it.
+func TestRemoveRehomedColdFile1825_TheObjectSurvivesItsDelete(t *testing.T) {
+	m, _, cold := coldRig1825(t)
+	store := m.ColdBackendIdentity()
+	m.coldBackend = stickyCold{cold}
+	if err := m.RemoveRehomedColdFile(context.Background(), gateDailyA, store); err == nil {
+		t.Fatal("a removal that left the object in cold storage was reported done")
+	}
+	if fileMeta(t, m, gateDailyA).Tier != TierCold {
+		t.Fatal("the row was retired with the object still in cold storage")
+	}
+}
+
+// listThen is a cold store whose listing is followed by after, once: what
+// happens to cold storage between a sync's listing and its read of the rows.
+type listThen struct {
+	*hookCold
+	after func()
+}
+
+func (l *listThen) ListObjects(ctx context.Context, prefix string) ([]storage.ObjectInfo, error) {
+	objs, err := l.hookCold.ListObjects(ctx, prefix)
+	if l.after != nil {
+		f := l.after
+		l.after = nil
+		f()
+	}
+	return objs, err
+}
+
+// A cold sync whose listing still shows a file that is removed, row and all,
+// before the sync reads the rows: the file is not recorded again. It used to
+// come back as a cold row with no object, which the next sync reports as a
+// lost file, for a removal that had gone as intended.
+func TestColdSync1825_AFileRemovedUnderTheListingIsNotRecordedAgain(t *testing.T) {
+	ctx := context.Background()
+	m, _, cold := coldRig1825(t)
+	store := m.ColdBackendIdentity()
+	lt := &listThen{hookCold: cold}
+	m.coldBackend = lt
+	lt.after = func() {
+		if err := m.RemoveRehomedColdFile(ctx, gateDailyA, store); err != nil {
+			t.Errorf("removal: %v", err)
+		}
+	}
+	if _, err := m.syncColdTierMetadata(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if row, _ := m.metadata.GetFile(ctx, gateDailyA); row != nil {
+		t.Fatalf("a file removed under the sync's listing was recorded again: %+v", row)
+	}
+	// With no removal under it, a cold object with no row is still recorded.
+	mustWrite(t, cold.mockBackend, gateDailyB)
+	if _, err := m.syncColdTierMetadata(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if row, _ := m.metadata.GetFile(ctx, gateDailyB); row == nil || row.Tier != TierCold {
+		t.Fatalf("a cold object with no row was not recorded: %+v", row)
 	}
 }

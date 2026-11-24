@@ -159,7 +159,9 @@ restart ended with Arc and the table holding the same rows.
 **What a job does differently with the export on.**
 
 - **Before it changes anything**, it asks the export for a pass of the measurement's
-  table. If that pass fails, or the export is paused or does not export the table yet
+  table, and a second time if the first fails (a pass can fail once on a file another
+  operation removed under it). If both fail, or the export is paused or does not export
+  the table yet
   (a namespace awaiting migration), the job is refused with the export's reason and the
   file is as it was.
 - **After queries use the new files**, it asks for a pass again and removes the old file
@@ -215,10 +217,11 @@ with files on both tiers, a query for the misfiled rows' day went from 1 of 13 r
 files, and the next `POST /api/v1/tiering/migrate` moved them to cold storage with no
 scan in between.
 
-**A file on the cold tier is not moved in this release.** It is refused, as is a hot file
-that cold storage holds a copy of (a migration that kept its hot copy, a file restored
-to hot from a backup), whatever the file's name: splitting the hot copy would leave the
-cold one to be read beside the new files.
+**A hot file that cold storage also holds is refused** (a migration that kept its hot
+copy, a file restored to hot from a backup), whatever the file's name: splitting the hot
+copy would leave the cold one to be read beside the new files.
+`POST /api/v1/tiering/reconcile` finishes such a migration. A file that is on the cold
+tier only is moved as described in the next section.
 
 **What changes with tiering on.**
 
@@ -240,7 +243,7 @@ cold one to be read beside the new files.
 
 **What is refused, with the reason.**
 
-- A file being moved to cold storage, in cold storage, or with a copy there.
+- A file being moved to cold storage, or on the hot tier with a copy in cold storage.
 - Any file while cold storage cannot be asked: `tiered_storage.cold.enabled = true` and
   the cold tier could not be reached at start, or tiering is not running at all (no
   licence). With no cold tier configured there is nothing to ask and the job runs.
@@ -267,6 +270,117 @@ cold one to be read beside the new files.
 
 Run with `tiered_storage.default_hot_max_age_days = 1`, `migration_batch_size = 1` and
 `migration_max_concurrent = 1` (non-default) together with the Iceberg export.
+
+
+## Fix: Iceberg reconcile passes fail on a table that has a cold file the export must read ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
+
+With the Iceberg export tracking an S3 cold tier, reconcile passes of a table failed
+once the table held a cold file the export has to read: one it leaves out of the table
+because its rows span more than one day (#1754), or cold data that predates the export
+and could not be registered. The first pass that read the cold tier went through. Every
+later pass that had anything to register or remove failed with
+
+    build data file for s3://...: open s3://...: operation error S3: GetObject, context canceled
+
+and committed nothing, until the server was restarted, which bought one more pass. Files
+migrated in the usual way do not cause it: the export takes them from the table's own
+entry and never reads them.
+
+Measured with `iceberg.ingest_append_enabled = false` and `tiered_storage.cold.s3_prefix`
+set, on a table with one such cold file and an ingest flush every nine seconds: the
+first two passes went through and the next eight failed, one per flush, so nothing more
+reached the table. With ingest appends on (the default) new ingest files reach a table
+without a pass; what needs a pass (compactions, deletes, retention, files moving to
+cold) is what would have been stuck. That case was not measured.
+
+**The cause.** The export kept one reader for the cold tier and built it with the context
+of the pass that first needed it. iceberg-go's S3 reader issues every request under the
+context it was built with, and a pass's context is cancelled when the pass ends. A
+reader is now built for each pass, so a cold read is still bound by its pass's deadline.
+
+**What to do.** Nothing. A table that was stuck catches up at its next pass.
+
+## New: moving a misfiled file's rows when the file is on the cold tier ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
+
+`POST /api/v1/rehome` now takes a file that is in cold storage: a daily file that spans
+days and has since been migrated. It is read from cold storage, its rows are written to
+new files on the hot tier in the directories they belong to, and it is removed from cold
+storage with its tier row. Day files among the new ones migrate again on a later
+tiering cycle. `"dry_run": true` works on a cold file too, and reports what the real run
+would refuse. Standalone node, hot tier on local storage.
+
+On ten cold daily files each holding one row of another month, a query for that month
+returned 1 row once the first file was moved and 10 once all were; unfiltered queries
+returned the same 32 rows throughout.
+
+**What a query sees.** No row twice, on either tier, and every row a query could see
+before. While the new files are put in place queries read the cold file; once they are
+in place queries leave it out by its address in cold storage and read the new files;
+then it is removed.
+
+A time-filtered query sees a misfiled row only once its file has been moved, as before
+the job. One case looks like a loss and is not: a query for a range with no directory
+at all reads the whole measurement, so it sees misfiled rows of that range by accident.
+The first job that creates a directory for the range ends that: the query is pruned to
+the directory and returns only the rows moved so far. In the run below a query for a
+month with no directory returned 10 rows before any job, 0 while the first job had
+created the directory and not yet switched over, 1 after it, and 10 after the tenth. With eight clients
+querying through 10 jobs, 2,812 answers were right, none was a retry, none was wrong.
+With a job held switched-over and the old file still in cold storage, every query
+returned the exact count.
+
+**Checked before anything changes.**
+
+- The file must be cold and only cold: a tier row that says cold, the object in cold
+  storage, nothing at that name on the hot tier, no DELETE rewrite of it beside it on
+  either tier. Otherwise the job is refused with the reason.
+- The job asks the query engine what name it reports for the file, through the same
+  kind of read a query makes, and is refused unless that is the name Arc would leave it
+  out by. That name depends on the cold backend and its configuration; if they ever
+  differed, queries would read the old file beside the new ones.
+
+**Removal.** The query caches are dropped, the object is deleted, cold storage is asked
+that it is gone, and its tier row is retired; the job does not end before that. If the removal fails the
+job stays where it is, the old file left out of queries, and
+`POST /api/v1/rehome/<id>/resume` tries again.
+
+**Other operations on the cold tier.** A row DELETE and retention leave a cold file a
+job owns: DELETE answers 207, says how many files a re-home job holds and points to
+`GET /api/v1/rehome`; retention takes the file on its next run. Neither can remove the
+file after the job has read it: DELETE asks who owns each file under the lock the job
+checks its file under, and retention holds a claim on each file, which a job cannot
+start against, from before it looks at the file until it moves on.
+
+A tiering sync that lists cold storage while a file is being removed (by a job, a cold
+DELETE or retention) no longer records that file again: it skips any file whose cold
+row was retired since its listing began. It used to come back as a cold
+row with no object, reported on `/health` and in the log as a lost file.
+
+**With the Iceberg export on.** As for a hot file: the old file stays in cold storage
+until the published table no longer names it. One case specific to a cold file is
+closed in the export: a pass whose listing happened to span the whole switch would
+have published the cold file beside its replacements; such a listing is now taken
+again.
+
+**Things to know.**
+
+- The job's record names the cold store the file was in. Taken up after a restart
+  against another bucket or prefix, with no cold tier, or with tiering not running, the
+  job is kept as recorded and listed as `stopped`: "not there" is not taken for
+  "removed". It goes on holding backup, restore and a delete of that database off until
+  it ends: put the cold store back as it was and `POST /api/v1/rehome/<id>/resume`.
+- Do not roll back to an earlier build while a job on a cold file is recorded
+  (`GET /api/v1/rehome`): an earlier build reads the record as a hot file's, ends the
+  job, and leaves the old file in cold storage beside the new ones.
+- A file that is not on the hot tier while cold storage cannot be reached is answered
+  502, not 404.
+- A query planned while a measurement's last cold file was still there, and run just
+  after it went, used to be answered as an empty measurement. It is now answered 503
+  "retry" for a minute after Arc removes cold files (a job, a cold DELETE, retention).
+- The new files are on the hot tier until tiering migrates them: a large cold file
+  needs that much room on the hot volume, twice while the job runs.
+- Refused: a cold file with no tier row (run `POST /api/v1/tiering/scan`), a quarantined
+  one, a file on both tiers.
 
 ## Fix: a migrate cut off by its time budget no longer leaves files read twice ([#1830](https://github.com/Basekick-Labs/arc/issues/1830))
 

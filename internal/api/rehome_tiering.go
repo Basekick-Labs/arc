@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/basekick-labs/arc/internal/rehome"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
 )
 
@@ -21,7 +22,7 @@ import (
 //   - before reads are sent to the new files, the job records them as hot;
 //     after the old file is removed, it forgets that file's row.
 //
-// A file on the cold tier is not moved in this version.
+// A file that is on the cold tier is a job of its own kind: rehome_cold.go.
 
 // RehomeTiering is what a job needs of the tiering manager.
 type RehomeTiering interface {
@@ -29,6 +30,11 @@ type RehomeTiering interface {
 	CanRecord(path string) error
 	RecordRehomedFiles(ctx context.Context, files []tiering.RehomedFile) error
 	ForgetRehomedFiles(ctx context.Context, paths []string) error
+	// For a file in cold storage (rehome_cold.go).
+	ColdBackend() storage.Backend
+	CheckRehomeColdSource(ctx context.Context, path string) (size int64, store string, err error)
+	ColdSourceStat(ctx context.Context, path, store string) (int64, error)
+	RemoveRehomedColdFile(ctx context.Context, path, store string) error
 }
 
 // SetTiering binds the tiering manager, or records that none runs (nil: off,
@@ -110,9 +116,9 @@ func (h *RehomeHandler) tieringSource(ctx context.Context, key string) (refusal 
 	case err == nil:
 		return nil, false
 	case errors.Is(err, tiering.ErrFileMoving):
-		return rehome.Refusef("%s is being moved to cold storage; a file on the cold tier is not supported in this version", key), true
+		return rehome.Refusef("%s is being moved to cold storage; send the request again once it has moved", key), true
 	case errors.Is(err, tiering.ErrRehomeColdCopy):
-		return rehome.Refusef("%s is in cold storage, or a copy of it is; a file on the cold tier is not supported in this version", key), true
+		return rehome.Refusef("%s is on the hot tier and cold storage holds it too, or a copy of it: moving the hot file's rows would leave the cold one read beside them. POST /api/v1/tiering/reconcile finishes a migration that kept its hot copy; then send the request again", key), true
 	}
 	return rehome.Refusef("cold storage could not be asked whether it holds a copy of %s (%v); retry once it can", key, err), false
 }

@@ -141,6 +141,14 @@ type Manager struct {
 	coldMissingStarted time.Time
 	coldRemovals       atomic.Int32
 	coldRemovalGen     atomic.Uint64
+	// coldRemovalEndedAt is when the last such run ended (unix nanoseconds),
+	// for ColdRemovalRecent.
+	coldRemovalEndedAt atomic.Int64
+	// coldRetired is the cold rows retired lately, by path, with when: what
+	// a cold sync must not record again from a listing taken before the
+	// removal (noteColdRetired, dropRetiredSince).
+	coldRetiredMu sync.Mutex
+	coldRetired   map[string]time.Time
 
 	// tierEvent* carry the registration reports the cluster layer makes for
 	// files this node did not write itself — pulled from a peer, or unlinked
@@ -1134,6 +1142,9 @@ func (m *Manager) RetireColdRows(ctx context.Context, paths []string) (int, erro
 		return 0, nil
 	}
 	removed := 0
+	// Noted before the rows go, so a cold sync that is listing now does not
+	// record them again from a listing that still shows the objects.
+	m.noteColdRetired(paths)
 	for _, path := range paths {
 		ok, err := m.metadata.DeleteFileInTier(ctx, path, TierCold, time.Time{})
 		if err != nil {
@@ -1468,6 +1479,14 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 	// Decided before the listing: only a listing that started after the
 	// cold mark's fence may seed it (#1552).
 	seed := m.beginColdMarkSeed()
+	// Taken before the listing: a cold removal that overlaps this sync (a
+	// DELETE, retention, a re-home job) deletes an object this listing may
+	// still show, and retires its row before the rows are read below. The
+	// object would look like "listed, no row" and be recorded again, as a
+	// cold row with no object: reported lost, though nothing was (#1825).
+	// Rows retired from here on are not recorded by this sync
+	// (dropRetiredSince).
+	listingStarted := time.Now()
 	objects, err := lister.ListObjects(ctx, "")
 	if err != nil {
 		return 0, fmt.Errorf("failed to list cold objects: %w", err)
@@ -1524,6 +1543,16 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 		touched := make(map[tierCacheScope]struct{})
 		defer m.metadata.invalidateTierCacheScopes(touched)
 		defer func() { batch = batch[:0] }()
+
+		// A file whose cold row was retired since the listing began was
+		// removed under it (a DELETE, retention, a re-home job): the listing
+		// may still show it, and it must not be recorded again.
+		if kept := m.dropRetiredSince(batch, listingStarted); len(kept) != len(batch) {
+			batch = kept
+			if len(batch) == 0 {
+				return nil
+			}
+		}
 
 		notWritten, batchScopes, err := m.metadata.recordColdFilesBatch(ctx, batch, time.Time{})
 		if err != nil {

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
 )
 
@@ -67,6 +68,18 @@ func (f *fakeTiering1825) ForgetRehomedFiles(_ context.Context, paths []string) 
 		delete(f.rows, p)
 	}
 	return nil
+}
+
+// The fake has no cold tier; rehome_cold_1825_test.go has one that does.
+func (f *fakeTiering1825) ColdBackend() storage.Backend { return nil }
+func (f *fakeTiering1825) CheckRehomeColdSource(context.Context, string) (int64, string, error) {
+	return 0, "", errors.New("no cold tier")
+}
+func (f *fakeTiering1825) ColdSourceStat(context.Context, string, string) (int64, error) {
+	return 0, errors.New("no cold tier")
+}
+func (f *fakeTiering1825) RemoveRehomedColdFile(context.Context, string, string) error {
+	return errors.New("no cold tier")
 }
 
 func (f *fakeTiering1825) hot() []string {
@@ -136,7 +149,7 @@ func TestSwapRefusedByTiering1825(t *testing.T) {
 		want string
 	}{
 		"moving":          {fmt.Errorf("%w: x", tiering.ErrFileMoving), "being moved to cold storage"},
-		"a cold copy":     {fmt.Errorf("%w: x", tiering.ErrRehomeColdCopy), "in cold storage"},
+		"a cold copy":     {fmt.Errorf("%w: x", tiering.ErrRehomeColdCopy), "cold storage holds it too"},
 		"cannot be asked": {fmt.Errorf("%w: x", tiering.ErrColdCheckFailed), "could not be asked"},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -442,7 +455,7 @@ func TestResumeUndoesAJobWhoseFileColdStorageHolds1825(t *testing.T) {
 	if code, out := rehomeDo(t, r.app, "POST", "/api/v1/rehome/"+id+"/resume", "", ""); code != 202 {
 		t.Fatalf("resume: %d %v", code, out)
 	}
-	if job := r.wait(id); job["state"] != "refused" || !strings.Contains(fmt.Sprint(job["reason"]), "in cold storage") {
+	if job := r.wait(id); job["state"] != "refused" || !strings.Contains(fmt.Sprint(job["reason"]), "cold storage holds it too") {
 		t.Fatalf("job: %v", job)
 	}
 	if _, _, files := r.reads(); r.reg.Active() || len(files) != 1 || files[0] != swapKey {

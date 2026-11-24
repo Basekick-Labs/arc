@@ -419,3 +419,65 @@ func TestPassAnswerVerdict1825(t *testing.T) {
 		}
 	}
 }
+
+// A file on the cold tier that starts being left out while a listing runs
+// (a re-home job switched its reads to the files replacing it): the listing
+// is taken again. The hot listing cannot show a cold file, so the check that
+// catches this for a hot file never saw it, and the pass would have published
+// the cold file beside its replacements: its rows twice.
+func TestFilesAndLocal1825_AColdFileLeftOutDuringTheListingListsAgain(t *testing.T) {
+	ctx := context.Background()
+	r := newTierRig(t, time.Hour)
+	r.writeHot(0)
+	r.migrate(0, false, true) // the old file: in cold storage only
+	ex := &fakeExclusions{}
+	r.src.SetExclusions(ex)
+	fired := false
+	// Between the hot listing and the second read of the exclusions: the job
+	// puts its new file in place and switches reads to it.
+	r.src.SetPendingOutputs(func(context.Context, string) (map[string]struct{}, error) {
+		if !fired {
+			fired = true
+			r.writeHot(1)
+			ex.set(r.key(0))
+		}
+		return nil, nil
+	})
+	files, _, err := r.src.FilesAndLocal(ctx, Measurement{Database: "mydb", Measurement: "cpu"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fired {
+		t.Fatal("the job never switched during the listing: the test did not run its case")
+	}
+	got := map[string]bool{}
+	for _, f := range files {
+		got[f.Key] = true
+	}
+	if got[r.key(0)] || !got[r.key(1)] || len(got) != 1 {
+		t.Fatalf("files = %v; want the new file only, not the cold file beside it", got)
+	}
+	if ex.calls != 4 {
+		t.Fatalf("exclusions read %d times, want 4 (twice per listing, two listings)", ex.calls)
+	}
+}
+
+// A cold file left out from before the listing is simply left out: nothing
+// moved, nothing is listed again.
+func TestFilesAndLocal1825_AColdFileLeftOutBeforeTheListing(t *testing.T) {
+	ctx := context.Background()
+	r := newTierRig(t, time.Hour)
+	r.writeHot(0)
+	r.migrate(0, false, true)
+	r.writeHot(1)
+	ex := &fakeExclusions{}
+	ex.set(r.key(0))
+	r.src.SetExclusions(ex)
+	files, _, err := r.src.FilesAndLocal(ctx, Measurement{Database: "mydb", Measurement: "cpu"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0].Key != r.key(1) || ex.calls != 2 {
+		t.Fatalf("files %v, exclusions read %d times; want the hot file and one listing", files, ex.calls)
+	}
+}
