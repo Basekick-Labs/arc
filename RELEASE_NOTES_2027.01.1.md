@@ -95,6 +95,11 @@ fail and ask to be retried):
   deadline is not waited for (it is logged; it fails if its files are removed).
 - **Queries cancelled by a lease loss stay cancelled** after the lease is retaken, so a query that
   started before a node lost contact never reads with what it knew before.
+- **With `query.enable_s3_cache` on:** clearing DuckDB's HTTP cache while queries read it makes some
+  of them fail with an internal error, or hang inside DuckDB; this happens without this change too
+  ([#1861](https://github.com/Basekick-Labs/arc/issues/1861)). Totals stay right; a hung query
+  delays compaction until 30 seconds after its own deadline, or for as long as it hangs with
+  `query.timeout = 0` and a client that stays connected.
 - **What shows it:** `GET /api/v1/cluster`, `compaction_commit.read_fences_enabled` and, while a
   compaction waits, `read_fences_behind` (the nodes it waits for).
 - **Rolling upgrade:** the change turns on once every node runs this release, like compaction
