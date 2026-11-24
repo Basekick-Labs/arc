@@ -174,6 +174,8 @@ type Coordinator struct {
 	// rehomeLocalExclusions: re-home exclusions come from this node's own
 	// records only (SetRehomeLocalExclusions, #1860).
 	rehomeLocalExclusions atomic.Bool
+	// rehomeLocalRecords: jobs this node records (SetRehomeLocalRecords).
+	rehomeLocalRecords atomic.Pointer[func(string) bool]
 	// Compaction read fences (#1852, compaction_fences.go): the flag's join
 	// gate and this node's part of a fence.
 	fencesGate compactionFencesGate

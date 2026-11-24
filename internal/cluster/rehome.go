@@ -231,6 +231,16 @@ func (s *RehomeSource) ExcludedFor(_ context.Context, prefix string) []string {
 	return keys
 }
 
+// SetRehomeLocalRecords names the jobs this node records itself
+// (rehome.Registry.HasCluster): the unlink queued when a job ends leaves those
+// to the node's own settling, which removes the source only once the outputs
+// are here (#1860).
+func (c *Coordinator) SetRehomeLocalRecords(fn func(id string) bool) {
+	if c != nil && fn != nil {
+		c.rehomeLocalRecords.Store(&fn)
+	}
+}
+
 // SetRehomeLocalExclusions makes this node's own job records (rehome.Registry)
 // the only source of what its reads leave out for re-home jobs, on local
 // storage (#1860): every node places and removes its own copies, and its

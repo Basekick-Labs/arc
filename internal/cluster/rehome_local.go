@@ -104,6 +104,9 @@ func (c *Coordinator) rehomeEndedUnlink(j raft.RehomeJob) {
 	if j.State == raft.RehomeReverted {
 		return // its source is registered: nothing to unlink
 	}
+	if p := c.rehomeLocalRecords.Load(); p != nil && (*p)(j.ID) {
+		return // this node records the job: SweepLocal settles it, outputs first
+	}
 	c.enqueueLocalDelete(j.Source.Path, "rehome-ended:"+j.ID)
 }
 

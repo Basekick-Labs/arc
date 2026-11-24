@@ -95,8 +95,14 @@ func (h *RehomeHandler) ParticipateLocal(ctx context.Context, j raft.RehomeJob, 
 	}
 	unlock := h.localLocks.lock(j.ID)
 	defer unlock()
-	// Moved on while this step waited for the lock: the next state's step
-	// does what is needed.
+	// This node's record caught up with the leader's first: with no read
+	// lease on local storage, a node just restarted may hold a state the
+	// job left long ago (and act on it: record a finished job committed).
+	if err := lc.SyncManifest(ctx); err != nil {
+		return fmt.Errorf("sync with the cluster: %w", err)
+	}
+	// Moved on while this step waited: the next state's step does what is
+	// needed.
 	if cur, live := h.swap.Cluster.RehomeJob(j.ID); !live || cur.StateIndex != j.StateIndex {
 		return nil
 	}
@@ -149,48 +155,22 @@ func (h *RehomeHandler) ParticipateLocal(ctx context.Context, j raft.RehomeJob, 
 		h.dropLocalCaches(j)
 		return nil
 	case raft.RehomeLatched:
-		for _, o := range j.Outputs {
-			placed, err := h.outputInPlace(ctx, store, outputRef(o))
-			if err != nil {
-				return err
-			}
-			if !placed {
-				// Joined after published: the outputs are registered now and
-				// its puller brings them. Recorded committed first, so each
-				// is left out of reads as it lands, and the source stays
-				// until all are here.
-				if _, had := reg.Get(j.ID); !had {
-					if err := reg.Mirror(ctx, localRecord(j, rehome.StateCommitted)); err != nil {
-						return fmt.Errorf("record the job on this node: %w", err)
-					}
-				}
-				return fmt.Errorf("%s is not on this node yet", o.Key)
-			}
-		}
-		if err := reg.Mirror(ctx, localRecord(j, rehome.StateLatched)); err != nil {
-			return fmt.Errorf("record the job latched on this node: %w", err)
-		}
-		// Waited for here whether or not the job waits for this node: the
-		// unlink below must not pull a file from under a read.
-		if err := h.waitClusterStepReads(ctx, j); err != nil {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(rehomeLocalUnlinkGrace):
-		}
-		return h.unlinkLocalSource(ctx, store, j)
+		return h.latchLocal(ctx, store, j)
 	case raft.RehomeRemoved:
-		if err := h.unlinkLocalSource(ctx, store, j); err != nil {
+		// A node that did not do latched (it joined since) does it now.
+		if err := h.latchLocal(ctx, store, j); err != nil {
 			return err
 		}
 		if err := store.RemoveAll(ctx, rehome.StagedDir(j.ID)); err != nil {
 			return err
 		}
-		// From here this node's reads follow the cluster's record, which
-		// leaves the source out until the job ends.
-		return reg.End(ctx, j.ID)
+		// The source is gone and the outputs are in place here: right with
+		// no record.
+		if err := reg.End(ctx, j.ID); err != nil {
+			return err
+		}
+		h.localLocks.forget(j.ID)
+		return nil
 	case raft.RehomeReverted:
 		if err := h.removeLocalOutputs(ctx, store, j); err != nil {
 			return err
@@ -199,13 +179,59 @@ func (h *RehomeHandler) ParticipateLocal(ctx context.Context, j raft.RehomeJob, 
 			return err
 		}
 		h.dropLocalCaches(j)
+		h.localLocks.forget(j.ID)
 		return nil
 	}
 	return nil
 }
 
-// ForgetLocal drops this node's lock for an ended job.
-func (h *RehomeHandler) ForgetLocal(id string) { h.localLocks.forget(id) }
+// latchLocal makes this node read the outputs and not the source: every
+// output in place (a node that joined since published waits for its puller;
+// it records the job committed first, if it still has the source, so each
+// output is left out as it lands), the job recorded latched, the reads from
+// before over, then the source unlinked and caches dropped. Idempotent.
+func (h *RehomeHandler) latchLocal(ctx context.Context, store rehomeStore, j raft.RehomeJob) error {
+	reg := h.swap.Registry
+	for _, o := range j.Outputs {
+		placed, err := h.outputInPlace(ctx, store, outputRef(o))
+		if err != nil {
+			return err
+		}
+		if !placed {
+			if _, had := reg.Get(j.ID); !had {
+				if n, _ := store.StatFile(ctx, j.Source.Path); n >= 0 {
+					if err := reg.Mirror(ctx, localRecord(j, rehome.StateCommitted)); err != nil {
+						return fmt.Errorf("record the job on this node: %w", err)
+					}
+				}
+			}
+			return fmt.Errorf("%s is not on this node yet", o.Key)
+		}
+	}
+	if n, _ := store.StatFile(ctx, j.Source.Path); n < 0 {
+		if _, had := reg.Get(j.ID); !had {
+			return nil // nothing here to swap: the outputs are read, the source is not
+		}
+	}
+	if err := reg.Mirror(ctx, localRecord(j, rehome.StateLatched)); err != nil {
+		return fmt.Errorf("record the job latched on this node: %w", err)
+	}
+	// Waited for whether or not the job waits for this node: the unlink
+	// must not pull a file from under a read.
+	if err := h.waitClusterStepReads(ctx, j); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(rehomeLocalUnlinkGrace):
+	}
+	if err := h.unlinkLocalSource(ctx, store, j); err != nil {
+		return err
+	}
+	h.dropLocalCaches(j)
+	return nil
+}
 
 // holdStaged makes every output of j durable in its staged key here.
 func (h *RehomeHandler) holdStaged(ctx context.Context, store rehomeStore, lc rehomeLocalCluster, j raft.RehomeJob) error {
@@ -371,8 +397,29 @@ func (h *RehomeHandler) settleEndedLocal(ctx context.Context, store rehomeStore,
 		}
 	}
 	if _, listed := h.swap.Cluster.ManifestFile(rec.Source.Key); !listed {
-		if err := storage.DeleteWithRetry(ctx, store, rec.Source.Key); err != nil && !storage.IsNotFound(err) {
-			return err
+		// The source goes once every output the manifest lists is here,
+		// recorded latched first and after the reads from before.
+		for _, o := range j.Outputs {
+			if e, ok := h.swap.Cluster.ManifestFile(o.Key); ok && e.SHA256 == o.SHA256 {
+				if placed, err := h.outputInPlace(ctx, store, outputRef(o)); err != nil || !placed {
+					return fmt.Errorf("%s is not on this node yet", o.Key)
+				}
+			}
+		}
+		if n, _ := store.StatFile(ctx, rec.Source.Key); n >= 0 {
+			latched := *rec
+			latched.State = rehome.StateLatched
+			if err := h.swap.Registry.Mirror(ctx, &latched); err != nil {
+				return err
+			}
+			if h.swap.Reads != nil {
+				if err := h.swap.Reads.Wait(ctx, h.swap.Reads.Flip()); err != nil {
+					return err
+				}
+			}
+			if err := storage.DeleteWithRetry(ctx, store, rec.Source.Key); err != nil && !storage.IsNotFound(err) {
+				return err
+			}
 		}
 	}
 	if err := store.RemoveAll(ctx, rehome.StagedDir(rec.ID)); err != nil {
