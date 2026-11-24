@@ -215,7 +215,7 @@ func (s *RehomeSource) Active() bool {
 // Open reports whether a job under prefix may leave files out of reads.
 func (s *RehomeSource) Open(prefix string) bool {
 	f := s.fsm()
-	return f != nil && f.RehomeOpen(prefix)
+	return f != nil && !s.c.rehomeLocalExclusions.Load() && f.RehomeOpen(prefix)
 }
 
 // ExcludedFor returns the keys reads under prefix must leave out.
@@ -224,8 +224,22 @@ func (s *RehomeSource) ExcludedFor(_ context.Context, prefix string) []string {
 	if f == nil {
 		return nil
 	}
+	if s.c.rehomeLocalExclusions.Load() {
+		return nil
+	}
 	keys, _ := f.RehomeExcludedFor(prefix)
 	return keys
+}
+
+// SetRehomeLocalExclusions makes this node's own job records (rehome.Registry)
+// the only source of what its reads leave out for re-home jobs, on local
+// storage (#1860): every node places and removes its own copies, and its
+// record follows its disk, whatever its Raft state (behind the leader after a
+// restart, before it heard from it). The source still answers ownership.
+func (c *Coordinator) SetRehomeLocalExclusions() {
+	if c != nil {
+		c.rehomeLocalExclusions.Store(true)
+	}
 }
 
 // ExcludedTiered is ExcludedFor in the registry's tiered shape. A cluster

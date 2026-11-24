@@ -541,4 +541,20 @@ func TestDeferRehomeUnlink1860(t *testing.T) {
 	if c.deferRehomeUnlink(deleteRequest{path: in.Path, reason: "delete"}) {
 		t.Fatal("another reason was deferred")
 	}
+	// With this node's records the only source of exclusions, the cluster
+	// source still owns the job's files but leaves nothing out.
+	if err := c.RehomeAdvance(context.Background(), "ab12", raft.RehomeCommitted); err != nil {
+		t.Fatal(err)
+	}
+	src := c.RehomeSource()
+	if len(src.ExcludedFor(context.Background(), "testdb/cpu/")) != 1 {
+		t.Fatal("committed leaves nothing out")
+	}
+	c.SetRehomeLocalExclusions()
+	if ex := src.ExcludedFor(context.Background(), "testdb/cpu/"); len(ex) != 0 || src.Open("testdb/cpu/") {
+		t.Fatalf("local exclusions: the cluster source leaves out %v", ex)
+	}
+	if !src.Owns(in.Path) {
+		t.Fatal("the source is not owned")
+	}
 }

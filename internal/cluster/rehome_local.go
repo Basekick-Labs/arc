@@ -42,7 +42,13 @@ func (c *Coordinator) FetchRehomeStaged(ctx context.Context, j raft.RehomeJob, o
 		fctx, cancel := context.WithTimeout(ctx, stagedFetchTimeout)
 		pr, pw := io.Pipe()
 		done := make(chan error, 1)
-		go func() { done <- c.storage.WriteReader(fctx, out.StagedKey, pr, out.SizeBytes) }()
+		go func() {
+			err := c.storage.WriteReader(fctx, out.StagedKey, pr, out.SizeBytes)
+			// A writer that stopped early must not leave the fetch blocked
+			// writing into the pipe (it holds the job's lock on this node).
+			pr.CloseWithError(err)
+			done <- err
+		}()
 		_, ferr := c.fetcher.Fetch(fctx, n.Address, &entry, pw, 0, nil)
 		pw.CloseWithError(ferr)
 		werr := <-done
@@ -95,5 +101,18 @@ func (c *Coordinator) rehomeEndedUnlink(j raft.RehomeJob) {
 	if c.storage == nil || c.storage.Type() != "local" || j.Source.Path == "" || c.deleteManifestRelisted == nil {
 		return
 	}
+	if j.State == raft.RehomeReverted {
+		return // its source is registered: nothing to unlink
+	}
 	c.enqueueLocalDelete(j.Source.Path, "rehome-ended:"+j.ID)
+}
+
+// rehomeOwnsLocal: a re-home job owns path. Its source is unlinked by this
+// node's part of the job once its reads from before ended, not by a sweep.
+func (c *Coordinator) rehomeOwnsLocal(path string) bool {
+	if c.raftNode == nil {
+		return false
+	}
+	fsm := c.raftNode.FSM()
+	return fsm != nil && fsm.RehomeOwns(path)
 }

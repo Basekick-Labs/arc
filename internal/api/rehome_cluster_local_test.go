@@ -197,12 +197,14 @@ func TestLocalParticipantSwap1860(t *testing.T) {
 		t.Fatalf("latched: leaves out %v", ex)
 	}
 	r.advance(raft.RehomeRemoved)
+	// Removed ends this node's record: the source is gone and the outputs
+	// in place, which is right whatever the cluster's record says.
+	if r.reg.Active() || r.has(raft.RehomeStagedKey("ab12", 0)) {
+		t.Fatalf("removed: record %v, staged left %v", r.reg.Active(), r.has(raft.RehomeStagedKey("ab12", 0)))
+	}
 	r.end()
 	if err := r.h.SweepLocal(context.Background()); err != nil {
 		t.Fatal(err)
-	}
-	if r.reg.Active() || r.has(raft.RehomeStagedKey("ab12", 0)) {
-		t.Fatalf("after the end: record %v, staged left %v", r.reg.Active(), r.has(raft.RehomeStagedKey("ab12", 0)))
 	}
 	for _, o := range r.job.Outputs {
 		if !r.has(o.Key) {
@@ -274,5 +276,87 @@ func TestLocalSweepSettlesAMissedRevert1860(t *testing.T) {
 	}
 	if !r.has(lrSource) || r.reg.Active() {
 		t.Fatal("source gone or record left")
+	}
+}
+
+// A node with no record when the job latched (it joined after published):
+// it records the job committed, so the outputs its puller brings are left out
+// until all are here, and keeps the source until then.
+func TestLocalParticipantLateJoinerAtLatch1860(t *testing.T) {
+	r := newLocalRig(t)
+	ctx := context.Background()
+	for _, to := range []string{raft.RehomeCommitted, raft.RehomePublished} {
+		if err := r.c.RehomeAdvance(ctx, "ab12", to); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(50 * time.Millisecond) // the others ack
+	}
+	if err := r.c.RehomeClaim(ctx, "ab12"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for r.c.RehomeAdvance(ctx, "ab12", raft.RehomeLatched) != nil {
+		if time.Now().After(deadline) {
+			t.Fatal("no latch")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	j, _ := r.c.RehomeJob("ab12")
+	if err := r.h.ParticipateLocal(ctx, j, false); err == nil {
+		t.Fatal("latched without the outputs here")
+	}
+	if ex := r.excluded(); len(ex) != 2 || !r.has(lrSource) {
+		t.Fatalf("leaves out %v, source here %v", ex, r.has(lrSource))
+	}
+	// The puller brings them.
+	for _, o := range r.job.Outputs {
+		data, _ := r.peer.Read(ctx, o.StagedKey)
+		if err := r.local.Write(ctx, o.Key, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := r.h.ParticipateLocal(ctx, j, false); err != nil {
+		t.Fatal(err)
+	}
+	if ex := r.excluded(); len(ex) != 1 || ex[0] != lrSource || r.has(lrSource) {
+		t.Fatalf("latched: leaves out %v, source here %v", ex, r.has(lrSource))
+	}
+}
+
+// A node that missed the end of a job that finished: its outputs stay, the
+// source goes, the record ends.
+func TestLocalSweepSettlesAMissedFinish1860(t *testing.T) {
+	r := newLocalRig(t)
+	r.advance(raft.RehomeCommitted)
+	r.advance(raft.RehomePublished)
+	ctx := context.Background()
+	if err := r.c.RehomeClaim(ctx, "ab12"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for r.c.RehomeAdvance(ctx, "ab12", raft.RehomeLatched) != nil {
+		if time.Now().After(deadline) {
+			t.Fatal("no latch")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for r.c.RehomeAdvance(ctx, "ab12", raft.RehomeRemoved) != nil {
+		if time.Now().After(deadline) {
+			t.Fatal("no removed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	r.end() // this node took no part since published
+	if err := r.h.SweepLocal(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range r.job.Outputs {
+		if !r.has(o.Key) {
+			t.Fatalf("%s removed", o.Key)
+		}
+	}
+	if r.has(lrSource) || r.reg.Active() {
+		t.Fatalf("source here %v, record %v", r.has(lrSource), r.reg.Active())
 	}
 }

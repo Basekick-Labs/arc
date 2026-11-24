@@ -788,8 +788,10 @@ func (h *RehomeHandler) Recover(ctx context.Context) error {
 		h.recoverLater(later)
 	}
 	// Staging directories with no record: a job that stopped before it was
-	// journaled.
-	if ok {
+	// journaled. Not on a cluster node: a cluster job holds staged copies
+	// before this node records it, and SweepLocal settles those once synced
+	// (#1860).
+	if ok && h.swap.Cluster == nil {
 		keys, err := store.List(ctx, rehome.StagedRoot+"/")
 		if err != nil {
 			return fmt.Errorf("list %s/: %w", rehome.StagedRoot, err)

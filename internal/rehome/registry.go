@@ -98,7 +98,8 @@ type Job struct {
 	State       State     `json:"state"`
 	// Cluster: a job the cluster drives (#1860), recorded on this node so
 	// its reads leave the right files out whatever its Raft state after a
-	// restart. Recover leaves it alone; the cluster participant ends it.
+	// restart. Recover leaves it alone; this node's part of the job ends it
+	// (at removed or reverted), or SweepLocal once the job is gone.
 	Cluster   bool      `json:"cluster,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -407,6 +408,12 @@ func (r *Registry) Mirror(ctx context.Context, j *Job) error {
 			r.mu.Unlock()
 			return fmt.Errorf("%s: %w", k, ErrOwned)
 		}
+		// A backup or restore here, or a retention delete about to act:
+		// the step waits for it (it is retried).
+		if r.claims[k] > 0 || r.blockedLocked(k) {
+			r.mu.Unlock()
+			return fmt.Errorf("%s is being deleted, backed up or restored by another operation", k)
+		}
 	}
 	r.mu.Unlock()
 
@@ -438,6 +445,17 @@ func outputKeys(j *Job) []string {
 		out[i] = o.Key
 	}
 	return out
+}
+
+// HasCluster reports a cluster job this node records (Mirror).
+func (r *Registry) HasCluster(id string) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	j, ok := r.jobs[id]
+	return ok && j.Cluster
 }
 
 // End removes the job's record and then the job. The record goes first: a

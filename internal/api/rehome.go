@@ -398,6 +398,9 @@ func (h *RehomeHandler) resumeJob(c *fiber.Ctx) error {
 	}
 	id := strings.Clone(c.Params("id"))
 	rec, ok := h.swap.Registry.Get(id)
+	if ok && rec.Cluster {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "the cluster drives this job; it is not taken up from this node"})
+	}
 	if !ok {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "no job with that id is recorded on this node; a job that ended has no record"})
 	}

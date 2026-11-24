@@ -103,11 +103,13 @@ func (h *RehomeHandler) ParticipateLocal(ctx context.Context, j raft.RehomeJob, 
 	reg := h.swap.Registry
 	switch j.State {
 	case raft.RehomeCommitted:
-		if !acked {
-			return nil
-		}
-		if err := h.waitClusterStepReads(ctx, j); err != nil {
-			return err
+		// A node the state does not wait for (it joined since) fetches too:
+		// published waits for it, and by then peers may have moved their
+		// copies into place.
+		if acked {
+			if err := h.waitClusterStepReads(ctx, j); err != nil {
+				return err
+			}
 		}
 		return h.holdStaged(ctx, store, lc, j)
 	case raft.RehomePublished:
@@ -154,7 +156,14 @@ func (h *RehomeHandler) ParticipateLocal(ctx context.Context, j raft.RehomeJob, 
 			}
 			if !placed {
 				// Joined after published: the outputs are registered now and
-				// its puller brings them; the source stays until they are here.
+				// its puller brings them. Recorded committed first, so each
+				// is left out of reads as it lands, and the source stays
+				// until all are here.
+				if _, had := reg.Get(j.ID); !had {
+					if err := reg.Mirror(ctx, localRecord(j, rehome.StateCommitted)); err != nil {
+						return fmt.Errorf("record the job on this node: %w", err)
+					}
+				}
 				return fmt.Errorf("%s is not on this node yet", o.Key)
 			}
 		}
@@ -173,7 +182,15 @@ func (h *RehomeHandler) ParticipateLocal(ctx context.Context, j raft.RehomeJob, 
 		}
 		return h.unlinkLocalSource(ctx, store, j)
 	case raft.RehomeRemoved:
-		return h.unlinkLocalSource(ctx, store, j)
+		if err := h.unlinkLocalSource(ctx, store, j); err != nil {
+			return err
+		}
+		if err := store.RemoveAll(ctx, rehome.StagedDir(j.ID)); err != nil {
+			return err
+		}
+		// From here this node's reads follow the cluster's record, which
+		// leaves the source out until the job ends.
+		return reg.End(ctx, j.ID)
 	case raft.RehomeReverted:
 		if err := h.removeLocalOutputs(ctx, store, j); err != nil {
 			return err
@@ -186,6 +203,9 @@ func (h *RehomeHandler) ParticipateLocal(ctx context.Context, j raft.RehomeJob, 
 	}
 	return nil
 }
+
+// ForgetLocal drops this node's lock for an ended job.
+func (h *RehomeHandler) ForgetLocal(id string) { h.localLocks.forget(id) }
 
 // holdStaged makes every output of j durable in its staged key here.
 func (h *RehomeHandler) holdStaged(ctx context.Context, store rehomeStore, lc rehomeLocalCluster, j raft.RehomeJob) error {
@@ -237,6 +257,15 @@ func (h *RehomeHandler) removeLocalOutputs(ctx context.Context, store rehomeStor
 		if _, listed := h.swap.Cluster.ManifestFile(o.Key); listed {
 			continue
 		}
+		placed, err := h.outputInPlace(ctx, store, outputRef(o))
+		if err != nil {
+			// Another file at the key: not this job's to remove.
+			h.logger.Warn().Err(err).Str("job", j.ID).Str("path", o.Key).Msg("Re-home: left a file that is not the job's output")
+			continue
+		}
+		if !placed {
+			continue
+		}
 		if err := storage.DeleteWithRetry(ctx, store, o.Key); err != nil && !storage.IsNotFound(err) {
 			return fmt.Errorf("remove %s: %w", o.Key, err)
 		}
@@ -250,7 +279,9 @@ func (h *RehomeHandler) removeLocalOutputs(ctx context.Context, store rehomeStor
 // SweepLocal settles what jobs that ended left on this node: a record whose
 // job the cluster no longer has (this node missed the job's last steps: it
 // was down, or removed and back), and staged directories no job owns. Run
-// only once this node's record has caught up with the leader's.
+// only once this node's record has caught up with the leader's. A job's
+// staged files are written only after its stage applied on this node, so a
+// directory of a job not in the record is not one being staged.
 func (h *RehomeHandler) SweepLocal(ctx context.Context) error {
 	store, ok := h.mover()
 	if !ok || h.swap == nil || h.swap.Registry == nil || h.swap.Cluster == nil {
@@ -296,9 +327,12 @@ func (h *RehomeHandler) SweepLocal(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// settleEndedLocal ends a record of a job the cluster no longer has. The
-// manifest says how it ended: its source still registered, it reverted
-// (the outputs here go); otherwise it finished (the source here goes).
+// settleEndedLocal ends a record of a job the cluster no longer has. What
+// the manifest lists now decides each file, not a guess at how the job ended
+// (its source or an output may have been compacted or deleted since): an
+// output the manifest lists with the job's checksum is put in place (from
+// the staged copy, or the puller brings it); any other copy of an output is
+// removed; the source's copy goes unless the manifest lists it.
 func (h *RehomeHandler) settleEndedLocal(ctx context.Context, store rehomeStore, rec *rehome.Job) error {
 	unlock := h.localLocks.lock(rec.ID)
 	defer func() {
@@ -310,41 +344,45 @@ func (h *RehomeHandler) settleEndedLocal(ctx context.Context, store rehomeStore,
 	for _, o := range rec.Outputs {
 		j.Outputs = append(j.Outputs, raft.RehomeOutput{Key: o.Key, StagedKey: o.Staged, SizeBytes: o.Size, SHA256: o.SHA256, PartitionTime: o.Start})
 	}
-	log := h.logger.With().Str("job", rec.ID).Str("path", rec.Source.Key).Logger()
-	if _, listed := h.swap.Cluster.ManifestFile(rec.Source.Key); listed {
-		if err := h.removeLocalOutputs(ctx, store, j); err != nil {
-			return err
-		}
-		log.Info().Msg("Re-home: a job this node missed the end of had reverted; removed its outputs here")
-	} else {
-		// Outputs held but not moved in yet (stopped between the record
-		// and the move): moved in now. One missing altogether comes with
-		// the puller, as any registered file does.
-		for _, o := range j.Outputs {
+	for _, o := range j.Outputs {
+		e, listed := h.swap.Cluster.ManifestFile(o.Key)
+		if listed && e.SHA256 == o.SHA256 {
 			placed, err := h.outputInPlace(ctx, store, outputRef(o))
 			if err != nil {
 				return err
 			}
-			if placed {
-				continue
-			}
-			if ok, _ := h.outputInPlace(ctx, store, rehome.FileRef{Key: o.StagedKey, Size: o.SizeBytes, SHA256: o.SHA256}); ok {
-				if err := store.MoveObject(ctx, o.StagedKey, o.Key); err != nil {
-					return err
+			if !placed {
+				if ok, _ := h.outputInPlace(ctx, store, rehome.FileRef{Key: o.StagedKey, Size: o.SizeBytes, SHA256: o.SHA256}); ok {
+					if err := store.MoveObject(ctx, o.StagedKey, o.Key); err != nil {
+						return err
+					}
 				}
 			}
+			continue
 		}
-		if err := h.unlinkLocalSource(ctx, store, j); err != nil {
+		if listed {
+			continue // another file at the key now: not ours
+		}
+		placed, err := h.outputInPlace(ctx, store, outputRef(o))
+		if err == nil && placed {
+			if err := storage.DeleteWithRetry(ctx, store, o.Key); err != nil && !storage.IsNotFound(err) {
+				return err
+			}
+		}
+	}
+	if _, listed := h.swap.Cluster.ManifestFile(rec.Source.Key); !listed {
+		if err := storage.DeleteWithRetry(ctx, store, rec.Source.Key); err != nil && !storage.IsNotFound(err) {
 			return err
 		}
-		if err := store.RemoveAll(ctx, rehome.StagedDir(rec.ID)); err != nil {
-			return err
-		}
-		log.Info().Msg("Re-home: a job this node missed the end of had finished; removed the old file here")
+	}
+	if err := store.RemoveAll(ctx, rehome.StagedDir(rec.ID)); err != nil {
+		return err
 	}
 	if err := h.swap.Registry.End(ctx, rec.ID); err != nil {
 		return err
 	}
+	h.logger.Info().Str("job", rec.ID).Str("path", rec.Source.Key).
+		Msg("Re-home: settled a job this node missed the end of, by what the manifest lists now")
 	h.dropLocalCaches(j)
 	return nil
 }

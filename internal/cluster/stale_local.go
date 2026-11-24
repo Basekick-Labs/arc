@@ -741,7 +741,7 @@ func (c *Coordinator) staleCandidates(ctx context.Context, seen *seenLocal, now 
 			delete(s.firstUnlisted, p)
 			continue
 		}
-		if r.lsn > applied || (pending != nil && pending(p)) || c.CompactionOwns(p) || c.unlinkDeferred(p) ||
+		if r.lsn > applied || (pending != nil && pending(p)) || c.CompactionOwns(p) || c.unlinkDeferred(p) || c.rehomeOwnsLocal(p) ||
 			(cold != nil && cold(ctx, p)) {
 			delete(s.firstUnlisted, p)
 			continue

@@ -171,6 +171,9 @@ type Coordinator struct {
 	rehomePart   atomic.Pointer[RehomeParticipantFunc]
 	rehomeNotify chan struct{}
 	rehomeSteps  rehomeSteps
+	// rehomeLocalExclusions: re-home exclusions come from this node's own
+	// records only (SetRehomeLocalExclusions, #1860).
+	rehomeLocalExclusions atomic.Bool
 	// Compaction read fences (#1852, compaction_fences.go): the flag's join
 	// gate and this node's part of a fence.
 	fencesGate compactionFencesGate
@@ -2870,7 +2873,20 @@ func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequ
 		} else if out, rehomed := fsm.RehomeStagedOutput(sanitized); rehomed {
 			// A re-home job's staged output on local storage (#1860), while
 			// its job is committed or published, with its checksum and size.
-			entry, ok = &raft.FileEntry{Path: out.StagedKey, SHA256: out.SHA256, SizeBytes: out.SizeBytes}, true
+			// A node that already moved its copy into place (published)
+			// serves it from there: the output is not registered yet.
+			sanitized = out.StagedKey
+			c.mu.RLock()
+			b := c.storage
+			c.mu.RUnlock()
+			if b != nil {
+				sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				if n, err := b.StatFile(sctx, out.StagedKey); err == nil && n < 0 {
+					sanitized = out.Key
+				}
+				cancel()
+			}
+			entry, ok = &raft.FileEntry{Path: sanitized, SHA256: out.SHA256, SizeBytes: out.SizeBytes}, true
 		}
 	}
 	if !ok {
