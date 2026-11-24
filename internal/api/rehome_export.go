@@ -246,7 +246,9 @@ func (h *RehomeHandler) recoverLater(jobs []*rehome.Job) {
 	h.mu.Unlock()
 	h.mu.Lock()
 	for _, rec := range jobs {
-		h.jobs[rec.ID].WaitingFor = "the server, to finish starting"
+		if j := h.jobs[rec.ID]; j != nil {
+			j.WaitingFor = "the server, to finish starting"
+		}
 	}
 	h.mu.Unlock()
 	h.done.Add(1)
@@ -267,7 +269,9 @@ func (h *RehomeHandler) recoverLater(jobs []*rehome.Job) {
 		}
 		for _, rec := range jobs {
 			h.mu.Lock()
-			h.jobs[rec.ID].WaitingFor = ""
+			if j := h.jobs[rec.ID]; j != nil {
+				j.WaitingFor = ""
+			}
 			h.mu.Unlock()
 			h.mu.Lock()
 			job := h.jobs[rec.ID]

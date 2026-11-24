@@ -280,8 +280,12 @@ func TestRecoveryWaitsForTheExport1825(t *testing.T) {
 				t.Fatal("with the export not yet bound, the job removed the old file")
 			}
 			r.requireOnce("before the export is bound")
-			if code, _ := rehomeDo(t, r.app, "POST", "/api/v1/rehome", "", fmt.Sprintf(`{"path":%q,"dry_run":true}`, swapKey)); code != 409 {
+			if code, _ := rehomeDo(t, r.app, "POST", "/api/v1/rehome", "", fmt.Sprintf(`{"path":%q}`, swapKey)); code != 409 {
 				t.Fatalf("a second job while the recovered one waits: %d, want 409", code)
+			}
+			// A dry run changes nothing: it runs beside the waiting job (#1845).
+			if code, out := rehomeDo(t, r.app, "POST", "/api/v1/rehome", "", fmt.Sprintf(`{"path":%q,"dry_run":true}`, swapKey)); code != 202 {
+				t.Fatalf("a dry run while a job waits for the export: %d %v, want 202", code, out)
 			}
 			f := &fakeExport1825{answer: func(int, string) (RehomeExportAnswer, error) { return RehomeExportAnswer{Clear: true}, nil }}
 			r.h.SetExport(f.ask)

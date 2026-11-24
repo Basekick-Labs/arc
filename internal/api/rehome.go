@@ -70,7 +70,11 @@ type RehomeHandler struct {
 	mu      sync.Mutex
 	jobs    map[string]*rehomeJob
 	order   []string // job ids, oldest first
-	running bool
+	running bool     // a swap (or a resume) runs: one at a time
+	// dryRunning: a dry run runs, one at a time and beside a swap (#1845):
+	// it changes nothing, and a swap can hold its slot for long while it
+	// waits for the Iceberg export.
+	dryRunning bool
 	// run does a job's work and returns how it ended; a test seam.
 	run func(ctx context.Context, job *rehomeJob) (state, reason string, report *rehomeReport)
 	// swap is what a real swap needs (SetSwap); nil: dry runs only.
@@ -264,7 +268,11 @@ func (h *RehomeHandler) start(c *fiber.Ctx) error {
 	}
 
 	h.mu.Lock()
-	if h.running {
+	if req.DryRun && h.dryRunning {
+		h.mu.Unlock()
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "another dry run is running; one runs at a time"})
+	}
+	if !req.DryRun && h.running {
 		h.mu.Unlock()
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "another re-home job is running; one runs at a time"})
 	}
@@ -276,11 +284,12 @@ func (h *RehomeHandler) start(c *fiber.Ctx) error {
 	job := &rehomeJob{ID: id, Path: src.Key, DryRun: req.DryRun, Tier: tier, State: "running", StartedAt: time.Now().UTC()}
 	h.jobs[id] = job
 	h.order = append(h.order, id)
-	for len(h.order) > rehomeJobsKept {
-		delete(h.jobs, h.order[0])
-		h.order = h.order[1:]
+	h.trimJobsLocked()
+	if job.DryRun {
+		h.dryRunning = true
+	} else {
+		h.running = true
 	}
-	h.running = true
 	h.mu.Unlock()
 
 	h.done.Add(1)
@@ -305,7 +314,11 @@ func (h *RehomeHandler) start(c *fiber.Ctx) error {
 		now := time.Now().UTC()
 		h.mu.Lock()
 		job.State, job.Reason, job.Report, job.FinishedAt = state, reason, report, &now
-		h.running = false
+		if job.DryRun {
+			h.dryRunning = false
+		} else {
+			h.running = false
+		}
 		h.mu.Unlock()
 	}()
 	return c.Status(fiber.StatusAccepted).JSON(h.view(job))
@@ -609,4 +622,18 @@ func (h *RehomeHandler) prepare(ctx context.Context, key string, read func(ctx c
 		return nil, "reading the file's schema and times (it may not be a readable Parquet file)", err
 	}
 	return p, "", nil
+}
+
+// trimJobsLocked drops the oldest ended jobs beyond rehomeJobsKept; a running
+// one is kept whatever its age (a job waiting for the Iceberg export while dry
+// runs come and go, #1845). h.mu held.
+func (h *RehomeHandler) trimJobsLocked() {
+	for i := 0; len(h.order) > rehomeJobsKept && i < len(h.order); {
+		if j := h.jobs[h.order[i]]; j != nil && j.State == "running" {
+			i++
+			continue
+		}
+		delete(h.jobs, h.order[i])
+		h.order = append(h.order[:i], h.order[i+1:]...)
+	}
 }
