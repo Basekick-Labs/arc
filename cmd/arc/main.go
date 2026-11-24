@@ -4573,6 +4573,11 @@ func main() {
 		// turn out not to run (no licence).
 		TieringExpected: cfg.TieredStorage.Enabled,
 		ColdConfigured:  cfg.TieredStorage.Enabled && cfg.TieredStorage.Cold.Enabled,
+		// The names the query engine reports for files in cold storage, read
+		// the way a query reads them: a job on a cold file leaves it out of
+		// reads by that name, and checks first that it is the name Arc
+		// builds. This connection has the cold store's credentials.
+		ColdFileNames: api.ColdFileNamesFromEngine(db.DB()),
 		Refusal: func() string {
 			switch {
 			case cfg.Cluster.Enabled:

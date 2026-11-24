@@ -106,6 +106,8 @@ type rehomeJob struct {
 	State      string     `json:"state"` // running, done, refused, failed
 	StartedAt  time.Time  `json:"started_at"`
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	// Tier is "cold" for a job whose file is in cold storage.
+	Tier string `json:"tier,omitempty"`
 	// Reason: why a job was refused or failed.
 	Reason string `json:"reason,omitempty"`
 	// WaitingFor: what a running job is waiting on, when it is not Arc's
@@ -242,8 +244,18 @@ func (h *RehomeHandler) start(c *fiber.Ctx) error {
 		h.logger.Error().Err(err).Str("path", src.Key).Msg("Re-home: could not look the file up")
 		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "could not look the file up in storage"})
 	}
+	tier := ""
 	if err != nil || size < 0 {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": fmt.Sprintf("%s is not in this node's storage (a file on the cold tier is not supported in this version)", src.Key)})
+		// Not on the hot tier: in cold storage, if this node has any.
+		inCold, cerr := h.inColdStorage(ctx, src.Key)
+		if cerr != nil {
+			h.logger.Error().Err(cerr).Str("path", src.Key).Msg("Re-home: could not look the file up in cold storage")
+			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "the file is not on the hot tier, and cold storage could not be asked whether it holds it"})
+		}
+		if !inCold {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": fmt.Sprintf("%s is not in this node's storage, hot or cold", src.Key)})
+		}
+		tier = rehome.TierCold
 	}
 
 	h.mu.Lock()
@@ -256,7 +268,7 @@ func (h *RehomeHandler) start(c *fiber.Ctx) error {
 		h.mu.Unlock()
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not create a job id"})
 	}
-	job := &rehomeJob{ID: id, Path: src.Key, DryRun: req.DryRun, State: "running", StartedAt: time.Now().UTC()}
+	job := &rehomeJob{ID: id, Path: src.Key, DryRun: req.DryRun, Tier: tier, State: "running", StartedAt: time.Now().UTC()}
 	h.jobs[id] = job
 	h.order = append(h.order, id)
 	for len(h.order) > rehomeJobsKept {
@@ -472,7 +484,17 @@ func (h *RehomeHandler) dryRun(ctx context.Context, job *rehomeJob) (state, reas
 		}
 		return "failed", fmt.Sprintf("the job failed while it was %s; the server log has the error under this job's id", step), nil
 	}
-	prep, step, err := h.prepare(ctx, job.Path)
+	read := h.storage.ReadTo
+	if job.Tier == rehome.TierCold {
+		// What the real run would refuse, said by the dry run too. Nothing
+		// is owned here, so the answer is as of now.
+		_, _, cold, cerr := h.coldSource(ctx, job.Path)
+		if cerr != nil {
+			return fail("checking the file in cold storage", cerr)
+		}
+		read = cold.ReadTo
+	}
+	prep, step, err := h.prepare(ctx, job.Path, read)
 	if err != nil {
 		return fail(step, err)
 	}
@@ -529,7 +551,7 @@ func (p *rehomePrep) close() {
 // prepare copies the file at key to a scratch directory, hashing it on the
 // way, opens the private DuckDB instance and plans the split. On an error it
 // returns the step that failed, for the job's reason, and has cleaned up.
-func (h *RehomeHandler) prepare(ctx context.Context, key string) (prep *rehomePrep, step string, err error) {
+func (h *RehomeHandler) prepare(ctx context.Context, key string, read func(ctx context.Context, key string, w io.Writer) error) (prep *rehomePrep, step string, err error) {
 	p := &rehomePrep{}
 	defer func() {
 		if err != nil {
@@ -555,7 +577,7 @@ func (h *RehomeHandler) prepare(ctx context.Context, key string) (prep *rehomePr
 		return nil, "creating the local copy", err
 	}
 	sum := sha256.New()
-	err = h.storage.ReadTo(ctx, p.src.Key, io.MultiWriter(f, sum))
+	err = read(ctx, p.src.Key, io.MultiWriter(f, sum))
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}

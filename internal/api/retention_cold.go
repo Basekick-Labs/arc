@@ -127,7 +127,25 @@ func (h *RetentionHandler) deleteOldColdFiles(ctx context.Context, c *coldRetent
 	}
 	var rows int64
 	var deleted, retire []string
+	// A file a re-home job in flight owns (#1825) is left for the next run,
+	// in every branch below: the delete, and the handling of a row whose
+	// object is gone. The claim is held from before the file is looked at
+	// until the run moves on, so a job cannot take the file in between.
+	release := func() {}
+	defer func() { release() }()
 	for _, f := range c.files[measurement] {
+		release()
+		release = func() {}
+		if !dryRun && h.rehomeClaim != nil {
+			r, free := h.rehomeClaim(f.Path)
+			if !free {
+				r()
+				h.logger.Info().Str("file", f.Path).Str("tier", string(tiering.TierCold)).
+					Msg("Retention leaves a file a re-home job in flight owns for its next run")
+				continue
+			}
+			release = r
+		}
 		if err := ctx.Err(); err != nil {
 			if !dryRun {
 				h.finishColdMeasurement(ctx, c, deleted, retire)

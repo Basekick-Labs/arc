@@ -73,7 +73,20 @@ type FileRef struct {
 	Start     time.Time `json:"start,omitempty"`
 	Rows      int64     `json:"rows,omitempty"`
 	Remainder bool      `json:"remainder,omitempty"`
+	// Tier is where the source is: "" for the hot tier, TierCold for the
+	// cold one. Set when the job starts and never changed; outputs are
+	// always written to the hot tier. ColdStore identifies the cold store
+	// the source was in then, so a job taken up against another bucket or
+	// prefix does not take "not there" for "removed".
+	Tier      string `json:"tier,omitempty"`
+	ColdStore string `json:"cold_store,omitempty"`
 }
+
+// TierCold is FileRef.Tier for a source in cold storage.
+const TierCold = "cold"
+
+// Cold reports a source that is in cold storage.
+func (f FileRef) Cold() bool { return f.Tier == TierCold }
 
 // Job is one swap.
 type Job struct {
@@ -161,6 +174,12 @@ func (j *Job) validate(id string) error {
 	}
 	if j.Source.Size <= 0 || j.Source.SHA256 == "" {
 		return errors.New("the source has no size or hash")
+	}
+	if j.Source.Tier != "" && j.Source.Tier != TierCold {
+		return fmt.Errorf("the source's tier is %q", j.Source.Tier)
+	}
+	if j.Source.Cold() && j.Source.ColdStore == "" {
+		return errors.New("the source is in cold storage and the record does not say which store")
 	}
 	return nil
 }
@@ -537,6 +556,37 @@ func (r *Registry) ExcludedFor(_ context.Context, prefix string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// ExcludedTiered is ExcludedFor with, in the same answer, which of the keys
+// are files in cold storage: a latched job's source that is on the cold
+// tier. A read names such a file by its cold address. One call, one lock:
+// asked in two, a job that latched in between would have a read leave out
+// both sides, or neither.
+func (r *Registry) ExcludedTiered(_ context.Context, prefix string) (keys, coldKeys []string) {
+	if r == nil {
+		return nil, nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, j := range r.jobs {
+		if j.Prefix() != prefix {
+			continue
+		}
+		switch j.State {
+		case StateCommitted:
+			for _, o := range j.Outputs {
+				keys = append(keys, o.Key)
+			}
+		case StateLatched:
+			keys = append(keys, j.Source.Key)
+			if j.Source.Cold() {
+				coldKeys = append(coldKeys, j.Source.Key)
+			}
+		}
+	}
+	sort.Strings(keys)
+	return keys, coldKeys
 }
 
 // Replaced returns, for the jobs under prefix whose reads already use the new

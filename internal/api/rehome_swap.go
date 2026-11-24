@@ -75,6 +75,10 @@ type RehomeSwap struct {
 	// (SetTiering). ColdConfigured: a cold tier is enabled too.
 	TieringExpected bool
 	ColdConfigured  bool
+	// ColdFileNames returns the names the query engine reports for the
+	// files a glob in cold storage matches (rehome_cold.go). It runs on the
+	// engine's own connection, which has the cold store's credentials.
+	ColdFileNames func(ctx context.Context, glob string) ([]string, error)
 }
 
 const (
@@ -178,7 +182,9 @@ func (h *RehomeHandler) runSwap(ctx context.Context, job *rehomeJob) (state, rea
 		return fail("reading the path", err)
 	}
 	rec := &rehome.Job{ID: job.ID, Database: src.Database, Measurement: src.Measurement,
-		Source: rehome.FileRef{Key: src.Key}, CreatedAt: job.StartedAt}
+		Source: rehome.FileRef{Key: src.Key, Tier: job.Tier}, CreatedAt: job.StartedAt}
+	cold := rec.Source.Cold()
+	read := h.storage.ReadTo
 
 	// 1. Own the source, then look for everyone else.
 	if err := reg.Begin(rec); err != nil {
@@ -198,6 +204,32 @@ func (h *RehomeHandler) runSwap(ctx context.Context, job *rehomeJob) (state, rea
 	var size int64
 	var checkErr error
 	check := func() {
+		if cold {
+			// In cold storage: what must be true of it is tiering's to say
+			// (the object, its row, no copy on hot, no DELETE rewrite
+			// beside it). Under the rewrite lock like the hot checks: a
+			// cold DELETE acts on files under it, and asks who owns them.
+			var backend storage.Backend
+			size, rec.Source.ColdStore, backend, checkErr = h.coldSource(ctx, src.Key)
+			if checkErr != nil {
+				return
+			}
+			read = backend.ReadTo
+			if h.swap.OtherExclusions != nil {
+				excluded, err := h.swap.OtherExclusions(ctx, rec.Prefix())
+				if err != nil {
+					checkErr = err
+					return
+				}
+				for _, k := range excluded {
+					if k == src.Key {
+						checkErr = rehome.Refusef("%s is already left out of reads by another operation; moving its rows would bring them back", src.Key)
+						return
+					}
+				}
+			}
+			return
+		}
 		size, checkErr = h.storage.StatFile(ctx, src.Key)
 		if checkErr == nil && size < 0 {
 			checkErr = rehome.Refusef("%s is not in storage any more", src.Key)
@@ -247,7 +279,7 @@ func (h *RehomeHandler) runSwap(ctx context.Context, job *rehomeJob) (state, rea
 	}
 	// The job owns the file now, so tiering leaves it where it is: what
 	// tiering says about it here holds for the job's life.
-	if checkErr == nil {
+	if checkErr == nil && !cold {
 		checkErr = h.checkTieringSource(ctx, src.Key)
 	}
 	if checkErr != nil {
@@ -255,7 +287,7 @@ func (h *RehomeHandler) runSwap(ctx context.Context, job *rehomeJob) (state, rea
 	}
 
 	// 2. Split in scratch.
-	prep, step, err := h.prepare(ctx, src.Key)
+	prep, step, err := h.prepare(ctx, src.Key, read)
 	if err != nil {
 		return fail(step, err)
 	}
@@ -326,6 +358,10 @@ func (h *RehomeHandler) runSwap(ctx context.Context, job *rehomeJob) (state, rea
 	// From here the job is on disk: what follows is the same code a restart
 	// runs, and a failure leaves the record for it.
 	if err := h.finishSwap(ctx, job.ID); err != nil {
+		var coldRefused errColdRefused
+		if errors.As(err, &coldRefused) {
+			return "refused", coldRefused.why + "; the job was undone before it moved anything, and the file is as it was", report
+		}
 		var refused errExportRefused
 		if errors.As(err, &refused) {
 			return "refused", fmt.Sprintf("the Iceberg export cannot publish %s.%s now (%s), so the job was undone before it moved anything; the file is as it was. Send the request again once the export is publishing that table", src.Database, src.Measurement, refused.why), report
@@ -376,6 +412,12 @@ func (e errJobKept) Error() string {
 	return "the job is kept as recorded and can be resumed later: " + e.why
 }
 
+// errColdRefused: a job on a file in cold storage was undone before it
+// changed anything for readers, for the reason given.
+type errColdRefused struct{ why string }
+
+func (e errColdRefused) Error() string { return e.why }
+
 // errUndone: the job was undone before anything changed for readers.
 var errUndone = errors.New("the job was undone: reads in flight did not end in time, and nothing had been moved")
 
@@ -395,7 +437,27 @@ func (h *RehomeHandler) finishSwap(ctx context.Context, id string) error {
 	// down: every step below is safe to repeat, none is safe to skip.
 	bg := context.WithoutCancel(ctx)
 
+	// A source in cold storage needs the cold store it was recorded in, at
+	// every step from here: without it the job is kept where it is.
+	if job.Source.Cold() {
+		if _, err := h.coldSourceSize(ctx, job); err != nil {
+			return errJobKept{err.Error()}
+		}
+	}
+
 	if job.State == rehome.StateStaged {
+		// A cold file is left out of reads by its cold address. That the
+		// query engine reports the file under exactly that address is
+		// asked now, while undoing the job costs nothing.
+		if job.Source.Cold() {
+			if why := h.coldNameCheck(ctx, job); why != "" {
+				if uerr := h.undo(bg, job); uerr != nil {
+					return fmt.Errorf("%s; undoing the job: %v", why, uerr)
+				}
+				return errColdRefused{why}
+			}
+			h.hook("cold-name")
+		}
 		// With the Iceberg export on: it must be publishing this table,
 		// asked while undoing the job costs nothing.
 		if h.exportExpected() {
@@ -505,7 +567,13 @@ func (h *RehomeHandler) finishSwap(ctx context.Context, id string) error {
 	// A source already gone (a stop between its removal and the record's)
 	// has nothing left to keep for the table's sake.
 	if h.exportExpected() {
-		n, err := store.StatFile(bg, job.Source.Key)
+		var n int64
+		var err error
+		if job.Source.Cold() {
+			n, err = h.coldSourceSize(bg, job)
+		} else {
+			n, err = store.StatFile(bg, job.Source.Key)
+		}
 		if err != nil && !storage.IsNotFound(err) {
 			return fmt.Errorf("stat %s: %w", job.Source.Key, err)
 		}
@@ -519,18 +587,29 @@ func (h *RehomeHandler) finishSwap(ctx context.Context, id string) error {
 
 	// 7. The source goes. A file that is already gone was removed before a
 	// restart.
-	if err := storage.DeleteWithRetry(bg, store, job.Source.Key); err != nil && !storage.IsNotFound(err) {
-		return fmt.Errorf("remove %s: %w", job.Source.Key, err)
-	}
-	// Durable before the record goes: a removal lost to a power cut, with the
-	// record gone, would bring the source back beside its outputs.
-	if dir := job.Source.Key[:strings.LastIndex(job.Source.Key, "/")]; dir != "" {
-		if err := store.Sync(bg, dir); err != nil && !storage.IsNotFound(err) && !os.IsNotExist(err) {
-			return fmt.Errorf("make the removal of %s durable: %w", job.Source.Key, err)
+	if job.Source.Cold() {
+		// From cold storage: the object, then its tier row, then the caches
+		// that name it, and not done until cold storage says it is gone
+		// (tiering.RemoveRehomedColdFile). A failure keeps the job latched:
+		// reads leave the file out, and a resume tries again.
+		if err := h.removeColdSource(bg, job); err != nil {
+			return err
 		}
+		h.hook("removed")
+	} else {
+		if err := storage.DeleteWithRetry(bg, store, job.Source.Key); err != nil && !storage.IsNotFound(err) {
+			return fmt.Errorf("remove %s: %w", job.Source.Key, err)
+		}
+		// Durable before the record goes: a removal lost to a power cut, with the
+		// record gone, would bring the source back beside its outputs.
+		if dir := job.Source.Key[:strings.LastIndex(job.Source.Key, "/")]; dir != "" {
+			if err := store.Sync(bg, dir); err != nil && !storage.IsNotFound(err) && !os.IsNotExist(err) {
+				return fmt.Errorf("make the removal of %s durable: %w", job.Source.Key, err)
+			}
+		}
+		h.hook("removed")
+		h.forgetTierRows(bg, id, []string{job.Source.Key})
 	}
-	h.hook("removed")
-	h.forgetTierRows(bg, id, []string{job.Source.Key})
 	if err := reg.End(bg, id); err != nil {
 		return err
 	}
@@ -705,8 +784,17 @@ func (h *RehomeHandler) Recover(ctx context.Context) error {
 // sourceWhole reports whether the file a job is moving is in storage at the
 // size the job recorded. While a job is committed, reads see that file and
 // leave the outputs out: if it is gone or changed, neither side is whole.
-func sourceWhole(ctx context.Context, store rehomeStore, job *rehome.Job) error {
-	n, err := store.StatFile(ctx, job.Source.Key)
+func (h *RehomeHandler) sourceWhole(ctx context.Context, store rehomeStore, job *rehome.Job) error {
+	var n int64
+	var err error
+	if job.Source.Cold() {
+		if n, err = h.coldSourceSize(ctx, job); err != nil {
+			// Not known to be wrong: cold storage could not be asked.
+			return errJobKept{err.Error()}
+		}
+	} else {
+		n, err = store.StatFile(ctx, job.Source.Key)
+	}
 	if err != nil {
 		return fmt.Errorf("stat the file being moved: %w", err)
 	}
@@ -719,7 +807,7 @@ func sourceWhole(ctx context.Context, store rehomeStore, job *rehome.Job) error 
 // undoIfSourceWhole undoes a job that has not latched, provided the file it
 // was moving is whole.
 func (h *RehomeHandler) undoIfSourceWhole(ctx context.Context, store rehomeStore, job *rehome.Job) error {
-	if err := sourceWhole(ctx, store, job); err != nil {
+	if err := h.sourceWhole(ctx, store, job); err != nil {
 		return err
 	}
 	return h.undo(ctx, job)
@@ -755,23 +843,27 @@ func (h *RehomeHandler) recoverJob(ctx context.Context, store rehomeStore, job *
 		// again.
 		return h.undo(ctx, job)
 	case rehome.StateCommitted:
-		if err := sourceWhole(ctx, store, job); err != nil {
+		if err := h.sourceWhole(ctx, store, job); err != nil {
 			return err
 		}
 		// Tiering is asked about the file again before the job goes on: it
 		// may have been recorded under another configuration, or kept at
 		// start because tiering could not be asked. Reads still use the
 		// source here, so both answers are safe to act on.
-		if cerr, known := h.tieringSource(ctx, job.Source.Key); cerr != nil {
-			if !known {
-				return errJobKept{cerr.Error()}
+		// (A cold source was asked about by sourceWhole, above: it is in
+		// the cold store the job recorded, at its size.)
+		if !job.Source.Cold() {
+			if cerr, known := h.tieringSource(ctx, job.Source.Key); cerr != nil {
+				if !known {
+					return errJobKept{cerr.Error()}
+				}
+				// Cold storage holds the file or a copy: going on would leave
+				// it read beside the new files.
+				if uerr := h.undo(ctx, job); uerr != nil {
+					return fmt.Errorf("%v; undoing the job: %w", cerr, uerr)
+				}
+				return cerr
 			}
-			// Cold storage holds the file or a copy: going on would leave
-			// it read beside the new files.
-			if uerr := h.undo(ctx, job); uerr != nil {
-				return fmt.Errorf("%v; undoing the job: %w", cerr, uerr)
-			}
-			return cerr
 		}
 		for _, o := range job.Outputs {
 			moved, err := h.outputInPlace(ctx, store, o)

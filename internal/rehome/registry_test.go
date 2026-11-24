@@ -364,3 +364,53 @@ func TestNilRegistry(t *testing.T) {
 		release()
 	}
 }
+
+// A latched job whose source is in cold storage names it as a cold key, in
+// the same answer as the keys to leave out.
+func TestExcludedTiered(t *testing.T) {
+	ctx := context.Background()
+	for _, cold := range []bool{false, true} {
+		r := seeded(t, testStore(t))
+		const id = "cd34"
+		job := testJob(id)
+		if cold {
+			job.Source.Tier, job.Source.ColdStore = TierCold, "s3://bucket/"
+		}
+		if err := r.Begin(job); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.SetOutputs(id, testOutputs(id)); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Advance(ctx, id, StateStaged); err != nil {
+			t.Fatal(err)
+		}
+		if k, c := r.ExcludedTiered(ctx, prefix); len(k) != 0 || len(c) != 0 {
+			t.Fatalf("staged: %v %v", k, c)
+		}
+		if err := r.Advance(ctx, id, StateCommitted); err != nil {
+			t.Fatal(err)
+		}
+		if k, c := r.ExcludedTiered(ctx, prefix); len(k) != 2 || len(c) != 0 {
+			t.Fatalf("committed: the outputs are on the hot tier: %v %v", k, c)
+		}
+		if err := r.Advance(ctx, id, StateLatched); err != nil {
+			t.Fatal(err)
+		}
+		k, c := r.ExcludedTiered(ctx, prefix)
+		if len(k) != 1 || k[0] != srcKey || (cold && (len(c) != 1 || c[0] != srcKey)) || (!cold && len(c) != 0) {
+			t.Fatalf("latched (cold source %v): keys %v, cold keys %v", cold, k, c)
+		}
+		if k, c := r.ExcludedTiered(ctx, "db/mem/"); len(k) != 0 || len(c) != 0 {
+			t.Fatalf("another measurement: %v %v", k, c)
+		}
+		// The record keeps the tier across a restart.
+		r2 := NewRegistry(r.store)
+		if err := r2.Seed(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := r2.Jobs()[0].Source; got.Cold() != cold || (cold && got.ColdStore != "s3://bucket/") {
+			t.Fatalf("after a restart: %+v", got)
+		}
+	}
+}

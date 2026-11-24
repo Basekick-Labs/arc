@@ -595,6 +595,10 @@ func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files 
 	// A key that started being left out while this listing ran: its
 	// replacement may have landed after the listing, so leaving it out could
 	// drop its rows, and keeping it could count them twice.
+	// newly is every key that started being left out while the listing ran,
+	// listed here or not: one of them may be a file on the cold tier, which
+	// only the cold listing below can show (#1825).
+	var newly map[string]struct{}
 	if s.exclusions != nil {
 		after, err := s.exclusions.ExcludedForStrict(ctx, prefix)
 		if err != nil {
@@ -609,6 +613,10 @@ func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files 
 			if _, before := leaveOut[k]; before {
 				continue
 			}
+			if newly == nil {
+				newly = make(map[string]struct{})
+			}
+			newly[k] = struct{}{}
 			if _, ok := listed[k]; ok {
 				vanished = append(vanished, k)
 			}
@@ -697,7 +705,16 @@ func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files 
 	}
 	sort.Strings(vanished)
 	if s.cold != nil {
+		// A cold file that started being left out while this listing ran:
+		// the files holding its rows may have landed on the hot tier after
+		// the hot listing, so keeping it could count them twice and leaving
+		// it out could drop them. The same answer as for a hot file above.
+		var movedCold []string
 		skip := func(key string) bool {
+			if _, ok := newly[key]; ok {
+				movedCold = append(movedCold, key)
+				return true
+			}
 			if s.pendingSkips(pending, replacing, key) {
 				return true
 			}
@@ -708,6 +725,10 @@ func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files 
 		}
 		if files, local, err = s.mergeCold(ctx, prefix, files, local, skip); err != nil {
 			return nil, nil, nil, err
+		}
+		if len(movedCold) > 0 {
+			sort.Strings(movedCold)
+			return nil, nil, movedCold, errExclusionsMoved
 		}
 	}
 	return files, local, vanished, nil

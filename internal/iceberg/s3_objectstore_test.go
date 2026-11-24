@@ -510,3 +510,73 @@ func TestS3Prune_KeepsVersionsByTheirSuccessorsAge(t *testing.T) {
 	}
 	t.Logf("copies inside the minimum age: %v; after it: %v", young, old)
 }
+
+// A cold file the export reads on every pass (one it leaves out of the table:
+// its rows span days) must stay readable after the pass that first read it
+// has ended. The cold tier's FileIO was built once, with that pass's context,
+// and iceberg-go's S3 FileIO keeps the context it is built with: once the
+// pass ended and its context was cancelled, every later read of a cold file
+// failed with "context canceled", and the table stopped being updated (#1825).
+func TestS3ColdTier_AColdFileIsReadableOnLaterPasses(t *testing.T) {
+	cold, _ := s3Rig(t)
+	hotRoot := t.TempDir()
+	hot, err := storage.NewLocalBackend(hotRoot, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := int64(1_700_000_000_000_000)
+	writeArcStyleParquet(t, filepath.Join(hotRoot, "mydb/cpu/2023/11/14/22/a.parquet"), base, 10)
+	// On cold only, spanning two days: left out of the table, so read again
+	// on every pass that has something to do.
+	const spanning = "mydb/cpu/2023/11/12/x_daily.parquet"
+	local := filepath.Join(t.TempDir(), "x.parquet")
+	writeStraddlingParquet(t, local, base-2*86_400_000_000)
+	data, err := os.ReadFile(local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cold.Write(context.Background(), spanning, data); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "arc.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	exp, err := NewExporter(db, hot, DefaultWarehouse(hot), "arc", 0, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := exp.SetColdTier(cold); err != nil {
+		t.Fatal(err)
+	}
+	src := NewStorageWalkSource(hot, "arc", zerolog.Nop())
+	if err := src.SetColdTier(cold, func(_ context.Context, k string) (bool, error) { return k == spanning, nil }, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: src, Logger: zerolog.Nop()})
+	m := Measurement{Database: "mydb", Measurement: "cpu"}
+	pass := func(when string) {
+		t.Helper()
+		// Each pass under a context of its own, cancelled when it ends, as
+		// the scheduler's are.
+		ctx, cancel := context.WithCancel(context.Background())
+		_, err := sched.reconcileOneRecovered(ctx, m, m.Database+"\x00"+m.Measurement)
+		cancel()
+		if err != nil {
+			t.Fatalf("%s: %v", when, err)
+		}
+	}
+	pass("the first pass")
+	if got := len(liveEntries(context.Background(), t, exp, "mydb", "cpu")); got != 1 {
+		t.Fatalf("the table holds %d files, want the one-day file only", got)
+	}
+	// Something new to register, so the pass runs and reads the left-out
+	// cold file again.
+	writeArcStyleParquet(t, filepath.Join(hotRoot, "mydb/cpu/2023/11/14/23/b.parquet"), base+3_600_000_000, 10)
+	pass("a later pass, after the first one's context was cancelled")
+	if got := len(liveEntries(context.Background(), t, exp, "mydb", "cpu")); got != 2 {
+		t.Fatalf("the table holds %d files after the later pass, want 2", got)
+	}
+}

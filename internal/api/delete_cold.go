@@ -109,6 +109,8 @@ type coldPass struct {
 	// After run:
 	deleted     []string
 	deletedRows int64
+	// rehomed counts the failed files a re-home job in flight owns (#1825).
+	rehomed int
 }
 
 // liveDonor is the donor less the files this run deleted.
@@ -396,6 +398,15 @@ func (h *DeleteHandler) runCold(ctx context.Context, c *coldPass, where string) 
 			c.failed = append(c.failed, f.path)
 			continue
 		}
+		// Asked now, under the rewrite lock this runs in, not at the scan:
+		// a re-home job (#1825) takes ownership first and then checks its
+		// file under the same lock, so one of the two sees the other.
+		if h.rehomeOwns != nil && h.rehomeOwns(f.path) {
+			h.logger.Info().Str("file", f.path).Msg("DELETE leaves a cold file a re-home job in flight owns; retry once the job has ended (GET /api/v1/rehome)")
+			c.failed = append(c.failed, f.path)
+			c.rehomed++
+			continue
+		}
 		size, err := c.backend.StatFile(ctx, f.path)
 		switch {
 		case err != nil:
@@ -464,6 +475,9 @@ func (h *DeleteHandler) runCold(ctx context.Context, c *coldPass, where string) 
 	for _, p := range c.missingRows {
 		if ctx.Err() != nil {
 			break
+		}
+		if h.rehomeOwns != nil && h.rehomeOwns(p) {
+			continue // the job retires or keeps its own file's row
 		}
 		coldSize, err := c.backend.StatFile(ctx, p)
 		if err != nil || coldSize >= 0 {
@@ -547,8 +561,11 @@ func (c *coldPass) applyCold(resp *DeleteResponse, dryRun bool) bool {
 	if n := len(c.hotCopy); n > 0 {
 		why = append(why, fmt.Sprintf("%d cold files %s", n, coldHotCopyWhy))
 	}
-	if n := len(c.failed); n > 0 {
+	if n := len(c.failed) - c.rehomed; n > 0 {
 		why = append(why, fmt.Sprintf("%d cold files could not be read or deleted and were left as they are", n))
+	}
+	if c.rehomed > 0 {
+		why = append(why, fmt.Sprintf("%d cold files are being re-homed and were left as they are; retry for those once the job has ended, GET /api/v1/rehome", c.rehomed))
 	}
 	if c.notExamined != "" {
 		why = append(why, "cold storage was not examined: "+c.notExamined+"; rows in it may still match")

@@ -892,6 +892,9 @@ type QueryHandler struct {
 
 	// Tiering support for multi-tier query routing (hot/cold)
 	tieringManager *tiering.Manager
+	// coldRemoval overrides, in tests, whether cold files were removed
+	// recently and what the cold backend is (coldGlobAfterRemoval).
+	coldRemoval func() (recent bool, cold storage.Backend)
 	// coldDatabases overrides coldDatabaseSource in tests.
 	coldDatabases func(context.Context) ([]string, error)
 
@@ -1735,18 +1738,28 @@ func wrapOpenCompactions(ctx context.Context, oc OpenCompactions, backend storag
 	if backend == nil {
 		return expr
 	}
-	return snapshotOpenCompactions(ctx, oc, database, measurement).apply(backend, expr)
+	return snapshotOpenCompactions(ctx, oc, database, measurement).apply(backend, nil, expr)
 }
 
 // readExclusions is what a read of one measurement must leave out,
-// as the registry had it at one instant.
+// snapshotted before the read's path list is built. keys are storage keys;
+// coldKeys are those of them that name a file in cold storage, which a read
+// knows by its cold address (a re-home job's source on the cold tier, #1825).
 type readExclusions struct {
-	keys []string
+	keys     []string
+	coldKeys []string
 }
 
-// snapshotOpenCompactions reads the registry for a measurement. It marks the
-// transform volatile when a job is open on it: whatever this read leaves out
-// now, the job's files can change before the next one, so it is never cached.
+// TieredExcluder is an OpenCompactions source that says, in the same answer
+// as the keys to leave out, which of them are files in cold storage
+// (rehome.Registry). One call: a source asked twice could change between the
+// answers, and a read would leave out both a file and its replacements, or
+// neither.
+type TieredExcluder interface {
+	ExcludedTiered(ctx context.Context, prefix string) (keys, coldKeys []string)
+}
+
+// snapshotOpenCompactions reads the exclusions for one measurement.
 func snapshotOpenCompactions(ctx context.Context, oc OpenCompactions, database, measurement string) readExclusions {
 	if oc == nil || database == "" || measurement == "" {
 		return readExclusions{}
@@ -1756,16 +1769,23 @@ func snapshotOpenCompactions(ctx context.Context, oc OpenCompactions, database, 
 		return readExclusions{}
 	}
 	pruning.MarkVolatile(ctx)
+	if te, ok := oc.(TieredExcluder); ok {
+		keys, cold := te.ExcludedTiered(ctx, prefix)
+		return readExclusions{keys: keys, coldKeys: cold}
+	}
 	return readExclusions{keys: oc.ExcludedFor(ctx, prefix)}
 }
 
 // apply filters expr, which contains one read_parquet(...) call and ends with
-// it, by file name.
-func (e readExclusions) apply(backend storage.Backend, expr string) string {
+// it, by file name. Every key is named by its address on backend (the hot
+// tier); a cold key also by its address on cold, the name a multi-tier read
+// reports it under. With a cold key and no cold backend there is no cold
+// glob in expr either, so nothing of that file is read.
+func (e readExclusions) apply(backend, cold storage.Backend, expr string) string {
 	if backend == nil || len(e.keys) == 0 {
 		return expr
 	}
-	quoted := make([]string, 0, len(e.keys))
+	quoted := make([]string, 0, len(e.keys)+len(e.coldKeys))
 	for _, k := range e.keys {
 		uri, err := storage.ObjectURI(backend, k)
 		if err != nil {
@@ -1773,7 +1793,57 @@ func (e readExclusions) apply(backend storage.Backend, expr string) string {
 		}
 		quoted = append(quoted, sqlutil.QuoteStringLiteral(uri))
 	}
+	if cold != nil {
+		for _, k := range e.coldKeys {
+			uri, err := storage.ObjectURI(cold, k)
+			if err != nil {
+				continue
+			}
+			quoted = append(quoted, sqlutil.QuoteStringLiteral(uri))
+		}
+	}
 	return sqlutil.ExcludeFiles(expr, openCompactionFileColumn, quoted)
+}
+
+// coldRemovalWindow is how long after Arc removed cold files an empty cold
+// glob is taken for a read planned before the removal (coldGlobAfterRemoval):
+// longer than the caches that could still offer the cold tier to a new read.
+const coldRemovalWindow = time.Minute
+
+// coldGlobAfterRemoval reports a glob under the cold tier's root that matched
+// nothing while Arc is removing cold files, or shortly after.
+func (h *QueryHandler) coldGlobAfterRemoval(pattern string) bool {
+	var cold storage.Backend
+	if h.coldRemoval != nil {
+		recent, backend := h.coldRemoval()
+		if !recent {
+			return false
+		}
+		cold = backend
+	} else {
+		if h.tieringManager == nil || !h.tieringManager.ColdRemovalRecent(coldRemovalWindow) {
+			return false
+		}
+		cold = h.coldBackendForReads()
+	}
+	if cold == nil {
+		return false
+	}
+	// The root is what every cold key's address starts with.
+	uri, err := storage.ObjectURI(cold, "x")
+	if err != nil {
+		return false
+	}
+	root := strings.TrimSuffix(uri, "x")
+	return root != "" && strings.HasPrefix(pattern, root)
+}
+
+// coldBackendForReads is the cold tier's backend, or nil when there is none.
+func (h *QueryHandler) coldBackendForReads() storage.Backend {
+	if h.tieringManager == nil {
+		return nil
+	}
+	return h.tieringManager.GetBackendForTier(tiering.TierCold)
 }
 
 // SetFileTimePruning enables file-level time pruning on the partition pruner
@@ -3071,11 +3141,21 @@ func (h *QueryHandler) classifyNoFiles(err error) noFilesKind {
 	if strings.HasSuffix(pattern, "**/*.parquet") {
 		// The date shape is checked without a root first, so a query on an
 		// empty measurement does not derive the storage root for nothing.
-		if !pruning.IsDayWideGlob(pattern, "") || !pruning.IsDayWideGlob(pattern, h.storageRoot()) {
+		switch {
+		case h.coldGlobAfterRemoval(pattern):
+			// The measurement's glob on the cold tier, matching nothing
+			// while Arc removes cold files or just has: the read was
+			// planned when the last cold file was still there. Its other
+			// paths hold rows (the files that replaced it, #1825), and an
+			// empty answer would leave them out.
+			h.logger.Warn().Str("pattern", pattern).
+				Msg("A measurement's cold files were removed while a query that read them was being planned; answering 503 so the query is retried without the cold tier")
+		case !pruning.IsDayWideGlob(pattern, "") || !pruning.IsDayWideGlob(pattern, h.storageRoot()):
 			return noFilesEmpty
+		default:
+			h.logger.Warn().Str("pattern", pattern).
+				Msg("A day was read whole because its storage listing failed, and it holds no files; answering 503 so the query is retried once the listing works")
 		}
-		h.logger.Warn().Str("pattern", pattern).
-			Msg("A day was read whole because its storage listing failed, and it holds no files; answering 503 so the query is retried once the listing works")
 	}
 	h.invalidateAfterVanished(pattern, false)
 	return noFilesVanished
@@ -4603,7 +4683,7 @@ func (h *QueryHandler) buildReadParquetExpr(ctx context.Context, path, originalS
 	// list. Twice is the side to err on: it is visible, and the next read is
 	// right.
 	excl := snapshotOpenCompactions(ctx, h.openCompactions, db, meas)
-	return excl.apply(h.storage, h.buildReadParquetExprRaw(ctx, path, originalSQL, keyword))
+	return excl.apply(h.storage, h.coldBackendForReads(), h.buildReadParquetExprRaw(ctx, path, originalSQL, keyword))
 }
 
 // buildReadParquetExprRaw is buildReadParquetExpr without the open
@@ -4671,7 +4751,7 @@ func (h *QueryHandler) buildReadParquetExprRaw(ctx context.Context, path, origin
 func (h *QueryHandler) buildReadParquetExprForMeasurement(ctx context.Context, database, measurement, originalSQL, keyword string) string {
 	// Exclusions first, then the path list: see buildReadParquetExpr.
 	excl := snapshotOpenCompactions(ctx, h.openCompactions, database, measurement)
-	return excl.apply(h.storage, h.buildReadParquetExprForMeasurementRaw(ctx, database, measurement, originalSQL, keyword))
+	return excl.apply(h.storage, h.coldBackendForReads(), h.buildReadParquetExprForMeasurementRaw(ctx, database, measurement, originalSQL, keyword))
 }
 
 // buildReadParquetExprForMeasurementRaw is buildReadParquetExprForMeasurement
