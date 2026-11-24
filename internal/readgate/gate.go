@@ -14,7 +14,9 @@
 // A read enters before its SQL is built and leaves no earlier than its
 // statement is bound. In practice it leaves once the statement has executed:
 // the DuckDB driver runs a query to completion inside the call that starts
-// it, and the callers leave when their handler returns. So a wait lasts as
+// it, and the callers leave when their handler returns, or, for a response
+// streamed after the handler returned, when the stream ends (#1858). So a
+// wait lasts as
 // long as the longest read in flight, which is bounded by that read's own
 // deadline (the query timeout, a governance policy's, ten minutes for a
 // continuous query). A job that waits needs its own deadline and a way to
@@ -32,8 +34,10 @@
 //
 // What is not counted, and a job must handle otherwise: the Iceberg export's
 // listing, DELETE's and retention's own reads of files, compaction, reads on
-// other nodes of a cluster (each node has its own gate), and files the arcx
-// router opens while it streams or shadows a query after the handler returned.
+// other nodes of a cluster (each node has its own gate), and the arcx
+// router's shadow queries, which run after the handler returned and serve
+// nothing (arcx declines a shared object store, the only place a job waits on
+// other nodes).
 package readgate
 
 import (

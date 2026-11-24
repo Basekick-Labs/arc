@@ -64,6 +64,17 @@ outage too.
 Clusters on local storage (which replicate files and have their own opt-in gate,
 `cluster.query_gate_on_catchup`) and standalone nodes are unchanged.
 
+## Fix: a streamed query response is waited for until it ends, not only until its handler returns ([#1858](https://github.com/Basekick-Labs/arc/issues/1858))
+
+**Who is affected:** deployments that move files under running queries: re-home jobs, and
+compactions on a cluster sharing one object store.
+
+Query responses (JSON, Arrow IPC, the per-measurement endpoint, the arcx engine's served queries)
+stream their rows after the request's handler returns. Those jobs waited for queries only until the
+handler returned, so a large response could still be reading a file when the job deleted it, and
+the query failed part way. They now wait until the stream has been sent. Results were never wrong;
+this removes the failure.
+
 ## Fix: on a cluster sharing one object store, a query no longer counts a compaction's rows twice ([#1852](https://github.com/Basekick-Labs/arc/issues/1852))
 
 **Who is affected:** clusters whose primary storage is S3, Azure or GCS, with compaction on.
@@ -171,10 +182,6 @@ Not handled in this version:
 - A backup, a DELETE or retention still running on a former primary writer after a failover does
   not see a job the new one starts (a DELETE rewrite that lands before the switch-over makes the
   job revert; one that lands after is not caught).
-- An Arrow IPC stream, and the arcx engine's streamed or shadowed reads, can still be reading
-  after their request's handler returned, and an ack does not wait for them: such a read fails if
-  its file is deleted, it does not return wrong rows. Schema reads (`getMeasurementSchema`) are not
-  counted either.
 - A new job is started on the primary writer only.
 
 ## Change: a cluster records re-home jobs in its replicated state; an older build cannot join once every node supports it ([#1825](https://github.com/Basekick-Labs/arc/issues/1825))
