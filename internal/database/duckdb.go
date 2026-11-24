@@ -1311,14 +1311,8 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 					if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_max_in_mem_cache_block_count=%d", maxBlocks)); err != nil {
 						logger.Warn().Err(err).Int64("max_blocks", maxBlocks).Msg("Failed to set cache_httpfs_max_in_mem_cache_block_count")
 					}
-					// Scale glob/metadata cache sizes proportionally.
-					// A 7-day hourly query generates ~168 glob patterns — the default
-					// 64 entries causes constant eviction on large deployments.
-					globEntries := max(maxBlocks/20, 64)      // ~5% of blocks, floor at default
+					// Scale the metadata cache size proportionally.
 					metadataEntries := max(maxBlocks/10, 250) // ~10% of blocks, floor at default
-					if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_glob_cache_entry_size=%d", globEntries)); err != nil {
-						logger.Warn().Err(err).Msg("Failed to set cache_httpfs_glob_cache_entry_size")
-					}
 					if _, err := db.Exec(fmt.Sprintf("SET GLOBAL cache_httpfs_metadata_cache_entry_size=%d", metadataEntries)); err != nil {
 						logger.Warn().Err(err).Msg("Failed to set cache_httpfs_metadata_cache_entry_size")
 					}
@@ -1339,15 +1333,21 @@ func configureS3Access(db *sql.DB, cfg *Config, logger zerolog.Logger) error {
 					logger.Warn().Err(err).Msg("Failed to set cache_httpfs_metadata_cache_entry_timeout_millisec")
 				}
 			}
-			// Glob TTL: 10s — directory listings change during compaction and S3 LIST
-			// overhead is negligible. Post-compaction invalidation handles the rest.
-			if _, err := db.Exec("SET GLOBAL cache_httpfs_glob_cache_entry_timeout_millisec=10000"); err != nil {
-				logger.Warn().Err(err).Msg("Failed to set cache_httpfs_glob_cache_entry_timeout_millisec")
+			// No glob cache (#1864): directory listings change whenever files
+			// are replaced (compaction, DELETE, re-home), and cache_httpfs stores
+			// a listing when it finishes, so one in progress during the clear
+			// that follows a replacement was stored after it and served the old
+			// set of files (without the new one, while the replaced ones are
+			// already left out). An S3 LIST per query is cheap next to the
+			// rows read; the data blocks and metadata caches stay.
+			if _, err := db.Exec("SET GLOBAL cache_httpfs_enable_glob_cache=false"); err != nil {
+				logger.Error().Err(err).Msg("Could not turn off cache_httpfs's glob cache: a listing from before a compaction or DELETE can be used after it (#1864)")
 			}
 			logger.Info().
 				Int64("cache_size_bytes", cfg.S3CacheSize).
 				Int("ttl_seconds", cfg.S3CacheTTLSeconds).
 				Bool("file_handle_cache", false).
+				Bool("glob_cache", false).
 				Msg("cache_httpfs extension loaded with in_mem mode")
 		}
 	}

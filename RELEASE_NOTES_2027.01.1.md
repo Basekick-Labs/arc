@@ -87,6 +87,18 @@ two nodes failed about 5,600 queries each over 2.5 minutes. The file-handle cach
 data, glob and metadata caches stay. Same run: no errors, no hung queries. The cost: each query
 opens the files it reads again instead of reusing an open handle, which can add a request per file
 to the object store; the file data itself is still served from the cache.
+## Fix: with the S3 cache on, a file listing from before a compaction or DELETE is no longer used after it ([#1864](https://github.com/Basekick-Labs/arc/issues/1864))
+
+**Who is affected:** deployments with `query.enable_s3_cache = true` (off by default).
+
+The S3 cache also cached directory listings (for 10 seconds). Arc clears the cache when files are
+replaced, but a listing another query had in progress at that moment was stored when it finished,
+after the clear: for up to 10 seconds, queries could read the old set of files, without a
+compaction's new output while its inputs were already left out, so those rows were missing. The
+listing cache is now off; the data and metadata caches stay. The cost is an S3 LIST per glob per
+query: in a test against a local SeaweedFS, about 7 ms more per small query (a query loop answered
+3,110 queries in two minutes instead of 3,776); more against a remote bucket, and little next to a
+query that reads many rows.
 
 ## Fix: on a cluster sharing one object store, a query no longer counts a compaction's rows twice ([#1852](https://github.com/Basekick-Labs/arc/issues/1852))
 
