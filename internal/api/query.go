@@ -4004,8 +4004,9 @@ func (h *QueryHandler) getTransformedSQLWithRefs(ctx context.Context, sql, heade
 			stamps = append(stamps, pathFailure.stamps[ref])
 		}
 		pruner := h.pruner
+		coldOnly := pathFailure.coldOnly
 		h.queryCache.SetWithMetadataCheck(cacheKey, transformed, encodeStoragePathReferences(refs),
-			func() bool { return !pruner.StampsCurrent(stamps) })
+			func() bool { return !pruner.StampsCurrent(stamps) || h.gainedHotTier(coldOnly) })
 	}
 	return transformed, false, refs, nil
 }
@@ -4354,6 +4355,10 @@ type storagePathFailure struct {
 	// recorded, which is before any of its files are listed (#1757).
 	stampOf func(database, measurement string) pruning.PublishStamp
 	stamps  map[TableReference]pruning.PublishStamp
+	// coldOnly: measurements this transform read with the hot tier left
+	// out, because no tier row said hot (#1765). The cached SQL goes stale
+	// once one has a hot row.
+	coldOnly []TableReference
 }
 
 // errColdTierUnavailable refuses a read that needs the cold tier on a node
@@ -4564,6 +4569,13 @@ func reservedPlaceholderInTransform(ctx context.Context, masked string) bool {
 func recordStoragePathFailure(ctx context.Context, err error) {
 	if f, ok := ctx.Value(storagePathCtxKey{}).(*storagePathFailure); ok && f.err == nil {
 		f.err = err
+	}
+}
+
+// recordColdOnly notes a measurement the transform read without its hot tier.
+func recordColdOnly(ctx context.Context, database, measurement string) {
+	if f, ok := ctx.Value(storagePathCtxKey{}).(*storagePathFailure); ok {
+		f.coldOnly = append(f.coldOnly, TableReference{Database: database, Measurement: measurement})
 	}
 }
 
@@ -5103,7 +5115,10 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 		// replication drainer drops the query caches for a measurement whose
 		// tier rows it changes, so a node that acquires hot rows for a
 		// measurement it is only receiving does not keep serving a cold-only
-		// read.
+		// read. And the cached transform goes stale once the measurement has
+		// a hot row (#1765): its first hot file, written on this node, is
+		// otherwise left out of a repeated query for up to the cache TTL.
+		recordColdOnly(ctx, database, measurement)
 		h.logger.Debug().
 			Str("database", database).
 			Str("measurement", measurement).
@@ -7109,4 +7124,28 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		}
 	})
 	return nil
+}
+
+// gainedHotTier reports whether a measurement a cached transform read with
+// its hot tier left out has a hot row now (#1765). Asked on every hit of
+// such a transform; the tier lookup is served from the tier cache, which a
+// recorded file invalidates. An error counts as gained: the transform is
+// rebuilt rather than served on a guess.
+func (h *QueryHandler) gainedHotTier(coldOnly []TableReference) bool {
+	if len(coldOnly) == 0 {
+		return false
+	}
+	tiers := h.multiTierView()
+	if tiers == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, ref := range coldOnly {
+		got, err := tiers.TiersForMeasurement(ctx, ref.Database, ref.Measurement)
+		if err != nil || got[tiering.TierHot] {
+			return true
+		}
+	}
+	return false
 }
