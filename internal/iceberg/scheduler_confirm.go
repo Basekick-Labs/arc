@@ -164,7 +164,11 @@ func (s *Scheduler) serviceConfirms(ctx context.Context) {
 		a := PassAnswer{Outcome: "checked"}
 		if s.exporter != nil {
 			mctx, cancel := context.WithTimeout(ctx, measurementTimeout)
-			exists, published, named, err := s.exporter.publishedNames(mctx, w.m.Database, w.m.Measurement, w.key)
+			var exists, published, named bool
+			err := s.exporter.adoptForCheck(s.exporter.withAWS(mctx), w.m.Database, w.m.Measurement)
+			if err == nil {
+				exists, published, named, err = s.exporter.publishedNames(mctx, w.m.Database, w.m.Measurement, w.key)
+			}
 			cancel()
 			switch {
 			case err != nil:

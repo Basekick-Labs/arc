@@ -618,6 +618,21 @@ func (e *Exporter) tableExists(ctx context.Context, database, measurement string
 // EnsureTable's adoption, so a stale row whose metadata another node had since
 // pruned failed every pass, and a node with no row never saw a table another
 // node published (#1609).
+// adoptForCheck brings this node's catalog row to the newest version
+// published in the warehouse, creating the namespace if this node has none:
+// a node that does not export (and so never ran a pass of the table) reads
+// the published table through its own catalog (#1870).
+func (e *Exporter) adoptForCheck(ctx context.Context, database, measurement string) error {
+	if !e.warehouseAuthoritative {
+		return nil
+	}
+	ident := e.tableIdent(database, measurement)
+	if err := e.catalog.CreateNamespace(ctx, ident[:len(ident)-1], nil); err != nil && !isAlreadyExists(err) {
+		return fmt.Errorf("create namespace %v: %w", ident[:len(ident)-1], err)
+	}
+	return e.adoptBeforeLoad(ctx, database, measurement)
+}
+
 func (e *Exporter) adoptBeforeLoad(ctx context.Context, database, measurement string) error {
 	if !e.warehouseAuthoritative {
 		return nil
