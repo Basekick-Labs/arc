@@ -6,6 +6,7 @@ import (
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/rs/zerolog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -610,5 +611,67 @@ func TestRehomeBeforePullRecordsTheJob1860(t *testing.T) {
 	}
 	if err := c.rehomeBeforePull(context.Background(), entry); err != nil || !recorded["ab12"] {
 		t.Fatalf("not recorded before an output landed (%v)", err)
+	}
+}
+
+// #1763: a file this node gains from another reaches its query caches, named
+// by its manifest entry.
+func TestFilePublishedReportsAPulledFile(t *testing.T) {
+	c := originRig(t, "writer-1", RoleWriter)
+	in := makeFileEntry("testdb/cpu/2026/10/12/10/x.parquet", []byte("x"), "writer-2")
+	in.CreatedAt = time.Now()
+	if err := c.raftNode.RegisterFile(in, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	c.SetFilePublished(func(db, m string, at time.Time) { got = append(got, db+"/"+m+"@"+at.UTC().Format("2006-01-02T15")) })
+	c.recordPulledFileInTiering(in.Path, in.SizeBytes)
+	if len(got) != 1 || got[0] != "testdb/cpu@"+in.PartitionTime.UTC().Format("2006-01-02T15") {
+		t.Fatalf("reported %v", got)
+	}
+	c.recordPulledFileInTiering("testdb/cpu/2026/10/12/10/not-registered.parquet", 1)
+	if len(got) != 1 {
+		t.Fatal("reported a file the manifest does not list")
+	}
+}
+
+// #1763: on a shared store, a file a peer registers is reported to this
+// node's query caches from the manifest callback; a compaction output is not.
+func TestFilePublishedReportsASharedRegistration(t *testing.T) {
+	c := originRig(t, "reader-1", RoleReader)
+	shared, err := storage.NewS3Backend(&storage.S3Config{Bucket: "b", Region: "us-east-1", Endpoint: "http://127.0.0.1:1", AccessKey: "k", SecretKey: "s", PathStyle: true}, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = shared.Close() })
+	c.storage = shared
+	var mu sync.Mutex
+	var got []string
+	c.SetFilePublished(func(db, m string, _ time.Time) {
+		mu.Lock()
+		got = append(got, db+"/"+m)
+		mu.Unlock()
+	})
+	c.startSharedManifestCallbacks()
+	in := makeFileEntry("testdb/cpu/2026/10/12/10/x.parquet", []byte("x"), "writer-1")
+	in.CreatedAt = time.Now()
+	if err := c.raftNode.RegisterFile(in, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	out := makeFileEntry("testdb/mem/2026/10/12/10/y.parquet", []byte("y"), "writer-1")
+	out.CreatedAt, out.CompactionJob = time.Now(), "job1"
+	if err := c.raftNode.RegisterFile(out, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	waitFSM(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(got) >= 1 })
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	// The callback may run more than once for one entry; a report is one
+	// counter increment, so repeats are harmless.
+	for _, g := range got {
+		if g != "testdb/cpu" {
+			t.Fatalf("reported %v, want only testdb/cpu (not the compaction output)", got)
+		}
 	}
 }

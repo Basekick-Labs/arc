@@ -4310,6 +4310,11 @@ func main() {
 	}
 	openCompactions := api.CombineOpenCompactions(compactionJobs, clusterOpen, retiredOpen, rehomeRegistry, rehomeClusterOpen)
 	queryHandler.SetOpenCompactions(openCompactions)
+	if clusterCoordinator != nil {
+		// Files this node gains from other nodes (pulled, or registered on a
+		// shared store) reach its query caches as its own flushes do (#1763).
+		clusterCoordinator.SetFilePublished(queryHandler.FilePublished)
+	}
 	queryHandler.RegisterRoutes(server.GetApp())
 	// Start the handler's background workers (currently the partition
 	// pruner cache janitor — sweeps expired globCache / partitionCache

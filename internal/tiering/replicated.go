@@ -815,13 +815,16 @@ func (m *Manager) applyTierEventBatch(batch []tierEvent) []tierEvent {
 	// a measurement reads from — the thing a completed migration changes,
 	// which is why that drops them (main.go wires notifyMigrationComplete to
 	// QueryHandler.InvalidateCaches). A pulled file for a measurement that
-	// already has hot rows, or a compaction unlink that leaves others, changes
-	// nothing those caches hold — and on a replicating node that is every
-	// batch in steady state, since every pulled file is a new path. Dropping
-	// them per batch would disable both caches on every node for as long as
-	// any peer is ingesting, and log two Info lines per batch doing it. So the
-	// sets are compared, and a set that could not be read, before or after,
-	// counts as changed. Without any notification on a genuine change, a node
+	// already has hot rows, or a compaction unlink that leaves others, does
+	// not change which tiers it reads — and on a replicating node that is
+	// every batch in steady state, since every pulled file is a new path.
+	// What such a file does change, a partition that was empty, is reported
+	// per file and per measurement where it lands (the coordinator's
+	// FilePublished report, #1763), not here. Dropping both caches wholesale
+	// per batch would disable them on every node for as long as any peer is
+	// ingesting, and log two Info lines per batch doing it. So the sets are
+	// compared, and a set that could not be read, before or after, counts as
+	// changed. Without any notification on a genuine change, a node
 	// that has just acquired its first hot row for a measurement it only
 	// receives would keep serving a cached cold-only read for the cache TTL.
 	changed := 0

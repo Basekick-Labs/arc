@@ -70,6 +70,9 @@ type common struct {
 	poll     time.Duration
 	timeout  time.Duration
 	out      string
+	// probeURL: where the late mode's queries go, when not -http (a cluster
+	// reader probed while the writer takes the writes, #1763).
+	probeURL string
 }
 
 func (c *common) register(fs *flag.FlagSet, timeout time.Duration) {
@@ -428,6 +431,7 @@ func lateCmd(ctx context.Context, args []string, w io.Writer) error {
 	trials := fs.Int("trials", 6, "number of trials")
 	offset := fs.Duration("offset", -3*time.Hour, "how far from now the late row is stamped (negative: the past; positive: the future)")
 	delays := fs.String("delays", "0s,5s,15s,35s", "time between the query that finds the hour empty and the late write, cycled over the trials")
+	fs.StringVar(&c.probeURL, "probe", "", "Arc base URL the queries go to (default: -http); on a cluster, a reader while -http is the writer")
 	_ = fs.Parse(args)
 	if c.token == "" {
 		return fmt.Errorf("-token is required (admin: this mode calls the flush endpoint)")
@@ -499,6 +503,12 @@ func secs(s float64) string {
 //  4. the same query text, and a query text never sent before, polled until
 //     each returns the row.
 func lateTrialRun(ctx context.Context, cl *client, c common, measurement, run string, offset, wait time.Duration) (lateTrial, error) {
+	qcl := cl
+	if c.probeURL != "" {
+		q := *cl
+		q.base = strings.TrimRight(c.probeURL, "/")
+		qcl = &q
+	}
 	tr := lateTrial{Measurement: measurement, OffsetS: offset.Seconds(), DelayS: wait.Seconds(), SameSQLS: -1, UniqueSQLS: -1}
 	now := time.Now()
 	hour := hourClock().UTC().Truncate(time.Hour)
@@ -528,7 +538,7 @@ func lateTrialRun(ctx context.Context, cl *client, c common, measurement, run st
 	// run is the one that finds the late row's hour empty.
 	seedBy := time.Now().Add(c.timeout)
 	for {
-		got, err := cl.queryMarkers(ctx, sql)
+		got, err := qcl.queryMarkers(ctx, sql)
 		if err != nil {
 			return tr, fmt.Errorf("prequery: %w", err)
 		}
@@ -557,7 +567,7 @@ func lateTrialRun(ctx context.Context, cl *client, c common, measurement, run st
 		// A failed query is counted and the trial goes on: it says nothing
 		// about what was visible.
 		if tr.SameSQLS < 0 {
-			if got, err := cl.queryMarkers(ctx, sql); err != nil {
+			if got, err := qcl.queryMarkers(ctx, sql); err != nil {
 				tr.QueryErrors++
 			} else if contains(got, 2) {
 				tr.SameSQLS = time.Since(published).Seconds()
@@ -565,7 +575,7 @@ func lateTrialRun(ctx context.Context, cl *client, c common, measurement, run st
 		}
 		if tr.UniqueSQLS < 0 {
 			// A predicate that changes the text and nothing else.
-			if got, err := cl.queryMarkers(ctx, fmt.Sprintf("%s AND marker <> -%d", sql, n+1)); err != nil {
+			if got, err := qcl.queryMarkers(ctx, fmt.Sprintf("%s AND marker <> -%d", sql, n+1)); err != nil {
 				tr.QueryErrors++
 			} else if contains(got, 2) {
 				tr.UniqueSQLS = time.Since(published).Seconds()
