@@ -198,6 +198,7 @@ func (s *Scheduler) dropIngest() {
 	s.reqMu.Lock()
 	clear(s.ingestDue)
 	clear(s.appendPending) // another node exports them (scheduler_append.go)
+	s.skipLoadWaitersLocked("")
 	if len(s.ingestPending) > 0 {
 		clear(s.ingestPending)
 		s.publishIngestPendingLocked()
@@ -210,6 +211,7 @@ func (s *Scheduler) forgetIngest(key string) {
 	s.reqMu.Lock()
 	delete(s.ingestDue, key)
 	delete(s.appendPending, key)
+	s.skipLoadWaitersLocked(key)
 	if _, waiting := s.ingestPending[key]; waiting {
 		delete(s.ingestPending, key)
 		s.publishIngestPendingLocked()
@@ -264,8 +266,10 @@ func (s *Scheduler) noteIngestCovered(key string, startedAt time.Time, outcome r
 		}
 	}
 	if err != nil || !settled || (outcome != outcomeReconciled && outcome != outcomeUnchanged) {
+		s.loadUnsettled[key] = true // a load does not wait on it (scheduler_load.go)
 		return
 	}
+	delete(s.loadUnsettled, key)
 	reports, waiting := s.ingestPending[key]
 	if !waiting || !reports.first.Before(startedAt) {
 		return // nothing waits, or everything waiting was reported after it started

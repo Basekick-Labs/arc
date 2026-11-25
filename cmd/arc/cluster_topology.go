@@ -211,6 +211,18 @@ func icebergArrivalInterval(seconds int, hasCoordinator bool) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+// icebergLoadInterval is how soon after a table's last ingest export a REST
+// catalog load may pull its next one forward (iceberg.load_export_min_interval,
+// #1752); 0 is off. Not on a cluster over a shared bucket: there every ingest
+// export is a pass of the table, and every node answers the catalog while
+// only the lease holder exports.
+func icebergLoadInterval(seconds int, hasCoordinator, sharedStorage bool) time.Duration {
+	if seconds <= 0 || (hasCoordinator && sharedStorage) {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
+}
+
 // icebergReconcileConcurrency is how many tables' reconcile passes this node
 // runs at once (#1786).
 //

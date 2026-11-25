@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/api"
@@ -46,7 +47,8 @@ func icebergCatalogServable(sharedWarehouse bool, gate iceberg.WriterGate) func(
 // cover it. rbacManager and spokeRegistry may be nil (no RBAC wired, not a
 // hub); authManager nil means auth is off.
 func registerIcebergRESTCatalog(app *fiber.App, exporter *iceberg.Exporter, authManager *auth.AuthManager, rbacManager *auth.RBACManager,
-	spokeRegistry *edgesync.Registry, backend storage.Backend, servable func() (bool, string)) {
+	spokeRegistry *edgesync.Registry, backend storage.Backend, servable func() (bool, string),
+	awaitFresh func(ctx context.Context, database, measurement string)) {
 	// A local warehouse outside the storage root is never published
 	// (writeVersionHint), so the catalog over it would be empty forever.
 	if !exporter.PublishedAddressable() {
@@ -61,6 +63,7 @@ func registerIcebergRESTCatalog(app *fiber.App, exporter *iceberg.Exporter, auth
 		h.SetSpokeNamespaces(receivedNamespaces(spokeRegistry))
 	}
 	h.SetServable(servable)
+	h.SetAwaitFresh(awaitFresh) // nil: off (#1752)
 	// Client-overridable defaults. The region only: an S3 endpoint is often
 	// an internal hostname, and credentials are never sent.
 	if s3, ok := backend.(*storage.S3Backend); ok && s3.GetRegion() != "" {

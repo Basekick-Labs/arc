@@ -4940,9 +4940,19 @@ func main() {
 		// How long a published table version outlives the next one, and how
 		// often ingest publishes one (#1751). Set on every node: it only ever
 		// keeps more.
-		exporter.SetVersionRetention(time.Duration(cfg.Iceberg.MinVersionAge)*time.Second,
-			icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil)+
-				icebergArrivalInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil))
+		icebergSharedWarehouse := cfg.Cluster.SharedStorageMode || cluster.IsSharedObjectStore(storageBackend)
+		// #1752: a REST catalog load can export a table as soon as
+		// load_export_min_interval after its last ingest export.
+		icebergLoadEvery := icebergLoadInterval(cfg.Iceberg.LoadExportMinInterval, clusterCoordinator != nil, icebergSharedWarehouse)
+		icebergIngestEvery := icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil) +
+			icebergArrivalInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil)
+		// Versions are kept by the shortest time two ingest exports of a
+		// table can be apart: with loads on, that is the load interval.
+		icebergCommitSpacing := icebergIngestEvery
+		if icebergLoadEvery > 0 && icebergLoadEvery < icebergCommitSpacing {
+			icebergCommitSpacing = icebergLoadEvery
+		}
+		exporter.SetVersionRetention(time.Duration(cfg.Iceberg.MinVersionAge)*time.Second, icebergCommitSpacing)
 		// #1676: where new tables are created. Colocated needs the warehouse
 		// to be the storage root, which only the resolved values can tell.
 		if err := exporter.SetLayout(cfg.Iceberg.Layout); err != nil {
@@ -5111,7 +5121,23 @@ func main() {
 			// How many tables' reconcile passes run at once (#1786): one on a
 			// cluster node.
 			ReconcileConcurrency: icebergPassesAtOnce,
+			// A REST catalog load pulls its table's ingest export forward
+			// (#1752). 0: off.
+			LoadInterval: icebergLoadEvery,
 		})
+		if cfg.Iceberg.LoadExportMinInterval > 0 {
+			switch {
+			case icebergLoadEvery == 0:
+				log.Warn().Msg("iceberg.load_export_min_interval is ignored on a cluster over a shared bucket: there every ingest export is a pass of the table")
+			case !cfg.Iceberg.RESTCatalogEnabled:
+				log.Warn().Msg("iceberg.load_export_min_interval has no effect without iceberg.rest_catalog_enabled: only a REST catalog table load pulls an export forward")
+			case !cfg.Iceberg.IngestAppendEnabled:
+				log.Warn().Msg("iceberg.load_export_min_interval has no effect with iceberg.ingest_append_enabled = false: a load pulls forward only an append")
+			default:
+				log.Info().Int("load_export_min_interval_s", cfg.Iceberg.LoadExportMinInterval).
+					Msg("Iceberg: a REST catalog table load waits up to 2 s for the files reported before it")
+			}
+		}
 		// #1825: a re-home job keeps the file it replaces until the published
 		// table does not name it, and the export commits that file's removal
 		// with the files that replace it.
@@ -5292,8 +5318,12 @@ func main() {
 		registerIcebergShutdown(shutdownCoordinator, icebergStop, closeIcebergDB)
 		log.Info().Str("warehouse", warehouse).Int("interval_s", cfg.Iceberg.ReconcileInterval).Msg("Iceberg export enabled")
 		if cfg.Iceberg.RESTCatalogEnabled {
+			var awaitFresh func(ctx context.Context, database, measurement string)
+			if icebergLoadEvery > 0 {
+				awaitFresh = icebergScheduler.AwaitFreshForRead
+			}
 			registerIcebergRESTCatalog(server.GetApp(), exporter, authManager, rbacManager, spokeRegistry, storageBackend,
-				icebergCatalogServable(cfg.Cluster.SharedStorageMode || cluster.IsSharedObjectStore(storageBackend), icebergGate))
+				icebergCatalogServable(cfg.Cluster.SharedStorageMode || cluster.IsSharedObjectStore(storageBackend), icebergGate), awaitFresh)
 		}
 		// #1690 option B: Glue sync starts and stops with the export.
 		if cfg.Iceberg.Glue.Enabled {

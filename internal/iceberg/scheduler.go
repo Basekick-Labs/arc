@@ -169,6 +169,14 @@ type Scheduler struct {
 	ingestDue      map[string]ingestRequest
 	ingestNext     map[string]time.Time
 	ingestPending  map[string]ingestReports
+	// REST catalog loads waiting for their table's reported files
+	// (scheduler_load.go, #1752), under reqMu. loadInterval is F, the least
+	// time between two of a table's ingest exports a load may pull its
+	// request to; 0 turns it off. loadUnsettled is the tables whose last
+	// ingest export did not settle.
+	loadInterval  time.Duration
+	loadWaiters   map[string][]*loadWaiter
+	loadUnsettled map[string]bool
 	// The append path (scheduler_append.go, #1751). appendPending is the
 	// files ingest reported per table (under reqMu). The rest is the loop
 	// goroutine's: appendOK the tables whose last reconcile pass settled,
@@ -343,6 +351,10 @@ type SchedulerConfig struct {
 	// (iceberg.reconcile_concurrency). One or less: one at a time, on the
 	// loop goroutine, as before #1786.
 	ReconcileConcurrency int
+	// LoadInterval lets a REST catalog table load pull its table's queued
+	// ingest export forward, to no sooner than this after the table's last
+	// one (iceberg.load_export_min_interval, #1752). Zero: off.
+	LoadInterval time.Duration
 }
 
 // NewScheduler builds a reconcile scheduler.
@@ -369,6 +381,9 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		ingestDue:         make(map[string]ingestRequest),
 		ingestNext:        make(map[string]time.Time),
 		ingestPending:     make(map[string]ingestReports),
+		loadInterval:      cfg.LoadInterval,
+		loadWaiters:       make(map[string][]*loadWaiter),
+		loadUnsettled:     make(map[string]bool),
 		appendEnabled:     cfg.IngestAppend,
 		gatePoll:          gateReopenPoll,
 		ingestConcurrency: max(1, cfg.IngestConcurrency),
@@ -895,6 +910,7 @@ func (s *Scheduler) loop(ctx context.Context) {
 		gatePoll = t.C
 	}
 	for {
+		s.serviceLoadWaiters()
 		s.armIngestTimer(ingestTimer)
 		if s.passOnReopen {
 			// The role came back (seen here, by a request or by a pass):

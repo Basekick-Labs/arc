@@ -751,6 +751,12 @@ type IcebergConfig struct {
 	// is exported after at most this long instead of at the next timed pass.
 	// 0 turns the ingest trigger off (timed passes only). Default 60.
 	IngestExportInterval int
+	// LoadExportMinInterval lets a REST catalog table load pull its table's
+	// queued ingest export forward and wait for it, up to 2 s: the table is
+	// then exported no sooner than this many seconds after its last export
+	// (#1752). 0 (the default) is off. Otherwise at least
+	// minIcebergIngestExportInterval and at most IngestExportInterval.
+	LoadExportMinInterval int
 	// MinVersionAge is how long, in seconds, a published table version
 	// (v<N>.metadata.json) is kept after the next one is published, on top
 	// of the newest retain_snapshots+1 (#1751). It is what lets ingest
@@ -1613,6 +1619,7 @@ func Load() (*Config, error) {
 			NamespaceMigrationDryRun: v.GetBool("iceberg.namespace_migration_dry_run"),
 			ReconcileInterval:        v.GetInt("iceberg.reconcile_interval"),
 			IngestExportInterval:     v.GetInt("iceberg.ingest_export_interval"),
+			LoadExportMinInterval:    v.GetInt("iceberg.load_export_min_interval"),
 			MinVersionAge:            v.GetInt("iceberg.min_version_age"),
 			IngestAppendEnabled:      v.GetBool("iceberg.ingest_append_enabled"),
 			IngestExportConcurrency:  v.GetInt("iceberg.ingest_export_concurrency"),
@@ -2178,6 +2185,12 @@ func Load() (*Config, error) {
 		if n := cfg.Iceberg.IngestExportInterval; n < 0 || (n > 0 && n < minIcebergIngestExportInterval) {
 			return nil, fmt.Errorf("iceberg.ingest_export_interval must be 0 or at least %d (got %d): it is the least time, in seconds, "+
 				"between two exports of a table that ingest causes; 0 turns that trigger off", minIcebergIngestExportInterval, n)
+		}
+		if n := cfg.Iceberg.LoadExportMinInterval; n < 0 || (n > 0 && (n < minIcebergIngestExportInterval ||
+			cfg.Iceberg.IngestExportInterval == 0 || n > cfg.Iceberg.IngestExportInterval)) {
+			return nil, fmt.Errorf("iceberg.load_export_min_interval must be 0 or between %d and iceberg.ingest_export_interval (%d), "+
+				"which must be on (got %d): it is the least time, in seconds, between two exports of a table that REST catalog loads cause; 0 turns that off",
+				minIcebergIngestExportInterval, cfg.Iceberg.IngestExportInterval, n)
 		}
 		if n := cfg.Iceberg.ExportLagTableSeries; n < 0 || n > maxIcebergExportLagTableSeries {
 			return nil, fmt.Errorf("iceberg.export_lag_table_series must be between 0 and %d, got %d: how many tables get their own "+
@@ -2851,6 +2864,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("iceberg.namespace_migration_dry_run", true)
 	v.SetDefault("iceberg.reconcile_interval", 300)          // seconds
 	v.SetDefault("iceberg.ingest_export_interval", 60)       // seconds; 0 = export on the timer only (#1750)
+	v.SetDefault("iceberg.load_export_min_interval", 0)      // seconds; 0 = a REST catalog load never pulls an export forward (#1752)
 	v.SetDefault("iceberg.min_version_age", 300)             // seconds a published version outlives its successor (#1751)
 	v.SetDefault("iceberg.ingest_append_enabled", true)      // ingest exports add only the new files (#1751)
 	v.SetDefault("iceberg.ingest_export_concurrency", 8)     // tables whose ingest appends run at once (#1778)

@@ -100,3 +100,26 @@ func TestIcebergIngestAppendMetrics(t *testing.T) {
 		t.Errorf("snapshot: appends=%v files=%v fallbacks=%v", snap["iceberg_ingest_appends"], snap["iceberg_ingest_append_files"], snap["iceberg_ingest_append_fallbacks"])
 	}
 }
+
+// #1752: the load outcomes are one labelled counter.
+func TestIcebergLoadFreshOutcomes(t *testing.T) {
+	m := &Metrics{}
+	m.IncIcebergLoadFresh(IcebergLoadFreshCovered)
+	m.IncIcebergLoadFresh(IcebergLoadFreshCovered)
+	m.IncIcebergLoadFresh(IcebergLoadFreshTimeout)
+	m.IncIcebergLoadFresh(99) // out of range: ignored
+	if got := m.icebergExport.loadFresh[IcebergLoadFreshCovered].Load(); got != 2 {
+		t.Fatalf("covered = %d, want 2", got)
+	}
+	out := string(m.appendIcebergExport(nil))
+	for _, want := range []string{
+		"# TYPE arc_iceberg_load_fresh_total counter\n",
+		`arc_iceberg_load_fresh_total{outcome="covered"} 2` + "\n",
+		`arc_iceberg_load_fresh_total{outcome="timeout"} 1` + "\n",
+		`arc_iceberg_load_fresh_total{outcome="nothing_pending"} 0` + "\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("exposition lacks %q", want)
+		}
+	}
+}
