@@ -181,10 +181,23 @@ func TestDeleteRefusedUntilTheLatchResets1938(t *testing.T) {
 	code, out = sendLatchDelete(t, h, latchDeleteBody)
 	require.Equal(t, 200, code, "%+v", out)
 	require.EqualValues(t, 2, out.DeletedCount)
+}
 
-	// A pending recovery refuses with its own message.
+// A DELETE refused for a pending recovery pass says so, not that a flush
+// failed (#1170): the startup recovery kept a file, and nothing flushed badly.
+func TestDeleteNamesAPendingRecoveryPass1938(t *testing.T) {
+	shortGiveUp(t, 100*time.Millisecond)
+	root, backend, db := recordsDuckDB(t)
+	const rel = "db/cpu/2026/10/11/10/cpu_a.parquet"
+	writeRecordsParquet(t, db, root, rel)
+	buf, _ := latchBuffer(t)
+	h := NewDeleteHandler(db, backend, &config.DeleteConfig{Enabled: true, MaxRowsPerDelete: 1000, ConfirmationThreshold: 1000}, nil, t.TempDir(), zerolog.Nop())
+	h.SetFlusher(buf)
+
 	buf.MarkWALRecoveryPending()
-	code, out = sendLatchDelete(t, h, latchDeleteBody)
+	code, out := sendLatchDelete(t, h, latchDeleteBody)
 	require.Equal(t, 503, code, "%+v", out)
 	require.Contains(t, out.Error, "a WAL recovery pass left files to replay")
+	require.NotContains(t, out.Error, "flush failed")
+	require.Equal(t, 4, countParquet(t, db, filepath.Join(root, rel), "true"))
 }
