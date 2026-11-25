@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -175,7 +176,7 @@ func TestFlushOutcomeCountsAQueuedDrop1888(t *testing.T) {
 	batch := refusalTestBatch()
 	_ = commitTrackedLocked(droppingCommit{}, batch)
 	o := &FlushOutcome{}
-	countOutcome(o, batch, 7)
+	countOutcome(o, batch, 7, math.MaxInt64)
 	if o.NoWALRows() != 7 || batch.outcome != o {
 		t.Fatalf("no-WAL rows %d, outcome attached %v", o.NoWALRows(), batch.outcome == o)
 	}

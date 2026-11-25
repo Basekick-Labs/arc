@@ -23,9 +23,17 @@ import (
 // waits for those flushes (WaitFlushes) only when it buffered rows without a
 // WAL copy, and fails only when rows of ITS OWN were at risk: another
 // writer's failure, even on the same measurement, is not attributed to it.
+//
+// A live write carries one only when it asked to wait until its rows are
+// visible (x-arc-wait: visible, #1759; NewVisibleOutcome): its vis then
+// counts every batch from append to a terminal state (flush_outcome_visible.go).
+// A live write without that header carries none.
 type FlushOutcome struct {
 	noWALRows atomic.Int64 // rows buffered without a WAL copy
 	atRisk    atomic.Int64 // of those, rows in a flush that failed
+	// vis is the visible-write bookkeeping (#1759); nil for an import, whose
+	// semantics above it never changes.
+	vis *visibleOutcome
 }
 
 // NoWALRows is how many rows were buffered without a WAL copy.
@@ -52,47 +60,138 @@ func flushOutcomeFrom(ctx context.Context) *FlushOutcome {
 	return o
 }
 
-// outcomeRowsOf is, per outcome, the rows of records without a WAL copy: what
-// a failure of their flush puts at risk. Read before the records are
-// released. nil when no record carries an outcome, which is every live write.
-func outcomeRowsOf(records []interface{}) map[*FlushOutcome]int64 {
-	var out map[*FlushOutcome]int64
+// outcomeTally is what one flush holds of one outcome's batches, read before
+// the records are released.
+type outcomeTally struct {
+	// noWALRows are the known rows of batches without a WAL copy: what a
+	// failure adds to atRisk (#1888). A batch whose rows are not known adds
+	// nothing, as before.
+	noWALRows int64
+	// The rest is read for a visible outcome only (#1759).
+	noWALBatches   int64 // batches without a WAL copy, rows known or not
+	walBatches     int64 // batches with a WAL copy
+	walRows        int64 // their known rows
+	knownBatches   int64 // batches whose rows are known
+	knownRows      int64 // and those rows
+	unknownBatches int64 // batches whose rows are not known
+}
+
+// flushTally is, per outcome, what a flush holds of it. nil when no record
+// carries an outcome: a live write without x-arc-wait, which so pays one
+// type assertion and one field load per batch and allocates nothing.
+type flushTally map[*FlushOutcome]*outcomeTally
+
+// outcomeTallyOf tallies records per outcome. Read before the records are
+// released.
+func outcomeTallyOf(records []interface{}) flushTally {
+	var out flushTally
 	for _, record := range records {
 		batch, ok := record.(*TypedColumnBatch)
-		if !ok || batch == nil || batch.outcome == nil || batch.hasWALCopy {
+		if !ok || batch == nil || batch.outcome == nil {
 			continue
 		}
-		rows, known := flushRecordRows(record)
-		if !known {
-			continue
+		if v := batch.outcome.vis; v != nil {
+			// A flush owns the batches it detached, so a plain flag. A
+			// batch tallied twice resolves nothing more: its write is not
+			// visible (#1759).
+			if batch.visTallied {
+				v.overResolved.Store(true)
+				v.signal()
+				continue
+			}
+			batch.visTallied = true
 		}
 		if out == nil {
-			out = map[*FlushOutcome]int64{}
+			out = flushTally{}
 		}
-		out[batch.outcome] += int64(rows)
+		t := out[batch.outcome]
+		if t == nil {
+			t = &outcomeTally{}
+			out[batch.outcome] = t
+		}
+		rows, known := flushRecordRows(record)
+		if known {
+			t.knownBatches++
+			t.knownRows += int64(rows)
+		} else {
+			t.unknownBatches++
+		}
+		if batch.hasWALCopy {
+			t.walBatches++
+			if known {
+				t.walRows += int64(rows)
+			}
+			continue
+		}
+		t.noWALBatches++
+		if known {
+			t.noWALRows += int64(rows)
+		}
 	}
 	return out
 }
 
 // noteOutcomeFailure adds a failed flush's at-risk rows to their outcomes:
 // all its rows without a WAL copy, including any a partial flush stored
-// before failing, since which outcome's rows those were is not known.
-func noteOutcomeFailure(atRisk map[*FlushOutcome]int64, _ error) {
-	for o, rows := range atRisk {
-		o.atRisk.Add(rows)
+// before failing, since which outcome's rows those were is not known. A
+// visible outcome also counts the flush's batches as failed, by batch: with
+// or without a WAL copy (#1759).
+func (b *ArrowBuffer) noteOutcomeFailure(tally flushTally, _ error) {
+	for o, t := range tally {
+		o.atRisk.Add(t.noWALRows)
+		if v := o.vis; v != nil {
+			v.failedNoWALBatches.Add(t.noWALBatches)
+			v.failedWALBatches.Add(t.walBatches)
+			v.walRowsFailed.Add(t.walRows)
+			b.visibleChanged(o)
+		}
+	}
+}
+
+// noteOutcomeSettled resolves a successful flush's batches of each visible
+// outcome (#1759). Called after completeFlush, never from a defer: a flush
+// that panics must leave its batches unresolved, so no 204 follows it.
+//
+// A batch settles when its file is stored and, with tiering, registered
+// (registered), and its rows are known; otherwise it is unconfirmed: the
+// flush succeeded, but it cannot be said that a query sees the batch. An
+// import outcome is not touched: success adds nothing to it.
+func (b *ArrowBuffer) noteOutcomeSettled(tally flushTally, registered bool) {
+	for o, t := range tally {
+		v := o.vis
+		if v == nil {
+			continue
+		}
+		if registered {
+			// Rows before batches: a waiter that sees the batches resolved
+			// must see their rows too.
+			v.settledRows.Add(t.knownRows)
+			v.settledBatches.Add(t.knownBatches)
+			v.unconfirmedBatches.Add(t.unknownBatches)
+		} else {
+			v.unconfirmedBatches.Add(t.knownBatches + t.unknownBatches)
+		}
+		b.visibleChanged(o)
 	}
 }
 
 // countOutcome attaches o to an import's batch and counts its rows without a
 // WAL copy. Called after the WAL commit, which can still clear hasWALCopy (a
-// queued append the WAL dropped), under the shard lock.
-func countOutcome(o *FlushOutcome, batch *TypedColumnBatch, rows int) {
+// queued append the WAL dropped), under the shard lock, immediately before
+// the append: a visible outcome marks the batch here (#1759), in the same
+// lock hold as the append, so it is marked before any flush can carry it.
+// minFuture is the batch's earliest row stamped past the outcome's future
+// floor (visibleMinFuture, computed before the lock); unused otherwise.
+func countOutcome(o *FlushOutcome, batch *TypedColumnBatch, rows int, minFuture int64) {
 	if o == nil {
 		return
 	}
 	batch.outcome = o
 	if !batch.hasWALCopy {
 		o.noWALRows.Add(int64(rows))
+	}
+	if o.vis != nil {
+		o.vis.mark(rows, minFuture)
 	}
 }
 
