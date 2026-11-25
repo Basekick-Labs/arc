@@ -90,6 +90,17 @@ func outcomeTallyOf(records []interface{}) flushTally {
 		if !ok || batch == nil || batch.outcome == nil {
 			continue
 		}
+		if v := batch.outcome.vis; v != nil {
+			// A flush owns the batches it detached, so a plain flag. A
+			// batch tallied twice resolves nothing more: its write is not
+			// visible (#1759).
+			if batch.visTallied {
+				v.overResolved.Store(true)
+				v.signal()
+				continue
+			}
+			batch.visTallied = true
+		}
 		if out == nil {
 			out = flushTally{}
 		}
@@ -152,8 +163,10 @@ func (b *ArrowBuffer) noteOutcomeSettled(tally flushTally, registered bool) {
 			continue
 		}
 		if registered {
-			v.settledBatches.Add(t.knownBatches)
+			// Rows before batches: a waiter that sees the batches resolved
+			// must see their rows too.
 			v.settledRows.Add(t.knownRows)
+			v.settledBatches.Add(t.knownBatches)
 			v.unconfirmedBatches.Add(t.unknownBatches)
 		} else {
 			v.unconfirmedBatches.Add(t.knownBatches + t.unknownBatches)

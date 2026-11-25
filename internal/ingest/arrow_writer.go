@@ -1142,6 +1142,11 @@ type TypedColumnBatch struct {
 	// succeeds, but a visible write's batches in it are unconfirmed. Beside
 	// hasWALCopy, in its padding, so the batch does not grow.
 	tierUnregistered bool
+	// visTallied is set when a flush first tallies this batch for a visible
+	// outcome (#1759, outcomeTallyOf): a second tally of it is a batch
+	// counted twice, which must never read as more of the write resolved.
+	// Also in hasWALCopy's padding.
+	visTallied bool
 	// outcome is the import this batch belongs to, if any (#1888,
 	// flush_outcome.go): a failed flush adds its rows without a WAL copy to
 	// it. Or the visible live write it belongs to (x-arc-wait: visible,

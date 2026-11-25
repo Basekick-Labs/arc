@@ -254,7 +254,7 @@ func WaitVisible(ctx context.Context, o *FlushOutcome, w VisibleWait) VisibleVer
 			ctxDone = ctx.Done()
 		}
 	wait:
-		for !o.Resolved() {
+		for !o.Resolved() && !v.overResolved.Load() {
 			select {
 			case <-v.changed:
 			case <-timer.C:
@@ -287,6 +287,10 @@ func (o *FlushOutcome) visibleVerdict(w VisibleWait, ended VisibleReason, now ti
 		return VisibleVerdict{Reason: VisibleReasonRowsAtRisk, RowsAtRisk: o.RowsAtRisk()}
 	case v.failedWALBatches.Load() > 0:
 		return VisibleVerdict{Reason: VisibleReasonWALReplay}
+	case v.overResolved.Load():
+		// A batch counted twice (a bug, logged): never visible, and no
+		// reason to wait out the budget for it.
+		return VisibleVerdict{Reason: VisibleReasonNotConfirmed}
 	case ended != VisibleReasonNone || !o.Resolved():
 		if ended == VisibleReasonNone {
 			ended = VisibleReasonTimeout

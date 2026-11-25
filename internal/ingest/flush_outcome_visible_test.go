@@ -14,6 +14,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/metrics"
@@ -530,8 +531,36 @@ func TestVisibleOverResolved1759(t *testing.T) {
 	if d := metrics.Get().Snapshot()["ingest_wait_visible_over_resolved_total"].(int64) - before; d != 1 {
 		t.Fatalf("over-resolved counted %d times, want once", d)
 	}
-	if v := waitVisible(o, 1, 50*time.Millisecond); v.Visible {
-		t.Fatalf("verdict %+v", v)
+	// Over-resolved ends the wait at once, as not_confirmed, not a timeout.
+	began := time.Now()
+	if v := waitVisible(o, 1, 2*time.Second); v.Visible || v.Reason != VisibleReasonNotConfirmed {
+		t.Fatalf("verdict %+v, want not_confirmed", v)
+	}
+	if took := time.Since(began); took > time.Second {
+		t.Fatalf("an over-resolved outcome waited %v", took)
+	}
+}
+
+// A batch tallied by a second flush (never expected) adds nothing resolved:
+// the second tally skips it and marks the outcome over-resolved.
+func TestVisibleBatchTalliedTwice1759(t *testing.T) {
+	o := NewVisibleOutcome(time.Now(), false, 0)
+	batch := visibleBatch(o, 1, false)
+	if first := outcomeTallyOf([]interface{}{batch}); first[o] == nil || first[o].knownBatches != 1 {
+		t.Fatalf("first tally %+v", first[o])
+	}
+	if second := outcomeTallyOf([]interface{}{batch}); second[o] != nil {
+		t.Fatalf("second tally counted the batch again: %+v", second[o])
+	}
+	if !o.vis.overResolved.Load() {
+		t.Fatal("a batch tallied twice did not mark the outcome over-resolved")
+	}
+}
+
+// The visible flags sit in existing padding: the batch does not grow.
+func TestTypedColumnBatchSize1759(t *testing.T) {
+	if got := unsafe.Sizeof(TypedColumnBatch{}); got != 192 {
+		t.Fatalf("TypedColumnBatch is %d bytes, want 192", got)
 	}
 }
 
