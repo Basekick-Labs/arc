@@ -137,11 +137,10 @@ job still waits at them, as before: re-home with the warehouse outside the stora
 standalone fix.
 ## Fix: a node with the Iceberg export, failover and replication on local storage joins its cluster ([#1914](https://github.com/Basekick-Labs/arc/issues/1914))
 
-**Who is affected:** clusters whose nodes list more than 16 capabilities. On local storage with
-`cluster.replication_enabled`: with `iceberg.enabled` and `cluster.failover_enabled` (and a licence
-that includes writer failover), or with `cluster.stream_takeover` (experimental). On a shared
-object store: with the Iceberg export, failover and `cluster.stream_takeover` together. Edge sync on
-lowers a node's count by one.
+**Who is affected:** clusters whose nodes list more than 16 capabilities, for example on local
+storage with `cluster.replication_enabled`, `iceberg.enabled` and `cluster.failover_enabled` (with a
+licence that includes writer failover), or with `cluster.stream_takeover` (experimental) on top of
+replication on local storage or of the Iceberg export and failover on a shared object store.
 
 A joining node lists the cluster capabilities it supports, and the member it contacts refused a list
 longer than 16. With the Iceberg export, failover and replication on local storage a node lists 17,
