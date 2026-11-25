@@ -2,6 +2,22 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: two re-home edges with tiered storage and the Iceberg export ([#1848](https://github.com/Basekick-Labs/arc/issues/1848))
+
+**Who is affected:** deployments with tiered storage or the Iceberg export on that run re-home
+jobs.
+
+- **A file removed since the tiering scan listed it is no longer a failed migration.** A scan whose
+  listing predates a re-home job's (or a compaction's, or a DELETE's) removal of a file re-inserts
+  its hot row; the next migration then tried to copy a file that was gone and logged
+  "Failed to migrate file" at Error, counting a failure. It now sees the file is gone, copies
+  nothing, logs at Info and counts nothing; the next scan retires the row as before.
+- **A job found at start before it switched reads is undone when the Iceberg export did not start
+  this time** (it failed to build, for example `wireIcebergCold` failing). Before, it switched
+  reads and then waited for an export that never runs, until the wait was waived. Reads still used
+  the old file, so the undo changes nothing for them; the request can be sent again once the
+  export runs.
+
 ## Change: on a cluster, the Iceberg export picks up a file as soon as it reaches the exporting node ([#1756](https://github.com/Basekick-Labs/arc/issues/1756))
 
 **Who is affected:** clusters with the Iceberg export on.

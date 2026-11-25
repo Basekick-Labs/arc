@@ -322,6 +322,10 @@ func (m *Migrator) dropTakenOver(ctx context.Context, files []MigrationCandidate
 	return kept
 }
 
+// errSourceGone: the hot file was removed after the scan listed it; its row
+// is stale and the next scan retires it. Not a failure of the migration.
+var errSourceGone = errors.New("the file was removed after the tiering scan listed it")
+
 // errHeldByCompaction: a compaction or a re-home job took the file over
 // during its migration.
 var errHeldByCompaction = errors.New("a compaction or a re-home job took the file over during its migration")
@@ -566,6 +570,10 @@ func (m *Migrator) migrateBatch(ctx context.Context, candidates []MigrationCandi
 					// file (CheckRehomeSource), and nothing of it is moving.
 					m.manager.claims.releaseMove(c.Path)
 					m.logger.Debug().Str("path", c.Path).Msg("A compaction or a re-home job owns the file; it stays hot this cycle")
+					return
+				}
+				if errors.Is(err, errSourceGone) {
+					m.logger.Info().Str("path", c.Path).Msg("A file listed for migration was removed since the tiering scan listed it (a compaction, a DELETE or a re-home job); nothing to copy, and the next scan retires its row")
 					return
 				}
 				if errors.Is(err, errCopyCutOff) {
@@ -837,7 +845,13 @@ func (m *Migrator) copyAndFlip(ctx context.Context, candidate MigrationCandidate
 	// object-store destination now enforces the declared length. Ask the
 	// source, falling back to the row when it cannot say.
 	size := candidate.SizeBytes
-	if n, err := srcBackend.StatFile(ctx, candidate.Path); err == nil && n > 0 {
+	n, statErr := srcBackend.StatFile(ctx, candidate.Path)
+	if statErr == nil && n < 0 {
+		// Gone since the scan listed it (a compaction, a DELETE, a re-home
+		// job removed it, #1848): nothing to copy. The scan retires its row.
+		return fmt.Errorf("%s: %w", candidate.Path, errSourceGone)
+	}
+	if statErr == nil && n > 0 {
 		size = n
 	}
 
@@ -880,6 +894,12 @@ func (m *Migrator) copyAndFlip(ctx context.Context, candidate MigrationCandidate
 		}
 		if errors.Is(migrationErr, storage.ErrInvalidPath) {
 			return m.quarantineCandidate(ctx, candidate, migrationErr)
+		}
+		// Removed between the stat and the copy: the same as gone before it.
+		if storage.IsNotFound(migrationErr) {
+			if n, err := srcBackend.StatFile(cctx, candidate.Path); err == nil && n < 0 {
+				return fmt.Errorf("%s: %w", candidate.Path, errSourceGone)
+			}
 		}
 		if ctx.Err() != nil && (errors.Is(migrationErr, context.DeadlineExceeded) || errors.Is(migrationErr, context.Canceled)) {
 			// Cut off by the run's end, not refused. The upload can still

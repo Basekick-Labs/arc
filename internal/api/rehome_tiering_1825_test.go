@@ -364,6 +364,43 @@ func TestExportNotStarted1825(t *testing.T) {
 	}
 }
 
+// #1848 item 3: a job found at start that had not switched reads, with the
+// export bound and not started this time, is undone: going on would switch
+// reads and then wait for an export that never runs.
+func TestRecoveryUndoesACommittedJobWhenTheExportDidNotStart1848(t *testing.T) {
+	for _, step := range []string{"committed", "moved"} {
+		t.Run(step, func(t *testing.T) {
+			r := newSwapRig(t)
+			nth := 1
+			if step == "moved" {
+				nth = 2
+			}
+			stopAt(t, r, step, nth)
+			r.swap.ExportExpected = true
+			asked := 0
+			r.h.SetExport(func(context.Context, string, string, string) (RehomeExportAnswer, error) {
+				asked++
+				return RehomeExportAnswer{}, context.DeadlineExceeded
+			})
+			r.h.SetExportNotStarted("the Iceberg export is not started on this node")
+			if err := r.h.Recover(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			r.h.Wired()
+			for i := 0; r.reg.Active(); i++ {
+				if i > 4000 {
+					t.Fatalf("the job is still recorded: %+v", r.reg.Jobs()[0])
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if !r.sourceThere() || asked != 0 {
+				t.Fatalf("source there %v, export asked %d time(s)", r.sourceThere(), asked)
+			}
+			r.requireOnce("after the undo")
+		})
+	}
+}
+
 // At start, a job that had not switched reads and whose file tiering cannot
 // be asked about is kept as recorded, not undone: nothing is known to be
 // wrong. A resume takes it up once tiering answers.
