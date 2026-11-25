@@ -3953,7 +3953,8 @@ func waitVisibleWarnings(cfg *Config) []LoadWarning {
 			Message: "ingest.wait_visible_enabled has no effect with cluster.enabled = true: a write carrying x-arc-wait: visible is refused with 400 and nothing written",
 		})
 	}
-	if b := cfg.Storage.Backend; b != "" && b != "local" {
+	// The same test as the handlers' storageConfirmable (api.WaitVisibleConfig).
+	if b := cfg.Storage.Backend; b != "local" {
 		out = append(out, LoadWarning{
 			Key:     "storage.backend",
 			Value:   b,

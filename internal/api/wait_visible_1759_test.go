@@ -605,8 +605,17 @@ func TestWaitVisibleCORS1759(t *testing.T) {
 	require.Equal(t, VisibleHeader+","+VisibleReasonHeader, resp.Header.Get("Access-Control-Expose-Headers"))
 }
 
-// A visible write waits holding no request body: it is returned before the
-// wait starts, on both handlers (#1759). Observed from inside the wait.
+// countingGate is a WAL disk gate that admits everything and counts the
+// bytes reserved and not yet released.
+type countingGate struct{ held atomic.Int64 }
+
+func (g *countingGate) Pressure() bool       { return false }
+func (g *countingGate) Reserve(n int64) bool { g.held.Add(n); return true }
+func (g *countingGate) Release(n int64)      { g.held.Add(-n) }
+
+// A visible write waits holding no request body and no WAL reservation: both
+// are returned before the wait starts, on both handlers (#1759). Observed
+// from inside the wait.
 func TestWaitVisibleWaitsWithoutTheBody1759(t *testing.T) {
 	for _, tc := range []struct {
 		path    string
@@ -618,15 +627,21 @@ func TestWaitVisibleWaitsWithoutTheBody1759(t *testing.T) {
 			if strings.Contains(tc.path, "msgpack") {
 				body = mpCPU(t, time.Now())
 			}
-			bodyLen := -1
+			gate := &countingGate{}
+			r.buf.SetWALDiskGate(gate)
+			bodyLen, held := -1, int64(-1)
 			budget := waitVisibleBudget
 			waitVisibleBudget = 50 * time.Millisecond // only the start of the wait matters here
 			t.Cleanup(func() { waitVisibleBudget = budget })
-			waitVisibleBeforeWait = func(c *fiber.Ctx) { bodyLen = len(c.Request().Body()) }
+			waitVisibleBeforeWait = func(c *fiber.Ctx) {
+				bodyLen = len(c.Request().Body())
+				held = gate.held.Load()
+			}
 			t.Cleanup(func() { waitVisibleBeforeWait = nil })
 			resp, out := r.post(t, tc.path, body, WaitVisibleHeader, "visible")
 			require.Less(t, resp.StatusCode, 300, out)
 			require.Equal(t, 0, bodyLen, "the request body was still held when the wait began")
+			require.Equal(t, int64(0), held, "a WAL reservation was still held when the wait began")
 		})
 	}
 }
