@@ -17,6 +17,18 @@ Now an import tracks its own rows through the flush:
 - **The TLE import now flushes its own measurement instead of the whole node.** A node-wide flush cut every other writer's buffers into small files, and failed the import on any of their errors.
 
 Measured on a laptop, local storage, WAL off. Five Line Protocol files of 1M rows, imported one after another, went from 8.67 s to 9.08 s, about 5%: an import's tail flush no longer overlaps the next file's parsing. Imported five at a time (`ingest.import_write_concurrency = 4`), it took 3.1–3.3 s either way, with the same memory.
+## New: a REST catalog table load can wait for the files written before it ([#1752](https://github.com/Basekick-Labs/arc/issues/1752))
+
+**Who is affected:** deployments that read Arc's tables through its Iceberg REST catalog and set the new key. Off by default.
+
+An ingest file reaches its table at most `iceberg.ingest_export_interval` (60 s by default) after the table's previous export. A reader that loads the table in between got the version before it. With **`iceberg.load_export_min_interval`** (`ARC_ICEBERG_LOAD_EXPORT_MIN_INTERVAL`, seconds, default `0` = off) set, a `loadTable` on the REST catalog first waits, at most 2 s, until every file reported for the table before the load is in the published version, then answers as before.
+
+- **It never commits from the request.** It moves the table's queued ingest export earlier, to no sooner than `load_export_min_interval` after the table's last export, and the export serves it as usual (an append). Concurrent loads share that export. A table nobody reads keeps `ingest_export_interval`.
+- **It waits only where an append can serve it soon:** a table whose last export settled, on the append path, not paused for a restore, with fewer than `ingest_export_concurrency` exports due. Otherwise, and when the 2 s run out (a timed pass or a batch of appends running, many requests ahead), the load reads the published version at once, as before.
+- **Bounds:** `0`, or between `5` and `ingest_export_interval`, which must be on; anything else is refused at startup. No effect with `ingest_append_enabled = false` or without `rest_catalog_enabled` (logged). Not used on a cluster over a shared bucket; on a cluster with local storage, only the exporting node answers the catalog, as before.
+- **Cost:** a reader that loads a table often makes it export every `load_export_min_interval` instead of every `ingest_export_interval`. A catalog that polls on its own clock (Snowflake refreshes every 30 s) does that for every table it polls. Table versions are then kept by the shorter spacing: iceberg-go keeps `min_version_age / load_export_min_interval` previous metadata files per table, at least `retain_snapshots` (60 instead of 10 at the defaults with the key at 5), and each table takes one metadata property commit when the key changes.
+- **Auth:** the load stays read-level. The wait runs after the caller's read permission on the table is checked, only on a `GET`, and at most once per table per interval can move an export. With auth off, anyone who reaches the catalog can.
+- **Metric:** `arc_iceberg_load_fresh_total{outcome}`: `nothing_pending`, `covered`, `skipped` and `timeout` (the last two read the published version).
 
 ## Fix: compaction stops at shutdown, and no compaction child outlives Arc ([#1887](https://github.com/Basekick-Labs/arc/issues/1887))
 
