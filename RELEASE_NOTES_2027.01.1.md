@@ -2,6 +2,26 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: a rejected `auth.bootstrap_token` stops Arc instead of leaving it with no admin token ([#1915](https://github.com/Basekick-Labs/arc/issues/1915))
+
+**Action required on upgrade** if `auth.bootstrap_token` (`ARC_AUTH_BOOTSTRAP_TOKEN`) is set to a value shorter than 32 bytes once surrounding whitespace is removed, with auth on. Arc now refuses to start with that value, where it used to log `Failed to create initial admin token` at every start and run on. Such a value has never been installed: every path that stores a token requires 32 bytes. So a deployment that runs today uses another token, and the short value can simply be removed, or replaced with a 32-byte one (`openssl rand -hex 32`). A Helm install that passes the value through `existingSecret` is not checked at render time: its pods stop at startup with the message instead.
+
+With a short value and auth on, Arc used to keep running with no admin token, so every request got 401. A fresh install looked healthy and nobody could log in. Now:
+
+- **A short token stops Arc at startup.** The message names `auth.bootstrap_token`, the length after trimming, and the 32-byte rule. It never includes the value.
+- **A configured value that was not installed now says so.** A value is installed only into an empty auth database. When the database already has tokens and the value is not one of them, Arc logs a warning that it was not installed, and how to add it: `auth.force_bootstrap=true` for one start. This used to be a debug line, so an operator who set or fixed the value on a populated database got 401 with nothing saying why.
+  - A value that is already a valid token stays quiet, which is the normal restart.
+  - A value matching a disabled (revoked) or expired token gets its own warning. `auth.force_bootstrap=true` adds it back as a new recovery token.
+  - The exception is a token from before token prefixes (December 2025): if the value equals one, it is reported as not installed although it authenticates.
+- **A forced recovery that adds nothing now says so.** Recovery adds a token named `arc-recovery`, and the name is unique. Two cases add nothing:
+  - one is left from an earlier recovery with a different value;
+  - it holds this value but is disabled.
+  
+  Arc used to log that the caller "still holds the token value they provided". It now says the value was not added and to **delete** `arc-recovery` through the API (`DELETE /api/v1/auth/tokens/<id>`); revoking only disables it, and the name stays taken. On a cluster, where the node's copy may lag, it says the same without checking the value.
+- **`auth.force_bootstrap` without `auth.bootstrap_token` logs a warning at load.** The flag acts only together with a token.
+
+The check for whether the value is installed reads the token table directly. It does not stamp `last_used_at` on the admin token at every start, as authenticating with it would. On a cluster the check is not exact on a follower, so Arc logs what to do at Info without claiming the value is absent.
+
 ## Fix: re-home jobs run with `iceberg.warehouse` outside the storage root ([#1906](https://github.com/Basekick-Labs/arc/issues/1906))
 
 **Who is affected:** standalone deployments with the Iceberg export on and `iceberg.warehouse` set to
@@ -15,6 +35,7 @@ On a cluster, nodes that do not export answer from the discovery files only, so 
 job still waits at them, as before: re-home with the warehouse outside the storage root is a
 standalone fix.
 
+
 ## Change: an Iceberg pass that a compaction raced is retried within seconds, and counted ([#1755](https://github.com/Basekick-Labs/arc/issues/1755))
 
 **Who is affected:** deployments with the Iceberg export on.
@@ -26,6 +47,7 @@ short interval, 30 seconds at the default `iceberg.reconcile_interval`. It now c
 seconds, then 10 and 20 if files keep vanishing, before the ordinary interval takes over. Such
 passes are counted in a new metric, `arc_iceberg_vanished_passes_total` (`iceberg_vanished_passes`
 in the JSON metrics), so how often a deployment hits the race can be seen.
+
 
 ## Fix: two re-home edges with tiered storage and the Iceberg export ([#1848](https://github.com/Basekick-Labs/arc/issues/1848))
 
@@ -2026,8 +2048,8 @@ No new configuration keys.
 - Arc now removes leading and trailing whitespace from the value when the configuration is loaded, from the environment or from `arc.toml`. Whitespace inside the value is kept. This covers both the first admin token and the recovery token added with `auth.force_bootstrap`.
 - When trimming changed the value, Arc logs a warning at startup for `auth.bootstrap_token`. The warning never includes the value.
 - With `auth.enabled = true`, a value that is only whitespace now stops Arc at startup with an error, instead of Arc quietly generating a random admin token. With auth disabled the key is not used and nothing changes; enabling auth later turns such a value into that startup error.
-- The 32-character minimum now applies to the trimmed value, so a 31-character token followed by a newline is refused (Arc logs the error and starts with no admin token, as for any short token). On a deployment that already has an admin token, such a value now logs `Failed to create initial admin token` at every start, where it used to be ignored; remove or fix the value. The `arc` and `arc-enterprise` Helm charts check the trimmed length too, so they refuse such a `auth.bootstrapToken.value` at render time.
-- Tokens already stored are not changed. A bootstrap token an earlier release stored with the whitespace cannot be sent in a header, but the `p` query parameter still accepts it with the whitespace URL-encoded, for example `curl -G --data-urlencode "p@token-file" http://<host>:8000/api/v1/auth/verify` (the `@file` form keeps the trailing newline; `$(cat token-file)` drops it). Use it once to create a new admin token through the API, then revoke the old one. Restarting with `ARC_AUTH_FORCE_BOOTSTRAP=true` and the token value also adds it, as the `arc-recovery` admin token; if an `arc-recovery` token already exists from an earlier attempt it is not replaced (the restart logs `Recovery token already exists` and adds nothing), so delete it through the API first.
+- The 32-character minimum now applies to the trimmed value, so a 31-character token followed by a newline is refused. Since #1915 that means Arc does not start; see that entry. The `arc` and `arc-enterprise` Helm charts check the trimmed length too, so they refuse such a `auth.bootstrapToken.value` at render time.
+- Tokens already stored are not changed. A bootstrap token an earlier release stored with the whitespace cannot be sent in a header, but the `p` query parameter still accepts it with the whitespace URL-encoded, for example `curl -G --data-urlencode "p@token-file" http://<host>:8000/api/v1/auth/verify` (the `@file` form keeps the trailing newline; `$(cat token-file)` drops it). Use it once to create a new admin token through the API, then revoke the old one. Restarting with `ARC_AUTH_FORCE_BOOTSTRAP=true` and the token value also adds it, as the `arc-recovery` admin token; if an `arc-recovery` token already exists from an earlier attempt it is not replaced (since #1915 the restart logs that the value was not added), so delete it through the API first.
 - During a rolling upgrade of a cluster that has never created its first admin token, a node still on the earlier release can create it with the untrimmed value. Upgrade every node before the first boot, or check that the token works afterwards.
 
 No new configuration keys.

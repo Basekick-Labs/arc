@@ -41,8 +41,8 @@ helm template arc-test "$chart" \
   --set auth.bootstrapToken.existingSecret=precreated-admin-token \
   > "$tmpdir/existing-token.yaml"
 
-# Arc refuses a token under 32 characters and starts with no admin token, so
-# the chart must refuse to render one. Exactly 32 is accepted.
+# Arc refuses to start with a token under 32 characters (#1915), so the chart
+# must refuse to render one. Exactly 32 is accepted.
 if out=$(helm template arc-test "$chart" \
   --set-string auth.bootstrapToken.value=0123456789012345678901234567890 2>&1); then
   echo 'chart rendered a 31-character bootstrap token' >&2
