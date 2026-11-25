@@ -344,6 +344,10 @@ type Metrics struct {
 	// ingestFutureStampedRows: rows stamped more than the file-time pruning
 	// margin past their flush, in its hour.
 	ingestFutureStampedRows atomic.Int64
+	// ingestWaitVisibleOverResolved: visible writes (x-arc-wait: visible,
+	// #1759) whose outcome resolved more batches than it marked. Always 0
+	// unless a flush counts a batch twice (a bug).
+	ingestWaitVisibleOverResolved atomic.Int64
 	// compactionCopyFallbackTotal counts compaction outputs an object store
 	// refused to copy server-side, copied through the node instead;
 	// compactionFinishedTotal, committed object-store compactions their
@@ -1237,6 +1241,10 @@ func (m *Metrics) IncFileTimePruningZeroSurvivors() { m.fileTimePruningZeroSurvi
 // pruning margin past their flush, in its hour.
 func (m *Metrics) AddIngestFutureStampedRows(n int) { m.ingestFutureStampedRows.Add(int64(n)) }
 
+// IncIngestWaitVisibleOverResolved counts a visible write whose outcome
+// resolved more batches than it marked (#1759): a bug, never expected.
+func (m *Metrics) IncIngestWaitVisibleOverResolved() { m.ingestWaitVisibleOverResolved.Add(1) }
+
 // AddFileTimePruningAnomalousKept records files kept because their name time
 // is before their directory's hour (future-stamped rows).
 func (m *Metrics) AddFileTimePruningAnomalousKept(n int) {
@@ -1637,6 +1645,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"file_time_pruning_zero_survivors_total":  m.fileTimePruningZeroSurvivors.Load(),
 		"file_time_pruning_anomalous_kept_total":  m.fileTimePruningAnomalousKept.Load(),
 		"ingest_future_stamped_rows_total":        m.ingestFutureStampedRows.Load(),
+		"ingest_wait_visible_over_resolved_total": m.ingestWaitVisibleOverResolved.Load(),
 		"compaction_copy_fallback_total":          m.compactionCopyFallbackTotal.Load(),
 		"compaction_finished_total":               m.compactionFinishedTotal.Load(),
 		"compaction_wedged_total":                 m.compactionWedgedTotal.Load(),
@@ -2426,6 +2435,7 @@ func (m *Metrics) PrometheusFormat() string {
 		{"arc_query_file_time_pruning_zero_survivors_total", "File-time pruning passes that kept no live-hour file: with the hour as the only path the glob is kept (fail safe); with other paths the hour is dropped and the pass also counts as expanded.", m.fileTimePruningZeroSurvivors.Load()},
 		{"arc_query_file_time_pruning_anomalous_kept_total", "Live-hour files kept because their name time is before their hour (rows stamped ahead of the flushing node's clock).", m.fileTimePruningAnomalousKept.Load()},
 		{"arc_ingest_future_stamped_rows_total", "Rows stamped more than query.file_time_pruning_margin_seconds past their flush, in the flush's hour: with file-level time pruning on, a query can miss them until the hour closes.", m.ingestFutureStampedRows.Load()},
+		{"arc_ingest_wait_visible_over_resolved_total", "Visible writes (x-arc-wait: visible) whose outcome resolved more batches than it marked: a batch counted twice, a bug. Such a write is never answered visible.", m.ingestWaitVisibleOverResolved.Load()},
 	} {
 		b = append(b, "# HELP "+c.name+" "+c.help+"\n"...)
 		b = append(b, "# TYPE "+c.name+" counter\n"...)
