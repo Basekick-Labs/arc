@@ -166,6 +166,15 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 			return reconcileResult{}, err
 		}
 	}
+	// A waived re-home job's record goes once the table, as published, no
+	// longer names its old file (#1845 item 1): checked after a pass that
+	// went through, and after the drop check below (deferred later, so run
+	// first): a table that check removed names nothing.
+	defer func() {
+		if err == nil {
+			e.settleWaived(ctx, database, measurement, res.commits > 0)
+		}
+	}()
 	// And at the end of the pass, however it ends (a pass can commit and
 	// then fail, and one that creates the table need not commit): if the
 	// database was dropped on another node meanwhile, what the pass wrote
@@ -436,13 +445,14 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 	// An entry given its day is replaced by itself: it commits with its own removal, and
 	// brings no other file of its day into the first commit, which a real removal does.
 	anchored, free := splitAnchored(toBuild, withoutPaths(toRemove, redatedPaths), database, measurement)
-	// A re-home job's old file is among the removals (#1825): its rows are in
+	// A re-home job's old file is among the removals (#1825), or that of a job
+	// whose wait was waived (#1845, SetReplacedWaived): its rows are in
 	// new files in other directories, often other days. Those files go in the
 	// first commit with the removal, so no published version has the removal
 	// without them, and that commit is all or nothing below. Only those: the
 	// first commit is not chunked or time-budgeted, and a backlog of other
 	// new files folded into it could keep it from ever fitting in a pass.
-	swapOutputs, swap := e.replacedOutputs(database, measurement, toRemove)
+	swapOutputs, swap, waivedOutputs, swapRecorded := e.replacedOutputs(database, measurement, toRemove)
 	if swap {
 		kept := free[:0]
 		for _, p := range free {
@@ -545,9 +555,12 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 			moved = true
 			days, byDay := daysOfPaths(ve.paths, database, measurement)
 			if !byDay || round >= maxVanishRounds || anyUnknownDay(toRemove, database, measurement) ||
-				anyUnknownDay(anchored, database, measurement) || anyUnknownDay(dataFilePaths(cloned), database, measurement) || swap {
-				// swap: a re-home job's files span days, and deferring one
-				// of them would commit the old file's removal without it.
+				anyUnknownDay(anchored, database, measurement) || anyUnknownDay(dataFilePaths(cloned), database, measurement) || swapRecorded {
+				// swapRecorded: a re-home job's files span days, and deferring
+				// one of them would commit the old file's removal without it.
+				// Not for a job whose wait was waived (#1845): its old file is
+				// gone, and deferring every day on each vanish would keep the
+				// table naming it, which the waiver was given to get past.
 				days = nil
 			}
 			leave(ve.paths) // only for the cold-listing flag: commit 0 is already split from the free set
@@ -573,6 +586,13 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 		}
 		for _, f := range skipped {
 			if isOneOf(f.path, keyOf[f.path], swapOutputs) {
+				if isOneOf(f.path, keyOf[f.path], waivedOutputs) {
+					// A waived job (#1845): its old file is gone from
+					// storage, and refusing would hold the table on it.
+					e.logger.Warn().Str("database", database).Str("measurement", measurement).Str("file", f.path).Str("reason", f.reason).
+						Msg("Iceberg: a new file of a re-home job whose export wait was waived cannot be registered; the old file's removal commits without it, and the table lacks its rows until it can be")
+					continue
+				}
 				return reconcileResult{}, fmt.Errorf("a re-home job's new file %s cannot be registered (%s); the file it replaces stays in the table until it can", f.path, f.reason)
 			}
 		}
@@ -1102,7 +1122,25 @@ func (e *Exporter) timeForChunk(ctx context.Context, last time.Duration) bool {
 	if !ok {
 		return true
 	}
-	return time.Until(dl) > e.commitReserve+last
+	return time.Until(dl) > e.reserve(ctx)+last
+}
+
+// commitReserveKey carries a commit reserve smaller than the exporter's:
+// the shutdown drain's whole budget is often below defaultCommitReserve, and
+// with it a pass would read no file at all (#1886).
+type commitReserveKey struct{}
+
+// withCommitReserve is ctx with the commit reserve d for the passes run under it.
+func withCommitReserve(ctx context.Context, d time.Duration) context.Context {
+	return context.WithValue(ctx, commitReserveKey{}, d)
+}
+
+// reserve is the commit reserve for a pass under ctx.
+func (e *Exporter) reserve(ctx context.Context) time.Duration {
+	if d, ok := ctx.Value(commitReserveKey{}).(time.Duration); ok {
+		return d
+	}
+	return e.commitReserve
 }
 
 // chunkContext is the context a chunk's footer reads run under: the pass's, ending the commit
@@ -1110,7 +1148,7 @@ func (e *Exporter) timeForChunk(ctx context.Context, last time.Duration) bool {
 // pass cleanly instead of failing it at the hard deadline.
 func (e *Exporter) chunkContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	if dl, ok := ctx.Deadline(); ok {
-		return context.WithDeadline(ctx, dl.Add(-e.commitReserve))
+		return context.WithDeadline(ctx, dl.Add(-e.reserve(ctx)))
 	}
 	return context.WithCancel(ctx)
 }

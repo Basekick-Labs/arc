@@ -285,10 +285,13 @@ func (b *writeThenFailBackend) Write(ctx context.Context, path string, data []by
 	return errors.New("storage down")
 }
 
-// A flush that fails while an import waits for flushes ends the import as a
-// failure part-way (#1429 review). Before, the failed re-flush was ignored:
-// it dropped the rows it took (WAL off), the buffered bytes fell, the wait
-// ended, and the import answered 200.
+// A re-flush that fails while an import waits for flushes (#1429 review):
+// here its rows are another writer's, written into the import's measurement
+// during the import's first flush, and the import's own row was stored. With
+// the WAL off the import's outcome knows whose rows failed (#1888), so the
+// import succeeds; a failure of its own rows answers 500
+// (TestLPImportFailsWhenItsOwnFlushFails1888). Before #1888 any failure of
+// the measurement failed the import, whoever's rows were lost.
 func TestImportWaitStopsOnAFailedReflush(t *testing.T) {
 	setVar(t, &importGroupBudgetOverride, 0)
 	setVar(t, &importAllowanceOverride, 1)
@@ -308,8 +311,8 @@ func TestImportWaitStopsOnAFailedReflush(t *testing.T) {
 	ci := &chunkedImport{app: importApp(t, h), buf: buf}
 
 	status, body := ci.post(t, "/api/v1/import/lp?db=d", []byte("cpu v=1 1700000000000000000\n"))
-	require.Equal(t, http.StatusInternalServerError, status, body)
-	require.NotNil(t, body["rows_written"], body)
+	require.Equal(t, http.StatusOK, status, body)
+	require.GreaterOrEqual(t, backend.calls.Load(), int32(2), "the other writer's re-flush did not run")
 }
 
 // A pass that stops part-way flushes what it wrote before it leaves the

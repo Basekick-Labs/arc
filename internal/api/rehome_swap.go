@@ -314,6 +314,12 @@ func (h *RehomeHandler) runSwap(ctx context.Context, job *rehomeJob) (state, rea
 		return fail("checking the file", checkErr)
 	}
 
+	// Room for the job (#1851 item 3): the copy and its split sit in scratch
+	// side by side, and the new files then go to the hot tier.
+	if why := h.roomForJob(size); why != "" {
+		return fail("checking the file", rehome.Refusef("%s", why))
+	}
+
 	// 2. Split in scratch.
 	prep, step, err := h.prepare(ctx, src.Key, read)
 	if err != nil {
@@ -903,6 +909,19 @@ func (h *RehomeHandler) recoverJob(ctx context.Context, store rehomeStore, job *
 					return fmt.Errorf("%v; undoing the job: %w", cerr, uerr)
 				}
 				return cerr
+			}
+		}
+		// The Iceberg export is on but did not start this time (it failed
+		// to build, #1848 item 3): going on would switch reads and then
+		// wait for an export that never runs. Reads still use the source,
+		// so undoing costs nothing. Only whether it runs: the question a
+		// new job puts to a pass is not one for a job past its commit.
+		if h.exportExpected() {
+			if why := h.exportNotStarted(); why != "" {
+				if uerr := h.undo(ctx, job); uerr != nil {
+					return fmt.Errorf("the Iceberg export cannot publish the table (%s); undoing the job: %w", why, uerr)
+				}
+				return errExportRefused{why}
 			}
 		}
 		for _, o := range job.Outputs {

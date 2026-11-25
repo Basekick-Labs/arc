@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"github.com/google/uuid"
 	"math"
 	"net"
 	"net/url"
@@ -705,6 +706,16 @@ type TelemetryConfig struct {
 	Enabled         bool   // Enable telemetry (default: true)
 	Endpoint        string // Telemetry endpoint URL
 	IntervalSeconds int    // Reporting interval in seconds (default: 86400 = 24h)
+	// InstanceID, when set, is this installation's telemetry id (#1885): a
+	// UUID, stored in canonical form, used instead of the id file, so a
+	// deployment without a persistent disk keeps one id. Must be unique per
+	// node; on a cluster, main derives one per node from it and
+	// cluster.node_id. Empty: the id file in DataDir.
+	InstanceID string
+	// DataDir is where the id file (.instance_id) lives when InstanceID is
+	// empty (#1885). Default "./data", relative to the working directory; it
+	// does not follow auth.db_path or storage.local_path.
+	DataDir string
 }
 
 type DeleteConfig struct {
@@ -740,6 +751,12 @@ type IcebergConfig struct {
 	// is exported after at most this long instead of at the next timed pass.
 	// 0 turns the ingest trigger off (timed passes only). Default 60.
 	IngestExportInterval int
+	// LoadExportMinInterval lets a REST catalog table load pull its table's
+	// queued ingest export forward and wait for it, up to 2 s: the table is
+	// then exported no sooner than this many seconds after its last export
+	// (#1752). 0 (the default) is off. Otherwise at least
+	// minIcebergIngestExportInterval and at most IngestExportInterval.
+	LoadExportMinInterval int
 	// MinVersionAge is how long, in seconds, a published table version
 	// (v<N>.metadata.json) is kept after the next one is published, on top
 	// of the newest retain_snapshots+1 (#1751). It is what lets ingest
@@ -1582,6 +1599,8 @@ func Load() (*Config, error) {
 			Enabled:         v.GetBool("telemetry.enabled"),
 			Endpoint:        v.GetString("telemetry.endpoint"),
 			IntervalSeconds: v.GetInt("telemetry.interval_seconds"),
+			InstanceID:      strings.TrimSpace(v.GetString("telemetry.instance_id")),
+			DataDir:         strings.TrimSpace(v.GetString("telemetry.data_dir")),
 		},
 		Delete: DeleteConfig{
 			Enabled:               v.GetBool("delete.enabled"),
@@ -1600,6 +1619,7 @@ func Load() (*Config, error) {
 			NamespaceMigrationDryRun: v.GetBool("iceberg.namespace_migration_dry_run"),
 			ReconcileInterval:        v.GetInt("iceberg.reconcile_interval"),
 			IngestExportInterval:     v.GetInt("iceberg.ingest_export_interval"),
+			LoadExportMinInterval:    v.GetInt("iceberg.load_export_min_interval"),
 			MinVersionAge:            v.GetInt("iceberg.min_version_age"),
 			IngestAppendEnabled:      v.GetBool("iceberg.ingest_append_enabled"),
 			IngestExportConcurrency:  v.GetInt("iceberg.ingest_export_concurrency"),
@@ -2118,7 +2138,18 @@ func Load() (*Config, error) {
 		cfg.Warnings = append(cfg.Warnings, *w)
 	}
 
+	if err := normalizeTelemetry(&cfg.Telemetry); err != nil {
+		return nil, err
+	}
+
 	w, err := normalizeBootstrapToken(&cfg.Auth)
+	if err != nil {
+		return nil, err
+	}
+	if w != nil {
+		cfg.Warnings = append(cfg.Warnings, *w)
+	}
+	w, err = validateBootstrapToken(cfg.Auth)
 	if err != nil {
 		return nil, err
 	}
@@ -2154,6 +2185,12 @@ func Load() (*Config, error) {
 		if n := cfg.Iceberg.IngestExportInterval; n < 0 || (n > 0 && n < minIcebergIngestExportInterval) {
 			return nil, fmt.Errorf("iceberg.ingest_export_interval must be 0 or at least %d (got %d): it is the least time, in seconds, "+
 				"between two exports of a table that ingest causes; 0 turns that trigger off", minIcebergIngestExportInterval, n)
+		}
+		if n := cfg.Iceberg.LoadExportMinInterval; n < 0 || (n > 0 && (n < minIcebergIngestExportInterval ||
+			cfg.Iceberg.IngestExportInterval == 0 || n > cfg.Iceberg.IngestExportInterval)) {
+			return nil, fmt.Errorf("iceberg.load_export_min_interval must be 0 or between %d and iceberg.ingest_export_interval (%d), "+
+				"which must be on (got %d): it is the least time, in seconds, between two exports of a table that REST catalog loads cause; 0 turns that off",
+				minIcebergIngestExportInterval, cfg.Iceberg.IngestExportInterval, n)
 		}
 		if n := cfg.Iceberg.ExportLagTableSeries; n < 0 || n > maxIcebergExportLagTableSeries {
 			return nil, fmt.Errorf("iceberg.export_lag_table_series must be between 0 and %d, got %d: how many tables get their own "+
@@ -2808,6 +2845,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("telemetry.enabled", true)                                               // Enabled by default (opt-out)
 	v.SetDefault("telemetry.endpoint", "https://telemetry.basekick.net/api/v1/telemetry") // Telemetry endpoint
 	v.SetDefault("telemetry.interval_seconds", 86400)                                     // 24 hours
+	v.SetDefault("telemetry.instance_id", "")                                             // "" = the id file in telemetry.data_dir (#1885)
+	v.SetDefault("telemetry.data_dir", "./data")                                          // where the id file lives (#1885)
 
 	// Delete defaults
 	v.SetDefault("delete.enabled", false)                // Disabled by default for safety
@@ -2825,6 +2864,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("iceberg.namespace_migration_dry_run", true)
 	v.SetDefault("iceberg.reconcile_interval", 300)          // seconds
 	v.SetDefault("iceberg.ingest_export_interval", 60)       // seconds; 0 = export on the timer only (#1750)
+	v.SetDefault("iceberg.load_export_min_interval", 0)      // seconds; 0 = a REST catalog load never pulls an export forward (#1752)
 	v.SetDefault("iceberg.min_version_age", 300)             // seconds a published version outlives its successor (#1751)
 	v.SetDefault("iceberg.ingest_append_enabled", true)      // ingest exports add only the new files (#1751)
 	v.SetDefault("iceberg.ingest_export_concurrency", 8)     // tables whose ingest appends run at once (#1778)
@@ -3060,6 +3100,34 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("backup.operation_timeout", "2h")
 }
 
+// normalizeTelemetry checks telemetry.instance_id and fills an empty
+// telemetry.data_dir (#1885). The id must be a UUID: the telemetry pages
+// promise a random UUID not linked to anything, and every count on the
+// server is a count of distinct ids, so a free-form value ("prod") would
+// merge unrelated installations. Stored in canonical form, so case and
+// braces do not make two ids of one. Checked only with telemetry on; with it
+// off the keys are never read.
+func normalizeTelemetry(t *TelemetryConfig) error {
+	if t.DataDir == "" {
+		t.DataDir = "./data"
+	}
+	if !t.Enabled || t.InstanceID == "" {
+		return nil
+	}
+	id, err := uuid.Parse(t.InstanceID)
+	if err != nil {
+		return fmt.Errorf("telemetry.instance_id (ARC_TELEMETRY_INSTANCE_ID) must be a UUID; generate one with uuidgen, and give each node its own")
+	}
+	// Placeholders anyone might copy would merge every installation that used
+	// them: the nil and max UUIDs, and the textbook example.
+	switch id {
+	case uuid.Nil, uuid.Max, uuid.MustParse("550e8400-e29b-41d4-a716-446655440000"):
+		return fmt.Errorf("telemetry.instance_id (ARC_TELEMETRY_INSTANCE_ID) is a placeholder UUID (%s); generate your own with uuidgen", id)
+	}
+	t.InstanceID = id.String()
+	return nil
+}
+
 // fipsBuild is fips.BuildTagged; a variable so the refusal below can be
 // tested in the default build.
 var fipsBuild = fips.BuildTagged
@@ -3096,6 +3164,38 @@ func normalizeBootstrapToken(auth *AuthConfig) (*LoadWarning, error) {
 		Value:   "(not shown)",
 		Message: "auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN) had surrounding whitespace, such as the newline at the end of a file it was read from: it was removed, and the trimmed value is the token clients must present. Tokens already stored are unchanged: a token an earlier release stored with the whitespace cannot be sent in a header (see the release notes for #1713 to recover)",
 	}, nil
+}
+
+// MinBootstrapTokenLength is the shortest auth.bootstrap_token Arc accepts, in
+// bytes. internal/auth enforces the same rule on every token value it stores
+// (a test there pins the two equal); config cannot import auth.
+const MinBootstrapTokenLength = 32
+
+// validateBootstrapToken refuses, at load, an auth.bootstrap_token that the
+// bootstrap would reject (#1915). Before, Arc logged "Failed to create
+// initial admin token" and ran with auth on and no admin token, answering
+// 401 to everything. It runs after normalizeBootstrapToken, so the length is
+// that of the trimmed value, and the message says so. With auth disabled the
+// key is never read.
+//
+// auth.force_bootstrap without a token gets a warning: the flag acts only
+// with auth.bootstrap_token, and without one Arc generates a token only on an
+// empty auth database.
+func validateBootstrapToken(auth AuthConfig) (*LoadWarning, error) {
+	if !auth.Enabled {
+		return nil, nil
+	}
+	if auth.BootstrapToken != "" && len(auth.BootstrapToken) < MinBootstrapTokenLength {
+		return nil, fmt.Errorf("auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN) is %d bytes after surrounding whitespace is removed; it must be at least %d. Set a longer token (for example `openssl rand -hex 32`), or unset the key to have Arc generate one", len(auth.BootstrapToken), MinBootstrapTokenLength)
+	}
+	if auth.ForceBootstrap && auth.BootstrapToken == "" {
+		return &LoadWarning{
+			Key:     "auth.force_bootstrap",
+			Value:   "true",
+			Message: "auth.force_bootstrap adds a recovery token only together with auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN); without one, Arc generates an admin token only when the auth database has no tokens, and otherwise does nothing",
+		}, nil
+	}
+	return nil, nil
 }
 
 // refuseGCSInFIPSBuild refuses a "gcs" backend at key in the FIPS build, which

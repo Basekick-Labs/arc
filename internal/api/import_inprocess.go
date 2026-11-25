@@ -373,8 +373,8 @@ func (h *ImportHandler) importCSV(c *fiber.Ctx, database, measurement string, up
 		return nil, err
 	}
 	// Hand what is still buffered of the import to the flush, its write slot
-	// already free (#1429): the rows are in the buffer and the WAL (when
-	// enabled); files follow as their flushes finish.
+	// already free (#1429); rows without a WAL copy are answered for once
+	// their flushes are done (#1888).
 	if err := w.finalFlush(writeCtx); err != nil {
 		return nil, &importError{StatusCode: fiber.StatusInternalServerError, Message: importFlushFailed, Err: err}
 	}
@@ -725,8 +725,8 @@ func (h *ImportHandler) importParquet(ctx fiberContext, database, measurement st
 		return nil, err
 	}
 	// Hand what is still buffered of the import to the flush, its write slot
-	// already free (#1429): the rows are in the buffer and the WAL (when
-	// enabled); files follow as their flushes finish.
+	// already free (#1429); rows without a WAL copy are answered for once
+	// their flushes are done (#1888).
 	if err := w.finalFlush(ctx); err != nil {
 		return nil, &importError{StatusCode: fiber.StatusInternalServerError, Message: importFlushFailed, Err: err}
 	}

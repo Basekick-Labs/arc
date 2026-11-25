@@ -214,6 +214,23 @@ func (g *GlueSync) Stop() {
 	<-g.done
 }
 
+// Flush stops the sync loop and then, where this node exports, syncs the
+// tables published since the loop last synced, on the caller's goroutine and
+// within ctx. It is the shutdown step after the export's final drain (#1886):
+// the drain's publishes reach Glue before the process exits. Stopping first
+// keeps the loop and Flush from updating the same table at once, where the
+// older of two updates could win. A sync that never started does nothing.
+func (g *GlueSync) Flush(ctx context.Context) {
+	if g.cancel == nil {
+		return
+	}
+	g.Stop()
+	if !g.canRun() || ctx.Err() != nil {
+		return
+	}
+	g.dirtyPass(ctx)
+}
+
 func (g *GlueSync) canRun() bool { return g.gate == nil || g.gate.CanRun() }
 
 func (g *GlueSync) loop(ctx context.Context) {

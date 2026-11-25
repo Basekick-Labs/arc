@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/google/uuid"
 	"io"
 	"net/http"
 	"os"
@@ -85,7 +86,8 @@ const defaultShutdownTimeout = 30 * time.Second
 // shutdownComponentReserve is the part of the shutdown budget the components
 // keep (shutdown.Coordinator.SetComponentReserve): half for the arrow
 // buffer's Close, whose budget is also half, plus a tenth for the WAL's final
-// sync and the closes after it (#1644).
+// sync and the closes after it (#1644). The Iceberg export's final drain
+// (#1886) uses only what the buffer leaves of the half, less that tenth.
 func shutdownComponentReserve(timeout time.Duration) time.Duration {
 	return timeout/2 + timeout/10
 }
@@ -1074,6 +1076,9 @@ func main() {
 			time.Sleep(time.Duration(try) * time.Second)
 		}
 		if seedErr = rehomeRegistry.Seed(context.Background()); seedErr == nil {
+			for _, s := range rehomeRegistry.ReplacedSkipped() {
+				log.Warn().Str("record", s).Msg("A waived re-home job's record under _rehome/replaced cannot be used and is left where it is; the Iceberg export's commit of that job's old file is not tied to its new files (#1845)")
+			}
 			break
 		}
 		log.Warn().Err(seedErr).Int("try", try+1).Msg("Could not read the re-home job journal; trying again")
@@ -1389,7 +1394,9 @@ func main() {
 	// shutdown_timeout=2 hands Close 100% of the coordinator's time and
 	// reintroduces the skip it was meant to prevent. Half is the honest rule at
 	// every value: the components after the buffer are a SQLite close, the WAL's
-	// final sync and the storage/database closes, all fast. Giving Close less
+	// final sync and the storage/database closes, all fast, plus the Iceberg
+	// export's final drain and Glue flush (#1886), which bound themselves to
+	// what is left of the budget. Giving Close less
 	// time only means more records stay in the WAL to be replayed, which is
 	// recoverable; starving the WAL writer's sync is not.
 	//
@@ -1841,9 +1848,12 @@ func main() {
 			// proposeTimeout=5s.
 			bootstrapCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			if cfg.Auth.ForceBootstrap && cfg.Auth.BootstrapToken != "" {
+			// auth.force_bootstrap acts only with a configured token: without
+			// one the generated first-run path runs, and the banner says so.
+			configured, recovery := bootstrapMode(cfg.Auth.BootstrapToken, cfg.Auth.ForceBootstrap)
+			if recovery {
 				bootstrapToken, bootstrapErr = authManager.ForceAddRecoveryToken(bootstrapCtx, cfg.Auth.BootstrapToken)
-			} else if cfg.Auth.BootstrapToken != "" {
+			} else if configured {
 				bootstrapToken, bootstrapErr = authManager.EnsureInitialTokenWithValue(bootstrapCtx, cfg.Auth.BootstrapToken)
 			} else {
 				bootstrapToken, bootstrapErr = authManager.EnsureInitialToken(bootstrapCtx)
@@ -1851,34 +1861,9 @@ func main() {
 			if bootstrapErr != nil {
 				log.Error().Err(bootstrapErr).Msg("Failed to create initial admin token")
 			} else if bootstrapToken != "" {
-				// Print colorized banner to stderr (bypasses structured logging)
-				const (
-					cyan   = "\033[96m"
-					yellow = "\033[93m"
-					bold   = "\033[1m"
-					reset  = "\033[0m"
-				)
-				banner := cyan + "======================================================================" + reset
-				fmt.Fprintln(os.Stderr)
-				fmt.Fprintln(os.Stderr, banner)
-				if cfg.Auth.ForceBootstrap {
-					fmt.Fprintln(os.Stderr, cyan+bold+"  RECOVERY TOKEN ADDED - EXISTING TOKENS PRESERVED"+reset)
-				} else {
-					fmt.Fprintln(os.Stderr, cyan+bold+"  FIRST RUN - INITIAL ADMIN TOKEN GENERATED"+reset)
-				}
-				fmt.Fprintln(os.Stderr, banner)
-				fmt.Fprintln(os.Stderr, yellow+bold+"  Admin API token: "+bootstrapToken+reset)
-				fmt.Fprintln(os.Stderr, banner)
-				fmt.Fprintln(os.Stderr, cyan+"  SAVE THIS TOKEN! It will not be shown again."+reset)
-				fmt.Fprintln(os.Stderr, cyan+"  Use this token to login to the web UI or API."+reset)
-				if cfg.Auth.ForceBootstrap {
-					fmt.Fprintln(os.Stderr, cyan+"  Use the API to revoke any tokens you no longer need."+reset)
-					fmt.Fprintln(os.Stderr, cyan+"  Remove ARC_AUTH_FORCE_BOOTSTRAP after recovery."+reset)
-				} else {
-					fmt.Fprintln(os.Stderr, cyan+"  You can create additional tokens after logging in."+reset)
-				}
-				fmt.Fprintln(os.Stderr, banner)
-				fmt.Fprintln(os.Stderr)
+				// Print the banner to stderr (bypasses structured logging). The token
+				// value is shown only when Arc generated it; see printBootstrapBanner.
+				printBootstrapBanner(os.Stderr, bootstrapToken, configured, recovery)
 			}
 		}
 
@@ -2222,15 +2207,17 @@ func main() {
 				Msg("Daily compaction scheduler started")
 		}
 
-		// One hook for both: they share a cycle claim, and stopping one while
-		// the other's deferred tick still waits lets that tick start a cycle
-		// mid-shutdown when the first's cycle ends (#220).
-		if hourlyScheduler != nil || dailyScheduler != nil {
-			shutdownCoordinator.RegisterHook("compaction-schedulers", func(ctx context.Context) error {
-				compaction.StopAll(hourlyScheduler, dailyScheduler)
-				return nil
-			}, shutdown.PriorityScheduler)
-		}
+		// Shutdown stops compaction early and waits for its running cycle
+		// later, bounded (#1887): a triggered cycle too, not only the
+		// schedulers'. One step for both schedulers: they share a cycle
+		// claim, and stopping one while the other's deferred tick still
+		// waits lets that tick start a cycle mid-shutdown (#220).
+		registerCompactionShutdown(shutdownCoordinator, &compactionShutdown{
+			manager:    compactionManager,
+			schedulers: []*compaction.Scheduler{hourlyScheduler, dailyScheduler},
+			timeout:    shutdownTimeout,
+			logger:     log.With().Str("component", "compaction-shutdown").Logger(),
+		})
 
 		log.Info().
 			Bool("hourly_enabled", cfg.Compaction.HourlyEnabled).
@@ -2247,10 +2234,11 @@ func main() {
 	var telemetryCollector *telemetry.Collector
 	if cfg.Telemetry.Enabled {
 		telemetryCfg := &telemetry.Config{
-			Enabled:  true,
-			Endpoint: cfg.Telemetry.Endpoint,
-			Interval: time.Duration(cfg.Telemetry.IntervalSeconds) * time.Second,
-			DataDir:  "./data",
+			Enabled:    true,
+			Endpoint:   cfg.Telemetry.Endpoint,
+			Interval:   time.Duration(cfg.Telemetry.IntervalSeconds) * time.Second,
+			DataDir:    cfg.Telemetry.DataDir,
+			InstanceID: telemetryInstanceID(cfg.Telemetry.InstanceID, cfg.Cluster.Enabled, telemetryNodeName(cfg.Cluster.NodeID)),
 		}
 		telemetryCollector, err = telemetry.New(telemetryCfg, Version, logger.Get("telemetry"))
 		if err != nil {
@@ -2581,7 +2569,9 @@ func main() {
 						// drain, which are components too (#1014). The schedulers
 						// that ask it whether they may run are hooks at
 						// PriorityScheduler, so they have already quiesced by the
-						// time any component runs.
+						// time any component runs; compaction's cycle is waited
+						// for by a component before it (priorityCompactionWait,
+						// #1887).
 						registerClusterCoordinatorShutdown(shutdownCoordinator, clusterCoordinator.Stop)
 
 						localNode := clusterCoordinator.GetLocalNode()
@@ -2767,11 +2757,12 @@ func main() {
 						// construct the watcher and schedulers on every node but only
 						// start them when the node holds the compactor lease.
 						//
-						// Shutdown ordering: the watcher is a hook, and the
-						// coordinator that owns Raft is a component, so the watcher
-						// drains any pending manifests BEFORE Raft goes away
-						// whatever its priority; PriorityCompaction - 1 keeps it
-						// after the schedulers that feed it.
+						// Shutdown ordering (#1887): the watcher is a component
+						// after the compaction wait (priorityCompactionWatcher),
+						// so its final drain sees the records of the batches that
+						// ended during the wait, and before the cluster
+						// coordinator (PriorityCompaction), so Raft is still up
+						// for them.
 						// The watcher itself was built before Start (see the
 						// compaction pause wiring above); nil when this node
 						// has none or its construction failed.
@@ -2790,10 +2781,10 @@ func main() {
 									Msg("Phase 4 compaction completion watcher started")
 							}
 
-							shutdownCoordinator.RegisterHook("compaction-completion-watcher", func(ctx context.Context) error {
+							shutdownCoordinator.Register("compaction-completion-watcher", shutdownFunc(func() error {
 								watcher.Stop()
 								return nil
-							}, shutdown.PriorityCompaction-1)
+							}), priorityCompactionWatcher)
 
 							// Phase 5: wire OnBecomeCompactor / OnLoseCompactor
 							// callbacks so the scheduler and watcher activate/deactivate
@@ -4949,9 +4940,23 @@ func main() {
 		// How long a published table version outlives the next one, and how
 		// often ingest publishes one (#1751). Set on every node: it only ever
 		// keeps more.
-		exporter.SetVersionRetention(time.Duration(cfg.Iceberg.MinVersionAge)*time.Second,
-			icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil)+
-				icebergArrivalInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil))
+		icebergSharedWarehouse := cfg.Cluster.SharedStorageMode || cluster.IsSharedObjectStore(storageBackend)
+		// #1752: a REST catalog load can export a table as soon as
+		// load_export_min_interval after its last ingest export.
+		// Only where it can act: the REST catalog is the only caller, and a
+		// load pulls forward only an append. Elsewhere it changes nothing,
+		// not even version retention (icebergLoadTopology says why).
+		icebergLoadTopology := icebergLoadInterval(cfg.Iceberg.LoadExportMinInterval, clusterCoordinator != nil, icebergSharedWarehouse)
+		icebergLoadEvery := icebergLoadEffective(icebergLoadTopology, cfg.Iceberg.RESTCatalogEnabled, cfg.Iceberg.IngestAppendEnabled)
+		icebergIngestEvery := icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil) +
+			icebergArrivalInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil)
+		// Versions are kept by the shortest time two ingest exports of a
+		// table can be apart: with loads on, that is the load interval.
+		icebergCommitSpacing := icebergIngestEvery
+		if icebergLoadEvery > 0 && icebergLoadEvery < icebergCommitSpacing {
+			icebergCommitSpacing = icebergLoadEvery
+		}
+		exporter.SetVersionRetention(time.Duration(cfg.Iceberg.MinVersionAge)*time.Second, icebergCommitSpacing)
 		// #1676: where new tables are created. Colocated needs the warehouse
 		// to be the storage root, which only the resolved values can tell.
 		if err := exporter.SetLayout(cfg.Iceberg.Layout); err != nil {
@@ -5120,7 +5125,23 @@ func main() {
 			// How many tables' reconcile passes run at once (#1786): one on a
 			// cluster node.
 			ReconcileConcurrency: icebergPassesAtOnce,
+			// A REST catalog load pulls its table's ingest export forward
+			// (#1752). 0: off.
+			LoadInterval: icebergLoadEvery,
 		})
+		if cfg.Iceberg.LoadExportMinInterval > 0 {
+			switch {
+			case icebergLoadTopology == 0:
+				log.Warn().Msg("iceberg.load_export_min_interval is ignored on a cluster over a shared bucket: there every ingest export is a pass of the table")
+			case !cfg.Iceberg.RESTCatalogEnabled:
+				log.Warn().Msg("iceberg.load_export_min_interval has no effect without iceberg.rest_catalog_enabled: only a REST catalog table load pulls an export forward")
+			case !cfg.Iceberg.IngestAppendEnabled:
+				log.Warn().Msg("iceberg.load_export_min_interval has no effect with iceberg.ingest_append_enabled = false: a load pulls forward only an append")
+			default:
+				log.Info().Int("load_export_min_interval_s", cfg.Iceberg.LoadExportMinInterval).
+					Msg("Iceberg: a REST catalog table load waits up to 2 s for the files reported before it")
+			}
+		}
 		// #1825: a re-home job keeps the file it replaces until the published
 		// table does not name it, and the export commits that file's removal
 		// with the files that replace it.
@@ -5140,6 +5161,19 @@ func main() {
 				}
 			}
 			return out
+		})
+		// Jobs that ended with their export wait waived (#1845 item 1): the
+		// old file's removal still commits with its new files, and the record
+		// goes once the published table does not name the old file.
+		exporter.SetReplacedWaived(func(database, measurement string) map[string][]string {
+			return rehomeRegistry.ReplacedWaived(database + "/" + measurement + "/")
+		}, func(database, measurement, source string) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := rehomeRegistry.ReplacedDone(ctx, database, measurement, source); err != nil {
+				log.Warn().Err(err).Str("database", database).Str("measurement", measurement).Str("source", source).
+					Msg("Could not remove a waived re-home job's record; the next pass of the table tries again")
+			}
 		})
 		rehomeHandler.SetExport(func(ctx context.Context, database, measurement, fileKey string) (api.RehomeExportAnswer, error) {
 			a, err := icebergScheduler.ReconcileAndConfirm(ctx, database, measurement, fileKey)
@@ -5267,23 +5301,37 @@ func main() {
 				clusterCoordinator.SetIcebergPathCallbacks(icebergScheduler.RequestReconcilePathsHot, icebergScheduler.RequestReconcilePathsLater, icebergScheduler.RequestReconcilePaths)
 			}
 		}
-		shutdownCoordinator.RegisterHook("iceberg", func(ctx context.Context) error {
-			icebergScheduler.Stop()
-			// Close only a handle this block opened. A borrowed one belongs to
-			// the auth manager, which closes it at PriorityAuth.
-			if icebergOwnsDB {
-				return icebergDB.Close()
-			}
-			return nil
-		}, shutdown.PriorityDatabase)
+		// #1886: the loop stops in a hook, the final flush's files are
+		// exported by a component after the WAL, Glue flushes after that,
+		// and the export's own SQLite handle closes last (iceberg_shutdown.go).
+		// A borrowed handle belongs to the auth manager, which closes it at
+		// PriorityAuth.
+		icebergStop := &icebergShutdown{
+			sched:   icebergScheduler,
+			timeout: shutdownTimeout,
+			glue:    cfg.Iceberg.Glue.Enabled,
+			logger:  logger.Get("iceberg"),
+		}
+		if clusterCoordinator != nil && (cfg.Cluster.SharedStorageMode || cluster.IsSharedObjectStore(storageBackend)) {
+			icebergStop.before = icebergManifestCatchUp(clusterCoordinator, icebergGate, logger.Get("iceberg"))
+		}
+		var closeIcebergDB func() error
+		if icebergOwnsDB {
+			closeIcebergDB = icebergDB.Close
+		}
+		registerIcebergShutdown(shutdownCoordinator, icebergStop, closeIcebergDB)
 		log.Info().Str("warehouse", warehouse).Int("interval_s", cfg.Iceberg.ReconcileInterval).Msg("Iceberg export enabled")
 		if cfg.Iceberg.RESTCatalogEnabled {
+			var awaitFresh func(ctx context.Context, database, measurement string)
+			if icebergLoadEvery > 0 {
+				awaitFresh = icebergScheduler.AwaitFreshForRead
+			}
 			registerIcebergRESTCatalog(server.GetApp(), exporter, authManager, rbacManager, spokeRegistry, storageBackend,
-				icebergCatalogServable(cfg.Cluster.SharedStorageMode || cluster.IsSharedObjectStore(storageBackend), icebergGate))
+				icebergCatalogServable(cfg.Cluster.SharedStorageMode || cluster.IsSharedObjectStore(storageBackend), icebergGate), awaitFresh)
 		}
 		// #1690 option B: Glue sync starts and stops with the export.
 		if cfg.Iceberg.Glue.Enabled {
-			icebergStart = wireIcebergGlue(exporter, storageBackend, icebergGate, cfg.Iceberg.Glue, cfg.Iceberg.Layout, shutdownCoordinator, icebergStart)
+			icebergStart = wireIcebergGlue(exporter, storageBackend, icebergGate, cfg.Iceberg.Glue, cfg.Iceberg.Layout, shutdownCoordinator, shutdownTimeout, icebergStart)
 		}
 	}
 
@@ -6533,7 +6581,14 @@ func main() {
 	log.Info().Str("signal", sig.String()).Msg("Initiating graceful shutdown...")
 
 	// Perform graceful shutdown of all components
-	if err := shutdownCoordinator.Shutdown(); err != nil {
+	shutdownErr := shutdownCoordinator.Shutdown()
+	// The coordinator skips its remaining components once its deadline
+	// passes, the compaction wait among them: no compaction child may
+	// outlive this process (#1887).
+	if compactionManager != nil {
+		killLeftoverCycles(compactionManager, log.Logger)
+	}
+	if err := shutdownErr; err != nil {
 		log.Error().Err(err).Msg("Shutdown completed with errors")
 		if code := exitCode.Load(); code != 0 {
 			os.Exit(int(code))
@@ -7179,7 +7234,9 @@ func registerFileRegistrarShutdown(coordinator *shutdown.Coordinator, stop func(
 // The cluster coordinator owns Raft. It must stop after the file registrar
 // has drained (so the final flush's files land in the manifest) and after the
 // tick-driven schedulers that ask it whether they may run — those are hooks
-// at PriorityScheduler and so already stopped. Registered as a component for
+// at PriorityScheduler and so already stopped, and compaction's running cycle
+// is waited for by an earlier component (priorityCompactionWait, #1887), as
+// is the completion watcher's final drain. Registered as a component for
 // the first reason: every hook runs before any component, so a hook here
 // would have stopped Raft before the buffer flushed (#1014).
 func registerClusterCoordinatorShutdown(coordinator *shutdown.Coordinator, stop func() error) {
@@ -7870,4 +7927,33 @@ func wireIcebergCold(src *iceberg.StorageWalkSource, exp *iceberg.Exporter, cold
 		return err
 	}
 	return exp.SetColdTier(cold)
+}
+
+// telemetryInstanceID is the telemetry id to send (#1885): the configured one
+// (already a canonical UUID), or "" for the id file. On a cluster with a
+// node id it is derived per node (UUIDv5 of the node id under the configured
+// UUID): one value set in a multi-replica template would otherwise make every
+// replica one instance, and a StatefulSet's node ids are stable.
+func telemetryInstanceID(configured string, clusterEnabled bool, nodeID string) string {
+	// nodeID comes from telemetryNodeName: cluster.node_id, or the host name.
+	if configured == "" || !clusterEnabled || strings.TrimSpace(nodeID) == "" {
+		return configured
+	}
+	ns, err := uuid.Parse(configured)
+	if err != nil {
+		return configured // config validated it; not reached
+	}
+	return uuid.NewSHA1(ns, []byte(strings.TrimSpace(nodeID))).String()
+}
+
+// telemetryNodeName is the per-node name telemetryInstanceID derives from:
+// cluster.node_id when set, otherwise the host name, which is stable on a
+// StatefulSet pod and on a VM. The coordinator fills in a node id only later,
+// and its fallback includes the PID, which changes on every restart.
+func telemetryNodeName(nodeID string) string {
+	if n := strings.TrimSpace(nodeID); n != "" {
+		return n
+	}
+	h, _ := os.Hostname()
+	return h
 }

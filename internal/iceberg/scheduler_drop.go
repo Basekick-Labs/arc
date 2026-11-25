@@ -292,6 +292,16 @@ func (s *Scheduler) forgetDatabase(db string) {
 			dropped = true
 		}
 	}
+	for k := range s.loadWaiters {
+		if match(k) {
+			s.skipLoadWaitersLocked(k)
+		}
+	}
+	for k := range s.loadUnsettled {
+		if match(k) {
+			delete(s.loadUnsettled, k)
+		}
+	}
 	if dropped {
 		s.publishIngestPendingLocked()
 	}
@@ -314,6 +324,11 @@ func (s *Scheduler) forgetDatabase(db string) {
 	for k := range s.busySince {
 		if match(k) {
 			delete(s.busySince, k)
+		}
+	}
+	for k := range s.vanishTries {
+		if match(k) {
+			delete(s.vanishTries, k)
 		}
 	}
 	for k := range s.lastBlocked {

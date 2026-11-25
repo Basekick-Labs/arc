@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -105,10 +106,23 @@ type Scheduler struct {
 	// cold-removal notice (the requests are dropped at the gate), so they are
 	// dropped when the gate opens again (#1728).
 	wasGated bool
+	// passOnReopen: the gate opened again since the last pass (loop goroutine,
+	// #1903). The loop then runs a pass at once rather than at the next tick,
+	// so a table nobody writes to is not left as this node last published it
+	// (naming files gone meanwhile) for up to the interval, while the REST
+	// catalog already serves it again. runPass clears it.
+	passOnReopen bool
+	// gatePoll is how often the loop asks the gate on its own, so that it sees
+	// the role move away and come back without any traffic (#1903). Zero turns
+	// the poll off (tests).
+	gatePoll time.Duration
 
 	// busySince is when each measurement last stopped making progress while busy: the first busy
 	// pass after one that committed or settled. Loop goroutine only, like state.
 	busySince map[string]time.Time
+	// vanishTries counts a table's passes in a row that left files because
+	// some vanished (noteVanished). Loop goroutine only.
+	vanishTries map[string]int
 	// leftOut is, per table, how many files its last pass that went through every new file
 	// left out because no day could be given to them (file_day.go); tables with none have no
 	// entry. Kept apart from state, which a pass that did not settle drops: the files are
@@ -156,6 +170,24 @@ type Scheduler struct {
 	ingestDue      map[string]ingestRequest
 	ingestNext     map[string]time.Time
 	ingestPending  map[string]ingestReports
+	// REST catalog loads waiting for their table's reported files
+	// (scheduler_load.go, #1752), under reqMu. loadInterval is F, the least
+	// time between two of a table's ingest exports a load may pull its
+	// request to; 0 turns it off. loadUnsettled is the tables whose last
+	// ingest export did not settle.
+	loadInterval  time.Duration
+	loadWaiters   map[string][]*loadWaiter
+	loadWaiterN   int
+	loadUnsettled map[string]bool
+	// loadPulls is when loads last pulled exports forward, within the last
+	// loadFreshBudget (the cap on all tables together). Under reqMu.
+	loadPulls []time.Time
+	// loadFellBack: tables whose last append fell back to a pass; a load
+	// does not pull them until an append settles. Loop goroutine.
+	loadFellBack map[string]bool
+	// inTimedPass is set while the loop runs a timed pass, which no load
+	// can get ahead of: a load then reads the published version at once.
+	inTimedPass atomic.Bool
 	// The append path (scheduler_append.go, #1751). appendPending is the
 	// files ingest reported per table (under reqMu). The rest is the loop
 	// goroutine's: appendOK the tables whose last reconcile pass settled,
@@ -218,6 +250,37 @@ const measurementTimeout = 2 * time.Minute
 // measurement otherwise takes interval x passes. Capped at the interval itself.
 func (s *Scheduler) partialRetryInterval() time.Duration {
 	return min(s.interval, max(30*time.Second, s.interval/10))
+}
+
+// vanishRetryFirst is the first retry of a table whose pass left files for
+// the next one because a file vanished under it (#1755): a compaction, a
+// DELETE or retention deleting a file between the listing and the read.
+// Such a race is usually over within seconds, and every file of the day it
+// held back, the ones ingest wrote just now among them, waits for the retry.
+// It doubles on each further such pass, up to partialRetryInterval, which
+// is where the ordinary retry takes over.
+const vanishRetryFirst = 5 * time.Second
+
+// noteVanished asks for a table again soon after a pass that left files
+// because some vanished, sooner each time than the ordinary retry, and
+// forgets the count once a pass did not. Loop goroutine only.
+func (s *Scheduler) noteVanished(job *passJob) {
+	if !job.vanished {
+		delete(s.vanishTries, job.key)
+		return
+	}
+	metrics.Get().IncIcebergVanishedPass()
+	// A table escalated as busy is left to the timed passes (serviceRequests).
+	if since, started := s.busySince[job.key]; started && time.Since(since) >= busyEscalateAfter {
+		return
+	}
+	n := s.vanishTries[job.key]
+	d := vanishRetryFirst << min(n, 8)
+	// Counted only when asked: a retry already pending (the ordinary one, or
+	// a spaced request) leaves this step of the ladder for the next pass.
+	if d < s.partialRetryInterval() && s.requestAfter(job.m, job.key, d) {
+		s.vanishTries[job.key] = n + 1
+	}
 }
 
 // reconcileOutcome is what reconcileOne did for one measurement.
@@ -299,6 +362,10 @@ type SchedulerConfig struct {
 	// (iceberg.reconcile_concurrency). One or less: one at a time, on the
 	// loop goroutine, as before #1786.
 	ReconcileConcurrency int
+	// LoadInterval lets a REST catalog table load pull its table's queued
+	// ingest export forward, to no sooner than this after the table's last
+	// one (iceberg.load_export_min_interval, #1752). Zero: off.
+	LoadInterval time.Duration
 }
 
 // NewScheduler builds a reconcile scheduler.
@@ -315,6 +382,7 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		state:             make(map[string]measurementState),
 		leftOut:           make(map[string]int),
 		busySince:         make(map[string]time.Time),
+		vanishTries:       make(map[string]int),
 		requested:         make(map[string]Measurement),
 		requestedPaths:    make(map[string]struct{}),
 		requestedHot:      make(map[string]struct{}),
@@ -324,7 +392,12 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		ingestDue:         make(map[string]ingestRequest),
 		ingestNext:        make(map[string]time.Time),
 		ingestPending:     make(map[string]ingestReports),
+		loadInterval:      cfg.LoadInterval,
+		loadWaiters:       make(map[string][]*loadWaiter),
+		loadUnsettled:     make(map[string]bool),
+		loadFellBack:      make(map[string]bool),
 		appendEnabled:     cfg.IngestAppend,
+		gatePoll:          gateReopenPoll,
 		ingestConcurrency: max(1, cfg.IngestConcurrency),
 		passConcurrency:   max(1, cfg.ReconcileConcurrency),
 		started:           time.Now(),
@@ -372,12 +445,13 @@ func (s *Scheduler) requestSpacing() time.Duration {
 	return requestMinSpacing
 }
 
-// requestAfter asks for m again after d, once per measurement at a time.
-func (s *Scheduler) requestAfter(m Measurement, key string, d time.Duration) {
+// requestAfter asks for m again after d, once per measurement at a time. It
+// reports whether it did: false while another such request is pending.
+func (s *Scheduler) requestAfter(m Measurement, key string, d time.Duration) bool {
 	s.reqMu.Lock()
 	if s.retrying[key] {
 		s.reqMu.Unlock()
-		return
+		return false
 	}
 	s.retrying[key] = true
 	s.reqMu.Unlock()
@@ -387,6 +461,7 @@ func (s *Scheduler) requestAfter(m Measurement, key string, d time.Duration) {
 		s.reqMu.Unlock()
 		s.RequestReconcile(m.Database, m.Measurement)
 	})
+	return true
 }
 
 // RequestReconcile asks for one measurement to be reconciled soon, outside the
@@ -710,8 +785,10 @@ func (s *Scheduler) serviceRequests(ctx context.Context) {
 			reqs = append(reqs, m)
 		}
 	}
-	for _, m := range reqs {
+	for i, m := range reqs {
 		if ctx.Err() != nil {
+			// Stopping (#1886): the shutdown drain serves the rest.
+			s.requeueRequests(reqs[i:])
 			return
 		}
 		key := m.Database + "\x00" + m.Measurement
@@ -746,6 +823,16 @@ func (s *Scheduler) serviceRequests(ctx context.Context) {
 	}
 }
 
+// requeueRequests puts measurements taken by serviceRequests back in the
+// queue, unserved.
+func (s *Scheduler) requeueRequests(ms []Measurement) {
+	s.reqMu.Lock()
+	for _, m := range ms {
+		s.requested[m.Database+"\x00"+m.Measurement] = m
+	}
+	s.reqMu.Unlock()
+}
+
 // noteOutcome records what a reconcile of key did: when the table last
 // changed (requestSpacing), and the end of a busy stretch.
 func (s *Scheduler) noteOutcome(key string, outcome reconcileOutcome) {
@@ -759,7 +846,13 @@ func (s *Scheduler) noteOutcome(key string, outcome reconcileOutcome) {
 
 // gateOpen reports whether this node may export now. On the first open check
 // after a closed one it drops every cached cold listing: one kept from an
-// earlier turn as exporter has missed the cold removals since.
+// earlier turn as exporter has missed the cold removals since. It also takes
+// every table off the append path (#1903): while another node exported, this
+// node dropped its ingest reports and files its tables name may have gone
+// (compaction inputs, retention, DELETE), so an append would publish the table
+// as this node left it plus the new files. The next export of each table is a
+// pass, which diffs it against the listing; a pass that reconciles the table
+// puts it back on the append path.
 func (s *Scheduler) gateOpen() bool {
 	if s.gate != nil && !s.gate.CanRun() {
 		s.wasGated = true
@@ -770,9 +863,17 @@ func (s *Scheduler) gateOpen() bool {
 		if ci, ok := s.source.(coldInvalidator); ok {
 			ci.InvalidateCold("")
 		}
+		clear(s.appendOK)
+		s.passOnReopen = true
 	}
 	return true
 }
+
+// gateReopenPoll is how often the loop asks a closed or open gate when it has
+// nothing else to do (Scheduler.gatePoll). CanRun reads this node's copy of
+// the cluster state, so asking is cheap; a few seconds bound how long a table
+// stays as this node last published it once the role is back.
+const gateReopenPoll = 5 * time.Second
 
 // Start launches the reconcile loop in the background. Stop cancels it.
 func (s *Scheduler) Start() {
@@ -794,12 +895,15 @@ func (s *Scheduler) Stop() {
 func (s *Scheduler) loop(ctx context.Context) {
 	defer close(s.done)
 	// Run one pass shortly after start so a fresh deployment publishes promptly.
-	partial := s.runPass(ctx)
+	partial := s.timedPass(ctx)
 	// A Timer reset AFTER each pass (rather than a Ticker) guarantees a full interval of idle
-	// between passes. With a Ticker, a pass that runs longer than the interval (slow disk, many
-	// files) would queue ticks and cause back-to-back passes with no breathing room — starving
-	// I/O and, in cluster mode, competing with the write path. The reconciler is idempotent, so
-	// a slightly-later next pass is always safe.
+	// between timed passes. With a Ticker, a pass that runs longer than the interval (slow disk,
+	// many files) would queue ticks and cause back-to-back passes with no breathing room —
+	// starving I/O and, in cluster mode, competing with the write path. The reconciler is
+	// idempotent, so a slightly-later next pass is always safe. The one exception is the export
+	// role coming back to this node (passOnReopen, #1903): that pass runs at once, since the
+	// REST catalog serves this node's tables again from that moment; how often it can happen is
+	// bounded by how fast the compactor lease moves.
 	next := s.interval
 	if partial {
 		next = s.partialRetryInterval()
@@ -810,15 +914,30 @@ func (s *Scheduler) loop(ctx context.Context) {
 	// at the top of each turn to the earliest one due.
 	ingestTimer := time.NewTimer(time.Hour)
 	defer ingestTimer.Stop()
+	// Without a gate (standalone) the role never moves: no poll.
+	var gatePoll <-chan time.Time
+	if s.gate != nil && s.gatePoll > 0 {
+		t := time.NewTicker(s.gatePoll)
+		defer t.Stop()
+		gatePoll = t.C
+	}
 	for {
+		s.serviceLoadWaiters()
 		s.armIngestTimer(ingestTimer)
+		if s.passOnReopen {
+			// The role came back (seen here, by a request or by a pass):
+			// pass now. runPass clears the flag on entry, whatever it then
+			// does, so a paused or gated pass cannot make this spin.
+			timer.Reset(0)
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-s.wake:
 			// A request between passes: serve it now. The timer is not
-			// touched, so the next timed pass keeps its time however many
-			// requests come in. Drops first: they run whatever the gate.
+			// touched here, so the next timed pass keeps its time however
+			// many requests come in (a reopen a request sees is acted on at
+			// the top of the loop). Drops first: they run whatever the gate.
 			// Ingest requests last, and only the ones already due.
 			if s.pausedForRestore() {
 				continue
@@ -833,8 +952,11 @@ func (s *Scheduler) loop(ctx context.Context) {
 			}
 			s.serviceIngest(ctx, ingestBatch)
 			continue
+		case <-gatePoll:
+			s.gateOpen() // a reopen sets passOnReopen; the top of the loop acts on it
+			continue
 		case <-timer.C:
-			partial = s.runPass(ctx)
+			partial = s.timedPass(ctx)
 		}
 		next = s.interval
 		if partial {
@@ -867,6 +989,9 @@ func (s *Scheduler) pausedForRestore() bool {
 // takes effect without a restart (nil gate = always run). It reports whether any measurement
 // was left partly registered, so the loop can come back sooner.
 func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
+	// Whatever this pass does, it answers a pending reopen (#1903): left set by
+	// a paused or gated return, the loop would ask for a pass at once, forever.
+	s.passOnReopen = false
 	if s.pausedForRestore() {
 		return false
 	}
@@ -887,6 +1012,8 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 		metrics.Get().SetIcebergFilesLeftOut(0) // the exporting node reports them
 		return false
 	}
+	// A reopen this pass's own gate check saw is answered by this pass.
+	s.passOnReopen = false
 	measurements, err := s.source.Measurements(ctx)
 	if err == nil {
 		s.known = measurements
@@ -1013,6 +1140,9 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 		if s.gate != nil && !s.gate.CanRun() {
 			s.logger.Info().Msg("Iceberg reconcile: this node stopped being the active writer mid-pass; stopping the pass")
 			clear(s.busySince)
+			// Seen closed, as gateOpen would record it: a reopen then runs
+			// a pass again, even one no poll or request saw close (#1903).
+			s.wasGated = true
 			return false
 		}
 		if len(batch) == 1 {
@@ -1046,6 +1176,11 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 	for k := range s.busySince {
 		if _, ok := seen[k]; !ok {
 			delete(s.busySince, k)
+		}
+	}
+	for k := range s.vanishTries {
+		if _, ok := seen[k]; !ok {
+			delete(s.vanishTries, k)
 		}
 	}
 	for k := range s.appendOK {

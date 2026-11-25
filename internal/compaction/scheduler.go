@@ -127,6 +127,13 @@ func (s *Scheduler) Start() error {
 		return nil
 	}
 
+	// After shutdown began (#1887), a compactor-lease callback must not
+	// restart a scheduler the shutdown has stopped.
+	if s.manager != nil && s.manager.Stopping() {
+		s.logger.Info().Msg("Compaction scheduler not started: the server is shutting down")
+		return nil
+	}
+
 	if s.running {
 		s.logger.Warn().Msg("Compaction scheduler already running")
 		return nil
@@ -215,6 +222,32 @@ func (s *Scheduler) signalStopLocked() {
 	if s.running && s.stopCh != nil {
 		close(s.stopCh)
 		s.stopCh = nil
+	}
+}
+
+// StopDispatchAll stops the schedulers' cron dispatch and their deferred
+// ticks, without waiting for a running cycle (#1887): shutdown's hooks call
+// it, and the wait happens later, bounded, in a component. StopAll after it
+// still waits for the cron jobs.
+func StopDispatchAll(schedulers ...*Scheduler) {
+	for _, s := range schedulers {
+		if s == nil {
+			continue
+		}
+		// TryLock: a Stop already holding the lock (OnLoseCompactor's)
+		// waits for the running cycle under it, and has stopped dispatch
+		// itself. Blocking on it here would hold every later shutdown hook
+		// behind a batch.
+		if !s.mu.TryLock() {
+			continue
+		}
+		if s.running {
+			s.signalStopLocked()
+			if s.cron != nil {
+				s.cron.Stop() // its context, which waits for the jobs, is dropped
+			}
+		}
+		s.mu.Unlock()
 	}
 }
 
@@ -313,6 +346,10 @@ func (s *Scheduler) runScheduledCycle() error {
 		switch {
 		case errors.Is(err, ErrCompactionPaused):
 			s.logger.Info().Int64("cycle_id", claim.ID).Dur("duration", time.Since(startTime)).Msg("Scheduled compaction stopped at a batch boundary: compaction is paused cluster-wide")
+		case errors.Is(err, ErrCompactionStopping):
+			s.logger.Info().Int64("cycle_id", claim.ID).Dur("duration", time.Since(startTime)).Msg("Scheduled compaction stopped at a batch boundary: the server is shutting down")
+		case s.manager.Stopping() && errors.Is(err, context.Canceled):
+			s.logger.Warn().Int64("cycle_id", claim.ID).Dur("duration", time.Since(startTime)).Msg("Scheduled compaction killed at the shutdown deadline; the next start recovers it from its manifest")
 		case ctx.Err() != nil:
 			s.logger.Info().Err(ctx.Err()).Int64("cycle_id", claim.ID).Dur("duration", time.Since(startTime)).Msg("Scheduled compaction interrupted")
 		default:

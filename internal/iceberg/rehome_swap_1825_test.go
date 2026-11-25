@@ -327,7 +327,7 @@ func TestPublishedNames1825_AHintBehindTheCatalogIsNotPublished(t *testing.T) {
 		t.Fatalf("%+v %v", a, err)
 	}
 	sched.Stop() // publishedNames runs where passes run; none does now
-	if _, published, named, err := exp.publishedNames(ctx, "mydb", "cpu", f0); err != nil || !published || named {
+	if _, published, named, err := exp.publishedNames(ctx, "mydb", "cpu", f0, false); err != nil || !published || named {
 		t.Fatalf("published %v, named %v, err %v", published, named, err)
 	}
 	// The hint as it was before the file's removal was committed: readers
@@ -335,7 +335,7 @@ func TestPublishedNames1825_AHintBehindTheCatalogIsNotPublished(t *testing.T) {
 	if err := os.WriteFile(hint, before, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	exists, published, _, err := exp.publishedNames(ctx, "mydb", "cpu", f0)
+	exists, published, _, err := exp.publishedNames(ctx, "mydb", "cpu", f0, false)
 	if err != nil || !exists || published {
 		t.Fatalf("with the hint behind the catalog: exists %v, published %v, err %v", exists, published, err)
 	}
@@ -373,6 +373,11 @@ func TestReconcileAndConfirm1825_SpacedPassesStillAnswer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	const f0 = "mydb/cpu/2023/11/14/22/f0.parquet"
+	// The spacing runs from the end of the first pass, which is after the
+	// first question was put: measured from there, it is a floor whatever
+	// the first answer's own check costs (#1846; a slow runner measured from
+	// the first answer saw 81 ms).
+	first := time.Now()
 	if a, err := sched.ReconcileAndConfirm(ctx, "mydb", "cpu", f0); err != nil || !a.Named {
 		t.Fatalf("%+v %v", a, err)
 	}
@@ -380,13 +385,12 @@ func TestReconcileAndConfirm1825_SpacedPassesStillAnswer(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Straight after a pass that committed: inside the spacing.
-	start := time.Now()
 	a, err := sched.ReconcileAndConfirm(ctx, "mydb", "cpu", f0)
 	if err != nil || !a.Clear() {
 		t.Fatalf("a question inside the spacing: %+v, err %v", a, err)
 	}
-	if time.Since(start) < 100*time.Millisecond {
-		t.Fatalf("answered after %s: the spacing was not kept", time.Since(start))
+	if since := time.Since(first); since < requestMinSpacing {
+		t.Fatalf("answered %s after the first question: the spacing (%s) was not kept", since, requestMinSpacing)
 	}
 }
 
@@ -531,5 +535,163 @@ func TestReconcileAndConfirmProbesTheMetadataDirectory(t *testing.T) {
 	left, _ := filepath.Glob(filepath.Join(metaDir, ".arc-write-probe-*"))
 	if len(left) != 0 {
 		t.Fatalf("probe left behind: %v", left)
+	}
+}
+
+// #1845 item 1: a job whose wait was waived still has its old file's removal
+// committed with its new files, and its record goes once the table, as
+// published, does not name the old file.
+func TestRehomeSwap1845_AWaivedJobStillCommitsTogether(t *testing.T) {
+	r := newSwapRig1825(t)
+	var done []string
+	r.exp.SetReplacedWaived(func(string, string) map[string][]string {
+		return map[string][]string{r.old.Key: {r.out.Key}}
+	}, func(_, _, src string) { done = append(done, src) })
+	commits := 0
+	if _, err := r.pass(func() bool { commits++; return commits == 1 }, append([]FileRef{r.keep, r.out}, r.extras...)...); err != nil {
+		t.Fatal(err)
+	}
+	r.holds(t, r.keep, r.out)
+	if len(done) != 1 || done[0] != r.old.Key {
+		t.Fatalf("done %v; want the old file once the table stopped naming it", done)
+	}
+}
+
+// A waived job's new file that cannot be registered is left out, not
+// refused: refusing would hold the table on a file that is gone.
+func TestRehomeSwap1845_AWaivedJobsBadFileIsLeftOut(t *testing.T) {
+	r := newSwapRig1825(t)
+	removeFile(t, r.out)
+	writeStraddlingParquet(t, r.out.LocalPath, day14+dayMicros)
+	out := refOf(t, r.out.LocalPath)
+	out.Key, out.LocalPath = r.out.Key, r.out.LocalPath
+	r.exp.SetReplacedWaived(func(string, string) map[string][]string {
+		return map[string][]string{r.old.Key: {out.Key}}
+	}, func(string, string, string) {})
+	if _, err := r.pass(nil, r.keep, out); err != nil {
+		t.Fatalf("a waived job's file that cannot be registered failed the pass: %v", err)
+	}
+	r.holds(t, r.keep)
+	// A recorded job naming the same old file still refuses.
+	r2 := newSwapRig1825(t)
+	removeFile(t, r2.out)
+	writeStraddlingParquet(t, r2.out.LocalPath, day14+dayMicros)
+	out2 := refOf(t, r2.out.LocalPath)
+	out2.Key, out2.LocalPath = r2.out.Key, r2.out.LocalPath
+	both := func(string, string) map[string][]string { return map[string][]string{r2.old.Key: {out2.Key}} }
+	r2.exp.SetReplaced(both)
+	r2.exp.SetReplacedWaived(both, func(string, string, string) {})
+	if _, err := r2.pass(nil, r2.keep, out2); err == nil || !strings.Contains(err.Error(), "cannot be registered") {
+		t.Fatalf("a recorded job's file: err %v, want a refusal", err)
+	}
+}
+
+// A waived job's swap does not defer every day when a file vanishes: only the
+// vanished file's day waits, so the waiver still gets the old file's removal
+// past a file that keeps vanishing elsewhere (#1845 review).
+func TestRehomeSwap1845_AWaivedSwapDefersOnlyTheVanishedDay(t *testing.T) {
+	r := newSwapRig1825(t)
+	r.exp.SetReplacedWaived(func(string, string) map[string][]string {
+		return map[string][]string{r.old.Key: {r.out.Key}}
+	}, func(string, string, string) {})
+	// Day 3 loses a file this pass (x3, in the table, then gone from
+	// storage), and a new file of day 3 vanishes as it is read: day 3 is in
+	// commit 0, apart from the old file's and its new file's days.
+	x3 := r.write(3, "x3")
+	if _, err := r.exp.ReconcileMeasurementWithHint(context.Background(), "mydb", "cpu", r.sc, []FileRef{r.keep, r.old, x3}); err != nil {
+		t.Fatal(err)
+	}
+	removeFile(t, x3)
+	gone := r.write(3, "gone")
+	removeFile(t, gone)
+	res, err := r.pass(nil, r.keep, r.out, gone)
+	if err != nil {
+		t.Fatalf("a vanished file failed the pass: %v", err)
+	}
+	if res.settled {
+		t.Fatalf("result %+v, want not settled", res)
+	}
+	// Day 3 waits whole (x3 still named); the old file left with its new one.
+	r.holds(t, r.keep, r.out, x3)
+}
+
+// #1906: with the warehouse outside the storage root no discovery files are
+// written, and the catalog's commit is the publish: a question about the
+// table is answered from it, not refused for ever.
+func TestReconcileAndConfirmWithTheWarehouseOutsideTheRoot1906(t *testing.T) {
+	root, wh := t.TempDir(), t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeArcStyleParquet(t, filepath.Join(root, "mydb/cpu/2023/11/14/22/f0.parquet"), day14, 5)
+	db, err := sql.Open("sqlite3", filepath.Join(root, "arc.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	exp, err := NewExporter(db, backend, "file://"+wh, "arc", 3, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc", zerolog.Nop()), Interval: time.Hour, Logger: zerolog.Nop()})
+	sched.Start()
+	t.Cleanup(sched.Stop)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	const f0 = "mydb/cpu/2023/11/14/22/f0.parquet"
+	a, err := sched.ReconcileAndConfirm(ctx, "mydb", "cpu", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, why := a.Verdict(false); !ok {
+		t.Fatalf("the ready question with the warehouse outside the root: %s (%+v)", why, a)
+	}
+	if a, err = sched.ReconcileAndConfirm(ctx, "mydb", "cpu", f0); err != nil || !a.Published || !a.Named {
+		t.Fatalf("the table names the file: %+v, err %v", a, err)
+	}
+	// A read-only question (a node that may not export, #1870) reads only
+	// discovery files, which this layout has none of: never "published".
+	if a, err := sched.CheckPublished(ctx, "mydb", "cpu", f0); err != nil || a.Published {
+		t.Fatalf("a read-only question: %+v, err %v; want not published", a, err)
+	}
+	if err := os.Remove(filepath.Join(root, f0)); err != nil {
+		t.Fatal(err)
+	}
+	if a, err = sched.ReconcileAndConfirm(ctx, "mydb", "cpu", f0); err != nil || !a.Clear() {
+		t.Fatalf("after the file left: %+v, err %v", a, err)
+	}
+}
+
+// #1906: only a warehouse outside the storage root counts as unaddressable;
+// the root itself, a subdirectory, and not a sibling whose name starts the
+// same.
+func TestWarehouseAddressable1906(t *testing.T) {
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		warehouse string
+		want      bool
+	}{
+		{root, true},
+		{filepath.Join(root, "wh"), true},
+		{root + "-other", false},
+		{t.TempDir(), false},
+	} {
+		db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "c.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		exp, err := NewExporter(db, backend, "file://"+tc.warehouse, "arc", 3, zerolog.Nop())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := exp.warehouseAddressable(); got != tc.want {
+			t.Errorf("warehouse %s: addressable %v, want %v", tc.warehouse, got, tc.want)
+		}
+		db.Close()
 	}
 }

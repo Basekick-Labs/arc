@@ -97,6 +97,10 @@ type MigrationResult struct {
 	// stopped being the writer, a DELETE held them, or a release failure
 	// stopped the run. A later run moves them.
 	NotAttempted int
+	// Gone files were removed since the scan listed them (a compaction, a
+	// DELETE, a re-home job, #1848): nothing to copy; the next scan retires
+	// their rows.
+	Gone int
 	// Kept files are migrated but their hot copy was not released (a
 	// manifest update or a hot delete failed). Until they are reconciled,
 	// a node reading both tiers reads them twice.
@@ -150,6 +154,7 @@ func (m *Migrator) MigrateTierFilteredResult(ctx context.Context, fromTier, toTi
 		r.Migrated += b.migrated
 		r.Failed += b.failed
 		r.NotAttempted += b.notAttempted
+		r.Gone += b.gone
 		r.Kept += b.kept
 		if b.releaseErr != nil {
 			// A manifest failure is not transient (Cluster Operations
@@ -322,6 +327,10 @@ func (m *Migrator) dropTakenOver(ctx context.Context, files []MigrationCandidate
 	return kept
 }
 
+// errSourceGone: the hot file was removed after the scan listed it; its row
+// is stale and the next scan retires it. Not a failure of the migration.
+var errSourceGone = errors.New("the file was removed after the tiering scan listed it")
+
 // errHeldByCompaction: a compaction or a re-home job took the file over
 // during its migration.
 var errHeldByCompaction = errors.New("a compaction or a re-home job took the file over during its migration")
@@ -405,7 +414,7 @@ func (m *Migrator) MigrateBatch(ctx context.Context, candidates []MigrationCandi
 
 // batchResult is migrateBatch's account of one batch.
 type batchResult struct {
-	migrated, failed, notAttempted, kept int
+	migrated, failed, notAttempted, kept, gone int
 	// releaseErr is the release's manifest failure, which stops the cycle.
 	releaseErr error
 }
@@ -500,7 +509,7 @@ func (m *Migrator) migrateBatch(ctx context.Context, candidates []MigrationCandi
 	sem := semaphore.NewWeighted(int64(m.maxConcurrent))
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	migrated, failed, notAttempted := 0, 0, 0
+	migrated, failed, notAttempted, gone := 0, 0, 0, 0
 	var moved []string // hot paths migrated, for the export (#1727)
 	var stop atomic.Bool
 	flippedCh := make(chan MigrationCandidate, len(candidates))
@@ -568,6 +577,13 @@ func (m *Migrator) migrateBatch(ctx context.Context, candidates []MigrationCandi
 					m.logger.Debug().Str("path", c.Path).Msg("A compaction or a re-home job owns the file; it stays hot this cycle")
 					return
 				}
+				if errors.Is(err, errSourceGone) {
+					m.logger.Info().Str("path", c.Path).Msg("A file listed for migration was removed since the tiering scan listed it (a compaction, a DELETE or a re-home job); nothing to copy, and the next scan retires its row")
+					mu.Lock()
+					gone++
+					mu.Unlock()
+					return
+				}
 				if errors.Is(err, errCopyCutOff) {
 					// Not a failure of the file: the run ran out of time
 					// while copying it. It stays hot, with no cold row.
@@ -623,7 +639,7 @@ func (m *Migrator) migrateBatch(ctx context.Context, candidates []MigrationCandi
 	// The hot copies are released by now: the export can name the cold ones
 	// (#1727).
 	m.manager.notifyPathsChanged(moved)
-	return batchResult{migrated: migrated, failed: failed, notAttempted: notAttempted, kept: rel.kept, releaseErr: rel.err}
+	return batchResult{migrated: migrated, failed: failed, notAttempted: notAttempted, kept: rel.kept, gone: gone, releaseErr: rel.err}
 }
 
 // releaseWindow bounds how long a flipped file waits for its chunk to start
@@ -837,7 +853,13 @@ func (m *Migrator) copyAndFlip(ctx context.Context, candidate MigrationCandidate
 	// object-store destination now enforces the declared length. Ask the
 	// source, falling back to the row when it cannot say.
 	size := candidate.SizeBytes
-	if n, err := srcBackend.StatFile(ctx, candidate.Path); err == nil && n > 0 {
+	n, statErr := srcBackend.StatFile(ctx, candidate.Path)
+	if statErr == nil && n < 0 {
+		// Gone since the scan listed it (a compaction, a DELETE, a re-home
+		// job removed it, #1848): nothing to copy. The scan retires its row.
+		return fmt.Errorf("%s: %w", candidate.Path, errSourceGone)
+	}
+	if statErr == nil && n > 0 {
 		size = n
 	}
 
@@ -874,6 +896,16 @@ func (m *Migrator) copyAndFlip(ctx context.Context, candidate MigrationCandidate
 		// ended: that is when a copy is most often cut off.
 		cctx, ccancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer ccancel()
+		// Removed between the stat and the copy: the same as gone before it,
+		// and recorded as such.
+		if storage.IsNotFound(migrationErr) {
+			if n, err := srcBackend.StatFile(cctx, candidate.Path); err == nil && n < 0 {
+				if migrationID > 0 {
+					m.manager.metadata.CompleteMigration(cctx, migrationID, errSourceGone)
+				}
+				return fmt.Errorf("%s: %w", candidate.Path, errSourceGone)
+			}
+		}
 		// Record failure
 		if migrationID > 0 {
 			m.manager.metadata.CompleteMigration(cctx, migrationID, migrationErr)

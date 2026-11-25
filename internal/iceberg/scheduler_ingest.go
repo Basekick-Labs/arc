@@ -198,6 +198,8 @@ func (s *Scheduler) dropIngest() {
 	s.reqMu.Lock()
 	clear(s.ingestDue)
 	clear(s.appendPending) // another node exports them (scheduler_append.go)
+	s.skipLoadWaitersLocked("")
+	clear(s.loadUnsettled)
 	if len(s.ingestPending) > 0 {
 		clear(s.ingestPending)
 		s.publishIngestPendingLocked()
@@ -210,6 +212,8 @@ func (s *Scheduler) forgetIngest(key string) {
 	s.reqMu.Lock()
 	delete(s.ingestDue, key)
 	delete(s.appendPending, key)
+	s.skipLoadWaitersLocked(key)
+	delete(s.loadUnsettled, key)
 	if _, waiting := s.ingestPending[key]; waiting {
 		delete(s.ingestPending, key)
 		s.publishIngestPendingLocked()
@@ -253,6 +257,10 @@ func (s *Scheduler) noteIngestCovered(key string, startedAt time.Time, outcome r
 	_, settled := s.state[key]
 	s.reqMu.Lock()
 	defer s.reqMu.Unlock()
+	ok := err == nil && settled && (outcome == outcomeReconciled || outcome == outcomeUnchanged)
+	// Runs before the unlock above: the loads of this table learn at once
+	// that their files are in (or that this export did not settle).
+	defer s.releaseLoadWaitersLocked(key, !ok)
 	if changed {
 		next := time.Now().Add(s.ingestInterval)
 		if next.After(s.ingestNext[key]) {
@@ -263,9 +271,13 @@ func (s *Scheduler) noteIngestCovered(key string, startedAt time.Time, outcome r
 			s.ingestDue[key] = r
 		}
 	}
-	if err != nil || !settled || (outcome != outcomeReconciled && outcome != outcomeUnchanged) {
+	if !ok {
+		if s.loadInterval > 0 {
+			s.loadUnsettled[key] = true // a load does not wait on it (scheduler_load.go)
+		}
 		return
 	}
+	delete(s.loadUnsettled, key)
 	reports, waiting := s.ingestPending[key]
 	if !waiting || !reports.first.Before(startedAt) {
 		return // nothing waits, or everything waiting was reported after it started

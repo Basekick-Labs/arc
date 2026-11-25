@@ -170,6 +170,14 @@ type exporterShared struct {
 	onPublished func(database, measurement string)
 	// replaced: the files re-home jobs are replacing (SetReplaced).
 	replaced func(database, measurement string) map[string][]string
+	// replacedWaived and replacedDone: the same for jobs that ended with
+	// their wait for the export waived, and what drops their record once the
+	// published table does not name the old file (SetReplacedWaived, #1845).
+	replacedWaived func(database, measurement string) map[string][]string
+	replacedDone   func(database, measurement, source string)
+	// waivedChecked: the tables settleWaived has looked at since the start.
+	waivedMu      sync.Mutex
+	waivedChecked map[string]bool
 
 	// servedLayoutOnce caches the warehouse layout the published-state reads
 	// (published.go) check names against.
@@ -2083,6 +2091,18 @@ func (e *Exporter) warnHintUnaddressableOnce(metaLoc string) {
 //	storage root "file:///data", warehouse "file:///data/wh",
 //	metaLoc "file:///data/wh/arc_db.db/cpu/metadata/00004-<uuid>.metadata.json"
 //	-> "wh/arc_db.db/cpu/metadata/00004-<uuid>.metadata.json"
+//
+// warehouseAddressable reports whether the storage backend can address the
+// warehouse: it is under the storage root (#1906). Where it is not, the
+// export writes no discovery files there (writeVersionHint).
+func (e *Exporter) warehouseAddressable() bool {
+	if e.backend == nil {
+		return false
+	}
+	e.resolveBases()
+	return isUnderDir(e.resolvedWarehouse, e.resolvedRoot)
+}
+
 func (e *Exporter) warehouseRelKey(metaLoc string) (string, bool) {
 	// Resolve symlinks before comparing (#639 item 5): the warehouse config,
 	// the storage root, and the metadata location can each render the same

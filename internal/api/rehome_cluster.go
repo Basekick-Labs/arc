@@ -247,6 +247,9 @@ func (h *RehomeHandler) runClusterSwap(ctx context.Context, job *rehomeJob) (sta
 	if checkErr != nil {
 		return fail("checking the file", checkErr)
 	}
+	if why := h.roomForJob(size); why != "" { // #1851 item 3
+		return fail("checking the file", rehome.Refusef("%s", why))
+	}
 
 	// Split in scratch.
 	prep, step, err := h.prepare(ctx, src.Key, h.storage.ReadTo)

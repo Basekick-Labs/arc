@@ -35,6 +35,9 @@ type Config struct {
 	Endpoint string        // Telemetry endpoint URL
 	Interval time.Duration // Reporting interval (default: 24h)
 	DataDir  string        // Directory for instance ID file
+	// InstanceID, when set, is the id: nothing is read from or written to
+	// DataDir (#1885). Config validates it as a UUID.
+	InstanceID string
 }
 
 // DefaultConfig returns the default telemetry configuration
@@ -167,10 +170,14 @@ func New(cfg *Config, version string, logger zerolog.Logger) (*Collector, error)
 		cfg = DefaultConfig()
 	}
 
-	// Load or generate instance ID
-	instanceID, err := loadOrCreateInstanceID(cfg.DataDir)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get instance ID: %w", err)
+	// A configured id, or the one in the id file (#1885).
+	instanceID := cfg.InstanceID
+	if instanceID == "" {
+		var err error
+		instanceID, err = loadOrCreateInstanceID(cfg.DataDir)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get instance ID: %w", err)
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -336,10 +343,17 @@ func loadOrCreateInstanceID(dataDir string) (string, error) {
 
 	idPath := filepath.Join(dataDir, instanceIDFile)
 
-	// Try to load existing ID
+	// Try to load existing ID. A file holding only whitespace is replaced:
+	// returning "" would merge every such installation into one id on the
+	// server. A read error other than a missing file is reported rather than
+	// minting a new id over a file that may hold the real one (#1885).
 	data, err := os.ReadFile(idPath)
-	if err == nil && len(data) > 0 {
-		return string(bytes.TrimSpace(data)), nil
+	if err == nil {
+		if id := string(bytes.TrimSpace(data)); id != "" {
+			return id, nil
+		}
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("failed to read instance ID: %w", err)
 	}
 
 	// Generate new ID as UUID format (matching Python's uuid.uuid4())
@@ -349,7 +363,7 @@ func loadOrCreateInstanceID(dataDir string) (string, error) {
 	}
 
 	// Save ID
-	if err := os.WriteFile(idPath, []byte(id), 0644); err != nil {
+	if err := os.WriteFile(idPath, []byte(id), 0600); err != nil {
 		return "", fmt.Errorf("failed to save instance ID: %w", err)
 	}
 
