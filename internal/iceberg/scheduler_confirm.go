@@ -363,10 +363,12 @@ func (e *Exporter) publishedIsCurrent(ctx context.Context, database, measurement
 		// (writeVersionHint).
 		return true, nil
 	}
-	if _, _, ok := e.parseVersionAndMetaDir(tbl.MetadataLocation()); !ok && ownPass {
+	if ownPass && !e.warehouseAddressable() {
 		// A warehouse the storage backend cannot address (outside the
 		// storage root): no discovery files either, and catalog readers are
 		// the only readers, who see the commit (writeVersionHint, #1906).
+		// Only that: a table whose metadata name is merely unusual in an
+		// addressable warehouse still answers from its discovery files.
 		return true, nil
 	}
 	pub, found, err := e.LoadPublished(ctx, database, measurement)

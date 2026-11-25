@@ -11,8 +11,9 @@ The export writes no discovery files (`version-hint.text`) in such a warehouse, 
 are the only readers there, so the catalog's commit is the publish. A re-home job's check read the
 published version from the discovery files, found none, and refused every job ("did not publish its
 version"). After a pass of its own, the export now takes the catalog's commit as published there.
-A node answering without its own pass (a cluster node that may not export) still reads only the
-discovery files, and so still holds a job in that layout.
+On a cluster, nodes that do not export answer from the discovery files only, so in this layout a
+job still waits at them, as before: re-home with the warehouse outside the storage root is a
+standalone fix.
 
 ## Fix: two re-home edges with tiered storage and the Iceberg export ([#1848](https://github.com/Basekick-Labs/arc/issues/1848))
 

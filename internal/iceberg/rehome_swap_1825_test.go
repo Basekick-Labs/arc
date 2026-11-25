@@ -662,3 +662,36 @@ func TestReconcileAndConfirmWithTheWarehouseOutsideTheRoot1906(t *testing.T) {
 		t.Fatalf("after the file left: %+v, err %v", a, err)
 	}
 }
+
+// #1906: only a warehouse outside the storage root counts as unaddressable;
+// the root itself, a subdirectory, and not a sibling whose name starts the
+// same.
+func TestWarehouseAddressable1906(t *testing.T) {
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		warehouse string
+		want      bool
+	}{
+		{root, true},
+		{filepath.Join(root, "wh"), true},
+		{root + "-other", false},
+		{t.TempDir(), false},
+	} {
+		db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "c.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		exp, err := NewExporter(db, backend, "file://"+tc.warehouse, "arc", 3, zerolog.Nop())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := exp.warehouseAddressable(); got != tc.want {
+			t.Errorf("warehouse %s: addressable %v, want %v", tc.warehouse, got, tc.want)
+		}
+		db.Close()
+	}
+}

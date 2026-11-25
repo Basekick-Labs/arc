@@ -2091,6 +2091,18 @@ func (e *Exporter) warnHintUnaddressableOnce(metaLoc string) {
 //	storage root "file:///data", warehouse "file:///data/wh",
 //	metaLoc "file:///data/wh/arc_db.db/cpu/metadata/00004-<uuid>.metadata.json"
 //	-> "wh/arc_db.db/cpu/metadata/00004-<uuid>.metadata.json"
+//
+// warehouseAddressable reports whether the storage backend can address the
+// warehouse: it is under the storage root (#1906). Where it is not, the
+// export writes no discovery files there (writeVersionHint).
+func (e *Exporter) warehouseAddressable() bool {
+	if e.backend == nil {
+		return false
+	}
+	e.resolveBases()
+	return isUnderDir(e.resolvedWarehouse, e.resolvedRoot)
+}
+
 func (e *Exporter) warehouseRelKey(metaLoc string) (string, bool) {
 	// Resolve symlinks before comparing (#639 item 5): the warehouse config,
 	// the storage root, and the metadata location can each render the same
