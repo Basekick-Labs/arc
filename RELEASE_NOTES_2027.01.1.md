@@ -11,7 +11,8 @@ jobs.
   listing predates a re-home job's (or a compaction's, or a DELETE's) removal of a file re-inserts
   its hot row; the next migration then tried to copy a file that was gone and logged
   "Failed to migrate file" at Error, counting a failure. It now sees the file is gone, copies
-  nothing, logs at Info and counts nothing; the next scan retires the row as before.
+  nothing and logs at Info; `POST /api/v1/tiering/migrate` reports such files in a new `gone`
+  count instead of `errors`, and the next scan retires the row as before.
 - **A job found at start before it switched reads is undone when the Iceberg export did not start
   this time** (it failed to build, for example `wireIcebergCold` failing). Before, it switched
   reads and then waited for an export that never runs, until the wait was waived. Reads still used
