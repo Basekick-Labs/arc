@@ -259,6 +259,9 @@ type importWriter struct {
 	slotHeld bool
 	tracked  bool
 	flushed  bool // finalFlush ran (or close flushed a stopped pass)
+	// outcome counts the import's rows without a WAL copy and those a failed
+	// flush put at risk (#1888); every write of the import carries it.
+	outcome *ingest.FlushOutcome
 }
 
 // importBufferedAllowance is how many bytes an import may have written and
@@ -336,6 +339,7 @@ func newImportWriter(ctx context.Context, buf *ingest.ArrowBuffer, database stri
 		maxWait:  importFlushWait,
 		measRows: map[string]int64{},
 		grouper:  ingest.NewHourGrouper(budget),
+		outcome:  &ingest.FlushOutcome{},
 	}
 	if err := w.pacer.acquire(ctx, w, buf.BufferedBytes, max(allowance-budget, 1)); err != nil {
 		return nil, err
@@ -398,7 +402,7 @@ func (w *importWriter) end(ctx context.Context) error {
 // for schema churn (see importChurnRetries).
 func (w *importWriter) writeBatch(ctx context.Context, measurement string, batch *ingest.TypedColumnBatch, rows int) error {
 	for attempt := 0; ; attempt++ {
-		err := importWriteDirect(w.buf, ctx, w.database, measurement, batch, rows)
+		err := importWriteDirect(w.buf, ingest.WithFlushOutcome(ctx, w.outcome), w.database, measurement, batch, rows)
 		if err == nil || !errors.Is(err, ingest.ErrSchemaChurnExceeded) || attempt >= importChurnRetries {
 			return err
 		}
@@ -427,13 +431,41 @@ func (w *importWriter) releaseSlot() {
 
 // finalFlush ends a write pass: the slot goes back, then the import's own
 // buffers are flushed. Call after end.
+//
+// When the import buffered rows without a WAL copy (the WAL off, or a queued
+// append the WAL dropped), it then waits for the flushes holding them, and
+// fails if a flush of its own rows failed (#1888): those rows were held only
+// in memory. With a WAL copy of every row it answers at once, as before: a
+// failed flush is replayed from the WAL.
 func (w *importWriter) finalFlush(ctx context.Context) error {
 	w.releaseSlot()
 	w.flushed = true
 	if importBeforeFinalFlushHook != nil {
 		importBeforeFinalFlushHook(w)
 	}
-	return w.buf.FlushMeasurements(ctx, w.database, w.order)
+	if err := w.buf.FlushMeasurements(ctx, w.database, w.order); err != nil {
+		return err
+	}
+	return w.waitOwnFlushes(ctx)
+}
+
+// waitOwnFlushes is finalFlush's wait for the flushes of the import's rows
+// without a WAL copy, and the verdict on them (#1888). Every flush task
+// finishes on every path and each file is bounded by
+// ingest.flush_timeout_seconds, so the wait has no timer of its own; it ends
+// early only when the server shuts down (the request's context) or the
+// buffer closes, and the outcome is then unknown.
+func (w *importWriter) waitOwnFlushes(ctx context.Context) error {
+	if w.outcome == nil || w.outcome.NoWALRows() == 0 {
+		return nil
+	}
+	if err := w.buf.WaitFlushes(ctx, w.database, w.order); err != nil {
+		return fmt.Errorf("the server stopped before this import's flushes finished, so whether its rows without a WAL copy were stored is not known: %w", err)
+	}
+	if n := w.outcome.RowsAtRisk(); n > 0 {
+		return fmt.Errorf("%d of this import's rows had no WAL copy and were in a flush that failed", n)
+	}
+	return nil
 }
 
 // close releases the write slot, if still held, and the pass's share of the

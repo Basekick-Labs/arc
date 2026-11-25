@@ -563,7 +563,10 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 		return respondWriteRefused(c, aerr)
 	}
 	defer release()
-	if err := h.arrowBuffer.WriteTypedColumnarDirect(writeCtx, database, measurement, batch, numRecords); err != nil {
+	// The import's own outcome (#1888): its rows without a WAL copy are
+	// waited for below, and only a failure of those fails it.
+	outcome := &ingest.FlushOutcome{}
+	if err := h.arrowBuffer.WriteTypedColumnarDirect(ingest.WithFlushOutcome(writeCtx, outcome), database, measurement, batch, numRecords); err != nil {
 		h.totalErrors.Add(1)
 		if ingest.IsWriteRefusal(err) {
 			return respondWriteRefused(c, err) // logged by reason (#1268)
@@ -580,8 +583,19 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 		})
 	}
 
-	// Force flush to ensure data is persisted before returning
-	if err := h.arrowBuffer.FlushAll(c.Context()); err != nil {
+	// Flush this import's measurement, not the whole node: a node-wide flush
+	// cut every other writer's buffers into small files and failed this
+	// import on any of their flush errors. Then the same wait and verdict as
+	// the other imports (#1888).
+	flushErr := h.arrowBuffer.FlushMeasurements(c.Context(), database, []string{measurement})
+	if flushErr == nil && outcome.NoWALRows() > 0 {
+		if err := h.arrowBuffer.WaitFlushes(c.Context(), database, []string{measurement}); err != nil {
+			flushErr = fmt.Errorf("the server stopped before this import's flushes finished, so whether its rows without a WAL copy were stored is not known: %w", err)
+		} else if n := outcome.RowsAtRisk(); n > 0 {
+			flushErr = fmt.Errorf("%d of this import's rows had no WAL copy and were in a flush that failed", n)
+		}
+	}
+	if err := flushErr; err != nil {
 		h.totalErrors.Add(1)
 		h.logger.Error().Err(err).Str("database", database).Msg("TLE import: flush failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
