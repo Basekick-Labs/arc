@@ -2,8 +2,11 @@ package iceberg
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
+
+	"github.com/basekick-labs/arc/internal/metrics"
 )
 
 // #1752: a REST catalog load waits, briefly, for the files reported for its
@@ -24,6 +27,8 @@ func startLoadRig(t *testing.T, ingest, load time.Duration, appendOn bool, gate 
 	r.sched.Start()
 	t.Cleanup(r.sched.Stop)
 	waitUntil(t, "the start-up pass did not publish the file", func() bool { return r.tableFiles() >= 1 })
+	// Until the pass has returned: a load during a timed pass does not wait.
+	waitUntil(t, "the start-up pass did not end", func() bool { return !r.sched.inTimedPass.Load() })
 	return r
 }
 
@@ -178,5 +183,119 @@ func TestLoadArrivingMidServiceIsNotSkipped(t *testing.T) {
 	}
 	if !s.loadWaiters[first][0].closed {
 		t.Fatal("the load in the snapshot was not decided (its table is not servable: no source)")
+	}
+}
+
+func newLoadScheduler(t *testing.T) (*Scheduler, string) {
+	t.Helper()
+	s := NewScheduler(SchedulerConfig{IngestInterval: time.Hour, LoadInterval: time.Second, IngestConcurrency: 2})
+	key := "db\x00m"
+	s.ingestPending[key] = ingestReports{first: time.Now().Add(-time.Minute), last: time.Now().Add(-time.Minute)}
+	return s, key
+}
+
+func addWaiter(s *Scheduler, key string, decided bool) *loadWaiter {
+	w := &loadWaiter{loadAt: time.Now(), done: make(chan struct{}), decided: decided}
+	s.loadWaiters[key] = append(s.loadWaiters[key], w)
+	s.loadWaiterN++
+	return w
+}
+
+// A pull never moves a due time later: a request already due sooner than F
+// allows keeps its time.
+func TestPullForLoadNeverDelays(t *testing.T) {
+	s, key := newLoadScheduler(t)
+	now := time.Now()
+	early := now.Add(-time.Minute)
+	s.ingestDue[key] = ingestRequest{m: Measurement{Database: "db", Measurement: "m"}, due: early}
+	s.ingestNext[key] = now.Add(time.Hour) // target = now + F (1 s), inside the window, after due
+	n := 0
+	if !s.pullForLoadLocked(key, true, now, now.Add(loadFreshBudget), &n) {
+		t.Fatal("a request already due was refused")
+	}
+	if !s.ingestDue[key].due.Equal(early) {
+		t.Fatalf("due moved from %v to %v", early, s.ingestDue[key].due)
+	}
+}
+
+// Loads pull at most ingestConcurrency exports per budget over all tables.
+func TestPullForLoadIsCappedOverAllTables(t *testing.T) {
+	s, _ := newLoadScheduler(t)
+	now := time.Now()
+	for i := range 3 {
+		key := "db\x00m" + string(rune('a'+i))
+		s.ingestDue[key] = ingestRequest{m: Measurement{Database: "db", Measurement: key}, due: now.Add(time.Hour)}
+		n := 0 // each its own service turn: only the cap over all tables applies
+		got := s.pullForLoadLocked(key, true, now, now.Add(loadFreshBudget), &n)
+		if want := i < 2; got != want { // IngestConcurrency 2
+			t.Fatalf("table %d: pulled %v, want %v", i, got, want)
+		}
+	}
+}
+
+// An export that covers a load's files lets it go at once, wherever the
+// loop is; one that does not settle lets go the loads it was pulled for.
+func TestCoveringExportReleasesLoadsAtOnce(t *testing.T) {
+	s, key := newLoadScheduler(t)
+	s.state[key] = measurementState{}
+	covered := addWaiter(s, key, true)
+	s.noteIngestCovered(key, time.Now(), outcomeReconciled, true, nil)
+	if !covered.closed || covered.outcome != metrics.IcebergLoadFreshCovered {
+		t.Fatalf("covering export: closed %v outcome %d", covered.closed, covered.outcome)
+	}
+
+	s, key = newLoadScheduler(t)
+	pulled, undecided := addWaiter(s, key, true), addWaiter(s, key, false)
+	s.noteIngestCovered(key, time.Now(), outcomeUnchanged, false, errors.New("commit failed"))
+	if !pulled.closed || pulled.outcome != metrics.IcebergLoadFreshSkipped {
+		t.Fatalf("failed export, pulled load: closed %v outcome %d", pulled.closed, pulled.outcome)
+	}
+	if undecided.closed {
+		t.Fatal("a failed export let go a load it was not pulled for")
+	}
+	if !s.loadUnsettled[key] {
+		t.Fatal("the table is not marked unsettled")
+	}
+}
+
+// Dropping what is reported (another node exports) lets loads go as skipped,
+// not as covered.
+func TestDroppedReportsSkipLoads(t *testing.T) {
+	s, key := newLoadScheduler(t)
+	w := addWaiter(s, key, false)
+	s.dropIngest()
+	if !w.closed || w.outcome != metrics.IcebergLoadFreshSkipped {
+		t.Fatalf("closed %v outcome %d, want skipped", w.closed, w.outcome)
+	}
+}
+
+// During a timed pass, past the caps, or after an unsettled export, a load
+// does not wait.
+func TestLoadDoesNotWaitWhenItCannotBeServed(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(s *Scheduler, key string)
+	}{
+		{"timed pass", func(s *Scheduler, _ string) { s.inTimedPass.Store(true) }},
+		{"unsettled", func(s *Scheduler, key string) { s.loadUnsettled[key] = true }},
+		{"per-table cap", func(s *Scheduler, key string) {
+			for range loadMaxWaitersPerTable {
+				addWaiter(s, key, false)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, key := newLoadScheduler(t)
+			tc.setup(s, key)
+			before := len(s.loadWaiters[key])
+			began := time.Now()
+			s.AwaitFreshForRead(context.Background(), "db", "m")
+			if took := time.Since(began); took > 100*time.Millisecond {
+				t.Fatalf("waited %v", took)
+			}
+			if len(s.loadWaiters[key]) != before {
+				t.Fatal("the load registered a waiter")
+			}
+		})
 	}
 }

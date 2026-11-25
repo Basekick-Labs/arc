@@ -4943,7 +4943,14 @@ func main() {
 		icebergSharedWarehouse := cfg.Cluster.SharedStorageMode || cluster.IsSharedObjectStore(storageBackend)
 		// #1752: a REST catalog load can export a table as soon as
 		// load_export_min_interval after its last ingest export.
-		icebergLoadEvery := icebergLoadInterval(cfg.Iceberg.LoadExportMinInterval, clusterCoordinator != nil, icebergSharedWarehouse)
+		// Only where it can act: the REST catalog is the only caller, and a
+		// load pulls forward only an append. Elsewhere it changes nothing,
+		// not even version retention (icebergLoadTopology says why).
+		icebergLoadTopology := icebergLoadInterval(cfg.Iceberg.LoadExportMinInterval, clusterCoordinator != nil, icebergSharedWarehouse)
+		icebergLoadEvery := icebergLoadTopology
+		if !cfg.Iceberg.RESTCatalogEnabled || !cfg.Iceberg.IngestAppendEnabled {
+			icebergLoadEvery = 0
+		}
 		icebergIngestEvery := icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil) +
 			icebergArrivalInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil)
 		// Versions are kept by the shortest time two ingest exports of a
@@ -5127,7 +5134,7 @@ func main() {
 		})
 		if cfg.Iceberg.LoadExportMinInterval > 0 {
 			switch {
-			case icebergLoadEvery == 0:
+			case icebergLoadTopology == 0:
 				log.Warn().Msg("iceberg.load_export_min_interval is ignored on a cluster over a shared bucket: there every ingest export is a pass of the table")
 			case !cfg.Iceberg.RESTCatalogEnabled:
 				log.Warn().Msg("iceberg.load_export_min_interval has no effect without iceberg.rest_catalog_enabled: only a REST catalog table load pulls an export forward")

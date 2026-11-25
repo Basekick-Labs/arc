@@ -353,6 +353,7 @@ func (s *Scheduler) finishAppend(job *ingestJob) (outcome reconcileOutcome, need
 		return outcomeUnchanged, true
 	}
 	s.noteRecent(job.key, job.done)
+	delete(s.loadFellBack, job.key)
 	outcome = outcomeUnchanged
 	if job.added > 0 {
 		// The cached listing no longer describes the table: make the next
@@ -375,6 +376,9 @@ func (s *Scheduler) finishAppend(job *ingestJob) (outcome reconcileOutcome, need
 // later listing. Loop goroutine only.
 func (s *Scheduler) noteAppendFallback(job *ingestJob) {
 	delete(s.appendOK, job.key)
+	if s.loadInterval > 0 {
+		s.loadFellBack[job.key] = true // a load does not pull it until an append settles (scheduler_load.go)
+	}
 	s.markAppended(job.key)
 	metrics.Get().IncIcebergIngestAppendFallback()
 	if job.reason == reasonTableMoved && s.gate == nil {

@@ -22,16 +22,26 @@ import (
 // waits and wakes the loop. The loop (serviceLoadWaiters, at the top of
 // each turn) owns the state that says whether the table can be served
 // soon: it pulls the request forward only for a table on the append path,
-// whose last ingest export settled, not paused for a restore, while fewer
-// than ingestConcurrency requests are due within the budget. Otherwise it
-// lets the load go at once, to read the published version as before: a
-// read-level caller never makes a table that needs a pass run it every F.
+// whose last ingest export settled and whose last append did not fall back
+// to a pass, not paused for a restore, while fewer than ingestConcurrency
+// requests are due within the budget and loads have pulled fewer than
+// ingestConcurrency exports in the last budget (all tables together).
+// Otherwise it lets the load go, to read the published version as before:
+// a read-level caller never makes a table that needs a pass run it every F.
+// serviceLoadWaiters itself never asks the gate; the wake a load sends runs
+// the loop's usual services, which do.
 //
 // Coverage: a file reported before the load is covered once ingestPending
 // no longer holds a report older than the load (noteIngestCovered deletes
 // the entry, or moves its first report to the start of the export that
-// covered the earlier ones). A table the loop drops instead (another node
-// exports, or the table is not exported) lets its loads go as skipped.
+// covered the earlier ones). noteIngestCovered lets the table's loads go
+// as soon as that happens, wherever the loop is. A table the loop drops
+// instead (another node exports, the table is not exported, its database
+// is dropped) lets its loads go as skipped.
+//
+// What it costs: up to ingestConcurrency extra exports per loadFreshBudget
+// in all, and per table at most one per F. A table polled by a reader takes
+// a full pass every appendMaxBetweenPasses appends (120), sooner than at I.
 
 // loadFreshBudget is how long a load waits for its table's files. An append
 // takes tens of milliseconds on local storage and a few hundred on object
@@ -41,6 +51,21 @@ var loadFreshBudget = 2 * time.Second // a var for tests
 // loadAfterSnapshot, when set (tests only), runs between serviceLoadWaiters'
 // two locked sections.
 var loadAfterSnapshot func()
+
+// The most loads that wait at once, per table and in all; more read the
+// published version at once.
+const (
+	loadMaxWaitersPerTable = 64
+	loadMaxWaiters         = 1024
+)
+
+// timedPass runs a timed pass with inTimedPass set: a load cannot get its
+// table's export ahead of a pass, so it does not wait for one.
+func (s *Scheduler) timedPass(ctx context.Context) bool {
+	s.inTimedPass.Store(true)
+	defer s.inTimedPass.Store(false)
+	return s.runPass(ctx)
+}
 
 // loadWaiter is one load waiting for its table. outcome is set once, under
 // reqMu, when done is closed.
@@ -73,18 +98,29 @@ func (s *Scheduler) AwaitFreshForRead(ctx context.Context, database, measurement
 		return
 	}
 	key := database + "\x00" + measurement
-	w := &loadWaiter{loadAt: time.Now(), done: make(chan struct{})}
 	s.reqMu.Lock()
 	if _, waiting := s.ingestPending[key]; !waiting {
 		s.reqMu.Unlock()
 		metrics.Get().IncIcebergLoadFresh(metrics.IcebergLoadFreshNothing)
 		return
 	}
+	if s.inTimedPass.Load() || s.loadUnsettled[key] || s.loadWaiterN >= loadMaxWaiters ||
+		len(s.loadWaiters[key]) >= loadMaxWaitersPerTable {
+		s.reqMu.Unlock()
+		metrics.Get().IncIcebergLoadFresh(metrics.IcebergLoadFreshSkipped)
+		return
+	}
+	w := &loadWaiter{loadAt: time.Now(), done: make(chan struct{})}
+	first := len(s.loadWaiters[key]) == 0
 	s.loadWaiters[key] = append(s.loadWaiters[key], w)
+	s.loadWaiterN++
 	s.reqMu.Unlock()
-	select {
-	case s.wake <- struct{}{}:
-	default:
+	if first {
+		// The loop needs one turn per table, not one per load.
+		select {
+		case s.wake <- struct{}{}:
+		default:
+		}
 	}
 	t := time.NewTimer(loadFreshBudget)
 	defer t.Stop()
@@ -106,6 +142,7 @@ func (s *Scheduler) removeLoadWaiterLocked(key string, w *loadWaiter) {
 	for i, x := range ws {
 		if x == w {
 			ws = append(ws[:i], ws[i+1:]...)
+			s.loadWaiterN--
 			break
 		}
 	}
@@ -129,6 +166,22 @@ func (s *Scheduler) skipLoadWaitersLocked(key string) {
 	}
 }
 
+// releaseLoadWaitersLocked lets key's loads go whose files an export has
+// just covered, and, when that export did not settle, the ones the loop had
+// pulled it for (the next try is a full interval away). From
+// noteIngestCovered, wherever the loop is. reqMu is held.
+func (s *Scheduler) releaseLoadWaitersLocked(key string, unsettled bool) {
+	for _, w := range s.loadWaiters[key] {
+		switch {
+		case w.closed:
+		case s.loadCoveredLocked(key, w.loadAt):
+			w.finishLocked(metrics.IcebergLoadFreshCovered)
+		case unsettled && w.decided:
+			w.finishLocked(metrics.IcebergLoadFreshSkipped)
+		}
+	}
+}
+
 // loadCoveredLocked reports whether every file reported for key before at
 // has been covered by an export. reqMu is held.
 func (s *Scheduler) loadCoveredLocked(key string, at time.Time) bool {
@@ -146,20 +199,24 @@ func (s *Scheduler) loadServableSoon(key string) bool {
 		return false
 	}
 	_, settled := s.state[key]
-	return settled && s.appendOK[key] && s.appendsSince[key] < appendMaxBetweenPasses
+	return settled && s.appendOK[key] && !s.loadFellBack[key] && s.appendsSince[key] < appendMaxBetweenPasses
 }
 
 // serviceLoadWaiters lets the loads whose files are covered go, and decides
 // for each table a load waits on whether to pull its request forward. Loop
 // goroutine, at the top of each turn (the loop then arms its ingest timer
-// on the new due time). Never asks the gate: a load must not move the
-// export role's bookkeeping (gateOpen), and a node that does not export
-// drops its requests, which lets the loads go (dropIngest).
+// on the new due time). It does not ask the gate (gateOpen moves the export
+// role's bookkeeping); a node that does not export drops its requests in
+// the services that follow, which lets the loads go (dropIngest).
 func (s *Scheduler) serviceLoadWaiters() {
 	if s.loadInterval <= 0 {
 		return
 	}
 	s.reqMu.Lock()
+	if len(s.loadWaiters) == 0 {
+		s.reqMu.Unlock()
+		return
+	}
 	var undecided []string
 	for key, ws := range s.loadWaiters {
 		for _, w := range ws {
@@ -249,18 +306,32 @@ func (s *Scheduler) pullForLoadLocked(key string, servable bool, now, horizon ti
 	if target.After(horizon) {
 		return false
 	}
-	if r.due.After(horizon) {
-		// Pulled into the budget's window: bounded by how many requests
-		// that window already holds, so a poller over many tables does not
-		// queue every table's export behind its loads.
-		if *dueSoon >= s.ingestConcurrency {
-			return false
+	if !target.Before(r.due) {
+		return true // already due as soon as F allows: nothing to pull
+	}
+	// Pulled earlier: bounded by how many requests the budget's window
+	// already holds, and by how many exports loads pulled in the last
+	// budget over all tables, so a poller over many tables neither queues
+	// every table's export behind its loads nor adds more than
+	// ingestConcurrency exports per budget.
+	if r.due.After(horizon) && *dueSoon >= s.ingestConcurrency {
+		return false
+	}
+	recent := s.loadPulls[:0]
+	for _, t := range s.loadPulls {
+		if now.Sub(t) < loadFreshBudget {
+			recent = append(recent, t)
 		}
+	}
+	s.loadPulls = recent
+	if len(s.loadPulls) >= s.ingestConcurrency {
+		return false
+	}
+	s.loadPulls = append(s.loadPulls, now)
+	if r.due.After(horizon) {
 		*dueSoon++
 	}
-	if target.Before(r.due) {
-		r.due = target
-		s.ingestDue[key] = r
-	}
+	r.due = target
+	s.ingestDue[key] = r
 	return true
 }
