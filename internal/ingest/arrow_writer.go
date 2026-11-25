@@ -1236,6 +1236,10 @@ type flushTask struct {
 	estimatedBytes int64
 	trackingID     uint64
 	bufferedAt     time.Time // the buffer's start time (publish_delay.go)
+	// forced: sent by ForceFlushKey (#1760), so it holds one of the ledger's
+	// forced-task slots until whoever takes it off the queue releases it
+	// (releaseForcedTask, always in a defer).
+	forced bool
 }
 
 // WALWriter interface for Write-Ahead Log support
@@ -1433,6 +1437,13 @@ type ArrowBuffer struct {
 	// flag set before the channel could be closed (the channel is
 	// never closed; workers exit on b.ctx.Done()).
 	closing atomic.Bool
+
+	// ledger is the per-key flush ledger behind ForceFlushKey (#1760,
+	// key_flush_ledger.go). Nil unless EnableKeyFlushLedger was called: with
+	// forcing unused, every detach and deferral site pays one nil test and
+	// nothing else. An atomic pointer because the workers and the age sweep
+	// are already running when it is enabled; once set it never changes.
+	ledger atomic.Pointer[keyFlushLedger]
 
 	// drainCh wakes flushDrainer when a flush-queue slot may have freed. Capacity
 	// 1 with a non-blocking send: the signal is an edge, not a count, and the
@@ -3054,6 +3065,46 @@ func (b *ArrowBuffer) enqueueOrDeferLocked(
 		return false, false
 	}
 
+	switch b.sendFlushLocked(shard, bufferKey, database, measurement, totalBuffered, false) {
+	case flushSent:
+		return true, false
+	case flushSendClosing:
+		// Close cancelled b.ctx between the checks above and the send. The
+		// records stay in the buffer for Close's shard loop.
+		return false, false
+	default:
+		// Lost the race against another writer for the last slot.
+		b.markDeferredLocked(shard, bufferKey)
+		return false, true
+	}
+}
+
+// flushSendResult is the outcome of sendFlushLocked.
+type flushSendResult uint8
+
+const (
+	// flushSent: the task is queued and the buffer no longer owns its records.
+	flushSent flushSendResult = iota
+	// flushSendClosing: b.ctx was cancelled (Close); nothing was touched.
+	flushSendClosing
+	// flushSendLostSlot: the queue had no free slot; nothing was touched.
+	flushSendLostSlot
+)
+
+// sendFlushLocked hands bufferKey's whole buffer to a flush worker with a
+// non-blocking send, or touches nothing. Caller holds shard.mu (write); the
+// forced caller has checked that the buffer has batches. It never marks the key deferred: that
+// is the caller's decision, and the forced caller (ForceFlushKey, #1760) never
+// makes it, so a forced attempt cannot leave a deferral behind.
+//
+// forced marks the task as holding a forced-task slot of the ledger; the
+// caller reserved it and keeps ownership unless the result is flushSent.
+func (b *ArrowBuffer) sendFlushLocked(
+	shard *bufferShard,
+	bufferKey, database, measurement string,
+	totalBuffered int,
+	forced bool,
+) flushSendResult {
 	// Hand the buffer's slice straight to the task rather than copying it. Safe
 	// because the map entries are deleted below on success, so the next write to
 	// this key starts a fresh slice and nothing appends to the one in flight.
@@ -3082,6 +3133,7 @@ func (b *ArrowBuffer) enqueueOrDeferLocked(
 		estimatedBytes: estimateBufferedBatchesBytes(shard.buffers[bufferKey]),
 		trackingID:     b.trackFlush(shard.bufferStartTimes[bufferKey]),
 		bufferedAt:     shard.bufferStartTimes[bufferKey],
+		forced:         forced,
 	}
 	task.group = b.newFlushGroup(bufferKey, task.records, task.walHashes)
 	queuedRecords := int64(task.recordCount)
@@ -3097,21 +3149,22 @@ func (b *ArrowBuffer) enqueueOrDeferLocked(
 		delete(shard.bufferStartTimes, bufferKey)
 		delete(shard.bufferRecordCounts, bufferKey)
 		delete(shard.bufferSchemas, bufferKey)
-		return true, false
+		// A detach (D1, #1760): recorded inside this shard.mu hold, so
+		// ForceFlushKey's re-check under the same lock always sees it.
+		if l := b.ledger.Load(); l != nil {
+			l.recordDetach(bufferKey, task.taskID)
+		}
+		return flushSent
 	case <-b.ctx.Done():
 		b.completeAsyncFlushTask(task.taskID)
 		b.adjustFlushRecordMetrics(-queuedRecords, 0)
 		b.untrackFlush(task.trackingID)
-		// Close cancelled b.ctx between the checks above and this select. The
-		// records stay in the buffer for Close's shard loop.
-		return false, false
+		return flushSendClosing
 	default:
 		b.completeAsyncFlushTask(task.taskID)
 		b.adjustFlushRecordMetrics(-queuedRecords, 0)
 		b.untrackFlush(task.trackingID)
-		// Lost the race against another writer for the last slot.
-		b.markDeferredLocked(shard, bufferKey)
-		return false, true
+		return flushSendLostSlot
 	}
 }
 
@@ -3277,6 +3330,11 @@ func splitDatabaseAndMeasurement(bufferKey string) (string, string) {
 func (b *ArrowBuffer) markDeferredLocked(shard *bufferShard, bufferKey string) {
 	shard.deferredKeys[bufferKey] = struct{}{}
 	b.recordFlushDeferred()
+	// The forced-flush budget refuses for max_buffer_age_ms after any
+	// deferral (#1760). One atomic store, and only with the ledger on.
+	if l := b.ledger.Load(); l != nil {
+		l.noteDeferral()
+	}
 
 	// Wake the drainer for THIS deferral. Relying only on the worker's
 	// dequeue signal loses a race: a writer can read a full queue, be
@@ -5197,34 +5255,40 @@ func (b *ArrowBuffer) flushWorker(workerID int) {
 				// Channel closed during shutdown
 				return
 			}
-			metrics.Get().SetBufferQueueDepth(b.queueDepth.Add(-1))
-			b.markFlushTaskInFlight(task)
-			// Signal here, not only after the flush: the queue slot frees at
-			// RECEIVE, so waiting for completion delays the drain by a whole
-			// flush time and lets the write path win the slot instead.
-			b.signalDrain()
-
-			b.logger.Debug().
-				Int("worker_id", workerID).
-				Str("buffer_key", task.bufferKey).
-				Int("records", task.recordCount).
-				Int64("queue_depth", b.queueDepth.Load()).
-				Msg("Worker processing flush task")
-
-			// Build the context HERE, not at enqueue: the per-file timeouts
-			// (fileContext, #1692) must measure the storage work, not the time
-			// this task waited in the queue (#1006). It derives from flushParent, so Close() cancelling
-			// b.ctx does not abort a write already in progress (#1007).
-			flushCtx, flushCancel := b.newFlushContext()
-			func() {
-				defer b.completeAsyncFlushTask(task.taskID)
-				// Error is already logged and recorded by flushRecordsAsync via
-				// markFlushFailure; the worker has nowhere to return it to.
-				_ = b.flushTrackedTask(flushCtx, task)
-				flushCancel()
-			}()
+			b.runQueuedFlushTask(workerID, task)
 		}
 	}
+}
+
+// runQueuedFlushTask flushes one task a worker took off the queue.
+func (b *ArrowBuffer) runQueuedFlushTask(workerID int, task flushTask) {
+	defer b.completeAsyncFlushTask(task.taskID)
+	// Deferred so that no exit, a panic included, leaks the slot (#1760).
+	defer b.releaseForcedTask(task)
+
+	metrics.Get().SetBufferQueueDepth(b.queueDepth.Add(-1))
+	b.markFlushTaskInFlight(task)
+	// Signal here, not only after the flush: the queue slot frees at
+	// RECEIVE, so waiting for completion delays the drain by a whole
+	// flush time and lets the write path win the slot instead.
+	b.signalDrain()
+
+	b.logger.Debug().
+		Int("worker_id", workerID).
+		Str("buffer_key", task.bufferKey).
+		Int("records", task.recordCount).
+		Int64("queue_depth", b.queueDepth.Load()).
+		Msg("Worker processing flush task")
+
+	// Build the context HERE, not at enqueue: the per-file timeouts
+	// (fileContext, #1692) must measure the storage work, not the time
+	// this task waited in the queue (#1006). It derives from flushParent, so Close() cancelling
+	// b.ctx does not abort a write already in progress (#1007).
+	flushCtx, flushCancel := b.newFlushContext()
+	defer flushCancel()
+	// Error is already logged and recorded by flushRecordsAsync via
+	// markFlushFailure; the worker has nowhere to return it to.
+	_ = b.flushTrackedTask(flushCtx, task)
 }
 
 func flushRecordRows(record interface{}) (int, bool) {
@@ -6100,6 +6164,11 @@ func (b *ArrowBuffer) extractBufferLocked(shard *bufferShard, bufferKey string) 
 	// Register before releasing shard.mu so a concurrent recovery fence cannot
 	// miss this flush after observing the extracted buffer as empty.
 	e.taskID = b.beginAsyncFlushTask(bufferKey)
+	// A detach (D2, #1760): recorded inside the caller's shard.mu hold, like
+	// D1, and never on the empty-cleanup return above (no rows left).
+	if l := b.ledger.Load(); l != nil {
+		l.recordDetach(bufferKey, e.taskID)
+	}
 
 	// The records have left the buffer and never enter the flush queue, so
 	// they count as in flight until the write ends; otherwise no gauge sees a
@@ -7915,6 +7984,8 @@ drain:
 		go func() {
 			defer wg.Done()
 			defer b.completeAsyncFlushTask(task.taskID)
+			// Both paths below, the abandon and the flush, end here (#1760).
+			defer b.releaseForcedTask(task)
 			defer func() { <-slots }()
 
 			// Built HERE, on slot acquisition, not when the task was drained:
