@@ -2004,11 +2004,11 @@ func (b *ArrowBuffer) newFlushContext() (context.Context, context.CancelFunc) {
 
 // fileContext bounds the work for one file of a flush by flushTimeout: its
 // Parquet encode, the storage write, the field-schema registration (whose
-// registry reads and writes storage), the tiering/manifest registration and
-// the WAL row checkpoint (#1692). Before #1692 one flushTimeout covered all of
-// that for every file of the flush together (and the merge before it); a
-// single-file flush still gets one flushTimeout, now starting after the merge
-// and sort.
+// registry reads and writes storage) and the WAL row checkpoint (#1692). The
+// tiering registration gets a flushTimeout of its own, on a context that is
+// not cancelled with the flush (#1693, #1933): a file's write and its tiering
+// record can together take two. Before #1692 one flushTimeout covered all of
+// that for every file of the flush together (and the merge before it).
 //
 // It derives from the ctx it is given, never from b.flushParent: Close()'s own
 // flushes run on closeFlushContext (WithoutCancel(flushParent) plus the close
@@ -5480,7 +5480,7 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		// Single hour - sort once and write one file
 		sorted := b.sortFlushBatch(database, measurement, merged, sortKeys)
 
-		ctx, cancelFile := b.fileContext(ctx) // #1692: one file, one flushTimeout, as before
+		ctx, cancelFile := b.fileContext(ctx) // #1692: one file, one flushTimeout (its tiering record gets its own, #1933)
 		defer cancelFile()
 
 		parquetData, fileSchema, err := b.writer.writeParquetColumnarWithSchema(ctx, measurement, sorted.Data, sorted.Validity, fileTags, sorted.DedupTime, decimalCols)
