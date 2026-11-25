@@ -50,6 +50,7 @@ are registered with the rest. Only for a day the pass removes nothing from: a da
 files in the pass is still deferred whole, fresh files with it, since a file named like a fresh
 ingest file can still be the replacement of a removed one (a re-home whose wait was waived, a
 restored original).
+
 ## Fix: files a backup restore writes are read at once ([#1764](https://github.com/Basekick-Labs/arc/issues/1764))
 
 **Who is affected:** anyone restoring data files from a backup into measurements that already have
