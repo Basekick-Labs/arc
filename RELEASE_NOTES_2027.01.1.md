@@ -13,7 +13,7 @@ Now an import tracks its own rows through the flush:
   - If one of those flushes failed, it answers 500: "failed to flush imported data; the rows were accepted and may still be stored, check before running the file again", with how many of its rows were at risk. "May still be stored" is meant: a flush can fail after storing some of its hour files, or a write that timed out can land anyway.
   - If the server shuts down during the wait, it answers 500 saying the outcome is not known.
   - The wait takes no barrier lock, so a DELETE or another flush barrier never waits behind it.
-- **Only the import's own rows count.** Another writer's failed flush, even on the same measurement, does not fail an import whose rows were stored.
+- **Only the import's own rows count.** This covers the flushes the import runs itself: the final flush, and the flushes it runs while pacing behind the memory limit. Another writer's failed flush, even on the same measurement, does not fail an import whose rows were stored. Before, any failure in those flushes failed the import, whoever's rows were lost. With every row WAL-copied, a failed flush the import runs itself still fails it, as before.
 - **The TLE import now flushes its own measurement instead of the whole node.** A node-wide flush cut every other writer's buffers into small files, and failed the import on any of their errors.
 
 Measured on a laptop, local storage, WAL off. Five Line Protocol files of 1M rows, imported one after another, went from 8.67 s to 9.08 s, about 5%: an import's tail flush no longer overlaps the next file's parsing. Imported five at a time (`ingest.import_write_concurrency = 4`), it took 3.1–3.3 s either way, with the same memory.

@@ -152,3 +152,82 @@ func TestWaitFlushesStopsWithItsContext1888(t *testing.T) {
 		t.Fatalf("wait = %v, want deadline exceeded", err)
 	}
 }
+
+// With a WAL every row has a copy: nothing is counted, so the import
+// does not wait. Counted after the commit; counted before it, hasWALCopy is
+// still false and every import would wait.
+func TestFlushOutcomeCountsNothingWithAWAL1888(t *testing.T) {
+	for _, mode := range walModes { // queued: the copy is set at the commit
+		t.Run(string(mode), func(t *testing.T) {
+			buf, _, _ := newWALRefusalRig(t, mode, nil)
+			t.Cleanup(func() { _ = buf.Close() })
+			o := &FlushOutcome{}
+			writeOutcomeBatch(t, buf, WithFlushOutcome(context.Background(), o), "mdur", 3)
+			if o.NoWALRows() != 0 {
+				t.Fatalf("no-WAL rows %d with a %s WAL, want 0", o.NoWALRows(), mode)
+			}
+		})
+	}
+}
+
+// A queued append the WAL dropped leaves the batch without a copy: counted.
+func TestFlushOutcomeCountsAQueuedDrop1888(t *testing.T) {
+	batch := refusalTestBatch()
+	_ = commitTrackedLocked(droppingCommit{}, batch)
+	o := &FlushOutcome{}
+	countOutcome(o, batch, 7)
+	if o.NoWALRows() != 7 || batch.outcome != o {
+		t.Fatalf("no-WAL rows %d, outcome attached %v", o.NoWALRows(), batch.outcome == o)
+	}
+}
+
+// The final flush is synchronous, and fails on the import's own rows: the
+// verdict is the import's failure (the storage site's attribution).
+func TestImportVerdictOwnSynchronousFailure1888(t *testing.T) {
+	st := &pathFailStorage{fail: "/msync/"}
+	buf := outcomeBuffer(t, st, 1000) // no size flush: the rows wait for the final one
+	o := &FlushOutcome{}
+	ctx := context.Background()
+	writeOutcomeBatch(t, buf, WithFlushOutcome(ctx, o), "msync", 4)
+	flushErr := buf.FlushMeasurements(ctx, "db", []string{"msync"})
+	if flushErr == nil {
+		t.Fatal("the synchronous flush did not fail")
+	}
+	if err := buf.ImportVerdict(ctx, o, "db", []string{"msync"}, flushErr); err == nil || o.RowsAtRisk() != 4 {
+		t.Fatalf("verdict %v, rows at risk %d; want a failure for 4 rows", err, o.RowsAtRisk())
+	}
+}
+
+// The final flush fails on another writer's rows of the same measurement,
+// the import's own rows already stored: the import succeeds.
+func TestImportVerdictIgnoresAnotherWritersSynchronousFailure1888(t *testing.T) {
+	st := &pathFailStorage{}
+	buf := outcomeBuffer(t, st, 1000)
+	o := &FlushOutcome{}
+	ctx := context.Background()
+	writeOutcomeBatch(t, buf, WithFlushOutcome(ctx, o), "mmix", 3)
+	if err := buf.FlushMeasurements(ctx, "db", []string{"mmix"}); err != nil {
+		t.Fatal(err)
+	}
+	st.mu.Lock()
+	st.fail = "/mmix/"
+	st.mu.Unlock()
+	writeOutcomeBatch(t, buf, ctx, "mmix", 3) // a live writer, no outcome
+	flushErr := buf.FlushMeasurements(ctx, "db", []string{"mmix"})
+	if flushErr == nil {
+		t.Fatal("the live writer's flush did not fail")
+	}
+	if err := buf.ImportVerdict(ctx, o, "db", []string{"mmix"}, flushErr); err != nil {
+		t.Fatalf("verdict %v: another writer's failure failed the import", err)
+	}
+}
+
+// Once the buffer is closing the outcome is unknown, even with nothing
+// pending: Close completes the tasks it abandons.
+func TestWaitFlushesReportsClosing1888(t *testing.T) {
+	buf := outcomeBuffer(t, &pathFailStorage{}, 1000)
+	_ = buf.Close()
+	if err := buf.WaitFlushes(context.Background(), "db", []string{"m"}); !errors.Is(err, ErrBufferClosing) {
+		t.Fatalf("wait after Close = %v, want ErrBufferClosing", err)
+	}
+}

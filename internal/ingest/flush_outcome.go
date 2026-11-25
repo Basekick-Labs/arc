@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"time"
 )
@@ -25,7 +26,6 @@ import (
 type FlushOutcome struct {
 	noWALRows atomic.Int64 // rows buffered without a WAL copy
 	atRisk    atomic.Int64 // of those, rows in a flush that failed
-	partial   atomic.Bool  // a failed flush had stored some of its files first
 }
 
 // NoWALRows is how many rows were buffered without a WAL copy.
@@ -74,16 +74,66 @@ func outcomeRowsOf(records []interface{}) map[*FlushOutcome]int64 {
 	return out
 }
 
-// noteOutcomeFailure adds a failed flush's at-risk rows to their outcomes.
-func noteOutcomeFailure(atRisk map[*FlushOutcome]int64, err error) {
-	var partial *flushPartialError
-	isPartial := errors.As(err, &partial)
+// noteOutcomeFailure adds a failed flush's at-risk rows to their outcomes:
+// all its rows without a WAL copy, including any a partial flush stored
+// before failing, since which outcome's rows those were is not known.
+func noteOutcomeFailure(atRisk map[*FlushOutcome]int64, _ error) {
 	for o, rows := range atRisk {
 		o.atRisk.Add(rows)
-		if isPartial {
-			o.partial.Store(true)
-		}
 	}
+}
+
+// countOutcome attaches o to an import's batch and counts its rows without a
+// WAL copy. Called after the WAL commit, which can still clear hasWALCopy (a
+// queued append the WAL dropped), under the shard lock.
+func countOutcome(o *FlushOutcome, batch *TypedColumnBatch, rows int) {
+	if o == nil {
+		return
+	}
+	batch.outcome = o
+	if !batch.hasWALCopy {
+		o.noWALRows.Add(int64(rows))
+	}
+}
+
+// OwnFlushErr filters a synchronous flush error an import got from flushing
+// its measurements (#1888). Such a flush also takes other writers' rows of
+// those measurements, so its error is the import's only when rows of its
+// own were in it. With rows without a WAL copy, the outcome knows: the error
+// is returned when the import's rows are at risk, or when the flush did not
+// run (the caller's context, the buffer closing). Without any (the WAL on),
+// it is returned as before.
+func (o *FlushOutcome) OwnFlushErr(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if o == nil || o.NoWALRows() == 0 || ctx.Err() != nil || errors.Is(err, ErrBufferClosing) {
+		return err
+	}
+	if n := o.RowsAtRisk(); n > 0 {
+		return fmt.Errorf("%d of this import's rows had no WAL copy and were in a flush that failed: %w", n, err)
+	}
+	return nil
+}
+
+// ImportVerdict is an import's answer once its final flush returned flushErr
+// (#1888): the flush error, filtered by OwnFlushErr; then, when the import
+// buffered rows without a WAL copy, the wait for their flushes and whether
+// any was at risk.
+func (b *ArrowBuffer) ImportVerdict(ctx context.Context, o *FlushOutcome, database string, measurements []string, flushErr error) error {
+	if err := o.OwnFlushErr(ctx, flushErr); err != nil {
+		return err
+	}
+	if o == nil || o.NoWALRows() == 0 {
+		return nil
+	}
+	if err := b.WaitFlushes(ctx, database, measurements); err != nil {
+		return fmt.Errorf("the server stopped before this import's flushes finished, so whether its rows without a WAL copy were stored is not known: %w", err)
+	}
+	if n := o.RowsAtRisk(); n > 0 {
+		return fmt.Errorf("%d of this import's rows had no WAL copy and were in a flush that failed", n)
+	}
+	return nil
 }
 
 // waitFlushesRecheck is how often WaitFlushes looks at the buffer closing,
@@ -97,8 +147,8 @@ const waitFlushesRecheck = time.Second
 // or already done. No barrier gate and no shard lock are taken, so a DELETE
 // or another barrier never waits behind it.
 //
-// It returns ctx's error (the server shutting down) or ErrBufferClosing if
-// it stops first; the import's outcome is then unknown.
+// It returns ctx's error (the server shutting down) or ErrBufferClosing once
+// the buffer is closing; the import's outcome is then unknown.
 func (b *ArrowBuffer) WaitFlushes(ctx context.Context, database string, measurements []string) error {
 	if len(measurements) == 0 {
 		return nil
@@ -119,12 +169,14 @@ func (b *ArrowBuffer) WaitFlushes(ctx context.Context, database string, measurem
 	recheck := time.NewTicker(waitFlushesRecheck)
 	defer recheck.Stop()
 	for {
+		// Closing first: Close abandons queued tasks it has no budget for,
+		// and they complete without a flush.
+		if b.closing.Load() {
+			return ErrBufferClosing
+		}
 		pending, changed := b.asyncFlushState(fence, match)
 		if !pending {
 			return nil
-		}
-		if b.closing.Load() {
-			return ErrBufferClosing
 		}
 		select {
 		case <-ctx.Done():

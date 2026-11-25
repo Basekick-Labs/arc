@@ -86,3 +86,24 @@ func TestLPImportSucceedsWhenItsFlushesSucceed1888(t *testing.T) {
 	walkParquet(t, ci.dir, func(rec arrow.RecordBatch) { n += int(rec.NumRows()) })
 	require.Equal(t, 23, n, "the import answered before its files were written")
 }
+
+// With decimal columns configured, for any measurement, LP imports write
+// through the columnar path: still tracked, so its own failure answers 500.
+func TestLPImportWithDecimalColumnsFailsWhenItsOwnFlushFails1888(t *testing.T) {
+	setVar(t, &lpChunkBytes, 64)
+	dir := t.TempDir()
+	local, err := storage.NewLocalBackend(dir, zerolog.Nop())
+	require.NoError(t, err)
+	buf := ingest.NewArrowBuffer(&config.IngestConfig{
+		MaxBufferSize: 5, MaxBufferAgeMS: 600000, Compression: "snappy",
+		FlushWorkers: 2, FlushQueueSize: 16, ShardCount: 1, DataPageVersion: "2.0",
+		DecimalColumns: []string{"other:price=10,2"},
+	}, &failPathBackend{Backend: local, fail: "/fail_m/"}, zerolog.Nop())
+	t.Cleanup(func() { buf.Close() })
+	h := NewImportHandler(zerolog.Nop())
+	h.SetArrowBuffer(buf)
+	ci := &chunkedImport{app: importApp(t, h), buf: buf, dir: dir}
+	status, body := ci.post(t, "/api/v1/import/lp?db=d", lpRows("fail_m", 23))
+	require.Equal(t, http.StatusInternalServerError, status, body)
+	require.Contains(t, fmt.Sprint(body["error"]), "had no WAL copy")
+}

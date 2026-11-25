@@ -3792,6 +3792,9 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 	// Hold lock ONLY to extract records, flush outside lock
 	var shouldFlush, flushDeferred bool
 
+	// Looked up before the lock: a context chain walk (#1888).
+	outcome := flushOutcomeFrom(ctx)
+
 	shard.mu.Lock()
 
 	// Schema evolution detection: flush buffer if columns changed.
@@ -3871,6 +3874,9 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 	if trackedPrep != nil {
 		walErr = commitTrackedLocked(trackedPrep, typedColumns)
 	}
+	// An import's batch carries its outcome (#1888): the LP import writes
+	// here when decimal columns are configured.
+	countOutcome(outcome, typedColumns, numRecords)
 
 	// Add typed columns to buffer (already converted via zero-copy fast paths)
 	shard.buffers[bufferKey] = append(shard.buffers[bufferKey], typedColumns)
@@ -4092,6 +4098,9 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 
 	var shouldFlush, flushDeferred bool
 
+	// Looked up before the lock: a context chain walk (#1888).
+	outcome := flushOutcomeFrom(ctx)
+
 	shard.mu.Lock()
 
 	// Schema evolution detection: see flushOnSchemaChangeLocked.
@@ -4166,14 +4175,9 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 	if trackedPrep != nil {
 		walErr = commitTrackedLocked(trackedPrep, typedColumns)
 	}
-	// An import's batch carries its outcome (#1888). After the commit, which
-	// can still clear hasWALCopy (a queued append the WAL dropped).
-	if o := flushOutcomeFrom(ctx); o != nil {
-		typedColumns.outcome = o
-		if !typedColumns.hasWALCopy {
-			o.noWALRows.Add(int64(numRecords))
-		}
-	}
+	// An import's batch carries its outcome (#1888), counted after the
+	// commit, which can still clear hasWALCopy.
+	countOutcome(outcome, typedColumns, numRecords)
 
 	// Add typed columns to buffer directly (no conversion needed)
 	shard.buffers[bufferKey] = append(shard.buffers[bufferKey], typedColumns)
@@ -7769,6 +7773,7 @@ drain:
 			noWAL := recordsWithoutWALCopy(task.records, task.recordCount)
 			flushCtx, flushCancel, ok := b.closeFlushContext(deadline)
 			if !ok {
+				noteOutcomeFailure(outcomeRowsOf(task.records), nil)
 				b.finishQueuedFlushTask(task)
 				b.releaseFlushTask(task)
 				mu.Lock()

@@ -327,9 +327,10 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 	importedMeasurements := w.order
 
 	// Hand what is still buffered of the import to the flush, its write slot
-	// already free for the next import (#1429). The rows are in the buffer
-	// and the WAL (when enabled) already; files follow as their flushes
-	// finish, so a 200 does not mean every file is written.
+	// already free for the next import (#1429). Rows with a WAL copy are
+	// answered for at once, their files following as the flushes finish;
+	// rows without one are answered for once their flushes are done
+	// (#1888).
 	if err := w.finalFlush(c.Context()); err != nil {
 		h.totalErrors.Add(1)
 		h.logger.Error().Err(err).Str("database", database).Msg("LP import: flush failed")
@@ -588,14 +589,7 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 	// import on any of their flush errors. Then the same wait and verdict as
 	// the other imports (#1888).
 	flushErr := h.arrowBuffer.FlushMeasurements(c.Context(), database, []string{measurement})
-	if flushErr == nil && outcome.NoWALRows() > 0 {
-		if err := h.arrowBuffer.WaitFlushes(c.Context(), database, []string{measurement}); err != nil {
-			flushErr = fmt.Errorf("the server stopped before this import's flushes finished, so whether its rows without a WAL copy were stored is not known: %w", err)
-		} else if n := outcome.RowsAtRisk(); n > 0 {
-			flushErr = fmt.Errorf("%d of this import's rows had no WAL copy and were in a flush that failed", n)
-		}
-	}
-	if err := flushErr; err != nil {
+	if err := h.arrowBuffer.ImportVerdict(c.Context(), outcome, database, []string{measurement}, flushErr); err != nil {
 		h.totalErrors.Add(1)
 		h.logger.Error().Err(err).Str("database", database).Msg("TLE import: flush failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{

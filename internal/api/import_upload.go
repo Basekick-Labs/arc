@@ -443,29 +443,14 @@ func (w *importWriter) finalFlush(ctx context.Context) error {
 	if importBeforeFinalFlushHook != nil {
 		importBeforeFinalFlushHook(w)
 	}
-	if err := w.buf.FlushMeasurements(ctx, w.database, w.order); err != nil {
-		return err
-	}
-	return w.waitOwnFlushes(ctx)
-}
-
-// waitOwnFlushes is finalFlush's wait for the flushes of the import's rows
-// without a WAL copy, and the verdict on them (#1888). Every flush task
-// finishes on every path and each file is bounded by
-// ingest.flush_timeout_seconds, so the wait has no timer of its own; it ends
-// early only when the server shuts down (the request's context) or the
-// buffer closes, and the outcome is then unknown.
-func (w *importWriter) waitOwnFlushes(ctx context.Context) error {
-	if w.outcome == nil || w.outcome.NoWALRows() == 0 {
-		return nil
-	}
-	if err := w.buf.WaitFlushes(ctx, w.database, w.order); err != nil {
-		return fmt.Errorf("the server stopped before this import's flushes finished, so whether its rows without a WAL copy were stored is not known: %w", err)
-	}
-	if n := w.outcome.RowsAtRisk(); n > 0 {
-		return fmt.Errorf("%d of this import's rows had no WAL copy and were in a flush that failed", n)
-	}
-	return nil
+	// The verdict (#1888): with rows without a WAL copy, the import waits
+	// for the flushes holding them and fails only for its own rows. Every
+	// flush task finishes on every path and each file is bounded by
+	// ingest.flush_timeout_seconds, so the wait has no timer of its own; it
+	// ends early when the server shuts down or the buffer closes, and the
+	// outcome is then unknown.
+	flushErr := w.buf.FlushMeasurements(ctx, w.database, w.order)
+	return w.buf.ImportVerdict(ctx, w.outcome, w.database, w.order, flushErr)
 }
 
 // close releases the write slot, if still held, and the pass's share of the
@@ -510,14 +495,18 @@ func (w *importWriter) pace(ctx context.Context) error {
 	if w.buf.BufferedBytes() <= limit() {
 		return nil
 	}
-	if err := w.buf.FlushScope(ctx, w.database); err != nil {
+	// A flush failure of other writers' rows does not end the import; one of
+	// its own rows without a WAL copy does (#1888).
+	if err := w.outcome.OwnFlushErr(ctx, w.buf.FlushScope(ctx, w.database)); err != nil {
 		return err
 	}
 	// Again while waiting, for the import's own buffers only: rows it wrote
 	// after the first flush. Every waiting pass flushes its own, so none waits
 	// on rows nobody flushes, and other writers' buffers are not cut into
 	// one-second files. A failed flush ends the wait with its error.
-	reflush := func() error { return w.buf.FlushMeasurements(ctx, w.database, w.order) }
+	reflush := func() error {
+		return w.outcome.OwnFlushErr(ctx, w.buf.FlushMeasurements(ctx, w.database, w.order))
+	}
 	return w.buf.WaitBufferedBelow(ctx, limit, w.maxWait, reflush, importReflushEvery)
 }
 
