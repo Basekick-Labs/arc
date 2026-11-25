@@ -49,7 +49,8 @@ last 45 minutes on the current UTC day are no compaction's input, so they now st
 are registered with the rest. Only for a day the pass removes nothing from: a day that also loses
 files in the pass is still deferred whole, fresh files with it, since a file named like a fresh
 ingest file can still be the replacement of a removed one (a re-home whose wait was waived, a
-restored original).
+restored original). A day where a fresh file itself vanished (a DELETE or a re-home over
+today's rows) also goes whole, as before.
 
 ## Fix: files a backup restore writes are read at once ([#1764](https://github.com/Basekick-Labs/arc/issues/1764))
 

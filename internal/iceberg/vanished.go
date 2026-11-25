@@ -187,12 +187,23 @@ func dropVanishedAt(paths, gone []string, database, measurement string, now time
 		goneSet[p] = struct{}{}
 	}
 	days, byDay := daysOfPaths(gone, database, measurement)
+	// A day where a fresh file itself vanished is being rewritten or deleted
+	// whole (a DELETE, a re-home), not compacted: its other fresh files may
+	// be next, and keeping them would spend the pass's vanish rounds on that
+	// day (maxVanishRounds) while older days wait. The day goes whole, as
+	// before #1755.
+	freshGone := map[string]bool{}
+	for _, p := range gone {
+		if freshIngestFile(p, database, measurement, now) {
+			freshGone[dayOf(p, database, measurement)] = true
+		}
+	}
 	for _, p := range paths {
 		_, isGone := goneSet[p]
 		inDay := false
 		if byDay && !isGone {
 			_, inDay = days[dayOf(p, database, measurement)]
-			if inDay && freshIngestFile(p, database, measurement, now) {
+			if inDay && !freshGone[dayOf(p, database, measurement)] && freshIngestFile(p, database, measurement, now) {
 				inDay = false // not a compaction input: it commits now
 			}
 		}

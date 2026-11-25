@@ -278,6 +278,12 @@ func TestDropVanishedKeepsFreshIngestFiles(t *testing.T) {
 	if len(dropped) != 5 {
 		t.Fatalf("dropped %v", dropped)
 	}
+	// A fresh file that itself vanished (a DELETE or a re-home over today): its day goes whole.
+	fresh2 := k("24", "15", ing(now.Add(-3*time.Minute)))
+	kept, _ = dropVanishedAt([]string{fresh, fresh2}, []string{fresh2}, "mydb", "cpu", now)
+	if len(kept) != 0 {
+		t.Fatalf("kept %v; a day where a fresh file vanished goes whole", kept)
+	}
 	// A rewrite replaces its original: never exempt, however fresh its name.
 	rw := k("24", "15", strings.TrimSuffix(ing(now.Add(-time.Minute)), ".parquet")+"_rewrite_1.parquet")
 	if freshIngestFile(rw, "mydb", "cpu", now) {
