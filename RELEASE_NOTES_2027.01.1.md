@@ -41,7 +41,7 @@ Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1292](https:/
 
 A write is acknowledged once its rows are buffered, and a query sees them only after their flush. That comes at most `ingest.max_buffer_age_ms` (5 s by default) later. A client that writes and then reads, such as a test, an agent's memory, or a job step, had to sleep or poll. With the key on, a write to `/api/v1/write/msgpack` or `/api/v1/write/line-protocol` can send **`x-arc-wait: visible`** and is answered once its rows are visible:
 
-- **204, `X-Arc-Visible: true`.** Every row is in a stored file. With tiered storage, that file is also registered. "Visible" means visible to a query over HTTP `/api/v1/query*` on this node that starts after the answer. Flight SQL and `/api/v1/query/arrow` are not covered by this answer. A concurrent DELETE can still remove the rows afterwards.
+- **204, `X-Arc-Visible: true`.** Every row is in a stored file. With tiered storage, that file is also registered. "Visible" means visible to a query over HTTP `/api/v1/query*` on this node that starts after the answer. Flight SQL is not covered. A concurrent DELETE can still remove the rows afterwards.
 - **202, `X-Arc-Visible: false`, `X-Arc-Visible-Reason: <reason>`**, body `{"visible": false, "reason", "rows_written"}`. The rows were accepted, as a plain 204 says, but they are not known to be visible. Do not resend them. The reasons:
   - `timeout`: 20 s passed first.
   - `shutdown`: the server began shutting down. The rows are still flushed at close.

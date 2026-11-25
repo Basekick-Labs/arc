@@ -14,7 +14,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -34,11 +33,12 @@ import (
 )
 
 type visRig struct {
-	app *fiber.App
-	buf *ingest.ArrowBuffer
-	dir string
-	wv  *WaitVisible
-	be  storage.Backend
+	app  *fiber.App
+	qapp *fiber.App // the query handler, built once: its caches stay warm
+	buf  *ingest.ArrowBuffer
+	dir  string
+	wv   *WaitVisible
+	be   storage.Backend
 }
 
 type visOpts struct {
@@ -124,21 +124,24 @@ func (r *visRig) requireNothingWritten(t *testing.T) {
 	require.Empty(t, files)
 }
 
-// count runs sql through the query handler, with file-level time pruning on
-// as in production, over the rig's storage.
+// count runs sql through one query handler per rig, with file-level time
+// pruning on as in production, over the rig's storage.
 func (r *visRig) count(t *testing.T, sql string) int64 {
 	t.Helper()
-	duck, err := database.New(&database.Config{MemoryLimit: "256MB", ThreadCount: 1, MaxConnections: 2, LocalStorageRoot: r.dir}, zerolog.Nop())
-	require.NoError(t, err)
-	defer duck.Close()
-	h := NewQueryHandler(duck, r.be, zerolog.Nop(), 0, 0)
-	h.SetFileTimePruning(true, time.Second)
-	app := fiber.New()
-	h.RegisterRoutes(app)
+	if r.qapp == nil {
+		duck, err := database.New(&database.Config{MemoryLimit: "256MB", ThreadCount: 1, MaxConnections: 2, LocalStorageRoot: r.dir}, zerolog.Nop())
+		require.NoError(t, err)
+		t.Cleanup(func() { duck.Close() })
+		h := NewQueryHandler(duck, r.be, zerolog.Nop(), 0, 0)
+		h.SetFileTimePruning(true, time.Second)
+		r.buf.AddOnFilePublished(h.FilePublished) // as main.go wires it
+		r.qapp = fiber.New()
+		h.RegisterRoutes(r.qapp)
+	}
 	b, _ := json.Marshal(QueryRequest{SQL: sql})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/query", bytes.NewReader(b))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := app.Test(req, -1)
+	resp, err := r.qapp.Test(req, -1)
 	require.NoError(t, err)
 	out, _ := io.ReadAll(resp.Body)
 	var res struct {
@@ -316,35 +319,66 @@ func TestWaitVisibleClusterRefusedBeforeForward1759(t *testing.T) {
 }
 
 // 204 X-Arc-Visible: true, and a query right after it (no flush in between)
-// sees every row: the current hour, an earlier hour, the next hour.
+// on a query handler that already served the measurement sees every row:
+// the current hour, an earlier hour, the next hour.
 func TestWaitVisible204ThenQuerySeesRows1759(t *testing.T) {
 	now := time.Now().UTC()
 	hourEnd := now.Truncate(time.Hour).Add(time.Hour)
-	if hourEnd.Sub(now) < time.Minute {
+	if hourEnd.Sub(now) < time.Minute || now.Sub(now.Truncate(time.Hour)) < time.Minute {
 		t.Skip("too close to an hour boundary")
 	}
 	times := []time.Time{now.Add(-2 * time.Second), now.Add(-2 * time.Hour), hourEnd.Add(time.Minute)}
+	noTime := func(times ...time.Time) []byte { // the decoder stamps them
+		b, err := msgpack.Marshal(map[string]interface{}{"m": "cpu", "columns": map[string]interface{}{"v": make([]float64, len(times))}})
+		require.NoError(t, err)
+		return b
+	}
+	rows := func(times ...time.Time) []byte {
+		items := make([]interface{}, len(times))
+		for i, at := range times {
+			items[i] = row("cpu", at.UnixMilli(), map[string]interface{}{"v": float64(i)}, nil)
+		}
+		b, err := msgpack.Marshal(items)
+		require.NoError(t, err)
+		return b
+	}
+	mp := func(times ...time.Time) []byte { return mpCPU(t, times...) }
+	gzipped := func(times ...time.Time) []byte { return gz(t, string(mpCPU(t, times...))) }
 	cases := []struct {
 		name, path string
 		decimal    bool
-		body       []byte
+		body       func(...time.Time) []byte
+		lastMinute int64 // of the three rows, those a query from a minute ago reads
 	}{
-		{"msgpack", "/api/v1/write/msgpack", false, mpCPU(t, times...)},
-		{"lp typed", "/api/v1/write/line-protocol", false, lpCPU(times...)},
-		{"lp record (decimal columns)", "/api/v1/write/line-protocol", true, lpCPU(times...)},
+		{"msgpack", "/api/v1/write/msgpack", false, mp, 2},
+		{"msgpack without time", "/api/v1/write/msgpack", false, noTime, 3},
+		{"msgpack rows", "/api/v1/write/msgpack", false, rows, 2},
+		{"msgpack gzip", "/api/v1/write/msgpack", false, gzipped, 2},
+		{"lp typed", "/api/v1/write/line-protocol", false, lpCPU, 2},
+		{"lp record (decimal columns)", "/api/v1/write/line-protocol", true, lpCPU, 2},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newVisRig(t, visOpts{ageMS: 200, decimal: tc.decimal})
+			// A row stored and queried first, so the queries after the
+			// 204 run on a handler that has served this measurement.
+			resp, out := r.post(t, tc.path, tc.body(now.Add(-10*time.Second)))
+			require.Equal(t, http.StatusNoContent, resp.StatusCode, out)
+			require.NoError(t, r.buf.FlushAllAndWait(context.Background()))
+			q3h := "SELECT COUNT(*) FROM d.cpu WHERE time >= '" + sqlTime(now.Add(-3*time.Hour)) + "'"
+			q1m := "SELECT COUNT(*) FROM d.cpu WHERE time >= '" + sqlTime(now.Add(-time.Minute)) + "'"
+			require.Equal(t, int64(1), r.count(t, q3h))
+			require.Equal(t, int64(1), r.count(t, q1m))
 			snap := metrics.Get().Snapshot()
 			latency, requests := snap["http_latency_count"].(int64), snap["http_requests_total"]
 			counts := waitVisibleCounts()
-			resp, out := r.post(t, tc.path, tc.body, WaitVisibleHeader, "visible")
+			resp, out = r.post(t, tc.path, tc.body(times...), WaitVisibleHeader, "visible")
 			require.Equal(t, http.StatusNoContent, resp.StatusCode, out)
 			v, reason := visible(resp.Header)
 			require.Equal(t, "true", v)
 			require.Empty(t, reason)
-			require.Equal(t, int64(3), r.count(t, "SELECT COUNT(*) FROM d.cpu WHERE time >= '"+sqlTime(now.Add(-3*time.Hour))+"'"))
+			require.Equal(t, int64(4), r.count(t, q3h))
+			require.Equal(t, 1+tc.lastMinute, r.count(t, q1m))
 
 			snap = metrics.Get().Snapshot()
 			require.Equal(t, latency, snap["http_latency_count"].(int64), "a waited write is left out of the HTTP latency")
@@ -352,7 +386,7 @@ func TestWaitVisible204ThenQuerySeesRows1759(t *testing.T) {
 			require.Equal(t, counts["visible"]+1, waitVisibleCounts()["visible"])
 			require.Zero(t, r.wv.waiters.Load(), "the slot is released")
 
-			_, _ = r.post(t, tc.path, tc.body) // the control: recorded
+			_, _ = r.post(t, tc.path, tc.body(now)) // the control: recorded
 			require.Equal(t, latency+1, metrics.Get().Snapshot()["http_latency_count"].(int64))
 		})
 	}
@@ -361,10 +395,7 @@ func TestWaitVisible204ThenQuerySeesRows1759(t *testing.T) {
 // Accepted, not known to be visible: 202 with the reason and rows_written.
 func TestWaitVisible202Reasons1759(t *testing.T) {
 	now := time.Now().UTC()
-	hourEnd := now.Truncate(time.Hour).Add(time.Hour)
-	if hourEnd.Sub(now) < 2*time.Minute {
-		t.Skip("too close to an hour boundary")
-	}
+	nearHourEnd := now.Truncate(time.Hour).Add(time.Hour).Sub(now) < 2*time.Minute
 	s3 := visLocal
 	s3.StorageBackend = "s3"
 	cases := []struct {
@@ -382,6 +413,9 @@ func TestWaitVisible202Reasons1759(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.reason == ingest.VisibleReasonFutureStamped && nearHourEnd {
+				t.Skip("too close to an hour boundary")
+			}
 			setVar(t, &waitVisibleBudget, tc.budget)
 			if tc.lost {
 				write := msgpackWrite
@@ -405,14 +439,19 @@ func TestWaitVisible202Reasons1759(t *testing.T) {
 				// another file of the hour survives the pass (alone, the
 				// hour's glob is kept). That file: a row at now, named as
 				// if flushed 25 s from now.
+				hourDir := filepath.Join(r.dir, "d", "cpu", now.Format("2006/01/02/15"))
+				first, _ := filepath.Glob(filepath.Join(hourDir, "*.parquet"))
+				require.Len(t, first, 1)
 				resp, out = r.post(t, "/api/v1/write/line-protocol", lpCPU(now))
 				require.Equal(t, http.StatusNoContent, resp.StatusCode, out)
 				require.NoError(t, r.buf.FlushAllAndWait(context.Background()))
-				hourDir := filepath.Join(r.dir, "d", "cpu", now.Format("2006/01/02/15"))
 				files, _ := filepath.Glob(filepath.Join(hourDir, "*.parquet"))
 				require.Len(t, files, 2)
-				sort.Strings(files) // by flush time: the second is the later write
-				require.NoError(t, os.Rename(files[1], filepath.Join(hourDir,
+				later := files[0]
+				if later == first[0] {
+					later = files[1]
+				}
+				require.NoError(t, os.Rename(later, filepath.Join(hourDir,
 					fmt.Sprintf("cpu_%s_%09d.parquet", now.Add(25*time.Second).Format("20060102_150405"), 0))))
 				require.Equal(t, int64(3), r.count(t, "SELECT COUNT(*) FROM d.cpu WHERE time >= '"+sqlTime(now.Add(-time.Minute))+"'"))
 				require.Zero(t, r.count(t, "SELECT COUNT(*) FROM d.cpu WHERE time >= '"+sqlTime(now.Add(20*time.Second))+"'"))
