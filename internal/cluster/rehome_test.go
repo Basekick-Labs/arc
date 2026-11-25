@@ -717,3 +717,20 @@ func TestRehomeSourceReplaced1870(t *testing.T) {
 		t.Fatalf("staged job replaced %v", got)
 	}
 }
+
+// #1756: a file that reaches this node from another asks the Iceberg export
+// for its table, without the query-cache report being set.
+func TestIcebergFileArrivedOnAPulledFile(t *testing.T) {
+	c := originRig(t, "writer-1", RoleWriter)
+	in := makeFileEntry("testdb/cpu/2026/10/12/10/x.parquet", []byte("x"), "writer-2")
+	in.CreatedAt = time.Now()
+	if err := c.raftNode.RegisterFile(in, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	c.SetIcebergFileArrived(func(db, m, path string, size int64) { got = append(got, db+"/"+m+" "+path) })
+	c.recordPulledFileInTiering(in.Path, in.SizeBytes)
+	if len(got) != 1 || got[0] != "testdb/cpu "+in.Path {
+		t.Fatalf("asked %v", got)
+	}
+}

@@ -188,6 +188,19 @@ func icebergIngestInterval(seconds int, hasCoordinator bool) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+// icebergArrivalInterval is the spacing of exports a cluster node's export
+// asks for when a file reaches it from another node (#1756): a file
+// registered in a shared bucket, or a pulled file landing on local storage.
+// iceberg.ingest_export_interval on a cluster node (the scheduler's gate
+// drops the request on a node that does not export); 0 on a standalone
+// node, whose own flushes report (icebergIngestInterval).
+func icebergArrivalInterval(seconds int, hasCoordinator bool) time.Duration {
+	if !hasCoordinator || seconds <= 0 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
+}
+
 // icebergReconcileConcurrency is how many tables' reconcile passes this node
 // runs at once (#1786).
 //

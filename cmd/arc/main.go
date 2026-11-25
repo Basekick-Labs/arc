@@ -4950,7 +4950,8 @@ func main() {
 		// often ingest publishes one (#1751). Set on every node: it only ever
 		// keeps more.
 		exporter.SetVersionRetention(time.Duration(cfg.Iceberg.MinVersionAge)*time.Second,
-			icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil))
+			icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil)+
+				icebergArrivalInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil))
 		// #1676: where new tables are created. Colocated needs the warehouse
 		// to be the storage root, which only the resolved values can tell.
 		if err := exporter.SetLayout(cfg.Iceberg.Layout); err != nil {
@@ -5105,9 +5106,11 @@ func main() {
 			Interval: time.Duration(cfg.Iceberg.ReconcileInterval) * time.Second,
 			Gate:     icebergGate,
 			Logger:   logger.Get("iceberg"),
-			// 0 leaves RequestIngestReconcile and its bookkeeping off (#1750),
-			// as on a cluster node, where nothing reports ingest files yet.
-			IngestInterval: icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil),
+			// 0 leaves RequestIngestReconcile and its bookkeeping off (#1750).
+			// On a cluster node the reports are files reaching it from other
+			// nodes (#1756).
+			IngestInterval: icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil) +
+				icebergArrivalInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil),
 			// An ingest request adds only the files ingest reported, without
 			// listing the measurement (#1751).
 			IngestAppend: cfg.Iceberg.IngestAppendEnabled,
@@ -5210,12 +5213,26 @@ func main() {
 			// starts, like the path requests above: a scheduler that never
 			// starts would only collect them.
 			//
-			// Not on a cluster node yet. There the node that flushes is
-			// usually not the one that exports (its request would be dropped
-			// at the gate), and on the exporter a request served before the
-			// file's registration lands costs a Raft barrier. The events that
-			// reach the exporting node (a file registered in a shared bucket,
-			// a pulled file landing) are #1756.
+			// Not from a cluster node's own flushes. There the node that
+			// flushes is usually not the one that exports (its request would
+			// be dropped at the gate), and on the exporter a request served
+			// before the file's registration lands costs a Raft barrier. A
+			// cluster node reports the files that reach it instead (#1756,
+			// SetIcebergFileArrived below).
+			if clusterCoordinator != nil && icebergArrivalInterval(cfg.Iceberg.IngestExportInterval, true) > 0 {
+				// #1756: a file that reaches this node from another (pulled
+				// onto local storage, or registered in a shared bucket) asks
+				// for an export of its table; the scheduler's gate drops the
+				// request unless this node exports.
+				appendOn := cfg.Iceberg.IngestAppendEnabled
+				clusterCoordinator.SetIcebergFileArrived(func(database, measurement, storagePath string, sizeBytes int64) {
+					if appendOn {
+						icebergScheduler.RequestIngestAppend(database, measurement, storagePath, sizeBytes)
+						return
+					}
+					icebergScheduler.RequestIngestReconcile(database, measurement)
+				})
+			}
 			if icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil) > 0 {
 				if cfg.Iceberg.IngestAppendEnabled {
 					// The append path (#1751): each file the flush registers

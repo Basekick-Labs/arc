@@ -20,9 +20,12 @@ func TestIngestFlushIsReportedToQueryCachesAndIceberg(t *testing.T) {
 	for _, want := range []string{
 		"arrowBuffer.AddOnFilePublished(queryHandler.FilePublished)",
 		"icebergScheduler.RequestIngestReconcile(database, measurement)",
-		// Standalone only, and only with the trigger on: one helper decides
-		// for the scheduler and for the receiver.
-		"IngestInterval: icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil),",
+		// Standalone flushes and, on a cluster node, files reaching it
+		// (#1756): the scheduler's interval is the sum of the two helpers,
+		// exactly one of which is non-zero.
+		"IngestInterval: icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil) +",
+		"icebergArrivalInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil),",
+		"clusterCoordinator.SetIcebergFileArrived(",
 		"if icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil) > 0 {",
 	} {
 		if !strings.Contains(src, want) {
@@ -129,5 +132,23 @@ func TestIcebergReconcileConcurrencyIsOneOnAClusterNode(t *testing.T) {
 	}
 	if icebergReconcileOnObjectStore != 4 {
 		t.Errorf("a standalone node on an object store runs %d passes at once by default, want 4", icebergReconcileOnObjectStore)
+	}
+}
+
+// #1756: a cluster node asks for exports when files reach it; a standalone
+// node does not (its flushes report).
+func TestIcebergArrivalIntervalIsOnlyOnAClusterNode(t *testing.T) {
+	for _, tc := range []struct {
+		seconds        int
+		hasCoordinator bool
+		want           time.Duration
+	}{
+		{60, true, time.Minute},
+		{0, true, 0},
+		{60, false, 0},
+	} {
+		if got := icebergArrivalInterval(tc.seconds, tc.hasCoordinator); got != tc.want {
+			t.Errorf("icebergArrivalInterval(%d, %v) = %v, want %v", tc.seconds, tc.hasCoordinator, got, tc.want)
+		}
 	}
 }
