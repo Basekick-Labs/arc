@@ -27,8 +27,9 @@ A job copies the file to a scratch directory and splits it there, which holds ab
 file's size side by side, then moves the new files to the hot tier. For a large file, a cold-tier
 file especially, that could fill the volume other writers share. A job is now refused up front,
 with the space it needs and the space that is free, when the scratch volume lacks twice the file's
-size plus 64 MiB or the hot storage volume lacks its size plus 64 MiB. A volume whose free space
-cannot be read is not refused on.
+size plus 64 MiB or the hot storage volume lacks its size plus 64 MiB (three times the size when
+they are one volume). It is an estimate: DuckDB may spill to scratch as well. A volume whose free
+space cannot be read is not refused on.
 
 ## Change: on a cluster, the Iceberg export picks up a file as soon as it reaches the exporting node ([#1756](https://github.com/Basekick-Labs/arc/issues/1756))
 

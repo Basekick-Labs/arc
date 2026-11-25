@@ -31,3 +31,37 @@ func TestRehomeRefusesAJobThatWouldNotFit1851(t *testing.T) {
 		t.Fatalf("job with room: %v", job)
 	}
 }
+
+// One volume for scratch and hot storage: the needs add up (3x); two
+// volumes: 2x on scratch and 1x on hot, each on its own.
+func TestRoomForJobAddsUpOnOneVolume1851(t *testing.T) {
+	old := rehomeDiskSpace
+	t.Cleanup(func() { rehomeDiskSpace = old })
+	r := newSwapRig(t)
+	const mib = 1 << 20
+	size := int64(100 * mib)
+	// 300 MiB free: enough for 2x + margin, not for 3x + margin.
+	rehomeDiskSpace = func(string) (uint64, uint64, error) { return 1 << 40, 300 * mib, nil }
+	if why := r.h.roomForJob(size); !strings.Contains(why, "scratch and hot storage volume") {
+		t.Fatalf("one volume: %q", why)
+	}
+	scratch := r.h.scratchRoot
+	rehomeDiskSpace = func(dir string) (uint64, uint64, error) {
+		if dir == scratch {
+			return 1 << 40, 300 * mib, nil
+		}
+		return 1 << 41, 200 * mib, nil
+	}
+	if why := r.h.roomForJob(size); why != "" {
+		t.Fatalf("two volumes with room: %q", why)
+	}
+	rehomeDiskSpace = func(dir string) (uint64, uint64, error) {
+		if dir == scratch {
+			return 1 << 40, 300 * mib, nil
+		}
+		return 1 << 41, 150 * mib, nil
+	}
+	if why := r.h.roomForJob(size); !strings.Contains(why, "the hot storage volume") {
+		t.Fatalf("hot volume short: %q", why)
+	}
+}
