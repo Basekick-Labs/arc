@@ -1844,7 +1844,10 @@ func main() {
 			// proposeTimeout=5s.
 			bootstrapCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			if cfg.Auth.ForceBootstrap && cfg.Auth.BootstrapToken != "" {
+			// auth.force_bootstrap acts only with a configured token: without
+			// one the generated first-run path runs, and the banner says so.
+			recovery := cfg.Auth.ForceBootstrap && cfg.Auth.BootstrapToken != ""
+			if recovery {
 				bootstrapToken, bootstrapErr = authManager.ForceAddRecoveryToken(bootstrapCtx, cfg.Auth.BootstrapToken)
 			} else if cfg.Auth.BootstrapToken != "" {
 				bootstrapToken, bootstrapErr = authManager.EnsureInitialTokenWithValue(bootstrapCtx, cfg.Auth.BootstrapToken)
@@ -1856,7 +1859,7 @@ func main() {
 			} else if bootstrapToken != "" {
 				// Print the banner to stderr (bypasses structured logging). The token
 				// value is shown only when Arc generated it; see printBootstrapBanner.
-				printBootstrapBanner(os.Stderr, bootstrapToken, cfg.Auth.BootstrapToken != "", cfg.Auth.ForceBootstrap)
+				printBootstrapBanner(os.Stderr, bootstrapToken, cfg.Auth.BootstrapToken != "", recovery)
 			}
 		}
 

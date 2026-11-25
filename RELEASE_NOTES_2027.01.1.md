@@ -17,6 +17,8 @@ is installed again on every start, so the value was printed on every start too.
 - For a configured token the banner says it was installed from configuration and leaves the value out.
   With `auth.force_bootstrap` it keeps the recovery wording and the reminder to remove the setting.
 - The "FIRST RUN" wording appears only for a generated token.
+- `auth.force_bootstrap` without `auth.bootstrap_token` generates a first-run token, as before; the
+  banner now says "FIRST RUN" for it instead of "RECOVERY TOKEN ADDED - EXISTING TOKENS PRESERVED".
 
 No new configuration keys.
 
