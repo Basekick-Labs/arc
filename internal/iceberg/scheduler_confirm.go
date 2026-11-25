@@ -177,7 +177,7 @@ func (s *Scheduler) serviceConfirms(ctx context.Context) {
 			var exists, published, named bool
 			err := s.exporter.adoptForCheck(s.exporter.withAWS(mctx), w.m.Database, w.m.Measurement)
 			if err == nil {
-				exists, published, named, err = s.exporter.publishedNames(mctx, w.m.Database, w.m.Measurement, w.key)
+				exists, published, named, err = s.exporter.publishedNames(mctx, w.m.Database, w.m.Measurement, w.key, false)
 			}
 			cancel()
 			switch {
@@ -254,7 +254,7 @@ func (s *Scheduler) serviceConfirms(ctx context.Context) {
 		// not leave none to find out what it published.
 		mctx, cancel = context.WithTimeout(ctx, measurementTimeout)
 		if s.exporter != nil {
-			exists, published, named, cerr := s.exporter.publishedNames(mctx, w.m.Database, w.m.Measurement, w.key)
+			exists, published, named, cerr := s.exporter.publishedNames(mctx, w.m.Database, w.m.Measurement, w.key, true)
 			switch {
 			case cerr != nil:
 				if a.Err == nil {
@@ -319,7 +319,12 @@ func (e *Exporter) probeMetadataWrite(ctx context.Context, database, measurement
 // version is the one the discovery files name, and whether that version
 // names the data file at storage key fileKey. Loop goroutine only: it loads
 // the table as a pass does.
-func (e *Exporter) publishedNames(ctx context.Context, database, measurement, fileKey string) (exists, published, named bool, err error) {
+//
+// ownPass: the question follows a pass of this node's (its catalog holds the
+// commit), which settles "published" where no discovery files exist (#1906).
+// A read-only question on a node that may not export reads only the
+// discovery files: its catalog can be behind the node that commits.
+func (e *Exporter) publishedNames(ctx context.Context, database, measurement, fileKey string, ownPass bool) (exists, published, named bool, err error) {
 	ctx = e.withAWS(ctx)
 	exists, err = e.tableExists(ctx, database, measurement)
 	if err != nil || !exists {
@@ -329,7 +334,7 @@ func (e *Exporter) publishedNames(ctx context.Context, database, measurement, fi
 	if err != nil {
 		return true, false, false, err
 	}
-	published, err = e.publishedIsCurrent(ctx, database, measurement, tbl)
+	published, err = e.publishedIsCurrent(ctx, database, measurement, tbl, ownPass)
 	if err != nil {
 		return true, false, false, err
 	}
@@ -352,10 +357,16 @@ func (e *Exporter) publishedNames(ctx context.Context, database, measurement, fi
 // has the same current snapshot as tbl, read from storage: the files a
 // reader of the table sees are that snapshot's. (alreadyPublished answers
 // from a pass's own memory, and only inside one.)
-func (e *Exporter) publishedIsCurrent(ctx context.Context, database, measurement string, tbl *icetable.Table) (bool, error) {
+func (e *Exporter) publishedIsCurrent(ctx context.Context, database, measurement string, tbl *icetable.Table, ownPass bool) (bool, error) {
 	if e.backend == nil {
 		// No discovery files are written: the catalog commit is the publish
 		// (writeVersionHint).
+		return true, nil
+	}
+	if _, _, ok := e.parseVersionAndMetaDir(tbl.MetadataLocation()); !ok && ownPass {
+		// A warehouse the storage backend cannot address (outside the
+		// storage root): no discovery files either, and catalog readers are
+		// the only readers, who see the commit (writeVersionHint, #1906).
 		return true, nil
 	}
 	pub, found, err := e.LoadPublished(ctx, database, measurement)
@@ -450,7 +461,7 @@ func (e *Exporter) settleWaived(ctx context.Context, database, measurement strin
 		return
 	}
 	for src := range e.replacedWaived(database, measurement) {
-		exists, published, named, err := e.publishedNames(ctx, database, measurement, src)
+		exists, published, named, err := e.publishedNames(ctx, database, measurement, src, true)
 		if err != nil {
 			return // the next pass asks again
 		}
