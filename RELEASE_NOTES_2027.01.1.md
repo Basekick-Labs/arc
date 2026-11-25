@@ -22,12 +22,15 @@ Existing counters change too, so that `arc_query_success_total + arc_query_error
 upgrade:
 
 - An Arrow IPC query that times out before its stream starts now also counts as an error.
-- An empty result (a measurement with no data) counts as a success on every route and goes into
-  the lifetime latency average. Before, the Arrow-JSON and MessagePack routes counted it as neither,
-  and the JSON route left it out of the average.
-- A query that shutdown cancels counts as an error on every route. Before, only the JSON route
-  counted it. The query registry still records it as cancelled.
-- A response whose final flush fails now counts as a failed query and a client disconnect.
+- An empty result (a measurement with no data) counts as a success on `/api/v1/query` (every
+  encoding), `/api/v1/query/msgpack` and `/api/v1/query/arrow`, and goes into the lifetime latency
+  average. Before, the Arrow-JSON and MessagePack paths counted it as neither, and the JSON path
+  left it out of the average. `/api/v1/query/:measurement` still answers it as an error.
+- A query that shutdown cancels counts as an error on every route. Before, the Arrow IPC,
+  Arrow-JSON and MessagePack paths did not count it. The query registry still records it as
+  cancelled.
+- A response whose final flush fails now counts as a failed query, and on the JSON and Arrow paths
+  also in `arc_query_client_disconnects_total`. Before, it counted as a success.
 - A stream that panics before it finishes counts once as a failure; a panic after the outcome was
   recorded does not count the query again.
 
