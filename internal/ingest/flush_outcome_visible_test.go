@@ -870,6 +870,27 @@ func TestVisibleFutureStampWindowShared1759(t *testing.T) {
 	}
 }
 
+// The hour bound is the verdict's hour, not the admission's: admitted at the
+// end of an hour, flushed and answered in the next, a row 30 s into that
+// next hour sits in its file's flush hour and can be hidden.
+func TestVisibleFutureStampUsesTheVerdictHour1759(t *testing.T) {
+	next := time.Now().UTC().Truncate(time.Hour).Add(time.Hour)
+	tAdm := next.Add(-time.Second)
+	o := NewVisibleOutcome(tAdm, true, time.Second)
+	batch := &TypedColumnBatch{Data: map[string]interface{}{"time": []int64{next.Add(30 * time.Second).UnixMicro()}}}
+	countOutcome(o, batch, 1, visibleMinFuture(o, batch))
+	o.vis.settledBatches.Store(1)
+	o.vis.settledRows.Store(1)
+	o.Seal()
+	w := VisibleWait{WrittenRows: 1, WrittenRowsKnown: true, StorageConfirmable: true}
+	if v := o.visibleVerdict(w, VisibleReasonNone, next.Add(time.Second)); v.Reason != VisibleReasonFutureStamped {
+		t.Fatalf("verdict in the next hour: %+v, want future_stamped", v)
+	}
+	if v := o.visibleVerdict(w, VisibleReasonNone, tAdm); !v.Visible {
+		t.Fatalf("verdict in the admission hour: %+v, want visible (a later hour's file is kept)", v)
+	}
+}
+
 // Through the append path: a row 30 s ahead in the same hour, margin 1 s →
 // future_stamped; a row in the next hour (kept as anomalous) → visible when
 // the verdict is in the admission hour; the check off → visible.
