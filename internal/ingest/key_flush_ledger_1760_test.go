@@ -484,25 +484,29 @@ func TestForceFlushKey_BudgetDeferralClockStepBack(t *testing.T) {
 	f.expect("db/k", Forced)
 }
 
-// max_buffer_age_ms <= 0 is accepted by Load; the recent-deferral window then
-// falls back to 1 s instead of turning the condition off (#1759).
+// max_buffer_age_ms is never validated by Load. A recent-deferral window
+// read straight from it would be zero at age <= 0 (the condition silently
+// off) and shorter than a second at 1-999 ms; it has a 1 s floor (#1759).
+// reserveForcedSlot is called directly: at age 0 the live sweep flushes every
+// buffer within a millisecond, so a test through ForceFlushKey races it.
 func TestForceFlushKey_BudgetDeferralWindowFloor(t *testing.T) {
-	cfg := forceConfig(4, 8)
-	cfg.MaxBufferAgeMS = 0
-	f := newForceFixture(t, cfg, &ForceBudget{})
-	f.write("k", 10)
-
-	ghost := "db/ghost"
-	shard := f.buf.getShard(ghost)
-	shard.mu.Lock()
-	f.buf.markDeferredLocked(shard, ghost)
-	delete(shard.deferredKeys, ghost)
-	shard.mu.Unlock()
-
-	f.clock.Advance(time.Second - time.Millisecond)
-	f.expect("db/k", OverBudget)
-	f.clock.Advance(time.Millisecond)
-	f.expect("db/k", Forced)
+	for _, ageMS := range []int{0, -5, 500} {
+		cfg := forceConfig(4, 8)
+		cfg.MaxBufferAgeMS = ageMS
+		f := newForceFixture(t, cfg, &ForceBudget{})
+		l := f.buf.ledger.Load()
+		l.noteDeferral()
+		f.clock.Advance(time.Second - time.Millisecond)
+		if f.buf.reserveForcedSlot(l, f.clock.Now()) {
+			l.inFlight.Add(-1)
+			t.Fatalf("age %d ms: a slot was reserved 999 ms after a deferral; the window has a 1 s floor", ageMS)
+		}
+		f.clock.Advance(time.Millisecond)
+		if !f.buf.reserveForcedSlot(l, f.clock.Now()) {
+			t.Fatalf("age %d ms: no slot 1 s after a deferral", ageMS)
+		}
+		l.inFlight.Add(-1)
+	}
 }
 
 func TestForceFlushKey_BudgetBufferedBytes(t *testing.T) {

@@ -266,9 +266,10 @@ func (b *ArrowBuffer) reserveForcedSlot(l *keyFlushLedger, now time.Time) bool {
 	// Wall-clock nanoseconds: a clock stepped back gives a negative distance,
 	// which counts as expired rather than as a deferral that never ends.
 	if last := l.lastDeferredNano.Load(); last != 0 {
-		// max_buffer_age_ms <= 0 (never validated: every sweep then flushes
-		// every buffer) would leave a zero window and silently turn this
-		// condition off; it gets a 1 s floor instead.
+		// The window is max_buffer_age_ms with a 1 s floor. The age is
+		// never validated: at <= 0 (every sweep then flushes every buffer)
+		// a zero window would silently turn this condition off, and ages of
+		// 1-999 ms are lifted to 1 s as well.
 		window := max(b.maxBufferAge, time.Second)
 		if d := now.UnixNano() - last; d >= 0 && d < int64(window) {
 			return false
