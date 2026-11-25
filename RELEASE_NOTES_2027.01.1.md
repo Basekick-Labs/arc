@@ -137,12 +137,15 @@ job still waits at them, as before: re-home with the warehouse outside the stora
 standalone fix.
 ## Fix: a node with the Iceberg export, failover and replication on local storage joins its cluster ([#1914](https://github.com/Basekick-Labs/arc/issues/1914))
 
-**Who is affected:** clusters on local storage with `cluster.replication_enabled`, `iceberg.enabled`
-and `cluster.failover_enabled` on.
+**Who is affected:** clusters whose nodes list more than 16 capabilities. On local storage with
+`cluster.replication_enabled`: with `iceberg.enabled` and `cluster.failover_enabled` (and a licence
+that includes writer failover), or with `cluster.stream_takeover` (experimental). On a shared
+object store: with the Iceberg export, failover and `cluster.stream_takeover` together. Edge sync on
+lowers a node's count by one.
 
 A joining node lists the cluster capabilities it supports, and the member it contacts refused a list
-longer than 16. With those three settings on local storage a node lists 17, so every node but the
-first was refused ("join rejected: authentication failed" on the joiner, "join capabilities exceed
+longer than 16. With the Iceberg export, failover and replication on local storage a node lists 17,
+so every node but the first was refused ("join rejected: authentication failed" on the joiner, "join capabilities exceed
 their bounds" on the member) and the cluster never formed. The limit is now 64; a node lists at most
 18 today. No released version had the limit.
 

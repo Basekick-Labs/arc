@@ -202,8 +202,9 @@ const MsgTypeJoinCaps MsgType = "join-caps"
 // before any MAC is computed over it. A node advertises up to 18 today
 // (localCapabilities, with every option on); 16 refused a node with the
 // Iceberg export, failover and replication on local storage (#1914).
-// TestEveryOptionalCapabilityFitsTheJoinBound keeps the list at half of
-// this at most.
+// TestEveryOptionalCapabilityFitsTheJoinBound keeps the list, with every
+// option it switches on, at half of this at most; a new optional capability
+// counts there only once the test switches it on too.
 const (
 	MaxJoinCapabilities  = 64
 	MaxJoinCapabilityLen = 64

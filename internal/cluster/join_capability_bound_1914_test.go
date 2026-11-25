@@ -13,8 +13,9 @@ import (
 // contacts applies, or the node never joins. Local storage with replication,
 // the Iceberg export and failover advertised 17 capabilities against a bound of
 // 16, and such a cluster never formed. Every optional capability is switched
-// on here, so the next one added to localCapabilities shows up against the
-// bound in this test rather than on a live cluster.
+// on here, so an unconditional one added to localCapabilities shows up against
+// the bound in this test rather than on a live cluster; a new optional one
+// does once its setter is added below.
 func TestEveryOptionalCapabilityFitsTheJoinBound(t *testing.T) {
 	c := originRig(t, "writer-1", RoleWriter)
 	b, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
@@ -53,6 +54,14 @@ func TestEveryOptionalCapabilityFitsTheJoinBound(t *testing.T) {
 	}
 	waitFSM(t, func() bool {
 		n, ok := c.raftNode.FSM().GetNode("reader-9")
-		return ok && len(n.Capabilities) == len(caps)
+		if !ok || len(n.Capabilities) != len(caps) {
+			return false
+		}
+		for _, want := range caps {
+			if !hasCapability(n.Capabilities, want) {
+				return false
+			}
+		}
+		return true
 	})
 }
