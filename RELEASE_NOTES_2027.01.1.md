@@ -2,6 +2,18 @@
 
 > **Status:** Planned — January 2027 release.
 
+## New: `telemetry.instance_id` and `telemetry.data_dir` ([#1885](https://github.com/Basekick-Labs/arc/issues/1885))
+
+Telemetry identifies an installation by a random id kept in `./data/.instance_id`, relative to the working directory. A deployment without a persistent disk got a new id on every start, and counted as a new installation each time. Examples are a pod with an `emptyDir`, or a container with nothing mounted at `/app/data`.
+
+- **`telemetry.instance_id`** (`ARC_TELEMETRY_INSTANCE_ID`) is an id to use instead of the file; nothing is written to disk.
+  - It must be a UUID: generate one with `uuidgen`, and don't copy one from an example. A value that is not a UUID stops Arc at startup while telemetry is on.
+  - It is stored in canonical form, so upper case or braces do not make a second id.
+  - Give each node its own. On a cluster with `cluster.node_id` set, Arc derives a per-node id from it, so one value in a multi-replica template still counts each replica once.
+  - Setting it on an installation that already has an id file changes its id, once.
+- **`telemetry.data_dir`** (`ARC_TELEMETRY_DATA_DIR`) is where the id file lives when no id is configured. The default is `./data`, as before; an empty value means the same. It does not follow `auth.db_path` or `storage.local_path`.
+- The id file is now written `0600`. A file that holds only whitespace is replaced with a new id instead of sending an empty one.
+
 ## Change: compaction cycle ids carry the process they belong to, and the trigger can wait ([#1884](https://github.com/Basekick-Labs/arc/issues/1884))
 
 Compaction cycle ids are counted from 1 in each Arc process. A client that keeps an id across requests can read another cycle's record under the same number. That happens when Arc restarts between its trigger and its poll, or when the poll lands on another node behind a load balancer. This was seen with a CronJob: two triggers an hour apart, with a restart between them, both got `cycle_id: 1`.
@@ -19,6 +31,7 @@ Compaction cycle ids are counted from 1 in each Arc process. A client that keeps
   - Behind a load balancer, keep the wait under its idle timeout (often 60 s), or the balancer answers 504 while the cycle carries on.
 
 Ids stay numeric and still restart at 1. Seeding them from the clock would have made `arcli compaction run --wait` report a cycle as finished after a restart, because it compares the id against `/stats`' `current_cycle_id`.
+
 
 ## Fix: files flushed at shutdown reach the Iceberg table, and Glue, before Arc exits ([#1886](https://github.com/Basekick-Labs/arc/issues/1886))
 
