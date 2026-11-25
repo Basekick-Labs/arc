@@ -35,6 +35,7 @@ upgrade:
   recorded does not count the query again.
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1292](https://github.com/Basekick-Labs/arc/pull/1292). Thank you.
+
 ## New: a write can wait until its rows are visible to a query (`x-arc-wait: visible`) ([#1759](https://github.com/Basekick-Labs/arc/issues/1759))
 
 **Who is affected:** standalone deployments that turn on the new key **`ingest.wait_visible_enabled`** (`ARC_INGEST_WAIT_VISIBLE_ENABLED`, default `false`). Off, nothing changes. A request carrying the header is then refused with 403, and nothing is written.
