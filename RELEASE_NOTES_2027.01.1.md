@@ -1353,11 +1353,11 @@ Reads of the JSON metrics family are no longer audited, whatever `include_reads`
 
 The node-wide `arc_iceberg_export_lag_seconds` and `arc_iceberg_export_pending_seconds` (#1750) say how late the export is, not which table is late. With `iceberg.export_lag_table_series` set to a number N (`ARC_ICEBERG_EXPORT_LAG_TABLE_SERIES`, 0–1000, default 0 = off), `/metrics` also has, labelled `database` and `measurement`:
 
-- **`arc_iceberg_export_table_pending_seconds`:** per table, how long its oldest file waiting for an export has waited. Only the N tables waiting longest are shown, and only those past a floor, so a healthy table between two exports is not listed. The floor is twice `ingest_export_interval`, or twice `reconcile_interval` where the ingest trigger is off, as on every cluster node. The wait is counted in one of two ways:
-  - from when the file was reported, on a standalone node with the ingest trigger on;
+- **`arc_iceberg_export_table_pending_seconds`:** per table, how long its oldest file waiting for an export has waited. Only the N tables waiting longest are shown, and only those past a floor, so a healthy table between two exports is not listed. The floor is twice `ingest_export_interval`, or twice `reconcile_interval` where the ingest trigger is off. The wait is counted in one of two ways:
+  - from when the file was reported, with the ingest trigger on (a standalone node, or a cluster's exporting node);
   - from when it was written, for files a table has committed but not yet published, in every mode, counting files written after the process started.
 
-  So on a cluster, or with `ingest_export_interval = 0`, a table whose commits keep failing is not shown, and after a restart neither is one whose publishes keep failing, until it commits again.
+  So with `ingest_export_interval = 0`, a table whose commits keep failing is not shown, and after a restart neither is one whose publishes keep failing, until it commits again.
 - **`arc_iceberg_export_tables_pending`:** how many tables are past that floor, so falling out of the top N can be told from catching up.
 - **`arc_iceberg_export_table_last_lag_seconds`:** per table, the longest time from an ingest file being written to its table version being published, among the files its last publish covered.
   - Only files written after the process started count.
@@ -1708,7 +1708,7 @@ On object storage an ingest-triggered export is a few hundred milliseconds of wa
 
 - **New key `iceberg.ingest_export_concurrency`** (default `8`, 1 to 32): how many tables' ingest appends run at once. `1` exports one table at a time, as before.
 - **Reconcile passes still run one table at a time**: a table's first export, the pass every `iceberg.reconcile_interval`, the pass after 120 appends, and any fallback. Only the append (#1751) is run for several tables at once.
-- **Standalone nodes only**, like the ingest trigger itself ([#1756](https://github.com/Basekick-Labs/arc/issues/1756)). On a cluster node nothing reads the key.
+- **On a cluster** (since [#1756](https://github.com/Basekick-Labs/arc/issues/1756), above), the exporting node uses it for its appends on local storage. Reconcile passes still run one table at a time there. Not run with several tables on a cluster.
 - A table is still exported by one thing at a time, and a file is still added to its table once: the scheduler starts a batch of appends, waits for all of them, and only then records what they did.
 
 Measured on AWS S3, standalone on EC2 in the bucket's region, over 4 to 5 minutes after a warm-up of 4 to 6 (one run each, except where two figures are given):
@@ -1816,7 +1816,7 @@ Since #1750 an ingest flush asks for an export of its table. Each of those expor
 - **New key `iceberg.min_version_age`** (seconds, default `300`): a published table version stays on disk for this long after the next one is published, on top of the newest `retain_snapshots + 1`. A reader that resolved a version, or Glue until its next sync, can still open it. It must be at least 120 s, and at least `iceberg.glue.sync_interval + 60` with Glue on. A value you set below that is refused at startup; the default is raised with a warning instead (to 660 s at `glue.sync_interval = 600`).
 - **`iceberg.ingest_export_interval` is no longer tied to `retain_snapshots`.** It must be `0` (off) or at least `5`. The rule from #1750 (`ingest_export_interval × retain_snapshots ≥ 120`) is gone: keeping versions by age gives the same guarantee directly. The default stays `60`.
 - **New key `iceberg.ingest_append_enabled`** (default `true`). `false` makes every ingest-triggered export a full pass, as in #1750.
-- **Standalone nodes only**, like the trigger itself ([#1756](https://github.com/Basekick-Labs/arc/issues/1756)). Keeping versions by age applies on every node.
+- **On a cluster** (since [#1756](https://github.com/Basekick-Labs/arc/issues/1756), above), on local storage, the exporting node appends the files that reach it and its own flushes. Keeping versions by age applies on every node.
 
 What one ingest export costs, as a full pass and as an append, through the scheduler on local disk (median of 7; `TestMeasure_AppendAgainstAPass`):
 
@@ -1914,7 +1914,7 @@ A file written by ingest used to reach its Iceberg table only at the next timed 
 
 - **New key `iceberg.ingest_export_interval`** (seconds, default `60`): the least time between two exports of one table that ingest causes. A flushed file is exported after at most this long, plus the export itself. `0` turns the trigger off and leaves the timed passes only.
 - **Bound:** it must be `0` or at least `5`. (As first merged, #1750 also required `ingest_export_interval × retain_snapshots ≥ 120`; #1751, above, replaced that with `iceberg.min_version_age`.)
-- **Standalone nodes only for now.** On a cluster node the trigger is not installed and the export runs on its timer as before: the node that flushes is usually not the node that exports. Tracked in [#1756](https://github.com/Basekick-Labs/arc/issues/1756). The lag histogram and the backlog counter are still filled there, by the timed passes; the pending gauge stays at 0. Not run on a cluster.
+- **On a cluster since [#1756](https://github.com/Basekick-Labs/arc/issues/1756)** (above): a file reaching the exporting node asks for the export, whichever node wrote it, and the pending gauge is set there; on the other nodes it stays at 0 (traced from code, not yet observed on a cluster).
 
 Measured on a standalone node, local storage, default buffer age:
 
