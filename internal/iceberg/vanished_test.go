@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -253,6 +254,34 @@ func TestDropVanished(t *testing.T) {
 	kept, dropped = dropVanished(paths, []string{"s3://b/odd/x.parquet"}, "mydb", "cpu")
 	if len(kept) != 3 || len(dropped) != 1 {
 		t.Fatalf("kept %v dropped %v; want only the unreadable-day file dropped", kept, dropped)
+	}
+}
+
+// #1755: a fresh ingest file of the current UTC day is not a compaction input, so a vanished file
+// of its day does not hold it back. Older ingest files, compacted files, and fresh files of an
+// earlier day (the daily tier may take those at once) still go with the day.
+func TestDropVanishedKeepsFreshIngestFiles(t *testing.T) {
+	now := time.Date(2026, 11, 24, 15, 30, 0, 0, time.UTC)
+	k := func(day, hour, name string) string { return "mydb/cpu/2026/11/" + day + "/" + hour + "/" + name }
+	ing := func(at time.Time) string { return "cpu_" + at.Format("20060102_150405") + "_000000001.parquet" }
+	gone := k("24", "09", "cpu_20261124_093000_000000001_compacted.parquet")
+	fresh := k("24", "15", ing(now.Add(-10*time.Minute)))
+	stale := k("24", "14", ing(now.Add(-50*time.Minute)))
+	compacted := k("24", "10", "cpu_20261124_110000_000000001_compacted.parquet")
+	lateOld := k("20", "03", ing(now.Add(-5*time.Minute))) // a fresh name in an older day
+	goneOld := k("20", "02", "cpu_20261120_030000_000000001_compacted.parquet")
+	kept, dropped := dropVanishedAt([]string{gone, fresh, stale, compacted, lateOld, goneOld},
+		[]string{gone, goneOld}, "mydb", "cpu", now)
+	if len(kept) != 1 || kept[0] != fresh {
+		t.Fatalf("kept %v; want only the fresh file of today", kept)
+	}
+	if len(dropped) != 5 {
+		t.Fatalf("dropped %v", dropped)
+	}
+	// A rewrite carries its original's time; on its own it is just as fresh.
+	rw := k("24", "15", strings.TrimSuffix(ing(now.Add(-time.Minute)), ".parquet")+"_rewrite_1.parquet")
+	if !freshIngestFile(rw, "mydb", "cpu", now) {
+		t.Fatal("a fresh rewrite of today was not fresh")
 	}
 }
 

@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path"
 	"sort"
 	"sync"
+	"time"
 
 	iceberg "github.com/apache/iceberg-go"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -156,9 +158,24 @@ func daysOfPaths(paths []string, database, measurement string) (days map[string]
 	return days, true
 }
 
+// freshIngestAge is how recent an ingest file's name must be for dropVanished to keep it beside a
+// vanished file of its day (#1755). Compaction skips a partition holding a file named within its
+// minimum age, at least an hour on both tiers (compaction/hourly.go groupHourPartitions,
+// compaction/daily.go groupDayPartitions); the daily tier stops checking for days older than
+// skip_file_age_check_days (at least one day), so only the current UTC day's files are exempt.
+// Such a file is not an input of the compaction whose file vanished, about to go too, and its rows
+// are new to the table. A quarter hour short of the hour, for clock skew between the node that
+// named the file and the node that compacts.
+const freshIngestAge = 45 * time.Minute
+
 // dropVanished removes from paths every path in gone and, when every gone path has a readable day,
-// every other path in one of those days. It returns what is kept and what was dropped.
+// every other path in one of those days, except a fresh ingest file (freshIngestAge). It returns
+// what is kept and what was dropped.
 func dropVanished(paths, gone []string, database, measurement string) (kept, dropped []string) {
+	return dropVanishedAt(paths, gone, database, measurement, time.Now())
+}
+
+func dropVanishedAt(paths, gone []string, database, measurement string, now time.Time) (kept, dropped []string) {
 	goneSet := make(map[string]struct{}, len(gone))
 	for _, p := range gone {
 		goneSet[p] = struct{}{}
@@ -169,6 +186,9 @@ func dropVanished(paths, gone []string, database, measurement string) (kept, dro
 		inDay := false
 		if byDay && !isGone {
 			_, inDay = days[dayOf(p, database, measurement)]
+			if inDay && freshIngestFile(p, database, measurement, now) {
+				inDay = false // not a compaction input: it commits now
+			}
 		}
 		if isGone || inDay {
 			dropped = append(dropped, p)
@@ -177,6 +197,16 @@ func dropVanished(paths, gone []string, database, measurement string) (kept, dro
 		}
 	}
 	return kept, dropped
+}
+
+// freshIngestFile reports whether p is an ingest file of the current UTC day named within
+// freshIngestAge of now (dropVanished).
+func freshIngestFile(p, database, measurement string, now time.Time) bool {
+	t, ok := storage.IngestFileTime(path.Base(p))
+	if !ok || now.Sub(t) >= freshIngestAge {
+		return false
+	}
+	return dayOf(p, database, measurement) == now.UTC().Format("2006/01/02")
 }
 
 // dataFilePaths returns the paths of DataFiles.
