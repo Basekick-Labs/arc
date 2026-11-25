@@ -183,9 +183,9 @@ func (refusingWriter) Write([]byte) (int, error) { return 0, errResponseBodyNotS
 // This file is the only place in the package that installs a body stream, and
 // each call is on one line with safeStream so the CI panic-safety guard can
 // see both.
-func (h *QueryHandler) setDirectBodyStream(fctx *fasthttp.RequestCtx, cancel func(), trailers *responseTrailers, stream string, onPanic func(), sw func(*bufio.Writer)) {
+func (h *QueryHandler) setDirectBodyStream(fctx *fasthttp.RequestCtx, cancel func(), trailers *responseTrailers, stream string, onPanic func(), sw func(*bufio.Writer), panicMetric ...func()) {
 	sw = takeHeldRead(fctx, sw)
-	fctx.Response.SetBodyStream(&directBodyStream{sw: h.safeStream(stream, onPanic, sw), cancel: cancel, trailers: trailers, header: &fctx.Response.Header}, -1)
+	fctx.Response.SetBodyStream(&directBodyStream{sw: h.safeStream(stream, onPanic, sw, panicMetric...), cancel: cancel, trailers: trailers, header: &fctx.Response.Header}, -1)
 }
 
 // streamReadsFiles marks the request's next direct stream as one that still

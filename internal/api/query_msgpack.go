@@ -92,7 +92,7 @@ func executeArrowMsgPackQuery(
 			if cancel != nil {
 				cancel()
 			}
-			m.IncQueryErrors()
+			m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			if onFail != nil {
 				onFail(vanishedPartitionMessage)
 			}
@@ -107,6 +107,8 @@ func executeArrowMsgPackQuery(
 			if onComplete != nil {
 				onComplete(0)
 			}
+			m.IncQuerySuccess()
+			m.RecordQueryLatencyForEngine(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			_ = respondEmptySuccess(c, timestamp, start)
 			return 0, true
 		}
@@ -116,7 +118,7 @@ func executeArrowMsgPackQuery(
 			if cancel != nil {
 				cancel()
 			}
-			m.IncQueryErrors()
+			m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			m.IncQueryTimeouts()
 			if onTimeout != nil {
 				onTimeout()
@@ -142,7 +144,10 @@ func executeArrowMsgPackQuery(
 			cancel()
 		}
 		if errors.Is(err, context.Canceled) && h.shuttingDown() {
-			// Shutdown cancelled it (#1644); onFail records it as such.
+			// Shutdown cancelled it (#1644); onFail records it as cancelled
+			// in the registry. The metrics count a failed execution, as on
+			// every query route (#1292), so success + errors = requests holds.
+			m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			if onFail != nil {
 				onFail("server shutting down")
 			}
@@ -150,7 +155,7 @@ func executeArrowMsgPackQuery(
 			_ = respondError(c, fiber.StatusServiceUnavailable, "Server shutting down", timestamp, start)
 			return -1, true
 		}
-		m.IncQueryErrors()
+		m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 		if onFail != nil {
 			onFail(err.Error())
 		}
@@ -209,7 +214,7 @@ func executeArrowMsgPackQuery(
 		// branch above, just driven by ctx state after the drain
 		// attempt.
 		if errors.Is(drainErr, context.DeadlineExceeded) {
-			m.IncQueryErrors()
+			m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			m.IncQueryTimeouts()
 			if onTimeout != nil {
 				onTimeout()
@@ -217,7 +222,8 @@ func executeArrowMsgPackQuery(
 			_ = respondError(c, fiber.StatusGatewayTimeout, "Query timed out", timestamp, start)
 			return -1, true
 		}
-		m.IncQueryErrors()
+
+		m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 		// A value outside int64 is the query's, not the server's: a 400 with
 		// the error's own text, which already names its row (#1784).
 		var overflow *decimalOverflowError
@@ -253,6 +259,7 @@ func executeArrowMsgPackQuery(
 	if respEncoding != "" {
 		c.Set(fiber.HeaderContentEncoding, respEncoding)
 	}
+	outcome := newQueryStreamOutcome(metrics.QueryEngineDuckDB, start)
 	h.setDirectBodyStream(c.Context(), cancel, nil, "query_msgpack", func() {
 		// A panic skips the dispositions below, leaving the query registered
 		// as running forever (#717).
@@ -285,11 +292,9 @@ func executeArrowMsgPackQuery(
 			bw = bufio.NewWriterSize(sink, 256*1024)
 		}
 		rc, streamErr := streamMsgPackFromBatches(ctx, bw, schema, batches, rowCount, governanceMaxRows, profile, start, timestamp)
-		bw.Flush()
-		if err := finishCompression(); err != nil && streamErr == nil {
-			streamErr = err
-		}
-		w.Flush()
+		streamErr = firstStreamWriteError(streamErr, bw.Flush())
+		streamErr = firstStreamWriteError(streamErr, finishCompression())
+		streamErr = firstStreamWriteError(streamErr, w.Flush())
 
 		// Reported before the error branch below: a stream can reach the cap
 		// and then fail on the way out, and the marker is emitted either way,
@@ -299,7 +304,7 @@ func executeArrowMsgPackQuery(
 		h.logGovernanceRowCap("msgpack", convertedSQL, tokenID, tokenName, governanceMaxRows, int64(rc))
 
 		if streamErr != nil {
-			m.IncQueryErrors()
+			outcome.fail()
 			if errors.Is(streamErr, context.DeadlineExceeded) {
 				m.IncQueryTimeouts()
 				if onTimeout != nil {
@@ -316,9 +321,7 @@ func executeArrowMsgPackQuery(
 			return
 		}
 
-		m.IncQuerySuccess()
-		m.IncQueryRows(int64(rc))
-		m.RecordQueryLatency(time.Since(start).Microseconds())
+		outcome.succeed(int64(rc))
 
 		if onComplete != nil {
 			onComplete(rc)
@@ -330,7 +333,7 @@ func executeArrowMsgPackQuery(
 			Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 			Msg("Arrow MsgPack query completed")
 		h.logSlowQuery(convertedSQL, start, rc, tokenName)
-	})
+	}, outcome.fail)
 
 	return 0, true
 }

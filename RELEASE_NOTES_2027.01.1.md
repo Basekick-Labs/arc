@@ -2,6 +2,37 @@
 
 > **Status:** Planned — January 2027 release.
 
+## New: query latency and outcomes per engine (DuckDB, arcx) ([#1292](https://github.com/Basekick-Labs/arc/pull/1292), [#823](https://github.com/Basekick-Labs/arc/issues/823))
+
+**Who is affected:** anyone scraping Arc's Prometheus metrics, or reading `/api/v1/metrics`.
+
+Two new metrics:
+
+- `arc_query_engine_executions_total{engine,outcome}`: query executions by engine (`duckdb`,
+  `arcx`) and outcome (`success`, `error`). In the JSON metrics: `query_engine_executions`.
+- `arc_query_latency_seconds{engine}`: a latency histogram per engine, failures included, with
+  buckets from 1 ms to 30 s. Before, query latency was only a lifetime average.
+
+They count queries that reached an engine. A request refused earlier (validation, permissions, the
+SQL transform) appears only in `arc_query_requests_total` and `arc_query_errors_total`, so the sum
+of `arc_query_engine_executions_total` can be lower than `arc_query_requests_total` by design.
+
+Existing counters change too, so that `arc_query_success_total + arc_query_errors_total` matches
+`arc_query_requests_total` on every query route. Dashboards built on them may move after the
+upgrade:
+
+- An Arrow IPC query that times out before its stream starts now also counts as an error.
+- An empty result (a measurement with no data) counts as a success on every route and goes into
+  the lifetime latency average. Before, the Arrow-JSON and MessagePack routes counted it as neither,
+  and the JSON route left it out of the average.
+- A query that shutdown cancels counts as an error on every route. Before, only the JSON route
+  counted it. The query registry still records it as cancelled.
+- A response whose final flush fails now counts as a failed query and a client disconnect.
+- A stream that panics before it finishes counts once as a failure; a panic after the outcome was
+  recorded does not count the query again.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1292](https://github.com/Basekick-Labs/arc/pull/1292). Thank you.
+
 ## Fix: a single-hour flush registers its file in tiered storage after a slow write or at shutdown ([#1933](https://github.com/Basekick-Labs/arc/issues/1933))
 
 **Who is affected:** tiered storage (`tiered_storage.enabled`).
