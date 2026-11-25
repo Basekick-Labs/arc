@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"math"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -23,8 +24,14 @@ import (
 //
 // A flush that panics, or rows Close had no budget for, leave the batch in no
 // terminal state: the outcome never resolves, and the waiter answers on its
-// budget or at shutdown, never "visible". The waiter reads only its own
-// outcome: no shard lock, no flush-task registry, no barrier.
+// budget or at shutdown, never "visible". The waiter decides its verdict from
+// its own outcome only: no flush-task registry, no barrier. To shorten the
+// wait it may ask for a flush of the keys it wrote (ForceFlushKey, #1759): at
+// most once per key per ingest.wait_visible_min_interval_ms, inside the
+// forced-flush budget. That takes the key's ledger stripe lock, and only when
+// a flush is due, the key's shard lock: read to check that a batch of this
+// outcome is still buffered, then write to send. No lock is held while it
+// waits.
 
 // visibleOutcome is a visible write's bookkeeping. Counters only grow.
 type visibleOutcome struct {
@@ -47,6 +54,66 @@ type visibleOutcome struct {
 	// without blocking, so an outcome nobody waits on (an error or partial
 	// answer) never holds a flush up.
 	changed chan struct{}
+
+	// keys are the buffer keys this outcome marked a batch in, each once,
+	// in first-mark order: what WaitVisible may force. keySet exists once a
+	// second key is seen; a write to one measurement, the common case,
+	// pays a compare with the last key. Read after Seal.
+	keysMu sync.Mutex
+	keys   []string
+	keySet map[string]struct{}
+}
+
+// noteVisibleKey records that o's write buffered a batch under key. Beside
+// countOutcome at both append sites, under the shard lock; a live write or an
+// import pays the nil tests.
+func noteVisibleKey(o *FlushOutcome, key string) {
+	if o == nil || o.vis == nil {
+		return
+	}
+	o.vis.addKey(key)
+}
+
+func (v *visibleOutcome) addKey(key string) {
+	v.keysMu.Lock()
+	defer v.keysMu.Unlock()
+	n := len(v.keys)
+	if n > 0 && v.keys[n-1] == key {
+		return
+	}
+	if n > 0 {
+		if v.keySet == nil {
+			v.keySet = make(map[string]struct{}, 4)
+			for _, k := range v.keys {
+				v.keySet[k] = struct{}{}
+			}
+		}
+		if _, seen := v.keySet[key]; seen {
+			return
+		}
+		v.keySet[key] = struct{}{}
+	}
+	v.keys = append(v.keys, key)
+}
+
+// markedKeys is a copy of the keys o marked a batch in.
+func (v *visibleOutcome) markedKeys() []string {
+	v.keysMu.Lock()
+	defer v.keysMu.Unlock()
+	return append([]string(nil), v.keys...)
+}
+
+// holdsOutcome is ForceFlushKey's want for o: whether a buffered batch is
+// one of o's. Run under the shard read lock, where batch.outcome is stable.
+func holdsOutcome(o *FlushOutcome) func(batches []interface{}) bool {
+	return func(batches []interface{}) bool {
+		for _, record := range batches {
+			if batch, ok := record.(*TypedColumnBatch); ok && batch != nil && batch.outcome == o {
+				return true
+			}
+		}
+		return false
+	}
 }
 
 // NewVisibleOutcome is the outcome of a write that waits until its rows are
@@ -210,6 +277,13 @@ type VisibleWait struct {
 	// StorageConfirmable: the backend's listing is known to show a new
 	// file to the next query. The zero value is the safe one: not visible.
 	StorageConfirmable bool
+	// Forcer, when set with a positive ForceInterval, shortens the wait:
+	// the keys the write marked are flushed early, at most once per
+	// ForceInterval per key (ingest.wait_visible_min_interval_ms) and inside
+	// the forced-flush budget. nil, or ForceInterval <= 0: never force; the
+	// write waits for its rows' age or size flush.
+	Forcer        KeyForcer
+	ForceInterval time.Duration
 }
 
 // VisibleVerdict is a visible write's answer.
@@ -231,7 +305,9 @@ var visibleNow = time.Now
 // WaitVisible seals o, waits until every batch marked on it is resolved, the
 // budget runs out, w.Done closes or ctx ends, and returns the verdict. Call
 // it after the write call under o returned, and never for a write that
-// failed or stopped part-way (their answers do not wait). Takes no lock.
+// failed or stopped part-way (their answers do not wait). Holds no lock while
+// it waits; a forcing round (ForceFlushKey) takes a key's stripe lock, and
+// when that key is due, its shard lock briefly.
 func WaitVisible(ctx context.Context, o *FlushOutcome, w VisibleWait) VisibleVerdict {
 	start := time.Now()
 	if o == nil || o.vis == nil {
@@ -253,10 +329,16 @@ func WaitVisible(ctx context.Context, o *FlushOutcome, w VisibleWait) VisibleVer
 		if ctx != nil {
 			ctxDone = ctx.Done()
 		}
+		f := newVisibleForcing(o, w)
+		defer f.stop()
 	wait:
 		for !o.Resolved() && !v.overResolved.Load() {
+			// A forcing round before each sleep, the first one included:
+			// an idle key has no flush coming to wake the wait.
+			dueC := f.round()
 			select {
 			case <-v.changed:
+			case <-dueC:
 			case <-timer.C:
 				ended = VisibleReasonTimeout
 				break wait
@@ -275,6 +357,111 @@ func WaitVisible(ctx context.Context, o *FlushOutcome, w VisibleWait) VisibleVer
 	verdict := o.visibleVerdict(w, ended, visibleNow())
 	verdict.Waited = time.Since(start)
 	return verdict
+}
+
+// visibleForcing is one wait's forcing state (#1759): the keys still worth
+// forcing, and one reusable timer for the earliest not-due key. nil: no
+// forcing, and every method is a no-op.
+type visibleForcing struct {
+	forcer   KeyForcer
+	interval time.Duration
+	want     func(batches []interface{}) bool
+	live     []forceKey
+	timer    *time.Timer
+}
+
+// forceKey is a key still worth forcing; due is when ForceFlushKey last said
+// it becomes due (zero: try at the next round).
+type forceKey struct {
+	key string
+	due time.Time
+}
+
+// visibleForceMinDelay is the shortest sleep before a not-due key's retry, so
+// a due time already past never makes a hot loop.
+const visibleForceMinDelay = 5 * time.Millisecond
+
+func newVisibleForcing(o *FlushOutcome, w VisibleWait) *visibleForcing {
+	if w.Forcer == nil || w.ForceInterval <= 0 {
+		return nil
+	}
+	keys := o.vis.markedKeys()
+	if len(keys) == 0 {
+		return nil
+	}
+	f := &visibleForcing{forcer: w.Forcer, interval: w.ForceInterval, want: holdsOutcome(o), live: make([]forceKey, len(keys))}
+	for i, k := range keys {
+		f.live[i].key = k
+	}
+	return f
+}
+
+// round asks once for each live key whose due time has come, and returns the
+// channel of the timer armed for the earliest not-due key (nil: none).
+//
+// Per result: Forced, NothingToForce and NotWanted drop the key. The wait
+// runs after Seal, so no batch of this write is appended any more, and a
+// detach takes a key's whole slice: once this write's batches of a key were
+// sent (by this force or by another detach) or are not buffered, none will be
+// again. NotDue keeps it until its due time. OverBudget keeps it with no
+// timer: it is asked again only at a later round (a batch of this write
+// resolved, or another key's due time), never in a loop, and otherwise waits
+// for its natural flush. LedgerOff and Closing end forcing for this wait.
+func (f *visibleForcing) round() <-chan time.Time {
+	if f == nil || len(f.live) == 0 {
+		return nil
+	}
+	now := time.Now()
+	var next time.Time
+	kept := f.live[:0]
+	for _, k := range f.live {
+		if !k.due.IsZero() && now.Before(k.due) {
+			kept = append(kept, k)
+			next = earliest(next, k.due)
+			continue
+		}
+		r, due := f.forcer.ForceFlushKey(k.key, f.interval, ForceWrite, f.want)
+		switch r {
+		case NotDue:
+			k.due = due
+			kept = append(kept, k)
+			next = earliest(next, due)
+		case OverBudget:
+			k.due = time.Time{}
+			kept = append(kept, k)
+		case LedgerOff, Closing:
+			f.live = nil
+			return nil
+		}
+		// Forced, NothingToForce, NotWanted: dropped.
+	}
+	f.live = kept
+	if next.IsZero() {
+		return nil
+	}
+	d := time.Until(next)
+	if d < visibleForceMinDelay {
+		d = visibleForceMinDelay
+	}
+	if f.timer == nil {
+		f.timer = time.NewTimer(d)
+	} else {
+		f.timer.Reset(d)
+	}
+	return f.timer.C
+}
+
+func (f *visibleForcing) stop() {
+	if f != nil && f.timer != nil {
+		f.timer.Stop()
+	}
+}
+
+func earliest(a, b time.Time) time.Time {
+	if a.IsZero() || b.Before(a) {
+		return b
+	}
+	return a
 }
 
 // visibleVerdict decides, in order of precedence: a failure without a WAL

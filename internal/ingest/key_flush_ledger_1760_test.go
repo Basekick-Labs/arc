@@ -128,8 +128,7 @@ func newForceFixture(t *testing.T, cfg *config.IngestConfig, budget *ForceBudget
 	buf.SetCloseBudget(10 * time.Second)
 	f := &forceFixture{t: t, buf: buf, store: store, clock: newLedgerClock()}
 	if budget != nil {
-		buf.EnableKeyFlushLedger(*budget)
-		buf.ledger.Load().now = f.clock.Now
+		buf.enableKeyFlushLedger(*budget, f.clock.Now)
 	}
 	t.Cleanup(func() {
 		forceAfterScanHook = nil
