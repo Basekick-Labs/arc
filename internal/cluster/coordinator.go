@@ -6022,7 +6022,10 @@ func (c *Coordinator) reportFilePublishedEntry(e *raft.FileEntry) {
 	if p != nil {
 		(*p)(e.Database, e.Measurement, e.PartitionTime)
 	}
-	if a != nil {
+	if a != nil && !c.rehomeOwnsLocal(e.Path) {
+		// Not a re-home job's file: its outputs reach the table in the
+		// commit that removes its source (#1870), never appended on their
+		// own beside it.
 		(*a)(e.Database, e.Measurement, e.Path, e.SizeBytes)
 	}
 }

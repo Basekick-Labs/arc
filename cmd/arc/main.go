@@ -5224,7 +5224,10 @@ func main() {
 				// onto local storage, or registered in a shared bucket) asks
 				// for an export of its table; the scheduler's gate drops the
 				// request unless this node exports.
-				appendOn := cfg.Iceberg.IngestAppendEnabled
+				// The append path needs a per-file check this storage has only
+				// when local; on a shared bucket every arrival would fall back
+				// to a full pass, so ask for one directly.
+				appendOn := cfg.Iceberg.IngestAppendEnabled && storageBackend.Type() == "local"
 				clusterCoordinator.SetIcebergFileArrived(func(database, measurement, storagePath string, sizeBytes int64) {
 					if appendOn {
 						icebergScheduler.RequestIngestAppend(database, measurement, storagePath, sizeBytes)
