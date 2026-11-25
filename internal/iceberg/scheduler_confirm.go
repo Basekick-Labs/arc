@@ -7,12 +7,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/basekick-labs/arc/internal/storage"
+	iofs "io/fs"
 	"net/url"
-	"path"
 	"strings"
 	"time"
 
+	iceio "github.com/apache/iceberg-go/io"
 	icetable "github.com/apache/iceberg-go/table"
 )
 
@@ -283,31 +283,34 @@ func (s *Scheduler) serviceConfirms(ctx context.Context) {
 }
 
 // probeMetadataWrite writes and deletes a small object in the table's
-// metadata directory, where the export's next commit writes (#1845 item 3).
-// nil where the export writes no discovery files (no backend, or a warehouse
-// the backend cannot address): the catalog commit is all it writes there.
-// Loop goroutine only.
+// metadata directory through the table's own file IO, the writer and
+// credentials its next commit uses there (#1845 item 3). Loop goroutine only.
 func (e *Exporter) probeMetadataWrite(ctx context.Context, database, measurement string) error {
-	if e.backend == nil {
-		return nil
-	}
 	ctx = e.withAWS(ctx)
 	tbl, err := e.loadTableRecovering(ctx, e.tableIdent(database, measurement))
 	if err != nil {
-		return err
+		return fmt.Errorf("could not check that the table's metadata directory can be written: %w", err)
 	}
-	_, dirKey, ok := e.parseVersionAndMetaDir(tbl.MetadataLocation())
+	fs, err := tbl.FS(ctx)
+	if err != nil {
+		return fmt.Errorf("could not check that the table's metadata directory can be written: %w", err)
+	}
+	w, ok := fs.(iceio.WriteFileIO)
 	if !ok {
-		return nil
+		return nil // a read-only IO: nothing this check can try
 	}
+	metaLoc := tbl.MetadataLocation()
+	dir := metaLoc[:strings.LastIndex(metaLoc, "/")+1]
 	var nonce [8]byte
 	_, _ = rand.Read(nonce[:])
-	key := path.Join(dirKey, ".arc-write-probe-"+hex.EncodeToString(nonce[:]))
-	if err := e.backend.Write(ctx, key, []byte("probe")); err != nil {
-		return fmt.Errorf("the table's metadata directory cannot be written (%s): %w", dirKey, err)
+	loc := dir + ".arc-write-probe-" + hex.EncodeToString(nonce[:])
+	werr := w.WriteFile(loc, []byte("probe"))
+	// Deleted even after a failed write: an object store may have kept it.
+	if derr := fs.Remove(loc); derr != nil && werr == nil && !errors.Is(derr, iofs.ErrNotExist) {
+		e.logger.Warn().Err(derr).Str("location", loc).Msg("Iceberg: could not delete the write probe in the table's metadata directory; it is safe to remove by hand")
 	}
-	if err := e.backend.Delete(ctx, key); err != nil && !storage.IsNotFound(err) {
-		e.logger.Warn().Err(err).Str("key", key).Msg("Iceberg: could not delete the write probe in the table's metadata directory; it is safe to remove by hand")
+	if werr != nil {
+		return fmt.Errorf("the table's metadata directory cannot be written (%s): %w", dir, werr)
 	}
 	return nil
 }
