@@ -299,3 +299,64 @@ func TestLoadDoesNotWaitWhenItCannotBeServed(t *testing.T) {
 		})
 	}
 }
+
+// A load that registers next to a waiter the loop has closed but its load
+// has not yet removed still gets a loop turn (it is the first open one).
+func TestLoadNextToAClosedWaiterIsServed(t *testing.T) {
+	r := startLoadRig(t, time.Hour, 10*time.Millisecond, false, nil) // append off: not servable, skipped by the loop
+	r.report(r.newFile())
+	// Let the report's own wake be served, so only a load's wake can bring
+	// the next loop turn.
+	waitUntil(t, "the loop did not take the report's wake", func() bool { return len(r.sched.wake) == 0 })
+	time.Sleep(50 * time.Millisecond)
+	r.sched.reqMu.Lock()
+	stale := &loadWaiter{loadAt: time.Now(), done: make(chan struct{})}
+	stale.finishLocked(0)
+	r.sched.loadWaiters["mydb\x00cpu"] = append(r.sched.loadWaiters["mydb\x00cpu"], stale)
+	r.sched.loadWaiterN++
+	r.sched.reqMu.Unlock()
+	done := make(chan time.Duration, 16)
+	for range 16 {
+		go func() { done <- awaitTimed(r) }()
+	}
+	for range 16 {
+		if took := <-done; took > 500*time.Millisecond {
+			t.Fatalf("a load waited %v next to a closed waiter", took)
+		}
+	}
+}
+
+// A table whose last append fell back to a pass is not pulled by a load
+// until an append settles again.
+func TestLoadDoesNotPullATableThatFellBack(t *testing.T) {
+	r := newAppendRig(t)
+	r.sched = NewScheduler(SchedulerConfig{Exporter: r.exp, Source: r.src, Interval: time.Hour, Logger: r.sched.logger,
+		IngestInterval: time.Millisecond, IngestAppend: true, LoadInterval: time.Millisecond})
+	r.sched.started = time.Now().Add(-time.Second)
+	r.settled()
+	key := "mydb\x00cpu"
+	if !r.sched.loadServableSoon(key) {
+		t.Fatal("a settled table on the append path is not servable")
+	}
+	job := &ingestJob{m: Measurement{Database: "mydb", Measurement: "cpu"}, key: key, reason: "a new column"}
+	r.sched.noteAppendFallback(job)
+	r.sched.appendOK[key] = true // as if the pass after it settled
+	if r.sched.loadServableSoon(key) {
+		t.Fatal("a table whose append fell back is pulled by loads")
+	}
+	r.sched.finishAppend(&ingestJob{m: job.m, key: key})
+	if !r.sched.loadServableSoon(key) {
+		t.Fatal("a settled append did not make the table servable again")
+	}
+}
+
+// Past the cap over all tables, a load does not wait.
+func TestLoadOverTheGlobalCapDoesNotWait(t *testing.T) {
+	s, key := newLoadScheduler(t)
+	s.loadWaiterN = loadMaxWaiters
+	began := time.Now()
+	s.AwaitFreshForRead(context.Background(), "db", "m")
+	if took := time.Since(began); took > 100*time.Millisecond || len(s.loadWaiters[key]) != 0 {
+		t.Fatalf("waited %v, registered %d", took, len(s.loadWaiters[key]))
+	}
+}

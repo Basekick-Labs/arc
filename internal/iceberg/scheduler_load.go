@@ -111,7 +111,15 @@ func (s *Scheduler) AwaitFreshForRead(ctx context.Context, database, measurement
 		return
 	}
 	w := &loadWaiter{loadAt: time.Now(), done: make(chan struct{})}
-	first := len(s.loadWaiters[key]) == 0
+	// A closed waiter stays listed until its own load removes it: only an
+	// open one means the loop already has this table in hand.
+	first := true
+	for _, x := range s.loadWaiters[key] {
+		if !x.closed {
+			first = false
+			break
+		}
+	}
 	s.loadWaiters[key] = append(s.loadWaiters[key], w)
 	s.loadWaiterN++
 	s.reqMu.Unlock()
