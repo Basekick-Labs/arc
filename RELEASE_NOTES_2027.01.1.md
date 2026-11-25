@@ -12,9 +12,11 @@ file that reaches the exporting node from another (pulled onto its disk on local
 registered in the shared bucket) asks for an export of its table, as an ingest flush does on a
 standalone node (`iceberg.ingest_export_interval`; on local storage it appends just the new files
 when `iceberg.ingest_append_enabled` is on, on a shared bucket it runs a pass of the table).
-Measured on a three-node cluster with local storage: a row written on one node was in the exporting
-node's table 0.6 seconds after its flush, against 276–300 seconds before. On local storage, rows
-written on the exporting node itself still wait for its timed pass.
+The export of a table then follows within `iceberg.ingest_export_interval` (60 seconds by default),
+as on a standalone node. Measured on a three-node cluster with local storage, a row written on one
+node was in the exporting node's table 58 seconds after its flush at the default (8 seconds with the
+interval at 10, under a second for a table's first file), against 276–300 seconds before. On local
+storage, rows written on the exporting node itself still wait for its timed pass (#1902).
 `iceberg.ingest_export_interval = 0` keeps the timed passes only.
 
 ## Fix: files a backup restore writes are read at once ([#1764](https://github.com/Basekick-Labs/arc/issues/1764))
