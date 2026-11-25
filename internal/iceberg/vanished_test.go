@@ -361,6 +361,13 @@ func TestScheduler_VanishedAfterListingIsBusyThenSettles(t *testing.T) {
 	if got := len(liveEntries(ctx, t, exp, "mydb", "cpu")); got != 1 {
 		t.Fatalf("after the first pass the table holds %d files, want b only", got)
 	}
+	// #1755: and asks for the table again sooner than the ordinary retry.
+	sched.reqMu.Lock()
+	asked := sched.retrying["mydb\x00cpu"]
+	sched.reqMu.Unlock()
+	if !asked || sched.vanishTries["mydb\x00cpu"] != 1 {
+		t.Fatalf("after a pass that left a vanished file: retry asked %v, tries %d", asked, sched.vanishTries["mydb\x00cpu"])
+	}
 	if sched.runPass(ctx) {
 		t.Fatal("second pass still busy")
 	}
@@ -369,6 +376,9 @@ func TestScheduler_VanishedAfterListingIsBusyThenSettles(t *testing.T) {
 	}
 	if len(sched.busySince) != 0 {
 		t.Fatal("busy clock kept after progress")
+	}
+	if len(sched.vanishTries) != 0 {
+		t.Fatal("the sooner-retry count kept after a pass that settled")
 	}
 }
 
@@ -419,5 +429,38 @@ func TestVanished_Commit0UnreadableDayDefersEverything(t *testing.T) {
 	live := r.live()
 	if _, ok := live[odd.PhysicalPath]; ok || len(live) != 2 {
 		t.Fatalf("table holds %v; want f1 and f2 untouched and odd not committed alone", keys(live))
+	}
+}
+
+// #1755 item 3: a pass that left files because some vanished asks for its
+// table again sooner than the ordinary retry, doubling each time, until the
+// ordinary retry (partialRetryInterval) takes over; a pass that did not
+// resets it.
+func TestNoteVanishedRetriesSooner1755(t *testing.T) {
+	r := newRig1686(t, 3, 16)
+	sched := NewScheduler(SchedulerConfig{Exporter: r.exp, Source: movingSource{}, Interval: 5 * time.Minute, Logger: zerolog.Nop()})
+	key := "mydb\x00cpu"
+	job := &passJob{m: Measurement{Database: "mydb", Measurement: "cpu"}, key: key, vanished: true}
+	scheduled := func() bool {
+		sched.reqMu.Lock()
+		defer sched.reqMu.Unlock()
+		was := sched.retrying[key]
+		delete(sched.retrying, key) // as if it fired
+		return was
+	}
+	// 5 s, 10 s, 20 s are sooner than the ordinary 30 s; 40 s is not.
+	for i, want := range []bool{true, true, true, false} {
+		sched.noteVanished(job)
+		if got := scheduled(); got != want {
+			t.Fatalf("pass %d: retry asked %v, want %v", i+1, got, want)
+		}
+	}
+	sched.noteVanished(&passJob{m: job.m, key: key})
+	if _, ok := sched.vanishTries[key]; ok {
+		t.Fatal("a pass with nothing vanished kept the count")
+	}
+	sched.noteVanished(job)
+	if !scheduled() {
+		t.Fatal("after a reset, the first retry is the soonest again")
 	}
 }

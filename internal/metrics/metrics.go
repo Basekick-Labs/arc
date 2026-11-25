@@ -1398,6 +1398,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"iceberg_ingest_appends":           m.icebergExport.appends.Load(),
 		"iceberg_ingest_append_files":      m.icebergExport.appendFiles.Load(),
 		"iceberg_ingest_append_fallbacks":  m.icebergExport.appendFallbacks.Load(),
+		"iceberg_vanished_passes":          m.icebergExport.vanishedPasses.Load(),
 		"iceberg_files_left_out":           m.icebergExport.leftOut.Load(),
 		"buffer_queue_depth":               m.bufferQueueDepth.Load(),
 		"buffer_records_queued":            m.bufferRecordsQueued.Load(),

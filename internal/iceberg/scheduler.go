@@ -109,6 +109,9 @@ type Scheduler struct {
 	// busySince is when each measurement last stopped making progress while busy: the first busy
 	// pass after one that committed or settled. Loop goroutine only, like state.
 	busySince map[string]time.Time
+	// vanishTries counts a table's passes in a row that left files because
+	// some vanished (noteVanished). Loop goroutine only.
+	vanishTries map[string]int
 	// leftOut is, per table, how many files its last pass that went through every new file
 	// left out because no day could be given to them (file_day.go); tables with none have no
 	// entry. Kept apart from state, which a pass that did not settle drops: the files are
@@ -220,6 +223,32 @@ func (s *Scheduler) partialRetryInterval() time.Duration {
 	return min(s.interval, max(30*time.Second, s.interval/10))
 }
 
+// vanishRetryFirst is the first retry of a table whose pass left files for
+// the next one because a file vanished under it (#1755): a compaction, a
+// DELETE or retention deleting a file between the listing and the read.
+// Such a race is usually over within seconds, and every file of the day it
+// held back, the ones ingest wrote just now among them, waits for the retry.
+// It doubles on each further such pass, up to partialRetryInterval, which
+// is where the ordinary retry takes over.
+const vanishRetryFirst = 5 * time.Second
+
+// noteVanished asks for a table again soon after a pass that left files
+// because some vanished, sooner each time than the ordinary retry, and
+// forgets the count once a pass did not. Loop goroutine only.
+func (s *Scheduler) noteVanished(job *passJob) {
+	if !job.vanished {
+		delete(s.vanishTries, job.key)
+		return
+	}
+	metrics.Get().IncIcebergVanishedPass()
+	n := s.vanishTries[job.key]
+	s.vanishTries[job.key] = n + 1
+	d := vanishRetryFirst << min(n, 8)
+	if d < s.partialRetryInterval() {
+		s.requestAfter(job.m, job.key, d)
+	}
+}
+
 // reconcileOutcome is what reconcileOne did for one measurement.
 type reconcileOutcome int
 
@@ -315,6 +344,7 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		state:             make(map[string]measurementState),
 		leftOut:           make(map[string]int),
 		busySince:         make(map[string]time.Time),
+		vanishTries:       make(map[string]int),
 		requested:         make(map[string]Measurement),
 		requestedPaths:    make(map[string]struct{}),
 		requestedHot:      make(map[string]struct{}),

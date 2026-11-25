@@ -42,6 +42,16 @@ type icebergExport struct {
 	// leftOut is how many files are in no table because no day could be
 	// given to them, as of each table's last complete pass (#1754).
 	leftOut atomic.Int64
+	// vanishedPasses counts reconcile passes that left files for the next
+	// pass because a file vanished under them (#1755).
+	vanishedPasses atomic.Int64
+}
+
+// IncIcebergVanishedPass counts a reconcile pass that left files for the
+// next one because a file vanished under it (a compaction, a DELETE or
+// retention deleting it between the listing and the read, #1755).
+func (m *Metrics) IncIcebergVanishedPass() {
+	m.icebergExport.vanishedPasses.Add(1)
 }
 
 // SetIcebergFilesLeftOut records how many files the Iceberg export holds
@@ -148,6 +158,9 @@ func (m *Metrics) appendIcebergExport(b []byte) []byte {
 	b = append(b, "# HELP arc_iceberg_ingest_append_fallbacks_total Ingest-triggered Iceberg exports that had files to add and ran a full reconcile pass of the measurement instead; the log names the reason\n"...)
 	b = append(b, "# TYPE arc_iceberg_ingest_append_fallbacks_total counter\n"...)
 	b = appendMetric(b, "arc_iceberg_ingest_append_fallbacks_total", float64(h.appendFallbacks.Load()))
+	b = append(b, "# HELP arc_iceberg_vanished_passes_total Iceberg reconcile passes that left files for the next pass because a file vanished under them (a compaction, DELETE or retention deleting it mid-pass); each is retried within seconds\n"...)
+	b = append(b, "# TYPE arc_iceberg_vanished_passes_total counter\n"...)
+	b = appendMetric(b, "arc_iceberg_vanished_passes_total", float64(h.vanishedPasses.Load()))
 
 	b = append(b, "# HELP arc_iceberg_files_left_out Files readable through Arc that are in no Iceberg table because no single UTC day could be given to them (rows spanning more than one day, a time column with no value, or one that cannot be read), as of each table's last reconcile pass that went through all its new files. The export's Error log names them. 0 on a node that does not export, and after a restart until each table's first pass.\n"...)
 	b = append(b, "# TYPE arc_iceberg_files_left_out gauge\n"...)

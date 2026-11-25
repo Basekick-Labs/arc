@@ -65,6 +65,7 @@ type passJob struct {
 	newState    measurementState
 	recent      []string // listed files an append could still be offered (noteRecent)
 	droppedCold bool     // a cold file vanished: the cold listing is stale
+	vanished    bool     // files vanished under the pass and were left for the next one
 	commits     int
 	outcome     reconcileOutcome
 	err         error
@@ -173,6 +174,7 @@ func (s *Scheduler) preparePass(m Measurement, key string) *passJob {
 // only.
 func (s *Scheduler) applyPassEffects(job *passJob) {
 	s.passCommits = job.commits
+	s.noteVanished(job)
 	if job.droppedCold {
 		if ci, ok := s.source.(coldInvalidator); ok {
 			ci.InvalidateCold(job.m.Database)
@@ -486,6 +488,7 @@ func (r *passRunner) reconcile(ctx context.Context, job *passJob, exp *Exporter)
 	if res.moved {
 		// Files vanished and were left for the next pass. Not cached: the table is not the listing.
 		job.dropState()
+		job.vanished = true
 		if res.commits > 0 {
 			return outcomeInProgress, nil
 		}
