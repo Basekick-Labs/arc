@@ -156,8 +156,10 @@ While another node held the lease, a node dropped its own ingest export requests
 named could go away (compaction inputs, retention, DELETE). When the lease came back, the next file it
 flushed was appended to the table as the node had left it: the published table then named the files
 that were gone and missed the ones written while another node exported, until the next timed pass
-(`iceberg.reconcile_interval`, 5 minutes by default). Now the first export of each table after the
-lease returns is a full pass, which brings the table in line with the node's files.
+(`iceberg.reconcile_interval`, 5 minutes by default). A table nobody wrote to stayed as the node
+had left it for up to that long too, while the node's REST catalog already served it again. Now the
+node checks the lease every 5 seconds even when idle, and when it comes back runs a full pass at once
+instead of appending, which brings every table in line with the node's files.
 
 
 

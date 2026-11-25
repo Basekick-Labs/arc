@@ -105,6 +105,15 @@ type Scheduler struct {
 	// cold-removal notice (the requests are dropped at the gate), so they are
 	// dropped when the gate opens again (#1728).
 	wasGated bool
+	// passOnReopen: the gate opened again since the last pass (loop goroutine,
+	// #1903). The loop then runs a pass at once rather than at the next tick,
+	// so a table nobody writes to is not left as this node last published it
+	// (naming files gone meanwhile) for up to the interval, while the REST
+	// catalog already serves it again. runPass clears it.
+	passOnReopen bool
+	// gatePoll is how often the loop asks the gate while nothing else does, so
+	// that it sees the role move away and come back without traffic (#1903).
+	gatePoll time.Duration
 
 	// busySince is when each measurement last stopped making progress while busy: the first busy
 	// pass after one that committed or settled. Loop goroutine only, like state.
@@ -360,6 +369,7 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		ingestNext:        make(map[string]time.Time),
 		ingestPending:     make(map[string]ingestReports),
 		appendEnabled:     cfg.IngestAppend,
+		gatePoll:          gateReopenPoll,
 		ingestConcurrency: max(1, cfg.IngestConcurrency),
 		passConcurrency:   max(1, cfg.ReconcileConcurrency),
 		started:           time.Now(),
@@ -825,9 +835,16 @@ func (s *Scheduler) gateOpen() bool {
 			ci.InvalidateCold("")
 		}
 		clear(s.appendOK)
+		s.passOnReopen = true
 	}
 	return true
 }
+
+// gateReopenPoll is how often the loop asks a closed or open gate when it has
+// nothing else to do (Scheduler.gatePoll). CanRun reads this node's copy of
+// the cluster state, so asking is cheap; a few seconds bound how long a table
+// stays as this node last published it once the role is back.
+const gateReopenPoll = 5 * time.Second
 
 // Start launches the reconcile loop in the background. Stop cancels it.
 func (s *Scheduler) Start() {
@@ -865,8 +882,20 @@ func (s *Scheduler) loop(ctx context.Context) {
 	// at the top of each turn to the earliest one due.
 	ingestTimer := time.NewTimer(time.Hour)
 	defer ingestTimer.Stop()
+	// Without a gate (standalone) the role never moves: no poll.
+	var gatePoll <-chan time.Time
+	if s.gate != nil && s.gatePoll > 0 {
+		t := time.NewTicker(s.gatePoll)
+		defer t.Stop()
+		gatePoll = t.C
+	}
 	for {
 		s.armIngestTimer(ingestTimer)
+		if s.passOnReopen {
+			// The role came back (seen here or by a request): pass now.
+			// Leaving it set, runPass clears it after its own gate check.
+			timer.Reset(0)
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -887,6 +916,9 @@ func (s *Scheduler) loop(ctx context.Context) {
 				continue
 			}
 			s.serviceIngest(ctx, ingestBatch)
+			continue
+		case <-gatePoll:
+			s.gateOpen() // a reopen sets passOnReopen; the top of the loop acts on it
 			continue
 		case <-timer.C:
 			partial = s.runPass(ctx)
@@ -922,6 +954,9 @@ func (s *Scheduler) pausedForRestore() bool {
 // takes effect without a restart (nil gate = always run). It reports whether any measurement
 // was left partly registered, so the loop can come back sooner.
 func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
+	// Whatever this pass does, it answers a pending reopen (#1903): left set by
+	// a paused or gated return, the loop would ask for a pass at once, forever.
+	s.passOnReopen = false
 	if s.pausedForRestore() {
 		return false
 	}
@@ -942,6 +977,8 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 		metrics.Get().SetIcebergFilesLeftOut(0) // the exporting node reports them
 		return false
 	}
+	// A reopen this pass's own gate check saw is answered by this pass.
+	s.passOnReopen = false
 	measurements, err := s.source.Measurements(ctx)
 	if err == nil {
 		s.known = measurements
