@@ -2583,6 +2583,15 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 	timestamp := start.UTC().Format(time.RFC3339)
 	m := metrics.Get()
 	m.IncQueryRequests()
+	decimalMode, decimalModeErr := requestDecimalMode(c)
+	if decimalModeErr != nil {
+		m.IncQueryErrors()
+		return respondError(c, fiber.StatusBadRequest, decimalModeErr.Error(), timestamp, start)
+	}
+	if decimalMode == decimalModeExact {
+		m.IncQueryErrors()
+		return respondError(c, fiber.StatusBadRequest, "x-arc-decimals=exact is supported only for Arrow IPC and Flight SQL", timestamp, start)
+	}
 
 	// Check if this request should be forwarded to a reader/writer node
 	// Compactor nodes cannot process queries locally, so they forward to readers/writers

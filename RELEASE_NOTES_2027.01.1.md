@@ -6875,6 +6875,12 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Exact decimal results are available to Arrow IPC and Flight SQL clients ([#1784](https://github.com/Basekick-Labs/arc/issues/1784))
+
+Clients can send `x-arc-decimals: exact` to keep scale-0 decimals with precision greater than 18 as Arrow decimal128 values, including integers that do not fit in int64. This is opt-in: existing response types are unchanged by default, and JSON and MessagePack requests that ask for exact decimals receive `400`. Flight SQL prepared schemas and result streams use the same decimal mode; changing the mode after preparing a statement is refused.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir).
+
 ### Fix: an Arrow query served by arcx honours the governance row cap ([#727](https://github.com/Basekick-Labs/arc/issues/727))
 
 A `POST /api/v1/query/arrow` query that arcx served ignored the token's

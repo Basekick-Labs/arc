@@ -58,6 +58,10 @@ func flightSQLBindSlots(db *database.DuckDB) int {
 // query metrics, no slow-query log; the bind has its own metrics.
 func (h *QueryHandler) describeFlightSQLSchema(c *fiber.Ctx, binds chan struct{}) error {
 	c.Locals(audit.DetailLocalsKey, map[string]string{"operation": "flight_sql.prepare"})
+	decimalMode, err := requestDecimalMode(c)
+	if err != nil {
+		return flightSQLSchemaRefusal(c, fiber.StatusBadRequest, err.Error())
+	}
 
 	// A node that does not serve queries forwards them, which a bind cannot
 	// be: 501, so the client runs the statement unprepared and it is
@@ -173,7 +177,7 @@ func (h *QueryHandler) describeFlightSQLSchema(c *fiber.Ctx, binds chan struct{}
 	h.recordFlightSQLBind(metrics.FlightSQLBindOK, waited, elapsed, req.SQL)
 
 	// As the Arrow route streams it (DoGet), decimals included.
-	if castInfo := normalizeDecimalSchema(schema); castInfo != nil {
+	if castInfo := normalizeDecimalSchemaForMode(schema, decimalMode); castInfo != nil {
 		schema = castInfo.schema
 	}
 	var buf bytes.Buffer

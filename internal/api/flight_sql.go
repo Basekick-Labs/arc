@@ -141,7 +141,8 @@ type flightStatement struct {
 	SQL string `json:"sql"`
 	// Database is the x-arc-database call header GetFlightInfo saw, so a
 	// client that sends it only there still runs in that database.
-	Database string `json:"database,omitempty"`
+	Database    string `json:"database,omitempty"`
+	DecimalMode string `json:"decimal_mode,omitempty"`
 }
 
 type flightQueryResponse struct {
@@ -773,12 +774,20 @@ func (s *flightSQLService) GetFlightInfoStatement(ctx context.Context, query fli
 	if err != nil {
 		return nil, err
 	}
-	return flightStatementInfo(desc, query.GetQuery(), database)
+	decimalMode, _, err := flightSQLDecimalMode(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return flightStatementInfo(desc, query.GetQuery(), database, decimalMode)
 }
 
 // flightStatementInfo answers a statement ticket for sql, to run in database.
-func flightStatementInfo(desc *flight.FlightDescriptor, sql, database string) (*flight.FlightInfo, error) {
-	handle, err := json.Marshal(flightStatement{SQL: sql, Database: database})
+func flightStatementInfo(desc *flight.FlightDescriptor, sql, database string, decimalModes ...string) (*flight.FlightInfo, error) {
+	decimalMode := ""
+	if len(decimalModes) > 0 && decimalModes[0] == decimalModeExact {
+		decimalMode = decimalModeExact
+	}
+	handle, err := json.Marshal(flightStatement{SQL: sql, Database: database, DecimalMode: decimalMode})
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "encode statement ticket: %v", err)
 	}
@@ -812,6 +821,9 @@ func (s *flightSQLService) DoGetStatement(ctx context.Context, ticket flightsql.
 	// like the header; the route then applies the same checks to both.
 	if err := validateHeaderDatabase(statement.Database); err != nil {
 		return nil, nil, status.Error(codes.InvalidArgument, "invalid database in statement ticket")
+	}
+	if _, err := flightStatementDecimalMode(ctx, statement.DecimalMode); err != nil {
+		return nil, nil, err
 	}
 	database, err := flightStatementDatabase(ctx, statement.Database)
 	if err != nil {
@@ -1011,6 +1023,15 @@ func isFlightShowSQL(sql string) bool {
 // the x-arc-database header; the catalog helpers pass "" because their SQL
 // qualifies every table, which the route refuses alongside the header.
 func (s *flightSQLService) query(ctx context.Context, path, sql, token, database string) (*http.Response, error) {
+	decimalMode := ""
+	decimalModePresent := false
+	if path == "/api/v1/query/arrow" || path == flightSQLSchemaPath {
+		var err error
+		decimalMode, decimalModePresent, err = flightSQLDecimalMode(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
 	body, err := json.Marshal(QueryRequest{SQL: sql})
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "encode query: %v", err)
@@ -1035,6 +1056,9 @@ func (s *flightSQLService) query(ctx context.Context, path, sql, token, database
 	}
 	if database != "" {
 		req.Header.Set(flightSQLDatabaseHeader, database)
+	}
+	if decimalModePresent {
+		req.Header.Set(flightSQLDecimalsHeader, decimalMode)
 	}
 	// Who is asking, for the query registry, the audit log and forwarding.
 	if p, ok := peer.FromContext(ctx); ok && p.Addr != nil {
