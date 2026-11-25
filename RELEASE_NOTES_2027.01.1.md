@@ -42,7 +42,7 @@ Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1292](https:/
 
 A write is acknowledged once its rows are buffered, and a query sees them only after their flush. That comes at most `ingest.max_buffer_age_ms` (5 s by default) later. A client that writes and then reads, such as a test, an agent's memory, or a job step, had to sleep or poll. With the key on, a write to `/api/v1/write/msgpack` or `/api/v1/write/line-protocol` can send **`x-arc-wait: visible`** and is answered once its rows are visible:
 
-- **204, `X-Arc-Visible: true`.** Every row is in a stored file. With tiered storage, that file is also registered. "Visible" means visible to a query over HTTP `/api/v1/query*` on this node that starts after the answer. Flight SQL is not covered. A concurrent DELETE can still remove the rows afterwards.
+- **204, `X-Arc-Visible: true`.** Every row is in a stored file. With tiered storage, that file is also registered. "Visible" means visible to a query over HTTP `/api/v1/query` on this node that starts after the answer. Flight SQL is not covered. A concurrent DELETE can still remove the rows afterwards.
 - **202, `X-Arc-Visible: false`, `X-Arc-Visible-Reason: <reason>`**, body `{"visible": false, "reason", "rows_written"}`. The rows were accepted, as a plain 204 says, but they are not known to be visible. Do not resend them. The reasons:
   - `timeout`: 20 s passed first.
   - `shutdown`: the server began shutting down. The rows are still flushed at close.
@@ -55,7 +55,7 @@ A write is acknowledged once its rows are buffered, and a query sees them only a
 - **Refused before anything is written:**
   - any other value of the header: 400;
   - a cluster (`cluster.enabled`): 400, before any forward;
-  - the header on `/write`, `/api/v2/write`, Prometheus remote write, TLE, or an import: 400;
+  - the header on `/write`, `/api/v2/write`, Prometheus remote write, TLE, or an import (`/api/v1/import/csv`, `parquet`, `lp`, `tle`): 400. Other routes, such as the edge-sync bundle routes, ignore it and answer without `X-Arc-Visible`;
   - more than 1024 waiting writes on the node: 503 with `X-Arc-Ingest-Refused: wait_visible_busy` and `Retry-After: 5`. The limit is per node and shared by every client: one client sending visible writes faster than about 200 a second at the default age can hold it and leave the others at 503. Writes without the header are not limited.
 
 **Latency.** The write is not flushed early. It waits for its rows' normal age or size flush, which is up to `ingest.max_buffer_age_ms` plus the flush time. A writer that keeps a measurement busy waits about half the age on average. A load warning names `ingest.max_buffer_age_ms` above 10000 with the key on, the key on a cluster, and the key on object storage (where every waited write ends as 202 `storage_not_confirmable`). Proxies and load balancers in front of Arc need idle timeouts above 20 s. Browsers may send the header (CORS), and the two answer headers are exposed; every CORS answer now lists them in `Access-Control-Expose-Headers`.
