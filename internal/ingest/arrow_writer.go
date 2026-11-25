@@ -1538,6 +1538,13 @@ type ArrowBuffer struct {
 	// The periodic WAL goroutine checks it to decide whether WAL replay is
 	// needed, and a DELETE refuses while it is set.
 	latch atomic.Uint64
+	// latchSetAt is when the metrics sampler first saw the latch set in the
+	// current episode (unix nanoseconds, 0 = clear). Only the sampler goroutine
+	// reads or writes it; see sampleLatchAge.
+	latchSetAt int64
+	// hasWAL mirrors SetWAL for the sampler, which runs before SetWAL and must
+	// not read b.wal concurrently with it.
+	hasWAL atomic.Bool
 	// clusterMode: no flush intents written or adopted (#1646, flush_intent.go).
 	clusterMode atomic.Bool
 
@@ -2317,6 +2324,7 @@ func NewArrowBuffer(cfg *config.IngestConfig, storage storage.Backend, logger ze
 // When set, records are written to WAL before being buffered
 func (b *ArrowBuffer) SetWAL(wal WALWriter) {
 	b.wal = wal
+	b.hasWAL.Store(wal != nil)
 	b.logger.Info().Msg("WAL enabled for ArrowBuffer")
 }
 
@@ -4874,10 +4882,32 @@ func (b *ArrowBuffer) metricsSampler() {
 			// walks every shard under RLock — 32 lock round-trips per flush on
 			// locks writers contend for, for a gauge that needs 1 Hz.
 			metrics.Get().SetBufferDeferredBuffers(b.countDeferredBuffers())
+			metrics.Get().SetFlushFailureLatchAge(b.sampleLatchAge(time.Now()))
 		}
 	}
 }
 
+// sampleLatchAge is one sampler tick of the latch-age gauge (#1938): how long
+// the WAL recovery latch has been set, the time every DELETE on this node has
+// been refused. The sampler owns the start stamp: the first tick that sees
+// the latch set stamps it, a tick that sees it clear zeroes it, and neither a
+// mark nor a reset writes it, so no sample reports a stamp a racing writer
+// has not finished. Resolution is one tick. An episode that clears and sets
+// again between two ticks reads as one continuing episode, overstated by at
+// most the earlier one's length.
+//
+// Without a WAL it is 0: nothing clears the latch there (there is no
+// recovery pass), and a DELETE does not consult it.
+func (b *ArrowBuffer) sampleLatchAge(now time.Time) time.Duration {
+	if !b.hasWAL.Load() || b.latch.Load()&latchBits == 0 {
+		b.latchSetAt = 0
+		return 0
+	}
+	if b.latchSetAt == 0 {
+		b.latchSetAt = now.UnixNano()
+	}
+	return time.Duration(now.UnixNano() - b.latchSetAt)
+}
 
 func (b *ArrowBuffer) periodicFlush() {
 	defer b.wg.Done()
