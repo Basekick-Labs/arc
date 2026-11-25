@@ -188,7 +188,7 @@ type IngestConfig struct {
 	ShardCount            int      // Number of buffer shards for lock distribution (default: 32)
 	SortKeys              []string // Per-measurement sort keys: "measurement:col1,col2,time"
 	DefaultSortKeys       string   // Default sort keys for measurements not in SortKeys
-	FlushTimeoutSeconds   int      // Timeout per file of a flush: its storage write, registrations and WAL checkpoint (default: 30s; <= 0 means 30s). Not a cap on the whole flush (#1692).
+	FlushTimeoutSeconds   int      // Timeout per file of a flush: its storage write, schema registration and WAL checkpoint, and separately its tiering record (default: 30s; <= 0 means 30s). Not a cap on the whole flush (#1692, #1933).
 	DecimalColumns        []string // Per-measurement decimal columns: "measurement:col=precision,scale;col2=p,s"
 	DefaultDecimalColumns string   // Default decimal columns for unmapped measurements
 	// ImportWriteConcurrency is how many bulk imports (/api/v1/import/lp,
