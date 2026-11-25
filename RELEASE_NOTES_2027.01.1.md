@@ -35,6 +35,21 @@ storage root), and refuses the job with the error when that fails. A nearly full
 pass: the probe is a few bytes. On a cluster the exporting node
 runs the probe as part of its check before it acks the job.
 
+## Change: a compaction racing an Iceberg export holds back fewer of the files ingest just wrote ([#1755](https://github.com/Basekick-Labs/arc/issues/1755))
+
+**Who is affected:** deployments with the Iceberg export on.
+
+When a file vanished while an export pass was running (deleted by a compaction, a DELETE rewrite,
+retention, a tier move or a re-home job), the pass left every new file of that file's UTC day for
+its retry, 30 seconds later at the default `iceberg.reconcile_interval`, on the reasoning that the
+day's other new files were the same compaction's inputs about to go too. Files ingest wrote in the
+last 45 minutes on the current UTC day are no compaction's input, so they now stay in the pass and
+are registered with the rest. Only for a day the pass removes nothing from: a day that also loses
+files in the pass is still deferred whole, fresh files with it, since a file named like a fresh
+ingest file can still be the replacement of a removed one (a re-home whose wait was waived, a
+restored original). A day where a fresh file itself vanished (a DELETE or a re-home over
+today's rows) also goes whole, as before.
+
 ## Fix: files a backup restore writes are read at once ([#1764](https://github.com/Basekick-Labs/arc/issues/1764))
 
 **Who is affected:** anyone restoring data files from a backup into measurements that already have

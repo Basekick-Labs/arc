@@ -268,7 +268,8 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 						return reconcileResult{}, err
 					}
 					// No table yet, so nothing is removed and every file is a free add: leaving
-					// the vanished files' days for the next pass loses no reader anything.
+					// the vanished files' days for the next pass, but for fresh ingest files
+					// (#1755), loses no reader anything.
 					moved = true
 					kept, dropped := dropVanished(refPaths(candidates), ve.paths, database, measurement)
 					leave(dropped)
@@ -648,8 +649,8 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 			if fe := e.fencedErr(); fe != nil {
 				return reconcileResult{}, fe
 			}
-			// New files only, none in the table: leave the vanished files' days for the next pass
-			// and go on with the rest (vanished.go).
+			// New files only, none in the table: leave the vanished files' days for the next pass,
+			// but for their fresh ingest files (#1755), and go on with the rest (vanished.go).
 			moved = true
 			var dropped []string
 			free, dropped = dropVanished(free, ve.paths, database, measurement)
