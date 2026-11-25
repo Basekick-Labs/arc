@@ -7172,10 +7172,16 @@ var _ api.PeerFlusher = (*cluster.Coordinator)(nil)
 // them back after it. Without a WAL there is no recovery: the rows of a
 // failed flush are gone, and the latch, which only recovery clears, would
 // refuse every DELETE on this node, and in shared storage on every node,
-// until a restart.
+// until a restart. So FlushFailureState reports neither reason; its
+// generation is still the buffer's, so a flush failing between that read and
+// the DELETE's flush refuses the DELETE (#1938), as one failing during the
+// flush always did.
 type noWALDeleteFlusher struct{ *ingest.ArrowBuffer }
 
-func (noWALDeleteFlusher) HasFlushFailure() bool { return false }
+func (f noWALDeleteFlusher) FlushFailureState() (flushFailed, recoveryPending bool, generation uint64) {
+	_, _, generation = f.ArrowBuffer.FlushFailureState()
+	return false, false, generation
+}
 
 // deleteFlusher is the buffer a DELETE flushes before it scans.
 func deleteFlusher(buffer *ingest.ArrowBuffer, walWriter *wal.Writer) cluster.DeleteScopeFlusher {

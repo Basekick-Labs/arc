@@ -7332,7 +7332,7 @@ func (b *ArrowBuffer) NewRecoveryFlushBarrier() func(context.Context) error {
 // deletion. Recovery must also use NewRecoveryFlushBarrier to cover failures
 // that completed before this call.
 func (b *ArrowBuffer) FlushAllAndWait(ctx context.Context) error {
-	return b.flushAndWait(ctx, nil, nil)
+	return b.flushAndWait(ctx, nil, nil, nil)
 }
 
 // FlushScopeAndWait is FlushAllAndWait for the buffer keys of one database
@@ -7343,8 +7343,22 @@ func (b *ArrowBuffer) FlushAllAndWait(ctx context.Context) error {
 // flush, every batch above it in a later one, so no file holds batches on
 // both sides of it.
 func (b *ArrowBuffer) FlushScopeAndWait(ctx context.Context, database, measurement string) (map[string]uint64, error) {
+	return b.flushScopeAndWait(ctx, database, measurement, nil)
+}
+
+// FlushScopeAndWaitSince is FlushScopeAndWait that fails if the failure
+// generation is not baseline: at entry, during the wait, or before it
+// returns. A DELETE passes the generation of the FlushFailureState it
+// checked (#1938), so a flush failure between that check and this call
+// refuses it; FlushScopeAndWait reads its own generation here and would
+// already count that failure.
+func (b *ArrowBuffer) FlushScopeAndWaitSince(ctx context.Context, database, measurement string, baseline uint64) (map[string]uint64, error) {
+	return b.flushScopeAndWait(ctx, database, measurement, &baseline)
+}
+
+func (b *ArrowBuffer) flushScopeAndWait(ctx context.Context, database, measurement string, baseline *uint64) (map[string]uint64, error) {
 	marks := map[string]uint64{}
-	err := b.flushAndWait(ctx, func(key string) bool { return keyInScope(key, database, measurement) }, marks)
+	err := b.flushAndWait(ctx, func(key string) bool { return keyInScope(key, database, measurement) }, marks, baseline)
 	return marks, err
 }
 
@@ -7353,7 +7367,9 @@ func keyInScope(key, database, measurement string) bool {
 	return len(parts) == 2 && parts[0] == database && (measurement == "" || parts[1] == measurement)
 }
 
-func (b *ArrowBuffer) flushAndWait(ctx context.Context, match func(key string) bool, marks map[string]uint64) error {
+// flushAndWait fails if the failure generation moves from baseline; nil reads
+// it at entry.
+func (b *ArrowBuffer) flushAndWait(ctx context.Context, match func(key string) bool, marks map[string]uint64, baseline *uint64) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -7367,6 +7383,9 @@ func (b *ArrowBuffer) flushAndWait(ctx context.Context, match func(key string) b
 		defer cancel()
 	}
 	generation := b.FlushFailureGeneration()
+	if baseline != nil {
+		generation = *baseline
+	}
 	check := func() error {
 		if err := ctx.Err(); err != nil {
 			return err

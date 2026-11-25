@@ -31,9 +31,13 @@ import (
 // with stream takeover a DELETE is recorded in the cluster (#1207 d1).
 
 // DeleteScopeFlusher is a node's ingest buffer as a peer flush uses it.
+// It has the method set of api.DeleteFlusher: one buffer serves both.
 type DeleteScopeFlusher interface {
 	FlushScopeAndWait(ctx context.Context, database, measurement string) (map[string]uint64, error)
-	HasFlushFailure() bool
+	// FlushFailureState reads the WAL recovery latch once (#1938).
+	FlushFailureState() (flushFailed, recoveryPending bool, generation uint64)
+	// FlushScopeAndWaitSince also fails if a flush failed since baseline.
+	FlushScopeAndWaitSince(ctx context.Context, database, measurement string, baseline uint64) (map[string]uint64, error)
 }
 
 // Tunables, variables so tests can shrink them.
@@ -127,6 +131,10 @@ func (c *Coordinator) handleFlushScopeRequest(conn net.Conn, q *protocol.FlushSc
 	c.sendFlushScopeReply(conn, q, status, paths)
 }
 
+// localFlushAfterState, when set (tests only), runs between the latch read
+// and the flush (#1938).
+var localFlushAfterState func()
+
 // localFlushAnswer flushes this node's buffered rows of the scope and lists
 // its files of the scope still waiting to register.
 func (c *Coordinator) localFlushAnswer(database, measurement string) (string, []string) {
@@ -139,12 +147,23 @@ func (c *Coordinator) localFlushAnswer(database, measurement string) (string, []
 	}
 	if fp != nil {
 		f := *fp
-		if f.HasFlushFailure() {
+		// One read of the latch, whose generation the flush is held to: a
+		// flush failing in between refuses too (#1938). A pending recovery
+		// pass is not a flush failure and is not logged as one (#1170).
+		flushFailed, recoveryPending, generation := f.FlushFailureState()
+		switch {
+		case flushFailed:
 			c.logger.Warn().Str("database", database).Msg("Flush for a DELETE refused: an earlier flush failed and its rows wait for WAL recovery")
 			return protocol.FlushStatusFailed, nil
+		case recoveryPending:
+			c.logger.Warn().Str("database", database).Msg("Flush for a DELETE refused: a WAL recovery pass left files to replay")
+			return protocol.FlushStatusFailed, nil
+		}
+		if localFlushAfterState != nil {
+			localFlushAfterState()
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), peerFlushTimeout-5*time.Second)
-		_, err := f.FlushScopeAndWait(ctx, database, measurement)
+		_, err := f.FlushScopeAndWaitSince(ctx, database, measurement, generation)
 		cancel()
 		if err != nil {
 			c.logger.Warn().Err(err).Str("database", database).Str("measurement", measurement).Msg("Flush for a DELETE failed")
