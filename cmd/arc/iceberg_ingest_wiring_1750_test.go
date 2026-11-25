@@ -39,7 +39,7 @@ func TestIngestFlushIsReportedToQueryCachesAndIceberg(t *testing.T) {
 	// scheduler is built: a scheduler that never starts would only collect requests.
 	start := strings.Index(src, "icebergStart = func() {")
 	add := strings.Index(src, "icebergScheduler.RequestIngestReconcile(database, measurement)")
-	end := strings.Index(src, `shutdownCoordinator.RegisterHook("iceberg"`) // the statement after the wrapper
+	end := strings.Index(src, `icebergStop := &icebergShutdown{`) // the statement after the wrapper (#1886: the shutdown steps)
 	if start < 0 || end < start || add < start || add > end {
 		t.Error("the Iceberg receiver is not installed inside icebergStart")
 	}
@@ -96,7 +96,7 @@ func TestIngestRegistrationIsReportedToTheIcebergAppendPath(t *testing.T) {
 		t.Error("the published hook is installed beside the registered one, not instead of it")
 	}
 	start := strings.Index(src, "icebergStart = func() {")
-	end := strings.Index(src, `shutdownCoordinator.RegisterHook("iceberg"`)
+	end := strings.Index(src, `icebergStop := &icebergShutdown{`) // the statement after the wrapper (#1886)
 	if start < 0 || registered < start || registered > end {
 		t.Error("the append receiver is not installed inside icebergStart")
 	}
