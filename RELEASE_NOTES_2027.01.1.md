@@ -18,6 +18,8 @@ A DELETE refused because a recovery pass left WAL files to replay now says so ("
 
 New metric `arc_ingest_flush_failure_latch_age_seconds` (gauge): how long the failure state has been set, during which DELETEs and database drops that flush this node's buffer are refused (on shared storage, also those issued on other nodes). It is 0 when clear and with the WAL off, sampled once a second. A state that clears and is set again within one second reads as one continuing period.
 
+`wal.recovery_interval_seconds` must be greater than 0 when `wal.enabled = true`: Arc now refuses to start with a clear error instead of panicking when the recovery pass starts.
+
 **Cost.** None on the write or successful flush path: a failed flush does one atomic compare-and-swap, a DELETE one atomic read.
 
 ## New: query latency and outcomes per engine (DuckDB, arcx) ([#1292](https://github.com/Basekick-Labs/arc/pull/1292), [#823](https://github.com/Basekick-Labs/arc/issues/823))
