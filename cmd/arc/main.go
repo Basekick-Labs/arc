@@ -1299,6 +1299,15 @@ func main() {
 		Int("flush_queue_size", cfg.Ingest.FlushQueueSize).
 		Msg("Initializing Arrow buffer with ingestion config")
 	arrowBuffer := ingest.NewArrowBuffer(&cfg.Ingest, storageBackend, logger.Get("arrow"))
+	// x-arc-wait: visible flushes a write's measurements early (#1759): the
+	// per-key flush ledger, enabled before WAL recovery and the first
+	// flushes so its limiter sees every detach.
+	if writeForcingEnabled(cfg) {
+		arrowBuffer.EnableKeyFlushLedger(ingest.ForceBudget{})
+		log.Info().
+			Int("wait_visible_min_interval_ms", cfg.Ingest.WaitVisibleMinIntervalMS).
+			Msg("Visible writes may flush their measurements early (ingest.wait_visible_enabled): per-measurement flush ledger on")
+	}
 	// Grace days 7-14 of an expired license refuse live ingestion (503,
 	// X-Arc-Ingest-Refused: license_grace); replay, CQ and compaction writes
 	// are never refused.
@@ -3255,6 +3264,9 @@ func main() {
 	// x-arc-wait: visible (#1759), one instance for both write handlers so
 	// the waiter limit is the node's. From cfg only, not the cluster router.
 	waitVisible := api.NewWaitVisible(waitVisibleConfig(cfg))
+	if writeForcingEnabled(cfg) {
+		waitVisible.SetForcer(arrowBuffer, waitVisibleForceInterval(cfg))
+	}
 
 	// Register MessagePack handler with Arrow buffer
 	msgpackHandler := api.NewMsgPackHandler(logger.Get("msgpack"), arrowBuffer, server.GetMaxPayloadSize())
