@@ -316,6 +316,11 @@ func (s *Scheduler) forgetDatabase(db string) {
 			delete(s.busySince, k)
 		}
 	}
+	for k := range s.vanishTries {
+		if match(k) {
+			delete(s.vanishTries, k)
+		}
+	}
 	for k := range s.lastBlocked {
 		if match(k) {
 			delete(s.lastBlocked, k)

@@ -463,4 +463,27 @@ func TestNoteVanishedRetriesSooner1755(t *testing.T) {
 	if !scheduled() {
 		t.Fatal("after a reset, the first retry is the soonest again")
 	}
+
+	// A retry already pending: this step is not spent, the next pass asks it.
+	sched.noteVanished(&passJob{m: job.m, key: key}) // reset
+	sched.reqMu.Lock()
+	sched.retrying[key] = true
+	sched.reqMu.Unlock()
+	sched.noteVanished(job)
+	if sched.vanishTries[key] != 0 {
+		t.Fatalf("a suppressed retry advanced the ladder to %d", sched.vanishTries[key])
+	}
+	scheduled() // the pending one fires
+	sched.noteVanished(job)
+	if !scheduled() || sched.vanishTries[key] != 1 {
+		t.Fatalf("the first step after a suppressed one: tries %d", sched.vanishTries[key])
+	}
+
+	// A table escalated as busy is left to the timed passes.
+	sched.noteVanished(&passJob{m: job.m, key: key})
+	sched.busySince[key] = time.Now().Add(-busyEscalateAfter - time.Minute)
+	sched.noteVanished(job)
+	if scheduled() {
+		t.Fatal("an escalated table was asked again sooner")
+	}
 }

@@ -241,11 +241,16 @@ func (s *Scheduler) noteVanished(job *passJob) {
 		return
 	}
 	metrics.Get().IncIcebergVanishedPass()
+	// A table escalated as busy is left to the timed passes (serviceRequests).
+	if since, started := s.busySince[job.key]; started && time.Since(since) >= busyEscalateAfter {
+		return
+	}
 	n := s.vanishTries[job.key]
-	s.vanishTries[job.key] = n + 1
 	d := vanishRetryFirst << min(n, 8)
-	if d < s.partialRetryInterval() {
-		s.requestAfter(job.m, job.key, d)
+	// Counted only when asked: a retry already pending (the ordinary one, or
+	// a spaced request) leaves this step of the ladder for the next pass.
+	if d < s.partialRetryInterval() && s.requestAfter(job.m, job.key, d) {
+		s.vanishTries[job.key] = n + 1
 	}
 }
 
@@ -402,12 +407,13 @@ func (s *Scheduler) requestSpacing() time.Duration {
 	return requestMinSpacing
 }
 
-// requestAfter asks for m again after d, once per measurement at a time.
-func (s *Scheduler) requestAfter(m Measurement, key string, d time.Duration) {
+// requestAfter asks for m again after d, once per measurement at a time. It
+// reports whether it did: false while another such request is pending.
+func (s *Scheduler) requestAfter(m Measurement, key string, d time.Duration) bool {
 	s.reqMu.Lock()
 	if s.retrying[key] {
 		s.reqMu.Unlock()
-		return
+		return false
 	}
 	s.retrying[key] = true
 	s.reqMu.Unlock()
@@ -417,6 +423,7 @@ func (s *Scheduler) requestAfter(m Measurement, key string, d time.Duration) {
 		s.reqMu.Unlock()
 		s.RequestReconcile(m.Database, m.Measurement)
 	})
+	return true
 }
 
 // RequestReconcile asks for one measurement to be reconciled soon, outside the
@@ -1076,6 +1083,11 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 	for k := range s.busySince {
 		if _, ok := seen[k]; !ok {
 			delete(s.busySince, k)
+		}
+	}
+	for k := range s.vanishTries {
+		if _, ok := seen[k]; !ok {
+			delete(s.vanishTries, k)
 		}
 	}
 	for k := range s.appendOK {
