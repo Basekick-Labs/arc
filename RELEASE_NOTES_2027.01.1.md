@@ -16,7 +16,7 @@ All three are closed:
 
 A DELETE refused because a recovery pass left WAL files to replay now says so ("a WAL recovery pass left files to replay; retry after the next pass"), instead of reporting a flush failure. The status code is unchanged (503).
 
-New metric `arc_ingest_flush_failure_latch_age_seconds` (gauge): how long the failure state has been set, during which every DELETE on the node is refused. It is 0 when clear and with the WAL off, sampled once a second. A state that clears and is set again within one second reads as one continuing period.
+New metric `arc_ingest_flush_failure_latch_age_seconds` (gauge): how long the failure state has been set, during which DELETEs and database drops that flush this node's buffer are refused (on shared storage, also those issued on other nodes). It is 0 when clear and with the WAL off, sampled once a second. A state that clears and is set again within one second reads as one continuing period.
 
 **Cost.** None on the write or successful flush path: a failed flush does one atomic compare-and-swap, a DELETE one atomic read.
 
