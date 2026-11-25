@@ -135,6 +135,16 @@ version"). After a pass of its own, the export now takes the catalog's commit as
 On a cluster, nodes that do not export answer from the discovery files only, so in this layout a
 job still waits at them, as before: re-home with the warehouse outside the storage root is a
 standalone fix.
+## Fix: a node with the Iceberg export, failover and replication on local storage joins its cluster ([#1914](https://github.com/Basekick-Labs/arc/issues/1914))
+
+**Who is affected:** clusters on local storage with `cluster.replication_enabled`, `iceberg.enabled`
+and `cluster.failover_enabled` on.
+
+A joining node lists the cluster capabilities it supports, and the member it contacts refused a list
+longer than 16. With those three settings on local storage a node lists 17, so every node but the
+first was refused ("join rejected: authentication failed" on the joiner, "join capabilities exceed
+their bounds" on the member) and the cluster never formed. The limit is now 64; a node lists at most
+18 today. No released version had the limit.
 
 
 

@@ -198,10 +198,14 @@ func joinFields(nonce string, ts int64, f JoinAuthFields) []string {
 // other.
 const MsgTypeJoinCaps MsgType = "join-caps"
 
-// Bounds on advertised capabilities (#1207): a join carries a handful, and
-// anything beyond these is refused before any MAC is computed over it.
+// Bounds on advertised capabilities (#1207): anything beyond these is refused
+// before any MAC is computed over it. A node advertises up to 18 today
+// (localCapabilities, with every option on); 16 refused a node with the
+// Iceberg export, failover and replication on local storage (#1914).
+// TestEveryOptionalCapabilityFitsTheJoinBound keeps the list at half of
+// this at most.
 const (
-	MaxJoinCapabilities  = 16
+	MaxJoinCapabilities  = 64
 	MaxJoinCapabilityLen = 64
 )
 
