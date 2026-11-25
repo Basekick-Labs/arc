@@ -284,14 +284,6 @@ func TestDropVanishedKeepsFreshIngestFiles(t *testing.T) {
 		t.Fatal("a rewrite was exempt")
 	}
 
-	// The same rule when the day loses files this pass: the fresh file is free, the day's
-	// other new files and a file rewritten in place stay with the removal.
-	removed := k("24", "09", "cpu_20261124_090000_000000001.parquet")
-	inPlace := k("24", "08", ing(now.Add(-2*time.Minute)))
-	anchored, free := splitAnchoredAt([]string{fresh, stale, compacted, inPlace, rw}, []string{removed, inPlace}, "mydb", "cpu", now)
-	if len(free) != 1 || free[0] != fresh || len(anchored) != 4 {
-		t.Fatalf("anchored %v free %v; want only the fresh file free", anchored, free)
-	}
 }
 
 // FileExists asks the backend that holds the file: a cold file is present on cold even with no

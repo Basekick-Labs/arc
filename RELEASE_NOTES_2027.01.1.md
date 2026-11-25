@@ -37,17 +37,19 @@ runs the probe as part of its check before it acks the job.
 
 ## Change: a compaction racing an Iceberg export no longer holds back the files ingest just wrote ([#1755](https://github.com/Basekick-Labs/arc/issues/1755))
 
+## Change: a compaction racing an Iceberg export holds back fewer of the files ingest just wrote ([#1755](https://github.com/Basekick-Labs/arc/issues/1755))
+
 **Who is affected:** deployments with the Iceberg export on.
 
-When a file vanished while an export pass was running (a compaction, a DELETE rewrite or retention
-deleted it), the pass left every new file of that file's UTC day for its retry, 30 seconds later
-at the default `iceberg.reconcile_interval`, and a day that also lost files that pass was deferred
-whole, its new files with it. Files ingest wrote in the last 45 minutes on the current UTC day are
-now exempt from both and commit in that pass: compaction never takes a file that young as an
-input, and such a file holds no rows any removal in the pass accounts for, so committing it on
-its own never shows a reader a day with rows missing. Older files, compacted files and DELETE
-rewrites are deferred as before.
-
+When a file vanished while an export pass was running (deleted by a compaction, a DELETE rewrite,
+retention, a tier move or a re-home job), the pass left every new file of that file's UTC day for
+its retry, 30 seconds later at the default `iceberg.reconcile_interval`, on the reasoning that the
+day's other new files were the same compaction's inputs about to go too. Files ingest wrote in the
+last 45 minutes on the current UTC day are no compaction's input, so they now stay in the pass and
+are registered with the rest. Only for a day the pass removes nothing from: a day that also loses
+files in the pass is still deferred whole, fresh files with it, since a file named like a fresh
+ingest file can still be the replacement of a removed one (a re-home whose wait was waived, a
+restored original).
 ## Fix: files a backup restore writes are read at once ([#1764](https://github.com/Basekick-Labs/arc/issues/1764))
 
 **Who is affected:** anyone restoring data files from a backup into measurements that already have
