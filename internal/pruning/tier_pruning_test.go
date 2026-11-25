@@ -283,3 +283,26 @@ func TestPruneTierPaths_SpokeShapedLayoutIsEmptyNotPruned(t *testing.T) {
 		t.Fatalf("spoke-shaped outcome = %v (paths=%v), want TierPruneEmpty — pruned paths would miss the extra namespace level", outcome, paths)
 	}
 }
+
+// #1764: the single-tier path on the hub layout keeps the full glob, so a
+// file the hub receives later is read without any cache to go stale.
+func TestOptimizeTablePath_SpokeShapedLayoutKeepsTheGlob(t *testing.T) {
+	p := NewPartitionPruner(zerolog.Nop())
+	base := t.TempDir()
+	deep := filepath.Join(base, "rocket-01", "telemetry", "engine_temp", "2024", "03", "15", "14")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(deep, "f.parquet"), []byte("p"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	glob := base + "/rocket-01/telemetry/**/*.parquet"
+	sql := "SELECT * FROM t WHERE time >= '2024-03-15T10:00:00Z' AND time < '2024-03-15T12:00:00Z'"
+	got, optimized := p.OptimizeTablePath(context.Background(), glob, sql)
+	if optimized {
+		t.Fatalf("pruned a spoke-shaped layout to %v", got)
+	}
+	if s, ok := got.(string); !ok || s != glob {
+		t.Fatalf("path %v, want the full glob", got)
+	}
+}
