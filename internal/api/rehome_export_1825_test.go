@@ -229,6 +229,11 @@ func TestSwapExportWaitWaived1825(t *testing.T) {
 		t.Fatal("after the waiver and an answer, the old file or the record is still there")
 	}
 	r.requireOnce("after the waiver")
+	// #1845 item 1: the export still learns what replaced the old file.
+	waived := r.reg.ReplacedWaived(r.key[:strings.Index(r.key, "/20")+1])
+	if len(waived) != 1 || len(waived[r.key]) == 0 {
+		t.Fatalf("after the waiver the export is told %v", waived)
+	}
 	if code, _ := rehomeDo(t, r.app, "POST", "/api/v1/rehome/"+id+"/resume", "", `{"skip_export_wait":true}`); code != 404 {
 		t.Fatalf("waiving for a job that ended: %d, want 404", code)
 	}

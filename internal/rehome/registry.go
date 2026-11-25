@@ -206,12 +206,17 @@ type Registry struct {
 	// strict read fails: an unread journal may hold a job whose files
 	// compaction would merge or retention delete.
 	seeded atomic.Bool
+
+	// replacedAfter: the replacement records of waived jobs, by job id
+	// (replaced.go); replacedSkipped: those Seed could not use.
+	replacedAfter   map[string]ReplacedRecord
+	replacedSkipped []string
 }
 
 // NewRegistry creates a registry over the storage root. Call Seed before
 // anything lists data files.
 func NewRegistry(store storage.Backend) *Registry {
-	return &Registry{store: store, jobs: map[string]*Job{}, owned: map[string]string{}, claims: map[string]int{}, blocks: map[string]int{}}
+	return &Registry{store: store, jobs: map[string]*Job{}, owned: map[string]string{}, claims: map[string]int{}, blocks: map[string]int{}, replacedAfter: map[string]ReplacedRecord{}}
 }
 
 // Seed reads every record under JournalRoot. A record that cannot be read or
@@ -225,8 +230,14 @@ func (r *Registry) Seed(ctx context.Context) error {
 		return fmt.Errorf("list %s/: %w", JournalRoot, err)
 	}
 	jobs := map[string]*Job{}
+	after := map[string]ReplacedRecord{}
+	var skipped []string
 	for _, k := range keys {
 		name := strings.TrimPrefix(k, JournalRoot+"/")
+		if strings.HasPrefix(name, "replaced/") {
+			r.seedReplaced(ctx, k, name, after, &skipped)
+			continue
+		}
 		id, ok := strings.CutSuffix(name, ".json")
 		if !ok || strings.Contains(name, "/") {
 			continue // not a record: a writer's temporary file
@@ -250,6 +261,7 @@ func (r *Registry) Seed(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.jobs = jobs
+	r.replacedAfter, r.replacedSkipped = after, skipped
 	r.owned = map[string]string{}
 	for id, j := range jobs {
 		r.owned[j.Source.Key] = id

@@ -31,6 +31,26 @@ size plus 64 MiB or the hot storage volume lacks its size plus 64 MiB (three tim
 they are one volume). It is an estimate: DuckDB may spill to scratch as well. A volume whose free
 space cannot be read is not refused on.
 
+## Change: a re-home job whose Iceberg wait was waived still has its old file removed from the table with its new files ([#1845](https://github.com/Basekick-Labs/arc/issues/1845) item 1)
+
+**Who is affected:** standalone deployments that waive a re-home job's wait for the Iceberg export
+(`POST /api/v1/rehome/<id>/resume {"skip_export_wait": true}`).
+
+A waived job ends before the export has published the table without its old file. Until now the
+pass that later removed the old file no longer knew what had replaced it, so the files holding its
+rows in other days could commit in a later step of that pass, and a pass that stopped part way
+published the table without some of those rows for a while. The job now leaves a small record
+(`_rehome/replaced/<id>.json`, written and made durable before the old file is removed) that the
+export reads as it would a running job's: the old file's removal commits together with its new
+files. A new file that cannot be registered is logged and left out instead of holding the table
+(the old file is already gone), and a file that vanishes during that pass holds back only its own
+day, not every day of the commit. The export removes the record once the published table does not
+name the old file, or the table is gone. If the record cannot be written, the old file is still
+removed as asked and the server logs an error; a server stopping at that moment keeps the job
+instead, and it waits again after the restart. The record is not a job: it holds no job slot and owns no file, and an older
+build ignores it. Not yet on a cluster, where the waived job's record lives in Raft and goes with
+the job.
+
 ## Change: on a cluster, the Iceberg export picks up a file as soon as it reaches the exporting node ([#1756](https://github.com/Basekick-Labs/arc/issues/1756))
 
 **Who is affected:** clusters with the Iceberg export on.
