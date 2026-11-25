@@ -2125,6 +2125,13 @@ func Load() (*Config, error) {
 	if w != nil {
 		cfg.Warnings = append(cfg.Warnings, *w)
 	}
+	w, err = validateBootstrapToken(cfg.Auth)
+	if err != nil {
+		return nil, err
+	}
+	if w != nil {
+		cfg.Warnings = append(cfg.Warnings, *w)
+	}
 
 	// Iceberg export runs on a local or an S3 primary backend (#939). The reconciler walks the
 	// single configured storage backend and publishes through iceberg-go's FileIO, which Arc
@@ -3096,6 +3103,38 @@ func normalizeBootstrapToken(auth *AuthConfig) (*LoadWarning, error) {
 		Value:   "(not shown)",
 		Message: "auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN) had surrounding whitespace, such as the newline at the end of a file it was read from: it was removed, and the trimmed value is the token clients must present. Tokens already stored are unchanged: a token an earlier release stored with the whitespace cannot be sent in a header (see the release notes for #1713 to recover)",
 	}, nil
+}
+
+// MinBootstrapTokenLength is the shortest auth.bootstrap_token Arc accepts, in
+// bytes. internal/auth enforces the same rule on every token value it stores
+// (a test there pins the two equal); config cannot import auth.
+const MinBootstrapTokenLength = 32
+
+// validateBootstrapToken refuses, at load, an auth.bootstrap_token that the
+// bootstrap would reject (#1915). Before, Arc logged "Failed to create
+// initial admin token" and ran with auth on and no admin token, answering
+// 401 to everything. It runs after normalizeBootstrapToken, so the length is
+// that of the trimmed value, and the message says so. With auth disabled the
+// key is never read.
+//
+// auth.force_bootstrap without a token gets a warning: the flag acts only
+// with auth.bootstrap_token, and without one Arc generates a token only on an
+// empty auth database.
+func validateBootstrapToken(auth AuthConfig) (*LoadWarning, error) {
+	if !auth.Enabled {
+		return nil, nil
+	}
+	if auth.BootstrapToken != "" && len(auth.BootstrapToken) < MinBootstrapTokenLength {
+		return nil, fmt.Errorf("auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN) is %d bytes after surrounding whitespace is removed; it must be at least %d. Set a longer token (for example `openssl rand -hex 32`), or unset the key to have Arc generate one", len(auth.BootstrapToken), MinBootstrapTokenLength)
+	}
+	if auth.ForceBootstrap && auth.BootstrapToken == "" {
+		return &LoadWarning{
+			Key:     "auth.force_bootstrap",
+			Value:   "true",
+			Message: "auth.force_bootstrap adds a recovery token only together with auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN); without one, Arc generates an admin token only when the auth database has no tokens, and otherwise does nothing",
+		}, nil
+	}
+	return nil, nil
 }
 
 // refuseGCSInFIPSBuild refuses a "gcs" backend at key in the FIPS build, which

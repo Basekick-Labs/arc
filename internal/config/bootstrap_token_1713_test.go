@@ -38,7 +38,8 @@ func TestLoad_BootstrapTokenTrimmed1713(t *testing.T) {
 		{name: "spaces", value: "  " + bootstrapTok1713 + "  ", auth: "true", want: bootstrapTok1713, wantWarn: true},
 		{name: "tabs", value: "\t" + bootstrapTok1713 + "\t", auth: "true", want: bootstrapTok1713, wantWarn: true},
 		{name: "clean value, no warning", value: bootstrapTok1713, auth: "true", want: bootstrapTok1713},
-		{name: "inner whitespace kept", value: " abc def\tghi\n", auth: "true", want: "abc def\tghi", wantWarn: true},
+		// 32+ bytes once trimmed: a shorter value is refused at load (#1915).
+		{name: "inner whitespace kept", value: " abc def\tghi " + bootstrapTok1713 + "\n", auth: "true", want: "abc def\tghi " + bootstrapTok1713, wantWarn: true},
 		{name: "force_bootstrap trimmed too", value: bootstrapTok1713 + "\n", auth: "true", force: true, want: bootstrapTok1713, wantWarn: true},
 		{name: "only whitespace refused", value: " \n\t\r\n", auth: "true", wantErr: "contains only whitespace"},
 		{name: "only whitespace with force_bootstrap refused", value: "\n", auth: "true", force: true, wantErr: "contains only whitespace"},

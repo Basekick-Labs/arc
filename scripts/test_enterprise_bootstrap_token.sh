@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Arc refuses a bootstrap token under 32 characters, logs one error and starts
-# with no admin token, so the Enterprise chart must refuse to render one.
+# Arc refuses to start with a bootstrap token under 32 characters (#1915), so
+# the Enterprise chart must refuse to render one.
 set -euo pipefail
 
 chart="${1:-helm/arc-enterprise}"
