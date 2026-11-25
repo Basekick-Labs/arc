@@ -462,6 +462,16 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 	// global last_cycle, so matching on cycle_id is the only way to tell
 	// whose result is whose.
 	claim, err := h.manager.ClaimCycle()
+	if errors.Is(err, compaction.ErrCompactionStopping) {
+		// Shutdown has begun (#1887): no new cycle. 503, not 409: retrying
+		// against another node, or this one once restarted, is the answer.
+		h.logger.Info().Strs("tiers", tierNames).Msg("Manual compaction trigger refused: the server is shutting down")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error":    "the server is shutting down",
+			"message":  "compaction is not taking new cycles; retry once the server is back",
+			"stopping": true,
+		})
+	}
 	if err != nil {
 		// RunningCycleID rather than GetCurrentCycleID: it takes the same
 		// mutex as the claim, so it cannot report the previous, finished
@@ -523,6 +533,10 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 			logger.Info().Err(ctx.Err()).Msg("Manual compaction interrupted")
 		} else if errors.Is(err, compaction.ErrCompactionPaused) {
 			logger.Info().Msg("Manual compaction stopped at a batch boundary: compaction is paused cluster-wide")
+		} else if errors.Is(err, compaction.ErrCompactionStopping) {
+			logger.Info().Msg("Manual compaction stopped at a batch boundary: the server is shutting down")
+		} else if h.manager.Stopping() && errors.Is(err, context.Canceled) {
+			logger.Warn().Msg("Manual compaction killed at the shutdown deadline; the next start recovers it from its manifest")
 		} else if err != nil {
 			logger.Error().Err(err).Msg("Manual compaction failed")
 		} else {

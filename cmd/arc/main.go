@@ -2210,12 +2210,17 @@ func main() {
 		// One hook for both: they share a cycle claim, and stopping one while
 		// the other's deferred tick still waits lets that tick start a cycle
 		// mid-shutdown when the first's cycle ends (#220).
-		if hourlyScheduler != nil || dailyScheduler != nil {
-			shutdownCoordinator.RegisterHook("compaction-schedulers", func(ctx context.Context) error {
-				compaction.StopAll(hourlyScheduler, dailyScheduler)
-				return nil
-			}, shutdown.PriorityScheduler)
-		}
+		// Shutdown stops compaction early and waits for its running cycle
+		// later, bounded (#1887): a triggered cycle too, not only the
+		// schedulers'. One step for both schedulers: they share a cycle
+		// claim, and stopping one while the other's deferred tick still
+		// waits lets that tick start a cycle mid-shutdown (#220).
+		registerCompactionShutdown(shutdownCoordinator, &compactionShutdown{
+			manager:    compactionManager,
+			schedulers: []*compaction.Scheduler{hourlyScheduler, dailyScheduler},
+			timeout:    shutdownTimeout,
+			logger:     log.With().Str("component", "compaction-shutdown").Logger(),
+		})
 
 		log.Info().
 			Bool("hourly_enabled", cfg.Compaction.HourlyEnabled).

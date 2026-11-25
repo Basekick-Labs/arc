@@ -20,11 +20,11 @@ import (
 // Now:
 //   - the hook still stops the loop (so no timed pass competes with the final
 //     flush), and remembers whether it ended in time;
-//   - a component after the WAL's close (PriorityWAL+1) serves what is
+//   - a component after the WAL's close (priorityIcebergExport) serves what is
 //     queued, the final flush's files included (Scheduler.DrainStopped);
-//   - Glue flushes after it (PriorityWAL+2);
+//   - Glue flushes after it (priorityIcebergGlue);
 //   - the export's own SQLite handle, when it has one, closes last
-//     (PriorityWAL+3), after Glue, which reads through the exporter.
+//     (priorityIcebergCatalogDB), after Glue, which reads through the exporter.
 //
 // After the WAL, not before: the coordinator checks its deadline only between
 // components, and a skipped WAL close loses its newest entries for good
@@ -193,19 +193,19 @@ func (g *icebergGlueShutdown) Close() error { return g.CloseContext(context.Back
 // the loop did not stop in time, since it may still be using the handle.
 func registerIcebergShutdown(c *shutdown.Coordinator, s *icebergShutdown, closeDB func() error) {
 	c.RegisterHook("iceberg", s.stopLoop, shutdown.PriorityDatabase)
-	c.Register("iceberg-export", s, shutdown.PriorityWAL+1)
+	c.Register("iceberg-export", s, priorityIcebergExport)
 	if closeDB != nil {
 		c.Register("iceberg-catalog-db", shutdownFunc(func() error {
 			if !s.stopped {
 				return nil
 			}
 			return closeDB()
-		}), shutdown.PriorityWAL+3)
+		}), priorityIcebergCatalogDB)
 	}
 }
 
 // registerIcebergGlueShutdown registers Glue's flush between the drain and
 // the catalog handle's close.
 func registerIcebergGlueShutdown(c *shutdown.Coordinator, g *icebergGlueShutdown) {
-	c.Register("iceberg-glue", g, shutdown.PriorityWAL+2)
+	c.Register("iceberg-glue", g, priorityIcebergGlue)
 }
