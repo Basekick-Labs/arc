@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -169,6 +170,24 @@ type Scheduler struct {
 	ingestDue      map[string]ingestRequest
 	ingestNext     map[string]time.Time
 	ingestPending  map[string]ingestReports
+	// REST catalog loads waiting for their table's reported files
+	// (scheduler_load.go, #1752), under reqMu. loadInterval is F, the least
+	// time between two of a table's ingest exports a load may pull its
+	// request to; 0 turns it off. loadUnsettled is the tables whose last
+	// ingest export did not settle.
+	loadInterval  time.Duration
+	loadWaiters   map[string][]*loadWaiter
+	loadWaiterN   int
+	loadUnsettled map[string]bool
+	// loadPulls is when loads last pulled exports forward, within the last
+	// loadFreshBudget (the cap on all tables together). Under reqMu.
+	loadPulls []time.Time
+	// loadFellBack: tables whose last append fell back to a pass; a load
+	// does not pull them until an append settles. Loop goroutine.
+	loadFellBack map[string]bool
+	// inTimedPass is set while the loop runs a timed pass, which no load
+	// can get ahead of: a load then reads the published version at once.
+	inTimedPass atomic.Bool
 	// The append path (scheduler_append.go, #1751). appendPending is the
 	// files ingest reported per table (under reqMu). The rest is the loop
 	// goroutine's: appendOK the tables whose last reconcile pass settled,
@@ -343,6 +362,10 @@ type SchedulerConfig struct {
 	// (iceberg.reconcile_concurrency). One or less: one at a time, on the
 	// loop goroutine, as before #1786.
 	ReconcileConcurrency int
+	// LoadInterval lets a REST catalog table load pull its table's queued
+	// ingest export forward, to no sooner than this after the table's last
+	// one (iceberg.load_export_min_interval, #1752). Zero: off.
+	LoadInterval time.Duration
 }
 
 // NewScheduler builds a reconcile scheduler.
@@ -369,6 +392,10 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		ingestDue:         make(map[string]ingestRequest),
 		ingestNext:        make(map[string]time.Time),
 		ingestPending:     make(map[string]ingestReports),
+		loadInterval:      cfg.LoadInterval,
+		loadWaiters:       make(map[string][]*loadWaiter),
+		loadUnsettled:     make(map[string]bool),
+		loadFellBack:      make(map[string]bool),
 		appendEnabled:     cfg.IngestAppend,
 		gatePoll:          gateReopenPoll,
 		ingestConcurrency: max(1, cfg.IngestConcurrency),
@@ -868,7 +895,7 @@ func (s *Scheduler) Stop() {
 func (s *Scheduler) loop(ctx context.Context) {
 	defer close(s.done)
 	// Run one pass shortly after start so a fresh deployment publishes promptly.
-	partial := s.runPass(ctx)
+	partial := s.timedPass(ctx)
 	// A Timer reset AFTER each pass (rather than a Ticker) guarantees a full interval of idle
 	// between timed passes. With a Ticker, a pass that runs longer than the interval (slow disk,
 	// many files) would queue ticks and cause back-to-back passes with no breathing room —
@@ -895,6 +922,7 @@ func (s *Scheduler) loop(ctx context.Context) {
 		gatePoll = t.C
 	}
 	for {
+		s.serviceLoadWaiters()
 		s.armIngestTimer(ingestTimer)
 		if s.passOnReopen {
 			// The role came back (seen here, by a request or by a pass):
@@ -928,7 +956,7 @@ func (s *Scheduler) loop(ctx context.Context) {
 			s.gateOpen() // a reopen sets passOnReopen; the top of the loop acts on it
 			continue
 		case <-timer.C:
-			partial = s.runPass(ctx)
+			partial = s.timedPass(ctx)
 		}
 		next = s.interval
 		if partial {

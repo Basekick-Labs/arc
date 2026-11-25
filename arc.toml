@@ -418,6 +418,10 @@ s3_cache_ttl_seconds = 3600
 # reconcile_concurrency = 0          # tables whose reconcile passes run at once (1-16);
 #                                    # 0 = 4 on object storage, 1 on local storage.
 #                                    # Standalone nodes only, a cluster node runs one
+# load_export_min_interval = 0       # seconds: with the REST catalog on, a table load
+#                                    # waits up to 2 s for the files written before it,
+#                                    # exporting the table no sooner than this after its
+#                                    # last export. 0 = off; otherwise 5..ingest_export_interval.
 # ingest_export_concurrency = 8      # tables whose ingest appends run at once (1-32);
 #                                    # 1 exports one table at a time
 # export_lag_table_series = 0        # tables with their own export lag series on

@@ -292,6 +292,16 @@ func (s *Scheduler) forgetDatabase(db string) {
 			dropped = true
 		}
 	}
+	for k := range s.loadWaiters {
+		if match(k) {
+			s.skipLoadWaitersLocked(k)
+		}
+	}
+	for k := range s.loadUnsettled {
+		if match(k) {
+			delete(s.loadUnsettled, k)
+		}
+	}
 	if dropped {
 		s.publishIngestPendingLocked()
 	}
