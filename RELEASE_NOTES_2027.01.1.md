@@ -50,16 +50,16 @@ A write is acknowledged once its rows are buffered, and a query sees them only a
   - `storage_not_confirmable`: the storage backend is S3, MinIO, GCS or Azure. In this version only local storage confirms.
   - `future_stamped`: a row is stamped more than `query.file_time_pruning_margin_seconds` ahead, in the current hour. File-level time pruning can hide it until the hour closes.
 - **500, `X-Arc-Visible-Reason: flush_failed_rows_at_risk`.** A flush holding rows without a WAL copy failed. The body has `rows_at_risk` and says the rows may still be stored, so check before resending. An import answers the same way since #1888.
-- **Answered at once, status unchanged:** a partial write (400) carries `X-Arc-Visible: false` and `partial_write`; a write stopped part way (500) carries `write_stopped`. An empty MessagePack write keeps its 204, with `X-Arc-Visible: true`. The absence of `X-Arc-Visible` never means visible.
+- **Answered at once, status unchanged:** a partial write (400, some points dropped) carries `X-Arc-Visible: false` and `partial_write`; a write stopped part way (500) carries `write_stopped`. An empty MessagePack write keeps its 204, with `X-Arc-Visible: true`. The absence of `X-Arc-Visible` never means visible.
 - **Refused before anything is written:**
   - any other value of the header: 400;
   - a cluster (`cluster.enabled`): 400, before any forward;
   - the header on `/write`, `/api/v2/write`, Prometheus remote write, TLE, or an import: 400;
-  - more than 1024 waiting writes on the node: 503 with `X-Arc-Ingest-Refused: wait_visible_busy` and `Retry-After: 5`.
+  - more than 1024 waiting writes on the node: 503 with `X-Arc-Ingest-Refused: wait_visible_busy` and `Retry-After: 5`. The limit is per node and shared by every client: one client sending visible writes faster than about 200 a second at the default age can hold it and leave the others at 503. Writes without the header are not limited.
 
-**Latency.** The write is not flushed early. It waits for its rows' normal age or size flush, which is up to `ingest.max_buffer_age_ms` plus the flush time. A writer that keeps a measurement busy waits about half the age on average. A load warning names `ingest.max_buffer_age_ms` above 10000 with the key on, and the key on a cluster. Proxies and load balancers in front of Arc need idle timeouts above 20 s. Browsers may send the header (CORS), and the two answer headers are exposed.
+**Latency.** The write is not flushed early. It waits for its rows' normal age or size flush, which is up to `ingest.max_buffer_age_ms` plus the flush time. A writer that keeps a measurement busy waits about half the age on average. A load warning names `ingest.max_buffer_age_ms` above 10000 with the key on, the key on a cluster, and the key on object storage (where every waited write ends as 202 `storage_not_confirmable`). Proxies and load balancers in front of Arc need idle timeouts above 20 s. Browsers may send the header (CORS), and the two answer headers are exposed; every CORS answer now lists them in `Access-Control-Expose-Headers`.
 
-**Cost.** Without the header, a write pays one header lookup. A waiting write holds no lock, no WAL reservation and no request body. Waited writes are left out of `arc_http_*` latency. Instead, metrics `arc_ingest_wait_visible_total{outcome}`, `arc_ingest_wait_visible_waiters` and `arc_ingest_wait_visible_seconds` record them.
+**Cost.** Without the header, a write pays a header lookup and a request-local lookup, within noise in the write benchmarks. A waiting write holds no lock, no WAL reservation and no request body. Waited writes are left out of `arc_http_*` latency. Instead, metrics `arc_ingest_wait_visible_total{outcome}`, `arc_ingest_wait_visible_waiters` and `arc_ingest_wait_visible_seconds` record them.
 
 ## Fix: a single-hour flush registers its file in tiered storage after a slow write or at shutdown ([#1933](https://github.com/Basekick-Labs/arc/issues/1933))
 

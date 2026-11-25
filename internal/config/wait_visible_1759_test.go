@@ -28,6 +28,9 @@ func TestLoad_WaitVisible1759(t *testing.T) {
 		{name: "on a cluster", env: map[string]string{
 			"ARC_INGEST_WAIT_VISIBLE_ENABLED": "true", "ARC_CLUSTER_ENABLED": "true",
 		}, want: true, warnKeys: []string{"ingest.wait_visible_enabled"}},
+		{name: "on object storage", env: map[string]string{
+			"ARC_INGEST_WAIT_VISIBLE_ENABLED": "true", "ARC_STORAGE_BACKEND": "s3", "ARC_STORAGE_S3_BUCKET": "b",
+		}, want: true, warnKeys: []string{"storage.backend"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

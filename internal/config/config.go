@@ -3953,6 +3953,13 @@ func waitVisibleWarnings(cfg *Config) []LoadWarning {
 			Message: "ingest.wait_visible_enabled has no effect with cluster.enabled = true: a write carrying x-arc-wait: visible is refused with 400 and nothing written",
 		})
 	}
+	if b := cfg.Storage.Backend; b != "" && b != "local" {
+		out = append(out, LoadWarning{
+			Key:     "storage.backend",
+			Value:   b,
+			Message: "ingest.wait_visible_enabled = true on object storage: a write carrying x-arc-wait: visible still waits for its rows' flush, then is answered 202 (storage_not_confirmable); only local storage confirms visibility in this version",
+		})
+	}
 	if cfg.Ingest.MaxBufferAgeMS > waitVisibleMaxBufferAgeMS {
 		out = append(out, LoadWarning{
 			Key:     "ingest.max_buffer_age_ms",

@@ -264,9 +264,13 @@ func TestWaitVisibleRefusals1759(t *testing.T) {
 // The cap: refused with 503 wait_visible_busy before admission, nothing
 // written, and the slot accounting left as it was.
 func TestWaitVisibleBusy1759(t *testing.T) {
-	for _, path := range []string{"/api/v1/write/msgpack", "/api/v1/write/line-protocol"} {
-		t.Run(path, func(t *testing.T) {
-			r := newVisRig(t, visOpts{})
+	for _, tc := range []struct {
+		path    string
+		decimal bool // line protocol's record path
+	}{{"/api/v1/write/msgpack", false}, {"/api/v1/write/line-protocol", false}, {"/api/v1/write/line-protocol", true}} {
+		path := tc.path
+		t.Run(fmt.Sprintf("%s decimal=%v", path, tc.decimal), func(t *testing.T) {
+			r := newVisRig(t, visOpts{decimal: tc.decimal})
 			body := lpCPU(time.Now())
 			if strings.Contains(path, "msgpack") {
 				body = mpCPU(t, time.Now())
@@ -599,4 +603,30 @@ func TestWaitVisibleCORS1759(t *testing.T) {
 	resp, err = app.Test(req, -1)
 	require.NoError(t, err)
 	require.Equal(t, VisibleHeader+","+VisibleReasonHeader, resp.Header.Get("Access-Control-Expose-Headers"))
+}
+
+// A visible write waits holding no request body: it is returned before the
+// wait starts, on both handlers (#1759). Observed from inside the wait.
+func TestWaitVisibleWaitsWithoutTheBody1759(t *testing.T) {
+	for _, tc := range []struct {
+		path    string
+		decimal bool
+	}{{"/api/v1/write/msgpack", false}, {"/api/v1/write/line-protocol", false}, {"/api/v1/write/line-protocol", true}} {
+		t.Run(fmt.Sprintf("%s decimal=%v", tc.path, tc.decimal), func(t *testing.T) {
+			r := newVisRig(t, visOpts{decimal: tc.decimal})
+			body := lpCPU(time.Now())
+			if strings.Contains(tc.path, "msgpack") {
+				body = mpCPU(t, time.Now())
+			}
+			bodyLen := -1
+			budget := waitVisibleBudget
+			waitVisibleBudget = 50 * time.Millisecond // only the start of the wait matters here
+			t.Cleanup(func() { waitVisibleBudget = budget })
+			waitVisibleBeforeWait = func(c *fiber.Ctx) { bodyLen = len(c.Request().Body()) }
+			t.Cleanup(func() { waitVisibleBeforeWait = nil })
+			resp, out := r.post(t, tc.path, body, WaitVisibleHeader, "visible")
+			require.Less(t, resp.StatusCode, 300, out)
+			require.Equal(t, 0, bodyLen, "the request body was still held when the wait began")
+		})
+	}
 }

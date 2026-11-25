@@ -193,6 +193,9 @@ func (vw *visibleWrite) notWaited(c *fiber.Ctx, reason string) {
 // could not count them. The caller has released the admission and the
 // request body: nothing the wait holds is still counted by admission.
 func (vw *visibleWrite) answer(c *fiber.Ctx, rows int64, rowsKnown bool) error {
+	if waitVisibleBeforeWait != nil {
+		waitVisibleBeforeWait(c)
+	}
 	c.Locals(waitVisibleLocal, true)
 	// Read once: fasthttp closes it when the HTTP drain begins (nil under
 	// app.Test, where the budget still ends the wait).
@@ -209,6 +212,11 @@ func (vw *visibleWrite) answer(c *fiber.Ctx, rows int64, rowsKnown bool) error {
 	m.IncIngestWaitVisible(waitVisibleOutcome(verdict))
 	return respondVisible(c, verdict, rows)
 }
+
+// waitVisibleBeforeWait, when set (tests only), runs as a visible write
+// starts waiting: what the request still holds then is what it holds for the
+// whole wait.
+var waitVisibleBeforeWait func(c *fiber.Ctx)
 
 // respondVisible answers a verdict: 204 only for visible, 500 only for rows
 // at risk, 202 for every other reason, a future one included.
