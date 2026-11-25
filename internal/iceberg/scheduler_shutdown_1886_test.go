@@ -165,3 +165,45 @@ func TestDrainStopped_ExpiredContext(t *testing.T) {
 		t.Fatalf("drained %d tables (listed %q) on an expired context", n, src.order())
 	}
 }
+
+// A table that needs a pass (its first export) is exported by a drain with
+// 15 s left, less than the default 20 s commit reserve: the drain scales the
+// reserve to its budget.
+func TestDrainStopped_PassFitsAShortBudget(t *testing.T) {
+	r, _ := newDrainRig(t, nil)
+	r.sched.Start()
+	if !r.sched.StopWithin(5 * time.Second) {
+		t.Fatal("loop did not stop")
+	}
+	name := ingestName("cpu", time.Now())
+	r.writeIn(t, "cpu", name)
+	r.sched.RequestIngestReconcile("mydb", "cpu")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if n := r.sched.DrainStopped(ctx); n != 1 {
+		t.Fatalf("drain exported %d tables with 15 s left, want 1", n)
+	}
+	if got := strings.Join(r.live(t), ","); got != name {
+		t.Fatalf("table = %q, want %s", got, name)
+	}
+}
+
+// Requests the loop had taken when it was stopped go back in the queue, for
+// the drain to serve, instead of leaving with the loop.
+func TestServiceRequestsPutsBackWhatAStopInterrupted(t *testing.T) {
+	r, src := newDrainRig(t, nil)
+	r.sched.RequestReconcile("mydb", "cpu")
+	r.sched.RequestReconcile("mydb", "mem")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.sched.serviceRequests(ctx)
+	if got := src.order(); got != "" {
+		t.Fatalf("listed %q on a cancelled context", got)
+	}
+	r.sched.reqMu.Lock()
+	n := len(r.sched.requested)
+	r.sched.reqMu.Unlock()
+	if n != 2 {
+		t.Fatalf("%d requests queued after the interrupted service, want 2", n)
+	}
+}

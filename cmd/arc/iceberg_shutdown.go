@@ -34,7 +34,14 @@ import (
 //
 // The drain uses what is left of the shutdown budget, less a tenth for the
 // closes after it and, with Glue on, a twentieth for Glue's flush: nothing is
-// taken from the hooks' share.
+// taken from the hooks' share. The drain and Glue's flush do network I/O
+// among the components, each bounded by its own deadline.
+//
+// The hook's wait for the loop is bounded. When the loop does not end in
+// time (a pass ignoring cancellation), the drain and the catalog handle's
+// close are skipped, and that pass may outlive the components after them
+// (cluster coordinator, auth, storage): the trade the old unbounded Stop made
+// the other way, holding the buffer's final flush behind such a pass.
 
 const (
 	// icebergStopWaitMax bounds the hook's wait for the loop, whose pass in
@@ -69,6 +76,35 @@ func endingBefore(ctx context.Context, margin, fallback time.Duration) (context.
 		return context.WithDeadline(ctx, dl.Add(-margin))
 	}
 	return context.WithTimeout(ctx, fallback)
+}
+
+// icebergManifestSyncer is the part of the cluster coordinator the drain's
+// manifest catch-up uses.
+type icebergManifestSyncer interface {
+	SyncManifestWithin(ctx context.Context, timeout time.Duration) error
+}
+
+// icebergManifestCatchUpMax bounds the catch-up: a whole-cluster stop can
+// leave a follower with no leader to sync from.
+const icebergManifestCatchUpMax = 5 * time.Second
+
+// icebergManifestCatchUp is the drain's `before` on a cluster with a shared
+// bucket: a follower exporter learns of the final flush's files (its own
+// included) from its FSM apply, so it catches up first. Only where this node
+// exports (gate), and for at most icebergManifestCatchUpMax.
+func icebergManifestCatchUp(c icebergManifestSyncer, gate interface{ CanRun() bool }, logger zerolog.Logger) func(context.Context) {
+	return func(ctx context.Context) {
+		if gate != nil && !gate.CanRun() {
+			return
+		}
+		wait := icebergManifestCatchUpMax
+		if dl, ok := ctx.Deadline(); ok {
+			wait = min(wait, time.Until(dl)/2)
+		}
+		if err := c.SyncManifestWithin(ctx, wait); err != nil {
+			logger.Warn().Err(err).Msg("Iceberg export: the manifest did not catch up before the final export; exporting what is queued, and the next start reconciles the rest")
+		}
+	}
 }
 
 // icebergDrainer is the part of *iceberg.Scheduler the shutdown steps use.
@@ -123,11 +159,14 @@ func (s *icebergShutdown) CloseContext(ctx context.Context) error {
 	}
 	began := time.Now()
 	n := s.sched.DrainStopped(dctx)
-	ev := s.logger.Info()
-	if dctx.Err() != nil {
+	ev := s.logger.Debug()
+	switch {
+	case dctx.Err() != nil:
 		ev = s.logger.Warn().Bool("deadline_reached", true)
+	case n > 0:
+		ev = s.logger.Info()
 	}
-	ev.Int("tables", n).Dur("took", time.Since(began)).
+	ev.Int("tables_changed", n).Dur("took", time.Since(began)).
 		Msg("Iceberg export: final export at shutdown done; anything left is reconciled at the next start")
 	return nil
 }

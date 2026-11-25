@@ -85,7 +85,8 @@ const defaultShutdownTimeout = 30 * time.Second
 // shutdownComponentReserve is the part of the shutdown budget the components
 // keep (shutdown.Coordinator.SetComponentReserve): half for the arrow
 // buffer's Close, whose budget is also half, plus a tenth for the WAL's final
-// sync and the closes after it (#1644).
+// sync and the closes after it (#1644). The Iceberg export's final drain
+// (#1886) uses only what the buffer leaves of the half, less that tenth.
 func shutdownComponentReserve(timeout time.Duration) time.Duration {
 	return timeout/2 + timeout/10
 }
@@ -1392,7 +1393,9 @@ func main() {
 	// shutdown_timeout=2 hands Close 100% of the coordinator's time and
 	// reintroduces the skip it was meant to prevent. Half is the honest rule at
 	// every value: the components after the buffer are a SQLite close, the WAL's
-	// final sync and the storage/database closes, all fast. Giving Close less
+	// final sync and the storage/database closes, all fast, plus the Iceberg
+	// export's final drain and Glue flush (#1886), which bound themselves to
+	// what is left of the budget. Giving Close less
 	// time only means more records stay in the WAL to be replayed, which is
 	// recoverable; starving the WAL writer's sync is not.
 	//
@@ -5273,14 +5276,7 @@ func main() {
 			logger:  logger.Get("iceberg"),
 		}
 		if clusterCoordinator != nil && (cfg.Cluster.SharedStorageMode || cluster.IsSharedObjectStore(storageBackend)) {
-			// A follower exporter learns of the final flush's files (its own
-			// included) from its FSM apply: catch up before draining.
-			coord := clusterCoordinator
-			icebergStop.before = func(ctx context.Context) {
-				if err := coord.SyncManifest(ctx); err != nil {
-					log.Debug().Err(err).Msg("Iceberg export: manifest sync before the final export failed; exporting what is queued")
-				}
-			}
+			icebergStop.before = icebergManifestCatchUp(clusterCoordinator, icebergGate, logger.Get("iceberg"))
 		}
 		var closeIcebergDB func() error
 		if icebergOwnsDB {

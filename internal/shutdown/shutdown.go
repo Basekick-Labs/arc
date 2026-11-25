@@ -17,7 +17,6 @@ type Shutdownable interface {
 	Close() error
 }
 
-// ShutdownFunc is a function that performs cleanup during shutdown
 // ContextCloser is a Shutdownable that also takes the shutdown's context.
 // The coordinator calls CloseContext instead of Close for one. The context's
 // deadline is the end of the whole shutdown budget: a component that does
@@ -29,6 +28,7 @@ type ContextCloser interface {
 	CloseContext(ctx context.Context) error
 }
 
+// ShutdownFunc is a function that performs cleanup during shutdown
 type ShutdownFunc func(ctx context.Context) error
 
 // Coordinator manages graceful shutdown of all components

@@ -133,3 +133,64 @@ func TestIcebergShutdownNoTimeLeft(t *testing.T) {
 		t.Fatalf("drain ran with no time left: %v", order)
 	}
 }
+
+type fakeSyncer struct {
+	calls int
+	wait  time.Duration
+}
+
+func (f *fakeSyncer) SyncManifestWithin(_ context.Context, d time.Duration) error {
+	f.calls++
+	f.wait = d
+	return nil
+}
+
+type gateFlag bool
+
+func (g gateFlag) CanRun() bool { return bool(g) }
+
+// The shared-bucket catch-up runs only where this node exports, bounded by
+// icebergManifestCatchUpMax and by half of what is left of the drain.
+func TestIcebergManifestCatchUp(t *testing.T) {
+	t.Run("not the exporter", func(t *testing.T) {
+		s := &fakeSyncer{}
+		icebergManifestCatchUp(s, gateFlag(false), zerolog.Nop())(context.Background())
+		if s.calls != 0 {
+			t.Fatalf("synced %d times on a node that does not export", s.calls)
+		}
+	})
+	t.Run("exporter, long budget", func(t *testing.T) {
+		s := &fakeSyncer{}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		icebergManifestCatchUp(s, gateFlag(true), zerolog.Nop())(ctx)
+		if s.calls != 1 || s.wait != icebergManifestCatchUpMax {
+			t.Fatalf("calls %d, wait %v; want 1, %v", s.calls, s.wait, icebergManifestCatchUpMax)
+		}
+	})
+	t.Run("exporter, short budget", func(t *testing.T) {
+		s := &fakeSyncer{}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		icebergManifestCatchUp(s, gateFlag(true), zerolog.Nop())(ctx)
+		if s.calls != 1 || s.wait > time.Second {
+			t.Fatalf("calls %d, wait %v; want 1, at most half the budget", s.calls, s.wait)
+		}
+	})
+}
+
+// The catch-up runs before the drain, within the drain's deadline.
+func TestIcebergShutdownRunsBeforeThenDrains(t *testing.T) {
+	var order []string
+	d := &fakeDrainer{order: &order, stopOK: true}
+	s := &icebergShutdown{sched: d, timeout: 10 * time.Second, logger: zerolog.Nop(), stopped: true,
+		before: func(context.Context) { order = append(order, "catch-up") }}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := s.CloseContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"catch-up", "iceberg-drain"}; !reflect.DeepEqual(order, want) {
+		t.Fatalf("order %v, want %v", order, want)
+	}
+}

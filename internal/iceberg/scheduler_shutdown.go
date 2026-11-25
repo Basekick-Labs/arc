@@ -2,7 +2,6 @@ package iceberg
 
 import (
 	"context"
-	"sort"
 	"time"
 )
 
@@ -21,9 +20,19 @@ import (
 // loop has ended by then, so the component's goroutine is the only one that
 // touches the loop's state.
 //
-// The drain does no full pass of its own. What it does not finish, because
-// its deadline passed or a table failed, stays queued and is lost with the
-// process; the next start's pass reconciles those tables, as it always has.
+// The drain starts no timed pass of its own: it serves the requests that are
+// queued, an append where one is possible and otherwise that table's own
+// pass, with a commit reserve scaled to the time left (drainCommitReserve).
+// What it does not finish, because its deadline passed or a table failed,
+// is lost with the process; the next start's pass reconciles those tables,
+// as it always has.
+//
+// The loop's stop is bounded (StopWithin). A pass that ignores cancellation
+// (the leader's manifest barrier, a shared-bucket drop record's one-minute
+// write) can outlive the wait: the drain and the export's own catalog handle
+// are then left alone, and that pass may still be running while the cluster
+// coordinator, auth and storage close after it. The old unbounded Stop could
+// instead hold the ingest buffer's final flush for as long as such a pass ran.
 
 // StopWithin cancels the loop, and the pass in flight with it, and waits at
 // most d for the loop to end. It reports whether the loop has ended: false
@@ -95,10 +104,11 @@ func (s *Scheduler) DrainStopped(ctx context.Context) int {
 		began := time.Now()
 		attempted[key] = began
 		mctx, cancel := context.WithTimeout(ctx, measurementTimeout)
+		mctx = withCommitReserve(mctx, drainCommitReserve(mctx))
 		outcome, err := s.exportIngest(mctx, m, key)
 		cancel()
 		s.afterIngest(m, key, outcome, err, time.Since(began))
-		if err == nil && (outcome == outcomeReconciled || outcome == outcomeUnchanged) {
+		if err == nil && outcome == outcomeReconciled {
 			exported++
 		}
 	}
@@ -108,31 +118,41 @@ func (s *Scheduler) DrainStopped(ctx context.Context) int {
 	return exported
 }
 
+// drainCommitReserve is the commit reserve for one table's export in the
+// drain: a third of what is left before ctx's deadline, at most the
+// exporter's default. A pass reads files only with more than its reserve
+// left; the default (20 s) is often more than the whole drain has, and a
+// table on a shared bucket, or one exported for the first time, is a pass.
+// A commit cut short by the deadline leaves what any cancelled commit
+// leaves, which the next start's pass reconciles.
+func drainCommitReserve(ctx context.Context) time.Duration {
+	dl, ok := ctx.Deadline()
+	if !ok {
+		return defaultCommitReserve
+	}
+	return min(time.Until(dl)/3, defaultCommitReserve)
+}
+
 // takeIngestForDrain removes and returns a queued ingest request, the one
 // queued longest first, whatever its due time: one whose table was not
 // attempted in this drain, or was attempted before a later file report.
 func (s *Scheduler) takeIngestForDrain(attempted map[string]time.Time) (Measurement, string, bool) {
 	s.reqMu.Lock()
 	defer s.reqMu.Unlock()
-	keys := make([]string, 0, len(s.ingestDue))
-	for k := range s.ingestDue {
+	var key string
+	var pick ingestRequest
+	for k, r := range s.ingestDue {
 		if at, tried := attempted[k]; tried && !s.ingestPending[k].last.After(at) {
 			continue
 		}
-		keys = append(keys, k)
+		if key == "" || r.due.Before(pick.due) || (r.due.Equal(pick.due) && k < key) {
+			key, pick = k, r
+		}
 	}
-	if len(keys) == 0 {
+	if key == "" {
 		return Measurement{}, "", false
 	}
-	sort.Slice(keys, func(i, j int) bool {
-		a, b := s.ingestDue[keys[i]].due, s.ingestDue[keys[j]].due
-		if !a.Equal(b) {
-			return a.Before(b)
-		}
-		return keys[i] < keys[j]
-	})
-	key := keys[0]
-	r := s.ingestDue[key]
+	r := pick
 	delete(s.ingestDue, key)
 	s.ingestNext[key] = time.Now().Add(s.ingestInterval)
 	return r.m, key, true
