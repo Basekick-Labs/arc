@@ -84,6 +84,17 @@ func (c *common) register(fs *flag.FlagSet, timeout time.Duration) {
 	fs.StringVar(&c.out, "out", "", "also write the report as JSON to this file")
 }
 
+// probeClient is cl aimed at -probe when it is set: the queries go there,
+// the writes and the metrics scrape stay on -http.
+func (c *common) probeClient(cl *client) *client {
+	if c.probeURL == "" {
+		return cl
+	}
+	q := *cl
+	q.base = strings.TrimRight(c.probeURL, "/")
+	return &q
+}
+
 func (c *common) client() *client {
 	return &client{
 		base:  strings.TrimRight(c.baseURL, "/"),
@@ -158,6 +169,7 @@ func steadyCmd(ctx context.Context, args []string, w io.Writer) error {
 	offset := fs.Duration("time-offset", 0, "stamp rows this far from now (negative: late data)")
 	endpoint := fs.String("endpoint", "json", "query endpoint to probe: json, msgpack, arrow, measurement")
 	prequery := fs.Bool("prequery", false, "run each probe query once before the first write")
+	fs.StringVar(&c.probeURL, "probe", "", "Arc base URL the probe queries go to (default: -http); on a cluster, a reader while -http is the writer. Writes and the server metrics stay on -http")
 	_ = fs.Parse(args)
 	if c.token == "" {
 		return fmt.Errorf("-token is required")
@@ -166,6 +178,7 @@ func steadyCmd(ctx context.Context, args []string, w io.Writer) error {
 		return fmt.Errorf("-rate must be > 0, -measurements and -probe-sample >= 1, -batch, -poll and -lookback >= 0")
 	}
 	cl := c.client()
+	qcl := c.probeClient(cl)
 	run := fmt.Sprintf("r%x", time.Now().UnixNano())
 	start := time.Now()
 	// One fixed range for the whole run, so the SQL text never changes, as a
@@ -196,7 +209,7 @@ func steadyCmd(ctx context.Context, args []string, w io.Writer) error {
 	before, scrapeErr := cl.scrape(ctx)
 	if *prequery {
 		for _, p := range probes {
-			if _, err := p.run(ctx, cl); err != nil {
+			if _, err := p.run(ctx, qcl); err != nil {
 				return fmt.Errorf("prequery: %w", err)
 			}
 		}
@@ -212,7 +225,7 @@ func steadyCmd(ctx context.Context, args []string, w io.Writer) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			probeLoop(probeCtx, cl, p, tr, c.poll, stats[i])
+			probeLoop(probeCtx, qcl, p, tr, c.poll, stats[i])
 		}()
 	}
 
@@ -503,12 +516,7 @@ func secs(s float64) string {
 //  4. the same query text, and a query text never sent before, polled until
 //     each returns the row.
 func lateTrialRun(ctx context.Context, cl *client, c common, measurement, run string, offset, wait time.Duration) (lateTrial, error) {
-	qcl := cl
-	if c.probeURL != "" {
-		q := *cl
-		q.base = strings.TrimRight(c.probeURL, "/")
-		qcl = &q
-	}
+	qcl := c.probeClient(cl)
 	tr := lateTrial{Measurement: measurement, OffsetS: offset.Seconds(), DelayS: wait.Seconds(), SameSQLS: -1, UniqueSQLS: -1}
 	now := time.Now()
 	hour := hourClock().UTC().Truncate(time.Hour)

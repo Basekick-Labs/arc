@@ -46,8 +46,9 @@ Not scripted, same harness:
   cost of a short buffer age.
 - **Object storage:** export `ARC_STORAGE_BACKEND=s3` and the bucket settings before `run.sh`
   (SeaweedFS locally).
-- **A cluster:** start it yourself and point `steady` at a reader. The lag then includes
-  replication; the server-side metric below does not.
+- **A cluster:** start it yourself, write to a writer and probe a reader:
+  `-http <writer> -probe <reader>` (a reader does not take writes). The lag then includes
+  replication; the server-side metric below (scraped from `-http`, the writer) does not.
 - **Another endpoint:** `-endpoint msgpack|arrow|measurement`. The `measurement` endpoint
   returns at most 1,000,000 rows, so keep `rate × duration` under that.
 - **A range that spans hour partitions:** `-lookback 3h`. A range inside the current hour and

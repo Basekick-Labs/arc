@@ -519,3 +519,21 @@ func TestSteadyFailsWhenNothingCouldBeTimed(t *testing.T) {
 		t.Errorf("every probe refused: err = %v", err)
 	}
 }
+
+// -probe sends the queries elsewhere and leaves the writes and the metrics
+// scrape on -http (a cluster's reader does not take writes).
+func TestProbeClientAimsOnlyTheQueries(t *testing.T) {
+	c := common{baseURL: "http://writer:8000/", token: "t"}
+	cl := c.client()
+	if got := c.probeClient(cl); got != cl {
+		t.Fatal("without -probe the queries must use the -http client")
+	}
+	c.probeURL = "http://reader:8000/"
+	q := c.probeClient(cl)
+	if q.base != "http://reader:8000" || cl.base != "http://writer:8000" {
+		t.Fatalf("probe base %q, write base %q", q.base, cl.base)
+	}
+	if q.http != cl.http || q.token != cl.token {
+		t.Fatal("the probe client must share the token and the connection pool")
+	}
+}
