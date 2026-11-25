@@ -174,13 +174,9 @@ func icebergTopologyFor(sharedMode, sharedBucket, hasCoordinator, hasCompactorFa
 }
 
 // icebergIngestInterval is the spacing of ingest-triggered Iceberg exports on
-// this node, in the scheduler's terms: iceberg.ingest_export_interval on a
-// standalone node, and off (0) on a cluster node. There the node that
-// flushes is usually not the node that exports, whose gate would drop the
-// request, and on the exporter a request served before the file's
-// registration lands costs a Raft barrier. The events that reach the
-// exporting node (a file registered in a shared bucket, a pulled file
-// landing) are #1756.
+// a standalone node: iceberg.ingest_export_interval there, 0 on a cluster
+// node, whose spacing is icebergArrivalInterval (#1756) and whose own flushes
+// report only where icebergOwnFlushReports says (#1902).
 func icebergIngestInterval(seconds int, hasCoordinator bool) time.Duration {
 	if hasCoordinator || seconds <= 0 {
 		return 0

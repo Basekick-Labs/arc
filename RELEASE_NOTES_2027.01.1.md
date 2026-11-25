@@ -17,8 +17,8 @@ as on a standalone node. Measured on a three-node cluster with local storage, a 
 node was in the exporting node's table 58 seconds after its flush at the default (8 seconds with the
 interval at 10, under a second for a table's first file), against 276–300 seconds before. On local
 storage, rows written on the exporting node itself follow the same interval too
-([#1902](https://github.com/Basekick-Labs/arc/issues/1902)): every node's own flushes ask for the
-export, and the nodes that do not export drop the request.
+([#1902](https://github.com/Basekick-Labs/arc/issues/1902)): on local storage every node's own
+flushes ask for the export, and the nodes that do not export drop the request.
 `iceberg.ingest_export_interval = 0` keeps the timed passes only.
 
 ## Fix: files a backup restore writes are read at once ([#1764](https://github.com/Basekick-Labs/arc/issues/1764))
