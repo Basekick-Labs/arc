@@ -2,6 +2,32 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: files flushed at shutdown reach the Iceberg table, and Glue, before Arc exits ([#1886](https://github.com/Basekick-Labs/arc/issues/1886))
+
+On SIGTERM, ingest's final flush writes what is still buffered. The Iceberg export had already stopped by then, so the files from that flush were not added to their tables. Files waiting for their next ingest export (up to `iceberg.ingest_export_interval`, 60 s by default) were left out too, along with export requests the loop had taken but not served. The tables stayed behind the bucket until Arc started again; on a node that does not come back (decommissioned, scaled away) they stayed behind. Glue, stopped earlier still, never learned of a version published that late.
+
+Now, at shutdown:
+
+- The export's loop stops early, as before, so no timed pass competes with the final flush. Requests it had taken but not served go back in the queue.
+- Once the buffer and the WAL have closed, the export serves what is queued, the final flush's files included, whatever each request's due time:
+  - one table at a time, each tried once (again only if a newer file was reported for it);
+  - with an append where one is possible, otherwise that table's own pass;
+  - then the requests a compaction, DELETE, retention or tiering change made.
+- A pass's commit reserve, which keeps the end of its deadline for the commit, is scaled to the time left: a third of it, at most the usual 20 s. With the usual reserve, a pass with less than 20 s left read no file at all.
+- Glue then syncs what was published, and the export's own catalog database closes.
+
+This uses what is left of `server.shutdown_timeout` after the buffer's close, less a tenth for the closes that follow and, with Glue on, a twentieth for Glue. Nothing is taken from the HTTP drain. The default `server.shutdown_timeout` (30 s) is unchanged.
+
+**Limits:**
+
+- **Long shutdowns.** Tables are served one at a time, and on S3 an append is a few requests. With many tables and little time left, the drain stops at its deadline, and the next start's pass reconciles the rest. Raise `server.shutdown_timeout` if every table must be current at exit.
+- **Shared bucket.** A table there is exported by a pass, and on a cluster the shutdown spends part of the budget elsewhere first: the ready drain, the HTTP drain, the file registrar. There, the exporting node first catches up with the cluster manifest, for at most 5 s, so the last registrations' files are queued. On such a cluster, `server.shutdown_timeout` of 45 s or more gives the drain room.
+- **`iceberg.ingest_export_interval = 0`.** Flushes report nothing to the export, so the drain serves only the other requests: a compaction's, a DELETE's, database drops. The final flush's files wait for the next start, as before.
+- **A node that does not export.** It serves its database drops, as the loop always did, and nothing else.
+- **A pass that ignores cancellation.** The loop's stop is bounded. If a pass does not stop in time (for example, a cluster manifest barrier), the drain and the catalog close are skipped, and that pass may still be running while the components after it close.
+
+Verified with a binary on S3 (SeaweedFS): two writes ten seconds apart, then SIGTERM straight after the second. Before, the second file was in the bucket and not in the table when Arc exited; now it is in the table. The same holds with the WAL on (`ack_mode = durable`), with `iceberg.ingest_export_interval = 300`, with `iceberg.ingest_append_enabled = false`, and with `server.shutdown_timeout = 5`.
+
 ## Fix: Arc no longer prints the admin token you configured at startup ([#1883](https://github.com/Basekick-Labs/arc/issues/1883))
 
 **Who is affected:** anyone who sets `auth.bootstrap_token` (`ARC_AUTH_BOOTSTRAP_TOKEN`), with or without
@@ -58,6 +84,7 @@ version"). After a pass of its own, the export now takes the catalog's commit as
 On a cluster, nodes that do not export answer from the discovery files only, so in this layout a
 job still waits at them, as before: re-home with the warehouse outside the storage root is a
 standalone fix.
+
 
 
 

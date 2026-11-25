@@ -85,7 +85,8 @@ const defaultShutdownTimeout = 30 * time.Second
 // shutdownComponentReserve is the part of the shutdown budget the components
 // keep (shutdown.Coordinator.SetComponentReserve): half for the arrow
 // buffer's Close, whose budget is also half, plus a tenth for the WAL's final
-// sync and the closes after it (#1644).
+// sync and the closes after it (#1644). The Iceberg export's final drain
+// (#1886) uses only what the buffer leaves of the half, less that tenth.
 func shutdownComponentReserve(timeout time.Duration) time.Duration {
 	return timeout/2 + timeout/10
 }
@@ -1392,7 +1393,9 @@ func main() {
 	// shutdown_timeout=2 hands Close 100% of the coordinator's time and
 	// reintroduces the skip it was meant to prevent. Half is the honest rule at
 	// every value: the components after the buffer are a SQLite close, the WAL's
-	// final sync and the storage/database closes, all fast. Giving Close less
+	// final sync and the storage/database closes, all fast, plus the Iceberg
+	// export's final drain and Glue flush (#1886), which bound themselves to
+	// what is left of the budget. Giving Close less
 	// time only means more records stay in the WAL to be replayed, which is
 	// recoverable; starving the WAL writer's sync is not.
 	//
@@ -5261,15 +5264,25 @@ func main() {
 				clusterCoordinator.SetIcebergPathCallbacks(icebergScheduler.RequestReconcilePathsHot, icebergScheduler.RequestReconcilePathsLater, icebergScheduler.RequestReconcilePaths)
 			}
 		}
-		shutdownCoordinator.RegisterHook("iceberg", func(ctx context.Context) error {
-			icebergScheduler.Stop()
-			// Close only a handle this block opened. A borrowed one belongs to
-			// the auth manager, which closes it at PriorityAuth.
-			if icebergOwnsDB {
-				return icebergDB.Close()
-			}
-			return nil
-		}, shutdown.PriorityDatabase)
+		// #1886: the loop stops in a hook, the final flush's files are
+		// exported by a component after the WAL, Glue flushes after that,
+		// and the export's own SQLite handle closes last (iceberg_shutdown.go).
+		// A borrowed handle belongs to the auth manager, which closes it at
+		// PriorityAuth.
+		icebergStop := &icebergShutdown{
+			sched:   icebergScheduler,
+			timeout: shutdownTimeout,
+			glue:    cfg.Iceberg.Glue.Enabled,
+			logger:  logger.Get("iceberg"),
+		}
+		if clusterCoordinator != nil && (cfg.Cluster.SharedStorageMode || cluster.IsSharedObjectStore(storageBackend)) {
+			icebergStop.before = icebergManifestCatchUp(clusterCoordinator, icebergGate, logger.Get("iceberg"))
+		}
+		var closeIcebergDB func() error
+		if icebergOwnsDB {
+			closeIcebergDB = icebergDB.Close
+		}
+		registerIcebergShutdown(shutdownCoordinator, icebergStop, closeIcebergDB)
 		log.Info().Str("warehouse", warehouse).Int("interval_s", cfg.Iceberg.ReconcileInterval).Msg("Iceberg export enabled")
 		if cfg.Iceberg.RESTCatalogEnabled {
 			registerIcebergRESTCatalog(server.GetApp(), exporter, authManager, rbacManager, spokeRegistry, storageBackend,
@@ -5277,7 +5290,7 @@ func main() {
 		}
 		// #1690 option B: Glue sync starts and stops with the export.
 		if cfg.Iceberg.Glue.Enabled {
-			icebergStart = wireIcebergGlue(exporter, storageBackend, icebergGate, cfg.Iceberg.Glue, cfg.Iceberg.Layout, shutdownCoordinator, icebergStart)
+			icebergStart = wireIcebergGlue(exporter, storageBackend, icebergGate, cfg.Iceberg.Glue, cfg.Iceberg.Layout, shutdownCoordinator, shutdownTimeout, icebergStart)
 		}
 	}
 

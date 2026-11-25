@@ -17,6 +17,17 @@ type Shutdownable interface {
 	Close() error
 }
 
+// ContextCloser is a Shutdownable that also takes the shutdown's context.
+// The coordinator calls CloseContext instead of Close for one. The context's
+// deadline is the end of the whole shutdown budget: a component that does
+// bounded work while the others are still to close (the Iceberg export's
+// final drain, #1886) needs it to leave time for the components after it,
+// which Close cannot tell it.
+type ContextCloser interface {
+	Shutdownable
+	CloseContext(ctx context.Context) error
+}
+
 // ShutdownFunc is a function that performs cleanup during shutdown
 type ShutdownFunc func(ctx context.Context) error
 
@@ -229,7 +240,13 @@ func (c *Coordinator) Shutdown() error {
 				Int("priority", comp.priority).
 				Msg("Shutting down component")
 
-			if err := comp.component.Close(); err != nil {
+			var err error
+			if cc, ok := comp.component.(ContextCloser); ok {
+				err = cc.CloseContext(ctx)
+			} else {
+				err = comp.component.Close()
+			}
+			if err != nil {
 				c.logger.Error().
 					Err(err).
 					Str("component", comp.name).

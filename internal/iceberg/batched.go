@@ -1122,7 +1122,25 @@ func (e *Exporter) timeForChunk(ctx context.Context, last time.Duration) bool {
 	if !ok {
 		return true
 	}
-	return time.Until(dl) > e.commitReserve+last
+	return time.Until(dl) > e.reserve(ctx)+last
+}
+
+// commitReserveKey carries a commit reserve smaller than the exporter's:
+// the shutdown drain's whole budget is often below defaultCommitReserve, and
+// with it a pass would read no file at all (#1886).
+type commitReserveKey struct{}
+
+// withCommitReserve is ctx with the commit reserve d for the passes run under it.
+func withCommitReserve(ctx context.Context, d time.Duration) context.Context {
+	return context.WithValue(ctx, commitReserveKey{}, d)
+}
+
+// reserve is the commit reserve for a pass under ctx.
+func (e *Exporter) reserve(ctx context.Context) time.Duration {
+	if d, ok := ctx.Value(commitReserveKey{}).(time.Duration); ok {
+		return d
+	}
+	return e.commitReserve
 }
 
 // chunkContext is the context a chunk's footer reads run under: the pass's, ending the commit
@@ -1130,7 +1148,7 @@ func (e *Exporter) timeForChunk(ctx context.Context, last time.Duration) bool {
 // pass cleanly instead of failing it at the hard deadline.
 func (e *Exporter) chunkContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	if dl, ok := ctx.Deadline(); ok {
-		return context.WithDeadline(ctx, dl.Add(-e.commitReserve))
+		return context.WithDeadline(ctx, dl.Add(-e.reserve(ctx)))
 	}
 	return context.WithCancel(ctx)
 }

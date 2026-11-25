@@ -747,8 +747,10 @@ func (s *Scheduler) serviceRequests(ctx context.Context) {
 			reqs = append(reqs, m)
 		}
 	}
-	for _, m := range reqs {
+	for i, m := range reqs {
 		if ctx.Err() != nil {
+			// Stopping (#1886): the shutdown drain serves the rest.
+			s.requeueRequests(reqs[i:])
 			return
 		}
 		key := m.Database + "\x00" + m.Measurement
@@ -781,6 +783,16 @@ func (s *Scheduler) serviceRequests(ctx context.Context) {
 			s.requestAfter(m, key, s.partialRetryInterval())
 		}
 	}
+}
+
+// requeueRequests puts measurements taken by serviceRequests back in the
+// queue, unserved.
+func (s *Scheduler) requeueRequests(ms []Measurement) {
+	s.reqMu.Lock()
+	for _, m := range ms {
+		s.requested[m.Database+"\x00"+m.Measurement] = m
+	}
+	s.reqMu.Unlock()
 }
 
 // noteOutcome records what a reconcile of key did: when the table last
