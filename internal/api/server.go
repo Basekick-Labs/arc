@@ -187,7 +187,9 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: "*",
 		AllowMethods: "GET,POST,PUT,DELETE,OPTIONS",
-		AllowHeaders: "Origin,Content-Type,Accept,Authorization,x-api-key,x-arc-database,Content-Encoding,Arcli-Installation-Id,Arc-Client-Installation-Id",
+		AllowHeaders: "Origin,Content-Type,Accept,Authorization,x-api-key,x-arc-database,Content-Encoding,Arcli-Installation-Id,Arc-Client-Installation-Id," + WaitVisibleHeader,
+		// A browser reads a visible write's answer (#1759).
+		ExposeHeaders: VisibleHeader + "," + VisibleReasonHeader,
 	}))
 
 	// Security headers middleware (pass TLS flag for HSTS)
@@ -1062,7 +1064,12 @@ func requestLogger(logger zerolog.Logger) fiber.Handler {
 		m := metrics.Get()
 
 		m.IncHTTPRequests()
-		m.RecordHTTPLatency(duration.Microseconds())
+		// A write that waited until its rows were visible (#1759) is
+		// recorded in arc_ingest_wait_visible_seconds instead: its seconds
+		// would swamp the HTTP latency of every other request.
+		if waited, _ := c.Locals(waitVisibleLocal).(bool); !waited {
+			m.RecordHTTPLatency(duration.Microseconds())
+		}
 
 		if status >= 400 {
 			m.IncHTTPError()

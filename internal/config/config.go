@@ -208,6 +208,12 @@ type IngestConfig struct {
 	// the memory limit it detects.
 	MaxBufferedBytes     int64
 	MaxBufferedBytesAuto bool
+	// WaitVisibleEnabled lets a MessagePack or line-protocol write carry
+	// x-arc-wait: visible and be answered once its rows are visible to a
+	// query on this node, at most 20 s later (#1759). false (the default):
+	// such a request is refused with 403 and nothing written. Standalone
+	// only: on a cluster the header is refused with 400.
+	WaitVisibleEnabled bool
 }
 
 // minIcebergIngestExportInterval is the shortest iceberg.ingest_export_interval
@@ -1494,6 +1500,7 @@ func Load() (*Config, error) {
 			DefaultDecimalColumns:  v.GetString("ingest.default_decimal_columns"),
 			ImportWriteConcurrency: v.GetInt("ingest.import_write_concurrency"),
 			ImportQueueTimeoutMS:   v.GetInt("ingest.import_queue_timeout_ms"),
+			WaitVisibleEnabled:     v.GetBool("ingest.wait_visible_enabled"),
 		},
 		Cache: CacheConfig{
 			Enabled:    v.GetBool("cache.enabled"),
@@ -2133,6 +2140,8 @@ func Load() (*Config, error) {
 		cfg.Warnings = append(cfg.Warnings, *w)
 	}
 
+	cfg.Warnings = append(cfg.Warnings, waitVisibleWarnings(cfg)...)
+
 	cfg.ConfigFile = v.ConfigFileUsed()
 	if w := shadowedConfigFilesWarning(cfg.ConfigFile); w != nil {
 		cfg.Warnings = append(cfg.Warnings, *w)
@@ -2717,7 +2726,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.default_decimal_columns", "")
 	v.SetDefault("ingest.import_write_concurrency", 0) // 0 = auto (#1429)
 	v.SetDefault("ingest.import_queue_timeout_ms", 30000)
-	v.SetDefault("ingest.max_buffered_bytes", "0") // off; "auto" = half the memory limit (#1468)
+	v.SetDefault("ingest.max_buffered_bytes", "0")     // off; "auto" = half the memory limit (#1468)
+	v.SetDefault("ingest.wait_visible_enabled", false) // x-arc-wait: visible refused with 403 (#1759)
 
 	// Log defaults
 	v.SetDefault("log.level", "info")
@@ -3922,4 +3932,41 @@ func (c *Config) checkIcebergGlue() error {
 		return fmt.Errorf("iceberg.glue.sync_interval must be >= 5 seconds (got %d)", g.SyncInterval)
 	}
 	return nil
+}
+
+// waitVisibleMaxBufferAgeMS is the largest ingest.max_buffer_age_ms that
+// leaves a write waiting with x-arc-wait: visible half its 20 s budget
+// (#1759).
+const waitVisibleMaxBufferAgeMS = 10000
+
+// waitVisibleWarnings are the advisories for ingest.wait_visible_enabled
+// (#1759), each only with the key on.
+func waitVisibleWarnings(cfg *Config) []LoadWarning {
+	if !cfg.Ingest.WaitVisibleEnabled {
+		return nil
+	}
+	var out []LoadWarning
+	if cfg.Cluster.Enabled {
+		out = append(out, LoadWarning{
+			Key:     "ingest.wait_visible_enabled",
+			Value:   "true",
+			Message: "ingest.wait_visible_enabled has no effect with cluster.enabled = true: a write carrying x-arc-wait: visible is refused with 400 and nothing written",
+		})
+	}
+	// The same test as the handlers' storageConfirmable (api.WaitVisibleConfig).
+	if b := cfg.Storage.Backend; b != "local" {
+		out = append(out, LoadWarning{
+			Key:     "storage.backend",
+			Value:   b,
+			Message: "ingest.wait_visible_enabled = true on object storage: a write carrying x-arc-wait: visible still waits for its rows' flush, then is answered 202 (storage_not_confirmable); only local storage confirms visibility in this version",
+		})
+	}
+	if cfg.Ingest.MaxBufferAgeMS > waitVisibleMaxBufferAgeMS {
+		out = append(out, LoadWarning{
+			Key:     "ingest.max_buffer_age_ms",
+			Value:   strconv.Itoa(cfg.Ingest.MaxBufferAgeMS),
+			Message: fmt.Sprintf("ingest.max_buffer_age_ms is above %d with ingest.wait_visible_enabled = true: a write carrying x-arc-wait: visible waits for its rows' age or size flush, at most 20 s, so on a measurement that does not reach ingest.max_buffer_size within the age it can be answered 202 (timeout) instead of 204", waitVisibleMaxBufferAgeMS),
+		})
+	}
+	return out
 }

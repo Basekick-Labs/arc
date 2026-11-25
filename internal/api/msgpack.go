@@ -99,6 +99,9 @@ type MsgPackHandler struct {
 
 	// Cluster routing support
 	router *cluster.Router
+
+	// waitVisible serves x-arc-wait: visible (#1759); nil: off.
+	waitVisible *WaitVisible
 }
 
 // NewMsgPackHandler creates a new MessagePack handler
@@ -130,6 +133,11 @@ func (h *MsgPackHandler) SetAuthAndRBAC(authManager *auth.AuthManager, rbacManag
 // When set, write requests from reader nodes will be forwarded to writer nodes.
 func (h *MsgPackHandler) SetRouter(router *cluster.Router) {
 	h.router = router
+}
+
+// SetWaitVisible sets the node's x-arc-wait: visible support (#1759).
+func (h *MsgPackHandler) SetWaitVisible(wv *WaitVisible) {
+	h.waitVisible = wv
 }
 
 // extractMeasurements extracts unique measurement names from decoded msgpack records.
@@ -193,6 +201,11 @@ func (h *MsgPackHandler) RegisterRoutes(app *fiber.App) {
 
 // writeMsgPack handles MessagePack binary write requests
 func (h *MsgPackHandler) writeMsgPack(c *fiber.Ctx) error {
+	// x-arc-wait (#1759): refused here, before anything is forwarded or read.
+	vw, handled, err := h.waitVisible.begin(c)
+	if handled {
+		return err
+	}
 	// Check if this request should be forwarded to a writer node
 	// Reader nodes cannot process writes locally, so they forward to writers
 	switch WriteForwardDecision(h.router, c) {
@@ -436,6 +449,18 @@ localProcessing:
 		}
 	}
 
+	// A visible write counts the rows it writes before the write, and takes
+	// its waiter slot (#1759): refused there, nothing is written.
+	var rows int64
+	var rowsKnown bool
+	if list, ok := records.([]interface{}); ok && vw != nil {
+		rows, rowsKnown = ingest.BatchRows(list)
+	}
+	if !vw.acquire() {
+		return respondIngestRefused(c, ingest.ErrWaitVisibleBusy)
+	}
+	defer vw.release()
+
 	// Admit the whole request, its size reserved against the WAL volume's
 	// free space (#676); a fence or disk pressure refuses it here.
 	writeCtx, release, aerr := h.arrowBuffer.AdmitRequest(ctx, int64(len(payload)))
@@ -443,6 +468,7 @@ localProcessing:
 		return respondWriteRefused(c, aerr)
 	}
 	defer release()
+	writeCtx = vw.context(writeCtx)
 	err = msgpackWrite(h.arrowBuffer, writeCtx, database, records)
 	// Checked first: the batch failed after part of it was buffered (#1437),
 	// so neither the drops answer nor the cause's own answer (a refusal says
@@ -455,6 +481,7 @@ localProcessing:
 		m := metrics.Get()
 		m.IncMsgPackRecords(ws.RecordsWritten)
 		m.IncIngestRecords(ws.RecordsWritten)
+		vw.notWaited(c, visibleReasonStopped)
 		return respondWriteStopped(c, h.logger, "MessagePack", database, ws)
 	}
 	var rowDrops *ingest.PointsDroppedError
@@ -522,7 +549,19 @@ localProcessing:
 
 	if dropped > 0 {
 		logPointDrops(h.logger, "MessagePack", database, drops)
+		vw.notWaited(c, visibleReasonPartial)
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": partialWriteMessage(drops, dropped, true)})
+	}
+
+	if vw != nil {
+		// The wait holds nothing admission stopped counting: the WAL
+		// reservation is released and the request body returned to its pool,
+		// as when a handler returns (the decoded records and the WAL copied
+		// what they keep, see above). Nothing below reads payload, records or
+		// rawBody.
+		release()
+		c.Request().ResetBody()
+		return vw.answer(c, rows, rowsKnown)
 	}
 
 	// Return 204 No Content (InfluxDB compatible)
