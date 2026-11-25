@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"github.com/google/uuid"
 	"math"
 	"net"
 	"net/url"
@@ -705,6 +706,16 @@ type TelemetryConfig struct {
 	Enabled         bool   // Enable telemetry (default: true)
 	Endpoint        string // Telemetry endpoint URL
 	IntervalSeconds int    // Reporting interval in seconds (default: 86400 = 24h)
+	// InstanceID, when set, is this installation's telemetry id (#1885): a
+	// UUID, stored in canonical form, used instead of the id file, so a
+	// deployment without a persistent disk keeps one id. Must be unique per
+	// node; on a cluster, main derives one per node from it and
+	// cluster.node_id. Empty: the id file in DataDir.
+	InstanceID string
+	// DataDir is where the id file (.instance_id) lives when InstanceID is
+	// empty (#1885). Default "./data", relative to the working directory; it
+	// does not follow auth.db_path or storage.local_path.
+	DataDir string
 }
 
 type DeleteConfig struct {
@@ -1582,6 +1593,8 @@ func Load() (*Config, error) {
 			Enabled:         v.GetBool("telemetry.enabled"),
 			Endpoint:        v.GetString("telemetry.endpoint"),
 			IntervalSeconds: v.GetInt("telemetry.interval_seconds"),
+			InstanceID:      strings.TrimSpace(v.GetString("telemetry.instance_id")),
+			DataDir:         strings.TrimSpace(v.GetString("telemetry.data_dir")),
 		},
 		Delete: DeleteConfig{
 			Enabled:               v.GetBool("delete.enabled"),
@@ -2116,6 +2129,10 @@ func Load() (*Config, error) {
 	cfg.ConfigFile = v.ConfigFileUsed()
 	if w := shadowedConfigFilesWarning(cfg.ConfigFile); w != nil {
 		cfg.Warnings = append(cfg.Warnings, *w)
+	}
+
+	if err := normalizeTelemetry(&cfg.Telemetry); err != nil {
+		return nil, err
 	}
 
 	w, err := normalizeBootstrapToken(&cfg.Auth)
@@ -2815,6 +2832,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("telemetry.enabled", true)                                               // Enabled by default (opt-out)
 	v.SetDefault("telemetry.endpoint", "https://telemetry.basekick.net/api/v1/telemetry") // Telemetry endpoint
 	v.SetDefault("telemetry.interval_seconds", 86400)                                     // 24 hours
+	v.SetDefault("telemetry.instance_id", "")                                             // "" = the id file in telemetry.data_dir (#1885)
+	v.SetDefault("telemetry.data_dir", "./data")                                          // where the id file lives (#1885)
 
 	// Delete defaults
 	v.SetDefault("delete.enabled", false)                // Disabled by default for safety
@@ -3065,6 +3084,34 @@ func setDefaults(v *viper.Viper) {
 	// The value both backup and restore were hardcoded to before #1085, so
 	// leaving it unset changes nothing.
 	v.SetDefault("backup.operation_timeout", "2h")
+}
+
+// normalizeTelemetry checks telemetry.instance_id and fills an empty
+// telemetry.data_dir (#1885). The id must be a UUID: the telemetry pages
+// promise a random UUID not linked to anything, and every count on the
+// server is a count of distinct ids, so a free-form value ("prod") would
+// merge unrelated installations. Stored in canonical form, so case and
+// braces do not make two ids of one. Checked only with telemetry on; with it
+// off the keys are never read.
+func normalizeTelemetry(t *TelemetryConfig) error {
+	if t.DataDir == "" {
+		t.DataDir = "./data"
+	}
+	if !t.Enabled || t.InstanceID == "" {
+		return nil
+	}
+	id, err := uuid.Parse(t.InstanceID)
+	if err != nil {
+		return fmt.Errorf("telemetry.instance_id (ARC_TELEMETRY_INSTANCE_ID) must be a UUID; generate one with uuidgen, and give each node its own")
+	}
+	// Placeholders anyone might copy would merge every installation that used
+	// them: the nil and max UUIDs, and the textbook example.
+	switch id {
+	case uuid.Nil, uuid.Max, uuid.MustParse("550e8400-e29b-41d4-a716-446655440000"):
+		return fmt.Errorf("telemetry.instance_id (ARC_TELEMETRY_INSTANCE_ID) is a placeholder UUID (%s); generate your own with uuidgen", id)
+	}
+	t.InstanceID = id.String()
+	return nil
 }
 
 // fipsBuild is fips.BuildTagged; a variable so the refusal below can be

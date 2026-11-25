@@ -561,6 +561,14 @@ enabled = false
 # -----------------------------------------------------------------------------
 [telemetry]
 enabled = true
+# instance_id = ""        # a UUID (uuidgen) to use instead of the id file, for a
+#                         # deployment without a persistent disk. Standalone: give
+#                         # each installation its own. On a cluster Arc derives one
+#                         # per node from it and cluster.node_id (or the host name
+#                         # when node_id is unset). Do not copy one from an example.
+# data_dir = "./data"     # where the id file (.instance_id) lives when instance_id
+#                         # is empty; relative to the working directory, not to
+#                         # auth.db_path
 
 # -----------------------------------------------------------------------------
 # Tiered Storage (Enterprise)
