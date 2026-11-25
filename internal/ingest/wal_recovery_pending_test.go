@@ -6,8 +6,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// MarkWALRecoveryPending used to set hasFlushFailure, whose other reader is the
-// shutdown WAL purge. So any startup that kept a WAL file made every later
+// MarkWALRecoveryPending used to set the flush-failure flag, whose other reader
+// is the shutdown WAL purge. So any startup that kept a WAL file made every later
 // shutdown log, at Error, "buffer flush did not complete cleanly on shutdown …
 // Investigate the buffer flush errors logged above" — pointing the operator at
 // logs that do not exist. Retention was right; the attribution was not.
@@ -28,7 +28,7 @@ func TestWALRecoveryPendingRetainsWithoutClaimingAFlushFailure(t *testing.T) {
 	require.True(t, b.HasFlushFailure(), "the maintenance tick must still arm recovery")
 	require.False(t, b.CloseFlushedCleanly(), "the WAL must still be retained")
 	require.True(t, b.RetainedForWALRecoveryOnly(), "the shutdown purge must be able to name the real cause")
-	require.False(t, b.hasFlushFailure.Load(), "a kept file is not a flush failure")
+	require.False(t, b.flushFailed(), "a kept file is not a flush failure")
 }
 
 // A genuine flush failure keeps the Error: it is the one that means records are
@@ -89,13 +89,13 @@ func TestResetFlushFailureClearsBothReasons(t *testing.T) {
 // the pass was running bumps it, and the reset then refuses rather than
 // declaring the WAL disposable.
 //
-// This is also why the double-check inside ResetFlushFailure restores
-// hasFlushFailure to TRUE rather than to a snapshot: the only writer that can
-// bump the generation in that window is markFlushFailure from a live flush
-// worker, so a mismatch IS a real flush failure, and a snapshot of `false`
-// would erase it. That branch is only reachable by a genuine race — the early
-// return below catches every sequential ordering — so it is pinned by the
-// invariant check that follows, not by a deterministic case.
+// A refused reset keeps each reason exactly as it was. The reset used to clear
+// both flags, re-check the generation and restore the flush flag to TRUE
+// rather than to a snapshot, since a mismatch there meant a real flush failure
+// (#1170); a reader between the clear and the restore saw the latch clear
+// (#1938). The reset is now one swap of the latch word, so there is no clear
+// to restore from; the race is pinned deterministically by
+// TestResetFlushFailureNeverShowsAClearLatchOverAConcurrentFailure1938.
 func TestResetFlushFailureRefusesAStaleGeneration(t *testing.T) {
 	b := &ArrowBuffer{}
 	b.closeFlushClean.Store(true)
@@ -106,9 +106,9 @@ func TestResetFlushFailureRefusesAStaleGeneration(t *testing.T) {
 	b.markFlushFailure()
 
 	require.False(t, b.ResetFlushFailure(stale))
-	require.True(t, b.hasFlushFailure.Load(),
+	require.True(t, b.flushFailed(),
 		"a flush failure that arrived during recovery must survive a stale reset")
-	require.True(t, b.walRecoveryPending.Load(),
+	require.True(t, b.recoveryPending(),
 		"the recovery reason was still outstanding and must survive too")
 	require.False(t, b.CloseFlushedCleanly())
 	require.False(t, b.RetainedForWALRecoveryOnly())
