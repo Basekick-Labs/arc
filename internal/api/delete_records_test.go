@@ -178,7 +178,8 @@ func (c *recordingCoordinator) WaitLocalFiles(_ context.Context, db, m string, _
 
 type recordingFlusher struct {
 	events  *[]string
-	failure bool
+	failure bool // the latch's flush-failure reason
+	pending bool // the latch's recovery-pending reason
 	err     error
 }
 
@@ -186,7 +187,12 @@ func (f *recordingFlusher) FlushScopeAndWait(_ context.Context, db, m string) (m
 	*f.events = append(*f.events, "flush "+db+"/"+m)
 	return map[string]uint64{db + "/" + m: 4}, f.err
 }
-func (f *recordingFlusher) HasFlushFailure() bool { return f.failure }
+func (f *recordingFlusher) FlushFailureState() (bool, bool, uint64) {
+	return f.failure, f.pending, 0
+}
+func (f *recordingFlusher) FlushScopeAndWaitSince(ctx context.Context, db, m string, _ uint64) (map[string]uint64, error) {
+	return f.FlushScopeAndWait(ctx, db, m)
+}
 
 func TestDeleteRecordsTheDeleteBeforeRewriting(t *testing.T) {
 	shortGiveUp(t, 100*time.Millisecond)

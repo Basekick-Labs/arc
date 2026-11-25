@@ -36,12 +36,15 @@ type Metrics struct {
 	// drainer acts on, so a value that stays non-zero while the queue has room
 	// means the drainer is not keeping up (or is wedged).
 	//
-	// Exported as arc_buffer_deferred_buffers, NOT arc_ingest_*: in this file
-	// arc_ingest_* is uniformly counters and arc_buffer_* holds the buffer-state
-	// gauges (arc_buffer_queue_depth, arc_buffer_records_buffered,
+	// Exported as arc_buffer_deferred_buffers, NOT arc_ingest_*: arc_buffer_*
+	// holds the buffer-state gauges (arc_buffer_queue_depth, arc_buffer_records_buffered,
 	// arc_buffer_records_queued, arc_buffer_records_inflight), which this sits
 	// beside and is published alongside.
 	bufferDeferredBuffers atomic.Int64
+	// flushFailureLatchAgeNS is a GAUGE (arc_ingest_flush_failure_latch_age_seconds):
+	// how long the WAL recovery latch has been set (#1938), 0 while clear and
+	// with the WAL off. While it is set, DELETEs and database drops that flush this node's buffer are refused (on shared storage, also those issued on other nodes).
+	flushFailureLatchAgeNS atomic.Int64
 
 	// MessagePack specific
 	msgpackRequestsTotal atomic.Int64
@@ -631,6 +634,10 @@ func (m *Metrics) IncIngestFlushDeferred()      { m.ingestFlushDeferred.Add(1) }
 
 // SetBufferDeferredBuffers publishes the current deferred-buffer count.
 func (m *Metrics) SetBufferDeferredBuffers(n int64) { m.bufferDeferredBuffers.Store(n) }
+
+// SetFlushFailureLatchAge publishes how long the WAL recovery latch has been
+// set (0 = clear).
+func (m *Metrics) SetFlushFailureLatchAge(d time.Duration) { m.flushFailureLatchAgeNS.Store(int64(d)) }
 
 // MessagePack Metrics
 func (m *Metrics) IncMsgPackRequests()           { m.msgpackRequestsTotal.Add(1) }
@@ -1438,6 +1445,8 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"ingest_flush_deferred_total": m.ingestFlushDeferred.Load(),
 		"buffer_deferred_buffers":     m.bufferDeferredBuffers.Load(),
 
+		"ingest_flush_failure_latch_age_seconds": float64(m.flushFailureLatchAgeNS.Load()) / float64(time.Second),
+
 		// MessagePack
 		"msgpack_requests_total": m.msgpackRequestsTotal.Load(),
 		"msgpack_records_total":  m.msgpackRecordsTotal.Load(),
@@ -1789,6 +1798,9 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_buffer_deferred_buffers Buffers currently holding records that no flush worker could take\n"...)
 	b = append(b, "# TYPE arc_buffer_deferred_buffers gauge\n"...)
 	b = appendMetric(b, "arc_buffer_deferred_buffers", float64(m.bufferDeferredBuffers.Load()))
+	b = append(b, "# HELP arc_ingest_flush_failure_latch_age_seconds How long the WAL recovery latch has been set, during which DELETEs and database drops that flush this node's buffer are refused; 0 when clear or with the WAL off\n"...)
+	b = append(b, "# TYPE arc_ingest_flush_failure_latch_age_seconds gauge\n"...)
+	b = appendMetric(b, "arc_ingest_flush_failure_latch_age_seconds", float64(m.flushFailureLatchAgeNS.Load())/float64(time.Second))
 
 	// MessagePack metrics
 	b = append(b, "# HELP arc_msgpack_requests_total Total MessagePack requests\n"...)

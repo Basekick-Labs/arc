@@ -2,6 +2,26 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: a DELETE could miss a flush failure, and a WAL recovery pass could clear the failure while its rows were still only in the WAL ([#1938](https://github.com/Basekick-Labs/arc/issues/1938))
+
+**Who is affected:** builds of `main` with the WAL on (`wal.enabled`).
+
+A DELETE (and dropping a database) refuses while a flush failure is waiting for WAL recovery, because recovery would bring the failed rows back. A failure in a short window just before the DELETE flushed its scope, or while a recovery pass was clearing the failure state, was not seen: the DELETE went ahead, and the next recovery pass restored the matching rows. Separately, a recovery pass could count a flush that failed during the pass as already handled and clear the failure state, although that flush's rows were only in the newest WAL file, which the pass does not read. A clean shutdown then deleted the WAL, and those rows with it.
+
+All three are closed:
+
+- The DELETE reads the failure state once, and its flush fails if any flush failed after that reading. The same holds for the flush a shared-storage DELETE asks of the other nodes.
+- Clearing the failure state is one atomic step that fails if anything was marked since the pass read it, so it can no longer hide a failure that arrives at the same moment.
+- A recovery pass reads the failure state before it rotates the WAL, so a flush that fails after the pass started keeps the state set for the next pass. Such a failure now keeps DELETEs refused for one more pass (`wal.recovery_interval_seconds`).
+
+A DELETE refused because a recovery pass left WAL files to replay now says so ("a WAL recovery pass left files to replay; retry after the next pass"), instead of reporting a flush failure. The status code is unchanged (503).
+
+New metric `arc_ingest_flush_failure_latch_age_seconds` (gauge): how long the failure state has been set, during which DELETEs and database drops that flush this node's buffer are refused (on shared storage, also those issued on other nodes). It is 0 when clear and with the WAL off, sampled once a second. A state that clears and is set again within one second reads as one continuing period.
+
+`wal.recovery_interval_seconds` must be greater than 0 when `wal.enabled = true`: Arc now refuses to start with a clear error instead of panicking when the recovery pass starts.
+
+**Cost.** None on the write or successful flush path: a failed flush does one atomic compare-and-swap, a DELETE one atomic read.
+
 ## New: query latency and outcomes per engine (DuckDB, arcx) ([#1292](https://github.com/Basekick-Labs/arc/pull/1292), [#823](https://github.com/Basekick-Labs/arc/issues/823))
 
 **Who is affected:** anyone scraping Arc's Prometheus metrics, or reading `/api/v1/metrics`.

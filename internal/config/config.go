@@ -1873,6 +1873,12 @@ func Load() (*Config, error) {
 	// The covered append (cluster.wal_coverage) commits under the ingest shard
 	// lock, where waiting for a sync would stall every writer to that
 	// measurement: durable acknowledgement does not support it yet.
+	// The periodic recovery pass ticks at this interval; time.NewTicker panics
+	// on a value <= 0, and a DELETE refused after a flush failure waits for
+	// that pass (#1938).
+	if cfg.WAL.Enabled && cfg.WAL.RecoveryIntervalSeconds <= 0 {
+		return nil, fmt.Errorf("wal.recovery_interval_seconds must be > 0 with wal.enabled = true (got %d)", cfg.WAL.RecoveryIntervalSeconds)
+	}
 	if !cfg.WAL.Enabled && cfg.WAL.AckMode == "durable" {
 		cfg.Warnings = append(cfg.Warnings, LoadWarning{
 			Key:     "wal.ack_mode",

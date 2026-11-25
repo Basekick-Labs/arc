@@ -24,7 +24,8 @@ import (
 type fakeScopeFlusher struct {
 	mu      sync.Mutex
 	scopes  []string
-	failed  bool
+	failed  bool // the latch's flush-failure reason
+	pending bool // the latch's recovery-pending reason
 	err     error
 	onFlush func()
 }
@@ -40,7 +41,11 @@ func (f *fakeScopeFlusher) FlushScopeAndWait(_ context.Context, database, measur
 	return nil, f.err
 }
 
-func (f *fakeScopeFlusher) HasFlushFailure() bool { return f.failed }
+func (f *fakeScopeFlusher) FlushFailureState() (bool, bool, uint64) { return f.failed, f.pending, 0 }
+
+func (f *fakeScopeFlusher) FlushScopeAndWaitSince(ctx context.Context, database, measurement string, _ uint64) (map[string]uint64, error) {
+	return f.FlushScopeAndWait(ctx, database, measurement)
+}
 
 func (f *fakeScopeFlusher) asked() []string {
 	f.mu.Lock()

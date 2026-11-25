@@ -1654,11 +1654,24 @@ func main() {
 						// that was cleared from buffers after failed flush
 						walLogger.Info().Msg("Flush failure detected, attempting WAL recovery")
 
-						// ORDER MATTERS, and it is: rotate, barrier, read
-						// checkpoints, purge, recover.
+						// ORDER MATTERS, and it is: read the failure
+						// generation, rotate, barrier, read checkpoints, purge,
+						// recover.
 						//
-						// Rotation comes FIRST so that every append racing this
-						// pass lands in a file whose fate this pass decides.
+						// The expected generation is read first, before the
+						// rotation: a flush failing after the rotation holds
+						// rows in the new active file, which this pass skips;
+						// reading the generation later absorbs that failure,
+						// and the reset would clear the latch over rows that
+						// exist only in the WAL, which a clean shutdown then
+						// purges (#1938). A failure before this read holds rows
+						// appended before the rotation, in files this pass
+						// scans. A failure after it keeps the latch for one
+						// more pass, even when its rows were replayed here.
+						//
+						// Rotation comes before the barrier so that every
+						// append racing this pass lands in a file whose fate
+						// this pass decides.
 						// Barriering first instead leaves a window — between the
 						// barrier returning and the rotation command being
 						// dequeued — in which a tracked append lands in the
@@ -1667,6 +1680,7 @@ func main() {
 						// replays an entry no checkpoint covers into a buffer
 						// that still holds the live copy, and nothing
 						// de-duplicates rows.
+						failureGeneration := arrowBuffer.FlushFailureGeneration()
 						previousActiveFile := ""
 						activeFile := ""
 						var activeCheckpointHashes []string
@@ -1700,6 +1714,9 @@ func main() {
 							walLogger.Error().Err(err).Msg("WAL recovery pre-barrier failed; retaining WAL files for the next pass")
 							continue
 						}
+						if walRecoveryAfterPreBarrier != nil {
+							walRecoveryAfterPreBarrier()
+						}
 
 						if walWriter != nil {
 							// Read AFTER the barrier, so the checkpoints it just
@@ -1717,7 +1734,6 @@ func main() {
 								walLogger.Info().Int("deleted", deleted).Msg("Purged old WAL files before recovery")
 							}
 						}
-						failureGeneration := arrowBuffer.FlushFailureGeneration()
 						stats, err := walRecovery.RecoverWithOptions(walMaintenanceCtx, recoveryCallback, &wal.RecoveryOptions{
 							SkipActiveFile:                 activeFile,
 							AdditionalCheckpointHashes:     activeCheckpointHashes,
@@ -7163,6 +7179,12 @@ func newRegistrationOutbox(cfg *config.Config, clusteringLicensed bool, logger z
 	return r
 }
 
+// walRecoveryAfterPreBarrier, when set, runs in the periodic WAL recovery pass
+// right after its pre-barrier. Nil in every build Arc ships: only the
+// test-only build tag arc_seam_1938 (seam_1938_pass_pause.go) sets it, to
+// pause a pass in a binary run of #1938's W3 window.
+var walRecoveryAfterPreBarrier func()
+
 // The coordinator is what a DELETE asks to flush the other nodes (#1265).
 var _ api.PeerFlusher = (*cluster.Coordinator)(nil)
 
@@ -7172,10 +7194,16 @@ var _ api.PeerFlusher = (*cluster.Coordinator)(nil)
 // them back after it. Without a WAL there is no recovery: the rows of a
 // failed flush are gone, and the latch, which only recovery clears, would
 // refuse every DELETE on this node, and in shared storage on every node,
-// until a restart.
+// until a restart. So FlushFailureState reports neither reason; its
+// generation is still the buffer's, so a flush failing between that read and
+// the DELETE's flush refuses the DELETE (#1938), as one failing during the
+// flush always did.
 type noWALDeleteFlusher struct{ *ingest.ArrowBuffer }
 
-func (noWALDeleteFlusher) HasFlushFailure() bool { return false }
+func (f noWALDeleteFlusher) FlushFailureState() (flushFailed, recoveryPending bool, generation uint64) {
+	_, _, generation = f.ArrowBuffer.FlushFailureState()
+	return false, false, generation
+}
 
 // deleteFlusher is the buffer a DELETE flushes before it scans.
 func deleteFlusher(buffer *ingest.ArrowBuffer, walWriter *wal.Writer) cluster.DeleteScopeFlusher {
