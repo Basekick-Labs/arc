@@ -731,3 +731,119 @@ func TestVisibleForceRetriesAfterItsOwnSettle1759(t *testing.T) {
 		t.Fatalf("k2 asked %d times, want 3: over budget in round 1, again in the round k1's settle woke, then once on the short retry", n)
 	}
 }
+
+// A settle whose token merged into Seal's (the channel was full) before the
+// drain is not lost: the loop re-reads Resolved after the drain.
+func TestVisibleSettleMergedIntoSealTokenNotLost1759(t *testing.T) {
+	o := NewVisibleOutcome(time.Now(), false, 0)
+	visibleBatch(o, 3, true)
+	visibleBatch(o, 3, true)
+	noteVisibleKey(o, "db/k")
+	o.Seal() // a token in the channel
+	// Batch 1 settles: its signal is dropped, the channel is full.
+	o.vis.settledRows.Add(3)
+	o.vis.settledBatches.Add(1)
+	o.vis.signal()
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		o.vis.settledRows.Add(3)
+		o.vis.settledBatches.Add(1)
+		o.vis.signal()
+	}()
+	if v := forceWait(o, 6, fixedForcer(NotWanted), time.Second, 3*time.Second); !v.Visible || v.Waited > time.Second {
+		t.Fatalf("%+v", v)
+	}
+}
+
+// scriptForcer answers per key from a script of results (the last repeats).
+// A NotDue answer is due after the key's delay, and the key answers NotDue to
+// anyone until then; Forced settles every batch.
+type scriptForcer struct {
+	mu     sync.Mutex
+	o      *FlushOutcome
+	script map[string][]ForceResult
+	delay  map[string]time.Duration
+	calls  map[string]int
+	rows   int64
+	due    map[string]time.Time
+	steps  map[string]int
+}
+
+func newScriptForcer(o *FlushOutcome, rows int64, script map[string][]ForceResult, delay map[string]time.Duration) *scriptForcer {
+	return &scriptForcer{o: o, rows: rows, script: script, delay: delay,
+		calls: map[string]int{}, due: map[string]time.Time{}, steps: map[string]int{}}
+}
+
+func (s *scriptForcer) callsOf(key string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls[key]
+}
+
+func (s *scriptForcer) ForceFlushKey(key string, _ time.Duration, _ ForceSource, _ func([]interface{}) bool) (ForceResult, time.Time) {
+	s.mu.Lock()
+	s.calls[key]++
+	if d, ok := s.due[key]; ok && time.Now().Before(d) {
+		s.mu.Unlock()
+		return NotDue, d
+	}
+	sc := s.script[key]
+	r := sc[min(s.steps[key], len(sc)-1)]
+	s.steps[key]++
+	if r == NotDue {
+		s.due[key] = time.Now().Add(s.delay[key])
+	}
+	d := s.due[key]
+	s.mu.Unlock()
+	switch r {
+	case NotDue:
+		return NotDue, d
+	case Forced:
+		go func() {
+			v := s.o.vis
+			v.settledRows.Add(s.rows)
+			v.settledBatches.Add(v.markedBatches.Load() - v.settledBatches.Load())
+			v.signal()
+		}()
+	}
+	return r, time.Time{}
+}
+
+// A not-due key after an over-budget one keeps its due timer: the round that
+// ends on the over-budget key still arms the timer for the keys after it.
+func TestVisibleForceOverBudgetKeepsTheRestsDueTimer1759(t *testing.T) {
+	o := NewVisibleOutcome(time.Now(), false, 0)
+	visibleBatch(o, 3, true)
+	noteVisibleKey(o, "db/k0")
+	visibleBatch(o, 3, true)
+	noteVisibleKey(o, "db/k1")
+	sf := newScriptForcer(o, 6,
+		map[string][]ForceResult{"db/k0": {NotDue, OverBudget, NotWanted}, "db/k1": {NotDue, Forced}},
+		map[string]time.Duration{"db/k0": 30 * time.Millisecond, "db/k1": 150 * time.Millisecond})
+	if v := forceWait(o, 6, sf, time.Second, 2*time.Second); !v.Visible || v.Waited > time.Second {
+		t.Fatalf("%+v (k0 %d calls, k1 %d): k1's due timer was lost when k0 was over budget", v, sf.callsOf("db/k0"), sf.callsOf("db/k1"))
+	}
+}
+
+// A not-due key is not asked again before its due time, however many rounds
+// run (the B8/B9 "a not-due key costs no call" property).
+func TestVisibleForceNotDueKeyNotAskedBeforeItsDue1759(t *testing.T) {
+	o := NewVisibleOutcome(time.Now(), false, 0)
+	visibleBatch(o, 3, true)
+	noteVisibleKey(o, "db/k")
+	sf := newScriptForcer(o, 3,
+		map[string][]ForceResult{"db/k": {NotDue, Forced}},
+		map[string]time.Duration{"db/k": 300 * time.Millisecond})
+	go func() {
+		for i := 0; i < 5; i++ {
+			time.Sleep(20 * time.Millisecond)
+			o.vis.signal()
+		}
+	}()
+	if v := forceWait(o, 3, sf, time.Second, 2*time.Second); !v.Visible {
+		t.Fatalf("%+v", v)
+	}
+	if n := sf.callsOf("db/k"); n != 2 {
+		t.Fatalf("k asked %d times, want 2 (once, then at its due): a not-due key is not asked at rounds before its due", n)
+	}
+}
