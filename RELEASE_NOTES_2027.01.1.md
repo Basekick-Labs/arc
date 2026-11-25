@@ -2,6 +2,23 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Change: on a cluster, the Iceberg export picks up a file as soon as it reaches the exporting node ([#1756](https://github.com/Basekick-Labs/arc/issues/1756))
+
+**Who is affected:** clusters with the Iceberg export on.
+
+On a cluster only one node exports, and a file written on another node waited for the exporting node's
+next timed pass (`iceberg.reconcile_interval`, 5 minutes by default) before it was in the table. Now a
+file that reaches the exporting node from another (pulled onto its disk on local storage, or
+registered in the shared bucket) asks for an export of its table, as an ingest flush does on a
+standalone node (`iceberg.ingest_export_interval`; on local storage it appends just the new files
+when `iceberg.ingest_append_enabled` is on, on a shared bucket it runs a pass of the table).
+The export of a table then follows within `iceberg.ingest_export_interval` (60 seconds by default),
+as on a standalone node. Measured on a three-node cluster with local storage, a row written on one
+node was in the exporting node's table 58 seconds after its flush at the default (8 seconds with the
+interval at 10, under a second for a table's first file), against 276–300 seconds before. On local
+storage, rows written on the exporting node itself still wait for its timed pass (#1902).
+`iceberg.ingest_export_interval = 0` keeps the timed passes only.
+
 ## Fix: files a backup restore writes are read at once ([#1764](https://github.com/Basekick-Labs/arc/issues/1764))
 
 **Who is affected:** anyone restoring data files from a backup into measurements that already have

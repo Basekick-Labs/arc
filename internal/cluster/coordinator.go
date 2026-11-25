@@ -177,6 +177,9 @@ type Coordinator struct {
 	// filePublished tells this node's query caches about a file it gained
 	// (SetFilePublished, #1763).
 	filePublished atomic.Pointer[func(database, measurement string, partitionTime time.Time)]
+	// icebergArrived asks the Iceberg export for a table a file reached this
+	// node of (SetIcebergFileArrived, #1756).
+	icebergArrived atomic.Pointer[func(database, measurement, path string, sizeBytes int64)]
 	// rehomeLocalExclusions: re-home exclusions come from this node's own
 	// records only (SetRehomeLocalExclusions, #1860).
 	rehomeLocalExclusions atomic.Bool
@@ -5979,9 +5982,19 @@ func (c *Coordinator) SetFilePublished(fn func(database, measurement string, par
 	}
 }
 
+// SetIcebergFileArrived sets what asks this node's Iceberg export for an
+// export of a table when a file of it reaches this node from another (#1756):
+// with the reports of SetFilePublished, from the same two places. O(1), never
+// blocks.
+func (c *Coordinator) SetIcebergFileArrived(fn func(database, measurement, path string, sizeBytes int64)) {
+	if c != nil && fn != nil {
+		c.icebergArrived.Store(&fn)
+	}
+}
+
 // reportFilePublished reports the file at path, named by its manifest entry.
 func (c *Coordinator) reportFilePublished(path string) {
-	if c.filePublished.Load() == nil || c.raftNode == nil {
+	if (c.filePublished.Load() == nil && c.icebergArrived.Load() == nil) || c.raftNode == nil {
 		return
 	}
 	fsm := c.raftNode.FSM()
@@ -5995,7 +6008,8 @@ func (c *Coordinator) reportFilePublished(path string) {
 
 func (c *Coordinator) reportFilePublishedEntry(e *raft.FileEntry) {
 	p := c.filePublished.Load()
-	if p == nil || e == nil || e.Database == "" || e.Measurement == "" {
+	a := c.icebergArrived.Load()
+	if (p == nil && a == nil) || e == nil || e.Database == "" || e.Measurement == "" {
 		return
 	}
 	// A compaction output or a DELETE rewrite replaces files of an hour that
@@ -6005,5 +6019,13 @@ func (c *Coordinator) reportFilePublishedEntry(e *raft.FileEntry) {
 	if e.CompactionJob != "" || rewriteStamp(e.Path) > 0 {
 		return
 	}
-	(*p)(e.Database, e.Measurement, e.PartitionTime)
+	if p != nil {
+		(*p)(e.Database, e.Measurement, e.PartitionTime)
+	}
+	if a != nil && !c.rehomeOwnsLocal(e.Path) {
+		// Not a re-home job's file: its outputs reach the table in the
+		// commit that removes its source (#1870), never appended on their
+		// own beside it.
+		(*a)(e.Database, e.Measurement, e.Path, e.SizeBytes)
+	}
 }

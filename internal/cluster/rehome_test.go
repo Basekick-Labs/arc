@@ -717,3 +717,56 @@ func TestRehomeSourceReplaced1870(t *testing.T) {
 		t.Fatalf("staged job replaced %v", got)
 	}
 }
+
+// #1756: a file that reaches this node from another asks the Iceberg export
+// for its table, without the query-cache report being set.
+func TestIcebergFileArrivedOnAPulledFile(t *testing.T) {
+	c := originRig(t, "writer-1", RoleWriter)
+	in := makeFileEntry("testdb/cpu/2026/10/12/10/x.parquet", []byte("x"), "writer-2")
+	in.CreatedAt = time.Now()
+	if err := c.raftNode.RegisterFile(in, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	c.SetIcebergFileArrived(func(db, m, path string, size int64) { got = append(got, db+"/"+m+" "+path) })
+	c.recordPulledFileInTiering(in.Path, in.SizeBytes)
+	if len(got) != 1 || got[0] != "testdb/cpu "+in.Path {
+		t.Fatalf("asked %v", got)
+	}
+}
+
+// #1756: a re-home job's output reaches the Iceberg table in the commit that
+// removes its source, never appended beside it: its arrival is not reported.
+func TestIcebergFileArrivedSkipsARehomeOutput(t *testing.T) {
+	c := originRig(t, "writer-1", RoleWriter)
+	inScope := append([]string{raft.CapabilityRehomeInScope}, rhList...)
+	capNodes(t, c, map[string][]string{"raft-1": inScope, "writer-1": inScope, "writer-2": inScope, "reader-1": inScope})
+	c.maybeEnableCompactionCommit()
+	waitFSM(t, c.CompactionCommitActive)
+	c.maybeEnableRehome()
+	waitFSM(t, c.raftNode.FSM().RehomeEnabled)
+	in := makeFileEntry("testdb/cpu/2026/10/12/10/x.parquet", []byte("x"), "writer-1")
+	in.CreatedAt = time.Now()
+	if err := c.raftNode.RegisterFile(in, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	out := "testdb/cpu/2026/10/11/10/cpu_20261124_150000_000000001.parquet"
+	raw, _ := json.Marshal(raft.StageRehomePayload{Job: "j1", Origin: "writer-1", Database: "testdb", Measurement: "cpu",
+		Source:  raft.CompactionInput{Path: in.Path, SizeBytes: in.SizeBytes, SHA256: in.SHA256},
+		Outputs: []raft.RehomeOutput{{Key: out, StagedKey: raft.RehomeStagedKey("j1", 0), SizeBytes: 1, SHA256: "s"}},
+		Now:     time.Now()})
+	if err := c.raftNode.Apply(&raft.Command{Type: raft.CommandStageRehome, Payload: raw}, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	c.SetIcebergFileArrived(func(_, _, path string, _ int64) { got = append(got, path) })
+	c.reportFilePublishedEntry(&raft.FileEntry{Path: out, Database: "testdb", Measurement: "cpu", SizeBytes: 1})
+	if len(got) != 0 {
+		t.Fatalf("a re-home output was reported: %v", got)
+	}
+	other := "testdb/cpu/2026/10/12/11/cpu_20261124_150001_000000001.parquet"
+	c.reportFilePublishedEntry(&raft.FileEntry{Path: other, Database: "testdb", Measurement: "cpu", SizeBytes: 1})
+	if len(got) != 1 || got[0] != other {
+		t.Fatalf("an ordinary file: %v", got)
+	}
+}
