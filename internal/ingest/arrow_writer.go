@@ -7425,7 +7425,11 @@ func (b *ArrowBuffer) flushAndWait(ctx context.Context, match func(key string) b
 		}
 		if b.FlushFailureGeneration() != generation {
 			if baseline != nil {
-				// A DELETE's flush (#1938): its rows wait for WAL recovery.
+				// A DELETE's flush (#1938). Without a WAL the failed flush's
+				// rows have no copy to recover from.
+				if !b.hasWAL.Load() {
+					return fmt.Errorf("a flush failed while the rows before the delete were flushed")
+				}
 				return fmt.Errorf("a flush failed while the rows before the delete were flushed; they wait for WAL recovery")
 			}
 			return fmt.Errorf("flush failed while waiting for WAL recovery barrier; retaining replayed files")
