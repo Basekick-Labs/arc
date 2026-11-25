@@ -188,6 +188,20 @@ func icebergIngestInterval(seconds int, hasCoordinator bool) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+// icebergOwnFlushReports reports whether this node's own ingest flushes ask
+// for Iceberg exports: on a standalone node with the ingest trigger on, and on
+// a cluster node with node-local storage (#1902), where the exporting node's
+// own files would otherwise wait for its timed pass (the gate drops the
+// request on the other nodes). Not on a cluster over a shared bucket: there
+// the registration of every file, the exporter's own included, reports as an
+// arrival (icebergArrivalInterval).
+func icebergOwnFlushReports(seconds int, hasCoordinator bool, storageType string) bool {
+	if seconds <= 0 {
+		return false
+	}
+	return !hasCoordinator || storageType == "local"
+}
+
 // icebergArrivalInterval is the spacing of exports a cluster node's export
 // asks for when a file reaches it from another node (#1756): a file
 // registered in a shared bucket, or a pulled file landing on local storage.

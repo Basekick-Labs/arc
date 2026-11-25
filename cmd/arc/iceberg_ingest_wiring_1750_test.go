@@ -26,7 +26,7 @@ func TestIngestFlushIsReportedToQueryCachesAndIceberg(t *testing.T) {
 		"IngestInterval: icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil) +",
 		"icebergArrivalInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil),",
 		"clusterCoordinator.SetIcebergFileArrived(",
-		"if icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil) > 0 {",
+		"if icebergOwnFlushReports(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil, storageBackend.Type()) {",
 	} {
 		if !strings.Contains(src, want) {
 			t.Errorf("main.go no longer has %q", want)
@@ -149,6 +149,28 @@ func TestIcebergArrivalIntervalIsOnlyOnAClusterNode(t *testing.T) {
 	} {
 		if got := icebergArrivalInterval(tc.seconds, tc.hasCoordinator); got != tc.want {
 			t.Errorf("icebergArrivalInterval(%d, %v) = %v, want %v", tc.seconds, tc.hasCoordinator, got, tc.want)
+		}
+	}
+}
+
+// #1902: a cluster node's own flushes report on local storage only.
+func TestIcebergOwnFlushReports(t *testing.T) {
+	for _, tc := range []struct {
+		seconds        int
+		hasCoordinator bool
+		storage        string
+		want           bool
+	}{
+		{60, false, "local", true},
+		{60, false, "s3", true},
+		{0, false, "local", false},
+		{60, true, "local", true},
+		{60, true, "s3", false},
+		{60, true, "azure", false},
+		{0, true, "local", false},
+	} {
+		if got := icebergOwnFlushReports(tc.seconds, tc.hasCoordinator, tc.storage); got != tc.want {
+			t.Errorf("icebergOwnFlushReports(%d, %v, %q) = %v, want %v", tc.seconds, tc.hasCoordinator, tc.storage, got, tc.want)
 		}
 	}
 }
