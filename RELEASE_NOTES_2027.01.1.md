@@ -35,8 +35,6 @@ storage root), and refuses the job with the error when that fails. A nearly full
 pass: the probe is a few bytes. On a cluster the exporting node
 runs the probe as part of its check before it acks the job.
 
-## Change: a compaction racing an Iceberg export no longer holds back the files ingest just wrote ([#1755](https://github.com/Basekick-Labs/arc/issues/1755))
-
 ## Change: a compaction racing an Iceberg export holds back fewer of the files ingest just wrote ([#1755](https://github.com/Basekick-Labs/arc/issues/1755))
 
 **Who is affected:** deployments with the Iceberg export on.
