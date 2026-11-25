@@ -34,11 +34,13 @@ import (
 //   - A new file in a day with no removal this pass (the free set) is not in the table, so no
 //     reader sees its rows yet. Every new file of that day is left for the next pass (the day's
 //     other files are, almost always, the same compaction's inputs, about to be deleted too); the
-//     rest of the pass goes on.
+//     rest of the pass goes on. Except a fresh ingest file of the current UTC day
+//     (freshIngestFile): no compaction takes it as an input, so it commits now (#1755).
 //   - A file of commit 0 (a day that also loses files this pass: a compaction output, a rewrite, a
 //     tier move) defers that whole day: its removals, tier moves and new files stay exactly as the
-//     table has them, and the other days commit. A day cannot be split, or a reader between two
-//     commits would see its rows missing (#1686).
+//     table has them, and the other days commit. A day's removals cannot be split from the files
+//     that hold their rows, or a reader between two commits would see its rows missing (#1686).
+//     A fresh ingest file holds no removed rows, so it is never in commit 0 (splitAnchoredAt).
 //
 // A pass that left files or days behind is never settled, so the scheduler does not cache the
 // listing it started from, and reports the measurement as busy (nothing committed) or in progress
@@ -200,9 +202,14 @@ func dropVanishedAt(paths, gone []string, database, measurement string, now time
 }
 
 // freshIngestFile reports whether p is an ingest file of the current UTC day named within
-// freshIngestAge of now (dropVanished).
+// freshIngestAge of now, and not a DELETE rewrite (which replaces its original), for
+// dropVanished and splitAnchoredAt.
 func freshIngestFile(p, database, measurement string, now time.Time) bool {
-	t, ok := storage.IngestFileTime(path.Base(p))
+	name := path.Base(p)
+	if storage.StripRewriteSuffix(name) != name {
+		return false
+	}
+	t, ok := storage.IngestFileTime(name)
 	if !ok || now.Sub(t) >= freshIngestAge {
 		return false
 	}

@@ -278,10 +278,19 @@ func TestDropVanishedKeepsFreshIngestFiles(t *testing.T) {
 	if len(dropped) != 5 {
 		t.Fatalf("dropped %v", dropped)
 	}
-	// A rewrite carries its original's time; on its own it is just as fresh.
+	// A rewrite replaces its original: never exempt, however fresh its name.
 	rw := k("24", "15", strings.TrimSuffix(ing(now.Add(-time.Minute)), ".parquet")+"_rewrite_1.parquet")
-	if !freshIngestFile(rw, "mydb", "cpu", now) {
-		t.Fatal("a fresh rewrite of today was not fresh")
+	if freshIngestFile(rw, "mydb", "cpu", now) {
+		t.Fatal("a rewrite was exempt")
+	}
+
+	// The same rule when the day loses files this pass: the fresh file is free, the day's
+	// other new files and a file rewritten in place stay with the removal.
+	removed := k("24", "09", "cpu_20261124_090000_000000001.parquet")
+	inPlace := k("24", "08", ing(now.Add(-2*time.Minute)))
+	anchored, free := splitAnchoredAt([]string{fresh, stale, compacted, inPlace, rw}, []string{removed, inPlace}, "mydb", "cpu", now)
+	if len(free) != 1 || free[0] != fresh || len(anchored) != 4 {
+		t.Fatalf("anchored %v free %v; want only the fresh file free", anchored, free)
 	}
 }
 

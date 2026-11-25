@@ -268,7 +268,8 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 						return reconcileResult{}, err
 					}
 					// No table yet, so nothing is removed and every file is a free add: leaving
-					// the vanished files' days for the next pass loses no reader anything.
+					// the vanished files' days for the next pass, but for fresh ingest files
+					// (#1755), loses no reader anything.
 					moved = true
 					kept, dropped := dropVanished(refPaths(candidates), ve.paths, database, measurement)
 					leave(dropped)
@@ -648,8 +649,8 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 			if fe := e.fencedErr(); fe != nil {
 				return reconcileResult{}, fe
 			}
-			// New files only, none in the table: leave the vanished files' days for the next pass
-			// and go on with the rest (vanished.go).
+			// New files only, none in the table: leave the vanished files' days for the next pass,
+			// but for their fresh ingest files (#1755), and go on with the rest (vanished.go).
 			moved = true
 			var dropped []string
 			free, dropped = dropVanished(free, ve.paths, database, measurement)
@@ -952,10 +953,24 @@ func (e *Exporter) prepareChunk(readCtx, commitCtx context.Context, tbl *icetabl
 // anchored when its UTC day directory also loses a file this pass — a compaction output, a
 // rewrite, a tier move whose clone did not resolve. A path or removal whose day cannot be read
 // from its key is treated as touching every day: with any removal at all, everything is
-// anchored, which is the single commit Arc made before #1686.
+// anchored, which is the single commit Arc made before #1686. A fresh ingest file is free even
+// in such a day (splitAnchoredAt, #1755).
 func splitAnchored(toBuild, toRemove []string, database, measurement string) (anchored, free []string) {
+	return splitAnchoredAt(toBuild, toRemove, database, measurement, time.Now())
+}
+
+// splitAnchoredAt is splitAnchored at now. A fresh ingest file (freshIngestFile) of a day with a
+// removal is free all the same (#1755): it is no compaction's input or output, nor a rewrite, so
+// no removal of its day stands for its rows, and committing it on its own never shows a reader a
+// day with rows missing. A re-home job's new files, also named like ingest files, are taken back
+// into the first commit by the caller (replacedOutputs).
+func splitAnchoredAt(toBuild, toRemove []string, database, measurement string, now time.Time) (anchored, free []string) {
 	if len(toRemove) == 0 {
 		return nil, append([]string(nil), toBuild...)
+	}
+	removing := make(map[string]struct{}, len(toRemove))
+	for _, p := range toRemove {
+		removing[p] = struct{}{}
 	}
 	days := make(map[string]struct{}, len(toRemove))
 	for _, p := range toRemove {
@@ -967,7 +982,13 @@ func splitAnchored(toBuild, toRemove []string, database, measurement string) (an
 	}
 	for _, p := range toBuild {
 		d := dayOf(p, database, measurement)
-		if _, hit := days[d]; hit || d == "" {
+		_, hit := days[d]
+		if hit {
+			if _, rewritten := removing[p]; !rewritten && freshIngestFile(p, database, measurement, now) {
+				hit = false
+			}
+		}
+		if hit || d == "" {
 			anchored = append(anchored, p)
 		} else {
 			free = append(free, p)
