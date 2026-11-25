@@ -1982,7 +1982,7 @@ Notes:
 - A flush that splits into several files (rows in more than one hour) observes each file, all measured from the same buffer start. An hour file that waits for the rest of its flush is observed when the flush registers it, not when it is written.
 - No labels: the histogram covers every database and measurement.
 
-`scripts/freshness` is a harness for the reader's side of the same question. It writes marker rows, polls a query, and reports the time from the write's acknowledgement to the first query that returned the row, next to the server's histogram for the same period. A second mode writes one late or future-stamped row into an hour that a query has just found empty and times how long queries keep answering without it ([#1757](https://github.com/Basekick-Labs/arc/issues/1757)). See `scripts/freshness/README.md`. No product behaviour changes.
+`scripts/freshness` is a harness for the reader's side of the same question. It writes marker rows, polls a query, and reports the time from the write's acknowledgement to the first query that returned the row, next to the server's histogram for the same period. A second mode writes one late or future-stamped row into an hour that a query has just found empty and times how long queries keep answering without it ([#1757](https://github.com/Basekick-Labs/arc/issues/1757)). On a cluster, `steady -probe <reader URL>` writes to the writer given with `-http` and queries the reader ([#1769](https://github.com/Basekick-Labs/arc/issues/1769)). See `scripts/freshness/README.md`. No product behaviour changes.
 
 ## Fix: on a node-local-storage cluster, deleting a database drops every node's Iceberg tables ([#1731](https://github.com/Basekick-Labs/arc/issues/1731))
 
