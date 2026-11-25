@@ -327,7 +327,7 @@ func TestPublishedNames1825_AHintBehindTheCatalogIsNotPublished(t *testing.T) {
 		t.Fatalf("%+v %v", a, err)
 	}
 	sched.Stop() // publishedNames runs where passes run; none does now
-	if _, published, named, err := exp.publishedNames(ctx, "mydb", "cpu", f0); err != nil || !published || named {
+	if _, published, named, err := exp.publishedNames(ctx, "mydb", "cpu", f0, false); err != nil || !published || named {
 		t.Fatalf("published %v, named %v, err %v", published, named, err)
 	}
 	// The hint as it was before the file's removal was committed: readers
@@ -335,7 +335,7 @@ func TestPublishedNames1825_AHintBehindTheCatalogIsNotPublished(t *testing.T) {
 	if err := os.WriteFile(hint, before, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	exists, published, _, err := exp.publishedNames(ctx, "mydb", "cpu", f0)
+	exists, published, _, err := exp.publishedNames(ctx, "mydb", "cpu", f0, false)
 	if err != nil || !exists || published {
 		t.Fatalf("with the hint behind the catalog: exists %v, published %v, err %v", exists, published, err)
 	}
@@ -613,4 +613,85 @@ func TestRehomeSwap1845_AWaivedSwapDefersOnlyTheVanishedDay(t *testing.T) {
 	}
 	// Day 3 waits whole (x3 still named); the old file left with its new one.
 	r.holds(t, r.keep, r.out, x3)
+}
+
+// #1906: with the warehouse outside the storage root no discovery files are
+// written, and the catalog's commit is the publish: a question about the
+// table is answered from it, not refused for ever.
+func TestReconcileAndConfirmWithTheWarehouseOutsideTheRoot1906(t *testing.T) {
+	root, wh := t.TempDir(), t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeArcStyleParquet(t, filepath.Join(root, "mydb/cpu/2023/11/14/22/f0.parquet"), day14, 5)
+	db, err := sql.Open("sqlite3", filepath.Join(root, "arc.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	exp, err := NewExporter(db, backend, "file://"+wh, "arc", 3, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc", zerolog.Nop()), Interval: time.Hour, Logger: zerolog.Nop()})
+	sched.Start()
+	t.Cleanup(sched.Stop)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	const f0 = "mydb/cpu/2023/11/14/22/f0.parquet"
+	a, err := sched.ReconcileAndConfirm(ctx, "mydb", "cpu", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, why := a.Verdict(false); !ok {
+		t.Fatalf("the ready question with the warehouse outside the root: %s (%+v)", why, a)
+	}
+	if a, err = sched.ReconcileAndConfirm(ctx, "mydb", "cpu", f0); err != nil || !a.Published || !a.Named {
+		t.Fatalf("the table names the file: %+v, err %v", a, err)
+	}
+	// A read-only question (a node that may not export, #1870) reads only
+	// discovery files, which this layout has none of: never "published".
+	if a, err := sched.CheckPublished(ctx, "mydb", "cpu", f0); err != nil || a.Published {
+		t.Fatalf("a read-only question: %+v, err %v; want not published", a, err)
+	}
+	if err := os.Remove(filepath.Join(root, f0)); err != nil {
+		t.Fatal(err)
+	}
+	if a, err = sched.ReconcileAndConfirm(ctx, "mydb", "cpu", f0); err != nil || !a.Clear() {
+		t.Fatalf("after the file left: %+v, err %v", a, err)
+	}
+}
+
+// #1906: only a warehouse outside the storage root counts as unaddressable;
+// the root itself, a subdirectory, and not a sibling whose name starts the
+// same.
+func TestWarehouseAddressable1906(t *testing.T) {
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		warehouse string
+		want      bool
+	}{
+		{root, true},
+		{filepath.Join(root, "wh"), true},
+		{root + "-other", false},
+		{t.TempDir(), false},
+	} {
+		db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "c.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		exp, err := NewExporter(db, backend, "file://"+tc.warehouse, "arc", 3, zerolog.Nop())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := exp.warehouseAddressable(); got != tc.want {
+			t.Errorf("warehouse %s: addressable %v, want %v", tc.warehouse, got, tc.want)
+		}
+		db.Close()
+	}
 }

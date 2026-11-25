@@ -2,6 +2,19 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: re-home jobs run with `iceberg.warehouse` outside the storage root ([#1906](https://github.com/Basekick-Labs/arc/issues/1906))
+
+**Who is affected:** standalone deployments with the Iceberg export on and `iceberg.warehouse` set to
+a directory outside the storage root.
+
+The export writes no discovery files (`version-hint.text`) in such a warehouse, and catalog readers
+are the only readers there, so the catalog's commit is the publish. A re-home job's check read the
+published version from the discovery files, found none, and refused every job ("did not publish its
+version"). After a pass of its own, the export now takes the catalog's commit as published there.
+On a cluster, nodes that do not export answer from the discovery files only, so in this layout a
+job still waits at them, as before: re-home with the warehouse outside the storage root is a
+standalone fix.
+
 ## Fix: two re-home edges with tiered storage and the Iceberg export ([#1848](https://github.com/Basekick-Labs/arc/issues/1848))
 
 **Who is affected:** deployments with tiered storage or the Iceberg export on that run re-home
