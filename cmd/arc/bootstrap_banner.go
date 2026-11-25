@@ -14,8 +14,11 @@ import (
 // already has it, and printing it would only copy a secret into the logs, on
 // every start of a deployment whose auth database is not persistent. In that
 // case the banner says the configured token was installed and leaves the value
-// out. force is auth.force_bootstrap, the recovery path.
+// out. force is the recovery path (auth.force_bootstrap with a configured
+// token, bootstrapMode); it means nothing without configured, and is ignored
+// then.
 func printBootstrapBanner(w io.Writer, token string, configured, force bool) {
+	force = force && configured
 	const (
 		cyan   = "\033[96m"
 		yellow = "\033[93m"
@@ -37,7 +40,11 @@ func printBootstrapBanner(w io.Writer, token string, configured, force bool) {
 	fmt.Fprintln(w, banner)
 	if configured {
 		fmt.Fprintln(w, cyan+"  The token from auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN) was installed."+reset)
-		fmt.Fprintln(w, cyan+"  Its value is not printed here. Use the one you configured."+reset)
+		if force {
+			fmt.Fprintln(w, cyan+"  Its value is not printed here. Use the recovery token you configured."+reset)
+		} else {
+			fmt.Fprintln(w, cyan+"  Its value is not printed here. Use the one you configured."+reset)
+		}
 	} else {
 		fmt.Fprintln(w, yellow+bold+"  Admin API token: "+token+reset)
 		fmt.Fprintln(w, banner)
@@ -52,4 +59,14 @@ func printBootstrapBanner(w io.Writer, token string, configured, force bool) {
 	}
 	fmt.Fprintln(w, banner)
 	fmt.Fprintln(w)
+}
+
+// bootstrapMode is how the startup bootstrap runs: configured when an admin
+// token value is set (auth.bootstrap_token), recovery when
+// auth.force_bootstrap is set too. auth.force_bootstrap without a token takes
+// the generated first-run path. One function picks the bootstrap call and the
+// banner's wording, so the two cannot disagree.
+func bootstrapMode(token string, force bool) (configured, recovery bool) {
+	configured = token != ""
+	return configured, configured && force
 }

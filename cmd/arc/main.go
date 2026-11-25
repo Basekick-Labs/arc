@@ -1846,10 +1846,10 @@ func main() {
 			defer cancel()
 			// auth.force_bootstrap acts only with a configured token: without
 			// one the generated first-run path runs, and the banner says so.
-			recovery := cfg.Auth.ForceBootstrap && cfg.Auth.BootstrapToken != ""
+			configured, recovery := bootstrapMode(cfg.Auth.BootstrapToken, cfg.Auth.ForceBootstrap)
 			if recovery {
 				bootstrapToken, bootstrapErr = authManager.ForceAddRecoveryToken(bootstrapCtx, cfg.Auth.BootstrapToken)
-			} else if cfg.Auth.BootstrapToken != "" {
+			} else if configured {
 				bootstrapToken, bootstrapErr = authManager.EnsureInitialTokenWithValue(bootstrapCtx, cfg.Auth.BootstrapToken)
 			} else {
 				bootstrapToken, bootstrapErr = authManager.EnsureInitialToken(bootstrapCtx)
@@ -1859,7 +1859,7 @@ func main() {
 			} else if bootstrapToken != "" {
 				// Print the banner to stderr (bypasses structured logging). The token
 				// value is shown only when Arc generated it; see printBootstrapBanner.
-				printBootstrapBanner(os.Stderr, bootstrapToken, cfg.Auth.BootstrapToken != "", recovery)
+				printBootstrapBanner(os.Stderr, bootstrapToken, configured, recovery)
 			}
 		}
 

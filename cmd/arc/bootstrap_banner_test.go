@@ -36,10 +36,13 @@ func TestPrintBootstrapBanner_TokenValue(t *testing.T) {
 			notWant:    []string{"FIRST RUN", "Admin API token", "SAVE THIS TOKEN"},
 		},
 		{
-			name:      "generated recovery token is printed",
+			// force without a configured token is not a recovery: the
+			// generated first-run path ran (bootstrapMode).
+			name:      "force without a configured token is a first run",
 			force:     true,
 			wantValue: true,
-			want:      []string{"RECOVERY TOKEN ADDED", "Admin API token: ", "Remove ARC_AUTH_FORCE_BOOTSTRAP after recovery."},
+			want:      []string{"FIRST RUN - INITIAL ADMIN TOKEN GENERATED", "Admin API token: "},
+			notWant:   []string{"RECOVERY TOKEN ADDED", "ARC_AUTH_FORCE_BOOTSTRAP"},
 		},
 	}
 
@@ -63,5 +66,24 @@ func TestPrintBootstrapBanner_TokenValue(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The bootstrap call and the banner's wording come from one decision.
+func TestBootstrapMode(t *testing.T) {
+	for _, tc := range []struct {
+		token                    string
+		force                    bool
+		wantConfigured, wantRecv bool
+	}{
+		{"", false, false, false},
+		{"", true, false, false}, // force alone: generated first run
+		{"configured-token-0123456789abcdef0123", false, true, false},
+		{"configured-token-0123456789abcdef0123", true, true, true},
+	} {
+		configured, recovery := bootstrapMode(tc.token, tc.force)
+		if configured != tc.wantConfigured || recovery != tc.wantRecv {
+			t.Errorf("bootstrapMode(%q, %v) = %v, %v; want %v, %v", tc.token, tc.force, configured, recovery, tc.wantConfigured, tc.wantRecv)
+		}
 	}
 }
