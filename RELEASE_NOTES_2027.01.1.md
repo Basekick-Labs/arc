@@ -19,6 +19,18 @@ jobs.
   the old file, so the undo changes nothing for them; the request can be sent again once the
   export runs.
 
+## Change: a re-home job checks there is room on disk before it starts ([#1851](https://github.com/Basekick-Labs/arc/issues/1851) item 3)
+
+**Who is affected:** anyone running re-home jobs (`POST /api/v1/rehome`), dry runs included.
+
+A job copies the file to a scratch directory and splits it there, which holds about twice the
+file's size side by side, then moves the new files to the hot tier. For a large file, a cold-tier
+file especially, that could fill the volume other writers share. A job is now refused up front,
+with the space it needs and the space that is free, when the scratch volume lacks twice the file's
+size plus 64 MiB or the hot storage volume lacks its size plus 64 MiB (three times the size when
+they are one volume). It is an estimate: DuckDB may spill to scratch as well. A volume whose free
+space cannot be read is not refused on.
+
 ## Change: on a cluster, the Iceberg export picks up a file as soon as it reaches the exporting node ([#1756](https://github.com/Basekick-Labs/arc/issues/1756))
 
 **Who is affected:** clusters with the Iceberg export on.

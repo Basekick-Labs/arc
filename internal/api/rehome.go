@@ -536,14 +536,21 @@ func (h *RehomeHandler) dryRun(ctx context.Context, job *rehomeJob) (state, reas
 		return "failed", fmt.Sprintf("the job failed while it was %s; the server log has the error under this job's id", step), nil
 	}
 	read := h.storage.ReadTo
+	var size int64
 	if job.Tier == rehome.TierCold {
 		// What the real run would refuse, said by the dry run too. Nothing
 		// is owned here, so the answer is as of now.
-		_, _, cold, cerr := h.coldSource(ctx, job.Path)
+		n, _, cold, cerr := h.coldSource(ctx, job.Path)
 		if cerr != nil {
 			return fail("checking the file in cold storage", cerr)
 		}
-		read = cold.ReadTo
+		read, size = cold.ReadTo, n
+	} else if n, err := h.storage.StatFile(ctx, job.Path); err == nil {
+		size = n
+	}
+	// A dry run copies and splits the file too (#1851 item 3).
+	if why := h.roomForJob(size); why != "" {
+		return fail("checking the file", rehome.Refusef("%s", why))
 	}
 	prep, step, err := h.prepare(ctx, job.Path, read)
 	if err != nil {

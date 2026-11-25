@@ -314,6 +314,12 @@ func (h *RehomeHandler) runSwap(ctx context.Context, job *rehomeJob) (state, rea
 		return fail("checking the file", checkErr)
 	}
 
+	// Room for the job (#1851 item 3): the copy and its split sit in scratch
+	// side by side, and the new files then go to the hot tier.
+	if why := h.roomForJob(size); why != "" {
+		return fail("checking the file", rehome.Refusef("%s", why))
+	}
+
 	// 2. Split in scratch.
 	prep, step, err := h.prepare(ctx, src.Key, read)
 	if err != nil {
