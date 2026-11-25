@@ -2,13 +2,17 @@ package iceberg
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	iofs "io/fs"
 	"net/url"
 	"strings"
 	"time"
 
+	iceio "github.com/apache/iceberg-go/io"
 	icetable "github.com/apache/iceberg-go/table"
 )
 
@@ -38,6 +42,9 @@ type PassAnswer struct {
 	// name. Named: that version names the file asked about.
 	Published bool
 	Named     bool
+	// WriteErr: on a question that names no file, the table's metadata
+	// directory could not be written (#1845 item 3).
+	WriteErr error
 }
 
 // Clear reports that the table, as published, does not name the file, or
@@ -56,6 +63,9 @@ const NotExportingReason = "this node is not the one exporting to Iceberg"
 // must have gone through, not only an earlier one's publish, since the job
 // is about to depend on the next one.
 func (a PassAnswer) Verdict(asked bool) (clear bool, why string) {
+	if !asked && a.WriteErr != nil {
+		return false, a.WriteErr.Error()
+	}
 	if a.Clear() && (asked || a.NotExported || a.Err == nil) {
 		return true, ""
 	}
@@ -257,6 +267,12 @@ func (s *Scheduler) serviceConfirms(ctx context.Context) {
 			default:
 				a.Published, a.Named = published, named
 			}
+			// A ready question (no key, #1845 item 3): a pass that needed no
+			// change wrote nothing, so a metadata directory that cannot be
+			// written would only show once the job waits for the export.
+			if w.key == "" && a.Err == nil && exists {
+				a.WriteErr = s.exporter.probeMetadataWrite(mctx, w.m.Database, w.m.Measurement)
+			}
 		}
 		cancel()
 		s.logger.Debug().Str("database", w.m.Database).Str("measurement", w.m.Measurement).Str("outcome", a.Outcome).
@@ -264,6 +280,39 @@ func (s *Scheduler) serviceConfirms(ctx context.Context) {
 			Msg("Iceberg reconcile for a re-home job")
 		w.ch <- a
 	}
+}
+
+// probeMetadataWrite writes and deletes a small object in the table's
+// metadata directory through the table's own file IO, the writer and
+// credentials its next commit uses there (#1845 item 3). Loop goroutine only.
+func (e *Exporter) probeMetadataWrite(ctx context.Context, database, measurement string) error {
+	ctx = e.withAWS(ctx)
+	tbl, err := e.loadTableRecovering(ctx, e.tableIdent(database, measurement))
+	if err != nil {
+		return fmt.Errorf("could not check that the table's metadata directory can be written: %w", err)
+	}
+	fs, err := tbl.FS(ctx)
+	if err != nil {
+		return fmt.Errorf("could not check that the table's metadata directory can be written: %w", err)
+	}
+	w, ok := fs.(iceio.WriteFileIO)
+	if !ok {
+		return nil // a read-only IO: nothing this check can try
+	}
+	metaLoc := tbl.MetadataLocation()
+	dir := metaLoc[:strings.LastIndex(metaLoc, "/")+1]
+	var nonce [8]byte
+	_, _ = rand.Read(nonce[:])
+	loc := dir + ".arc-write-probe-" + hex.EncodeToString(nonce[:])
+	werr := w.WriteFile(loc, []byte("probe"))
+	// Deleted even after a failed write: an object store may have kept it.
+	if derr := fs.Remove(loc); derr != nil && werr == nil && !errors.Is(derr, iofs.ErrNotExist) {
+		e.logger.Warn().Err(derr).Str("location", loc).Msg("Iceberg: could not delete the write probe in the table's metadata directory; it is safe to remove by hand")
+	}
+	if werr != nil {
+		return fmt.Errorf("the table's metadata directory cannot be written (%s): %w", dir, werr)
+	}
+	return nil
 }
 
 // publishedNames reports whether the table exists, whether its current
