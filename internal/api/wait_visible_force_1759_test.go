@@ -5,6 +5,7 @@ package api
 
 import (
 	"net/http"
+	"strconv"
 	"testing"
 	"time"
 
@@ -53,4 +54,23 @@ func TestWaitVisibleForcesThroughSetForcer1759(t *testing.T) {
 
 	var nilWV *WaitVisible
 	nilWV.SetForcer(r.buf, time.Second) // a no-op, no panic
+}
+
+// The first visible write to an idle measurement (never flushed) is forced on
+// its first ask and answered within a flush time, not an interval or an age:
+// the real buffer, local storage, line protocol through the handler.
+func TestWaitVisibleFirstWriteToAnIdleMeasurementAnswersAtOnce1759(t *testing.T) {
+	r := newVisRig(t, visOpts{ageMS: 25000})
+	r.buf.EnableKeyFlushLedger(ingest.ForceBudget{})
+	r.wv.SetForcer(r.buf, 5*time.Second)
+	for _, m := range []string{"idle1", "idle2", "idle3"} {
+		body := []byte(m + ",host=h v=1i " + strconv.FormatInt(time.Now().UnixNano(), 10) + "\n")
+		start := time.Now()
+		resp, out := r.post(t, "/api/v1/write/line-protocol", body, WaitVisibleHeader, "visible")
+		took := time.Since(start)
+		require.Equal(t, http.StatusNoContent, resp.StatusCode, out)
+		v, reason := visible(resp.Header)
+		require.Equal(t, "true", v, reason)
+		require.Less(t, took, 500*time.Millisecond, "%s: the first visible write to an idle measurement took %v; it is forced at its first ask", m, took)
+	}
 }
