@@ -1137,16 +1137,17 @@ type TypedColumnBatch struct {
 	// An entry accepted and then failed by an async WAL writer still reads as
 	// a copy; that failure is logged by the WAL writer.
 	hasWALCopy bool
+	// tierUnregistered is set on a merged batch by flushPartitionedData when
+	// a stored file's tiering registration failed (#1759): the flush still
+	// succeeds, but a visible write's batches in it are unconfirmed. Beside
+	// hasWALCopy, in its padding, so the batch does not grow.
+	tierUnregistered bool
 	// outcome is the import this batch belongs to, if any (#1888,
 	// flush_outcome.go): a failed flush adds its rows without a WAL copy to
 	// it. Or the visible live write it belongs to (x-arc-wait: visible,
 	// #1759, flush_outcome_visible.go), whose flush also settles it. nil for
 	// any other live write.
 	outcome *FlushOutcome
-	// tierUnregistered is set on a merged batch by flushPartitionedData when
-	// a stored file's tiering registration failed (#1759): the flush still
-	// succeeds, but a visible write's batches in it are unconfirmed.
-	tierUnregistered bool
 	// Coverage is the batch's coverage id on a coverage-enabled writer, or the
 	// pieces of a replayed covered entry (#1207). See coverage.go.
 	Coverage []CoveragePiece

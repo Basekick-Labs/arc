@@ -909,14 +909,24 @@ func TestVisibleFutureStampedRows1759(t *testing.T) {
 		{"within the margin", tAdm.Add(500 * time.Millisecond), true, VisibleReasonNone},
 		{"next hour", hourStart.Add(time.Hour + 5*time.Second), true, VisibleReasonNone},
 		{"check off", tAdm.Add(30 * time.Second), false, VisibleReasonNone},
+		{"columnar site, same hour, ahead", tAdm.Add(30 * time.Second), true, VisibleReasonFutureStamped},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			buf := outcomeBuffer(t, &pathFailStorage{}, 1000)
 			o := NewVisibleOutcome(tAdm, tc.check, 0) // raised to 1 s
-			data := map[string]interface{}{"time": []int64{tAdm.UnixMicro(), tc.t.UnixMicro()}, "value": []float64{1, 2}}
-			batch := &TypedColumnBatch{Data: data, Signature: getColumnSignature(data)}
-			if err := buf.WriteTypedColumnarDirect(WithFlushOutcome(context.Background(), o), "db", "mfuture", batch, 2); err != nil {
-				t.Fatal(err)
+			ctx := WithFlushOutcome(context.Background(), o)
+			if strings.HasPrefix(tc.name, "columnar") {
+				rec := &models.ColumnarRecord{Measurement: "mfuture", Columnar: true, TimeUnit: "us",
+					Columns: map[string][]interface{}{"time": {tAdm.UnixMicro(), tc.t.UnixMicro()}, "value": {1.0, 2.0}}}
+				if err := buf.WriteColumnarRecord(ctx, "db", rec); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				data := map[string]interface{}{"time": []int64{tAdm.UnixMicro(), tc.t.UnixMicro()}, "value": []float64{1, 2}}
+				batch := &TypedColumnBatch{Data: data, Signature: getColumnSignature(data)}
+				if err := buf.WriteTypedColumnarDirect(ctx, "db", "mfuture", batch, 2); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if err := buf.FlushAll(context.Background()); err != nil {
 				t.Fatal(err)
