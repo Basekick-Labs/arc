@@ -484,6 +484,27 @@ func TestForceFlushKey_BudgetDeferralClockStepBack(t *testing.T) {
 	f.expect("db/k", Forced)
 }
 
+// max_buffer_age_ms <= 0 is accepted by Load; the recent-deferral window then
+// falls back to 1 s instead of turning the condition off (#1759).
+func TestForceFlushKey_BudgetDeferralWindowFloor(t *testing.T) {
+	cfg := forceConfig(4, 8)
+	cfg.MaxBufferAgeMS = 0
+	f := newForceFixture(t, cfg, &ForceBudget{})
+	f.write("k", 10)
+
+	ghost := "db/ghost"
+	shard := f.buf.getShard(ghost)
+	shard.mu.Lock()
+	f.buf.markDeferredLocked(shard, ghost)
+	delete(shard.deferredKeys, ghost)
+	shard.mu.Unlock()
+
+	f.clock.Advance(time.Second - time.Millisecond)
+	f.expect("db/k", OverBudget)
+	f.clock.Advance(time.Millisecond)
+	f.expect("db/k", Forced)
+}
+
 func TestForceFlushKey_BudgetBufferedBytes(t *testing.T) {
 	cfg := forceConfig(4, 8)
 	cfg.MaxBufferedBytes = 1 << 40
