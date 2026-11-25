@@ -223,7 +223,12 @@ func TestOutboxDefersAFencedPath(t *testing.T) {
 	m := &fencingManifest{fakeOutboxManifest: newFakeOutboxManifest()}
 	m.owned.Store(outPathA)
 	r.HandOff(m, &fakeOutboxStorage{sizes: map[string]int64{outPathA: 10, outPathB: 20}}, "writer-1")
-	waitOutbox(t, "the unrelated file registered", func() bool { return m.isRegistered(outPathB) })
+	// The outbox applies a registration to the manifest before it takes the
+	// path out of its pending set, so wait for both: reading Pending() as soon
+	// as B shows in the manifest can still see 2 under load.
+	waitOutbox(t, "the unrelated file registered and settled", func() bool {
+		return m.isRegistered(outPathB) && r.Pending() <= 1
+	})
 	if m.isRegistered(outPathA) || r.Pending() != 1 {
 		t.Fatalf("fenced path: registered %v, pending %d", m.isRegistered(outPathA), r.Pending())
 	}
