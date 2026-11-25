@@ -353,6 +353,11 @@ func (e *Exporter) publishedNames(ctx context.Context, database, measurement, fi
 // reader of the table sees are that snapshot's. (alreadyPublished answers
 // from a pass's own memory, and only inside one.)
 func (e *Exporter) publishedIsCurrent(ctx context.Context, database, measurement string, tbl *icetable.Table) (bool, error) {
+	if e.backend == nil {
+		// No discovery files are written: the catalog commit is the publish
+		// (writeVersionHint).
+		return true, nil
+	}
 	pub, found, err := e.LoadPublished(ctx, database, measurement)
 	if err != nil || !found {
 		return false, err
@@ -404,25 +409,75 @@ func isOneOf(p, key string, keys []string) bool {
 // or a file of that commit vanished. nil: no such jobs.
 //
 // It is asked when the pass computes its diff, so it holds only while the
-// job is recorded: a job ended without the export's commit (its wait waived)
-// leaves its old file's removal to a pass that commits it like any other.
+// job is recorded; a job ended without the export's commit (its wait waived)
+// is answered by SetReplacedWaived.
 func (e *Exporter) SetReplaced(f func(database, measurement string) map[string][]string) {
 	e.replaced = f
 }
 
+// SetReplacedWaived sets the same answer for jobs that ended with their wait
+// for the export waived (#1845 item 1), and done, told once a pass of the
+// table has ended with the published table not naming such an old file (or
+// with no table). A waived job's new file that cannot be registered is left
+// out and logged, never refused: the waiver was given to get past exactly
+// such a pass, and its old file is gone from storage.
+func (e *Exporter) SetReplacedWaived(f func(database, measurement string) map[string][]string, done func(database, measurement, source string)) {
+	e.replacedWaived, e.replacedDone = f, done
+}
+
+// settleWaived tells replacedDone of each waived job of the table whose old
+// file the published table no longer names. At the end of a pass that went
+// through, on the pass's goroutine.
+func (e *Exporter) settleWaived(ctx context.Context, database, measurement string) {
+	if e.replacedWaived == nil || e.replacedDone == nil {
+		return
+	}
+	for src := range e.replacedWaived(database, measurement) {
+		exists, published, named, err := e.publishedNames(ctx, database, measurement, src)
+		if err != nil {
+			return // the next pass asks again
+		}
+		if !exists || (published && !named) {
+			e.replacedDone(database, measurement, src)
+		}
+	}
+}
+
 // replacedOutputs returns the keys of the new files of every re-home job
 // whose old file is among toRemove, and whether there is such a job.
-func (e *Exporter) replacedOutputs(database, measurement string, toRemove []string) (outputs []string, hit bool) {
-	if e.replaced == nil || len(toRemove) == 0 {
-		return nil, false
+//
+// waived holds the new files of the jobs among them whose wait was waived
+// (SetReplacedWaived) and no recorded job also names: those are left out
+// when they cannot be registered, not refused.
+func (e *Exporter) replacedOutputs(database, measurement string, toRemove []string) (outputs []string, hit bool, waived []string) {
+	if len(toRemove) == 0 {
+		return nil, false, nil
 	}
-	for old, outs := range e.replaced(database, measurement) {
+	removes := func(old string) bool {
 		for _, p := range toRemove {
 			if pathIsKey(p, old) {
+				return true
+			}
+		}
+		return false
+	}
+	live := map[string]bool{}
+	if e.replaced != nil {
+		for old, outs := range e.replaced(database, measurement) {
+			live[old] = true
+			if removes(old) {
 				outputs, hit = append(outputs, outs...), true
-				break
 			}
 		}
 	}
-	return outputs, hit
+	if e.replacedWaived != nil {
+		for old, outs := range e.replacedWaived(database, measurement) {
+			if live[old] || !removes(old) {
+				continue // a recorded job answers for it
+			}
+			outputs, hit = append(outputs, outs...), true
+			waived = append(waived, outs...)
+		}
+	}
+	return outputs, hit, waived
 }

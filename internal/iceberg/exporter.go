@@ -170,6 +170,11 @@ type exporterShared struct {
 	onPublished func(database, measurement string)
 	// replaced: the files re-home jobs are replacing (SetReplaced).
 	replaced func(database, measurement string) map[string][]string
+	// replacedWaived and replacedDone: the same for jobs that ended with
+	// their wait for the export waived, and what drops their record once the
+	// published table does not name the old file (SetReplacedWaived, #1845).
+	replacedWaived func(database, measurement string) map[string][]string
+	replacedDone   func(database, measurement, source string)
 
 	// servedLayoutOnce caches the warehouse layout the published-state reads
 	// (published.go) check names against.

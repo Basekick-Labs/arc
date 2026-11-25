@@ -1074,6 +1074,9 @@ func main() {
 			time.Sleep(time.Duration(try) * time.Second)
 		}
 		if seedErr = rehomeRegistry.Seed(context.Background()); seedErr == nil {
+			for _, s := range rehomeRegistry.ReplacedSkipped() {
+				log.Warn().Str("record", s).Msg("A waived re-home job's record under _rehome/replaced cannot be used and is left where it is; the Iceberg export's commit of that job's old file is not tied to its new files (#1845)")
+			}
 			break
 		}
 		log.Warn().Err(seedErr).Int("try", try+1).Msg("Could not read the re-home job journal; trying again")
@@ -5140,6 +5143,19 @@ func main() {
 				}
 			}
 			return out
+		})
+		// Jobs that ended with their export wait waived (#1845 item 1): the
+		// old file's removal still commits with its new files, and the record
+		// goes once the published table does not name the old file.
+		exporter.SetReplacedWaived(func(database, measurement string) map[string][]string {
+			return rehomeRegistry.ReplacedWaived(database + "/" + measurement + "/")
+		}, func(database, measurement, source string) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := rehomeRegistry.ReplacedDone(ctx, database, measurement, source); err != nil {
+				log.Warn().Err(err).Str("database", database).Str("measurement", measurement).Str("source", source).
+					Msg("Could not remove a waived re-home job's record; the next pass of the table tries again")
+			}
 		})
 		rehomeHandler.SetExport(func(ctx context.Context, database, measurement, fileKey string) (api.RehomeExportAnswer, error) {
 			a, err := icebergScheduler.ReconcileAndConfirm(ctx, database, measurement, fileKey)

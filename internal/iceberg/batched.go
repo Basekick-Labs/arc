@@ -166,6 +166,15 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 			return reconcileResult{}, err
 		}
 	}
+	// A waived re-home job's record goes once the table, as published, no
+	// longer names its old file (#1845 item 1): checked after a pass that
+	// went through, and after the drop check below (deferred later, so run
+	// first): a table that check removed names nothing.
+	defer func() {
+		if err == nil {
+			e.settleWaived(ctx, database, measurement)
+		}
+	}()
 	// And at the end of the pass, however it ends (a pass can commit and
 	// then fail, and one that creates the table need not commit): if the
 	// database was dropped on another node meanwhile, what the pass wrote
@@ -442,7 +451,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 	// without them, and that commit is all or nothing below. Only those: the
 	// first commit is not chunked or time-budgeted, and a backlog of other
 	// new files folded into it could keep it from ever fitting in a pass.
-	swapOutputs, swap := e.replacedOutputs(database, measurement, toRemove)
+	swapOutputs, swap, waivedOutputs := e.replacedOutputs(database, measurement, toRemove)
 	if swap {
 		kept := free[:0]
 		for _, p := range free {
@@ -573,6 +582,13 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 		}
 		for _, f := range skipped {
 			if isOneOf(f.path, keyOf[f.path], swapOutputs) {
+				if isOneOf(f.path, keyOf[f.path], waivedOutputs) {
+					// A waived job (#1845): its old file is gone from
+					// storage, and refusing would hold the table on it.
+					e.logger.Warn().Str("database", database).Str("measurement", measurement).Str("file", f.path).Str("reason", f.reason).
+						Msg("Iceberg: a new file of a re-home job whose export wait was waived cannot be registered; the old file's removal commits without it, and the table lacks its rows until it can be")
+					continue
+				}
 				return reconcileResult{}, fmt.Errorf("a re-home job's new file %s cannot be registered (%s); the file it replaces stays in the table until it can", f.path, f.reason)
 			}
 		}

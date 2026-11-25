@@ -199,7 +199,19 @@ func (h *RehomeHandler) waitExport(ctx context.Context, job *rehome.Job) error {
 			// answered: a pass that began before reads were switched has
 			// ended, or none runs, so no listing of the measurement is in
 			// flight that expects the old file.
-			log.Warn().Str("export", why).Msg("Re-home: removing the old file without waiting for the Iceberg export, as asked. Until the export next commits this table, it names a file that is gone, and readers of the table fail on it. That commit is no longer tied to this job: if it stops part way, the table can be published for a while without some of the file's rows")
+			//
+			// The record that keeps the export's commit of the old file's
+			// removal tied to its new files (#1845 item 1), durable before
+			// the old file goes. Without it the job still ends, as asked: a
+			// lost record only brings back the gap a waiver had before.
+			kerr := h.swap.Registry.KeepReplaced(ctx, job)
+			if kerr != nil && ctx.Err() == nil {
+				kerr = h.swap.Registry.KeepReplaced(ctx, job)
+			}
+			if kerr != nil {
+				log.Error().Err(kerr).Msg("Re-home: could not record the waived job's new files for the Iceberg export; the old file is removed as asked, and the export's commit of its removal is not tied to them: if that commit's pass stops part way, the table can be published for a while without some of the file's rows")
+			}
+			log.Warn().Str("export", why).Bool("recorded_for_export", kerr == nil).Msg("Re-home: removing the old file without waiting for the Iceberg export, as asked. Until the export next commits this table, it names a file that is gone, and readers of the table fail on it")
 			return nil
 		}
 		if time.Since(warned) >= rehomeExportWarnEvery {

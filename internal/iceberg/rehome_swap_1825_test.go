@@ -535,5 +535,51 @@ func TestReconcileAndConfirmProbesTheMetadataDirectory(t *testing.T) {
 	left, _ := filepath.Glob(filepath.Join(metaDir, ".arc-write-probe-*"))
 	if len(left) != 0 {
 		t.Fatalf("probe left behind: %v", left)
+
+// #1845 item 1: a job whose wait was waived still has its old file's removal
+// committed with its new files, and its record goes once the table, as
+// published, does not name the old file.
+func TestRehomeSwap1845_AWaivedJobStillCommitsTogether(t *testing.T) {
+	r := newSwapRig1825(t)
+	var done []string
+	r.exp.SetReplacedWaived(func(string, string) map[string][]string {
+		return map[string][]string{r.old.Key: {r.out.Key}}
+	}, func(_, _, src string) { done = append(done, src) })
+	commits := 0
+	if _, err := r.pass(func() bool { commits++; return commits == 1 }, append([]FileRef{r.keep, r.out}, r.extras...)...); err != nil {
+		t.Fatal(err)
+	}
+	r.holds(t, r.keep, r.out)
+	if len(done) != 1 || done[0] != r.old.Key {
+		t.Fatalf("done %v; want the old file once the table stopped naming it", done)
+	}
+}
+
+// A waived job's new file that cannot be registered is left out, not
+// refused: refusing would hold the table on a file that is gone.
+func TestRehomeSwap1845_AWaivedJobsBadFileIsLeftOut(t *testing.T) {
+	r := newSwapRig1825(t)
+	removeFile(t, r.out)
+	writeStraddlingParquet(t, r.out.LocalPath, day14+dayMicros)
+	out := refOf(t, r.out.LocalPath)
+	out.Key, out.LocalPath = r.out.Key, r.out.LocalPath
+	r.exp.SetReplacedWaived(func(string, string) map[string][]string {
+		return map[string][]string{r.old.Key: {out.Key}}
+	}, func(string, string, string) {})
+	if _, err := r.pass(nil, r.keep, out); err != nil {
+		t.Fatalf("a waived job's file that cannot be registered failed the pass: %v", err)
+	}
+	r.holds(t, r.keep)
+	// A recorded job naming the same old file still refuses.
+	r2 := newSwapRig1825(t)
+	removeFile(t, r2.out)
+	writeStraddlingParquet(t, r2.out.LocalPath, day14+dayMicros)
+	out2 := refOf(t, r2.out.LocalPath)
+	out2.Key, out2.LocalPath = r2.out.Key, r2.out.LocalPath
+	both := func(string, string) map[string][]string { return map[string][]string{r2.old.Key: {out2.Key}} }
+	r2.exp.SetReplaced(both)
+	r2.exp.SetReplacedWaived(both, func(string, string, string) {})
+	if _, err := r2.pass(nil, r2.keep, out2); err == nil || !strings.Contains(err.Error(), "cannot be registered") {
+		t.Fatalf("a recorded job's file: err %v, want a refusal", err)
 	}
 }
