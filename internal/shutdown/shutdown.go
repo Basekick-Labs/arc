@@ -307,8 +307,10 @@ const (
 	PriorityBuffer     = 30 // Flush buffers
 	PriorityWAL        = 40 // Flush WAL
 	// PriorityScheduler stops the tick-driven schedulers that ask the cluster
-	// coordinator whether they may run — compaction, continuous queries,
-	// retention, reconciliation. They quiesce BEFORE the coordinator they
+	// coordinator whether they may run — continuous queries, retention,
+	// reconciliation. (Compaction stops in a hook at priority 1 and waits for
+	// its running cycle in a component before the coordinator, #1887.) They
+	// quiesce BEFORE the coordinator they
 	// depend on, so a tick in flight never finds it gone (#854).
 	PriorityScheduler  = 45 // Stop cluster-gated schedulers
 	PriorityCompaction = 50 // Stop compaction and the cluster coordinator

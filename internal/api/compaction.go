@@ -430,6 +430,9 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 	// refuse up front, before the trigger is logged as accepted. Checked
 	// before the running-cycle check: a cycle that was already running when
 	// the pause landed is ending at its boundary.
+	if h.manager.Stopping() {
+		return h.refuseStopping(c, tierNames)
+	}
 	if h.manager.Paused() {
 		h.logger.Info().Strs("tiers", tierNames).Msg("Manual compaction trigger refused: compaction is paused cluster-wide")
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
@@ -463,14 +466,7 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 	// whose result is whose.
 	claim, err := h.manager.ClaimCycle()
 	if errors.Is(err, compaction.ErrCompactionStopping) {
-		// Shutdown has begun (#1887): no new cycle. 503, not 409: retrying
-		// against another node, or this one once restarted, is the answer.
-		h.logger.Info().Strs("tiers", tierNames).Msg("Manual compaction trigger refused: the server is shutting down")
-		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-			"error":    "the server is shutting down",
-			"message":  "compaction is not taking new cycles; retry once the server is back",
-			"stopping": true,
-		})
+		return h.refuseStopping(c, tierNames)
 	}
 	if err != nil {
 		// RunningCycleID rather than GetCurrentCycleID: it takes the same
@@ -1006,4 +1002,16 @@ func (h *CompactionHandler) listCycles(c *fiber.Ctx) error {
 		resp["running_cycle_id"] = page.RunningCycleID
 	}
 	return c.JSON(resp)
+}
+
+// refuseStopping answers a trigger after shutdown began (#1887): no new
+// cycle. 503, not 409: retrying against another node, or this one once
+// restarted, is the answer.
+func (h *CompactionHandler) refuseStopping(c *fiber.Ctx, tierNames []string) error {
+	h.logger.Info().Strs("tiers", tierNames).Msg("Manual compaction trigger refused: the server is shutting down")
+	return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+		"error":    "the server is shutting down",
+		"message":  "compaction is not taking new cycles; retry once the server is back",
+		"stopping": true,
+	})
 }

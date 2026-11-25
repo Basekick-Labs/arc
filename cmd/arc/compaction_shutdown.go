@@ -31,11 +31,16 @@ import (
 // The Iceberg export's drain, Glue and its catalog handle come after the
 // wait, before the cluster coordinator (shutdown.PriorityCompaction).
 const (
-	priorityCompactionStop   = 1 // before ready-flag-off and the HTTP drain
-	priorityCompactionWait   = shutdown.PriorityWAL + 1
-	priorityIcebergExport    = shutdown.PriorityWAL + 2
-	priorityIcebergGlue      = shutdown.PriorityWAL + 3
-	priorityIcebergCatalogDB = shutdown.PriorityWAL + 4
+	priorityCompactionStop = 1 // before ready-flag-off and the HTTP drain
+	priorityCompactionWait = shutdown.PriorityWAL + 1
+	// The cluster's completion watcher drains the records the last batches
+	// left after they ended, and before Raft stops: a component after the
+	// wait. As a hook it ran before the wait, and a batch ending after its
+	// final drain left its record unapplied.
+	priorityCompactionWatcher = shutdown.PriorityWAL + 2
+	priorityIcebergExport     = shutdown.PriorityWAL + 3
+	priorityIcebergGlue       = shutdown.PriorityWAL + 4
+	priorityIcebergCatalogDB  = shutdown.PriorityWAL + 5
 )
 
 // compactionWaitMargin is the part of the shutdown budget the wait leaves,
@@ -43,8 +48,22 @@ const (
 func compactionWaitMargin(timeout time.Duration) time.Duration { return timeout / 5 }
 
 // compactionKillGrace bounds the wait for the claim's release after the
-// kill, when the shutdown context has no deadline left.
+// kill, and for the schedulers' stop; never past the shutdown deadline
+// (graceWithin).
 const compactionKillGrace = 5 * time.Second
+
+// compactionExitGrace bounds the final kill's wait (killLeftoverCycles).
+const compactionExitGrace = 2 * time.Second
+
+// graceWithin is compactionKillGrace, cut to what is left of ctx's deadline,
+// and at least 100ms: the release after a kill takes milliseconds.
+func graceWithin(ctx context.Context) time.Duration {
+	g := compactionKillGrace
+	if dl, ok := ctx.Deadline(); ok {
+		g = min(g, time.Until(dl))
+	}
+	return max(g, 100*time.Millisecond)
+}
 
 // compactionStopper is the part of *compaction.Manager shutdown uses.
 type compactionStopper interface {
@@ -80,7 +99,7 @@ func (s *compactionShutdown) CloseContext(ctx context.Context) error {
 		s.logger.Warn().Int64("cycle_id", id).
 			Msg("Compaction cycle still running at the shutdown deadline: killing it; the next start recovers its job from the manifest")
 		s.manager.KillCycles()
-		kctx, kcancel := context.WithTimeout(context.Background(), compactionKillGrace)
+		kctx, kcancel := context.WithTimeout(context.Background(), graceWithin(ctx))
 		idle = s.manager.WaitIdle(kctx)
 		kcancel()
 		if !idle {
@@ -97,13 +116,36 @@ func (s *compactionShutdown) CloseContext(ctx context.Context) error {
 	}()
 	select {
 	case <-done:
-	case <-time.After(compactionKillGrace):
+	case <-time.After(graceWithin(ctx)):
 		s.logger.Warn().Msg("Compaction schedulers did not stop in time; shutdown continues")
 	}
 	return nil
 }
 
 func (s *compactionShutdown) Close() error { return s.CloseContext(context.Background()) }
+
+// killLeftoverCycles is the last step before the process exits: the
+// coordinator skips the remaining components once its deadline passes, and
+// the wait may never have run. A child that outlived the parent would race
+// a replacement process (#1887), so kill whatever still runs, and give its
+// claim a moment to release.
+func killLeftoverCycles(m compactionStopper, logger zerolog.Logger) {
+	if m == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	idle := m.WaitIdle(ctx)
+	cancel()
+	if idle {
+		return
+	}
+	logger.Warn().Int64("cycle_id", m.RunningCycleID()).
+		Msg("Compaction cycle still running as Arc exits: killing it; the next start recovers its job from the manifest")
+	m.KillCycles()
+	ctx, cancel = context.WithTimeout(context.Background(), compactionExitGrace)
+	defer cancel()
+	m.WaitIdle(ctx)
+}
 
 // registerCompactionShutdown registers both steps.
 func registerCompactionShutdown(c *shutdown.Coordinator, s *compactionShutdown) {

@@ -79,16 +79,17 @@ func TestCompactionShutdownOrder1887(t *testing.T) {
 	c.Register("arrow-buffer", shutdownFunc(func() error { order = append(order, "arrow-buffer"); return nil }), shutdown.PriorityBuffer)
 	c.Register("wal", shutdownFunc(func() error { order = append(order, "wal"); return nil }), shutdown.PriorityWAL)
 	c.Register("iceberg-export", shutdownFunc(func() error { order = append(order, "iceberg-export"); return nil }), priorityIcebergExport)
+	c.Register("compaction-completion-watcher", shutdownFunc(func() error { order = append(order, "completion-watcher"); return nil }), priorityCompactionWatcher)
 	registerClusterCoordinatorShutdown(c, func() error { order = append(order, "cluster-coordinator"); return nil })
 	registerCompactionShutdown(c, &compactionShutdown{manager: shutdownLogged{f, &order}, timeout: 5 * time.Second, logger: zerolog.Nop()})
 	if err := c.Shutdown(); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"compaction-stop", "ready-flag-off", "http-server", "arrow-buffer", "wal", "compaction-wait", "iceberg-export", "cluster-coordinator"}
+	want := []string{"compaction-stop", "ready-flag-off", "http-server", "arrow-buffer", "wal", "compaction-wait", "completion-watcher", "iceberg-export", "cluster-coordinator"}
 	if !reflect.DeepEqual(order, want) {
 		t.Fatalf("order = %v\nwant    %v", order, want)
 	}
-	if !(priorityCompactionWait < priorityIcebergExport && priorityIcebergExport < priorityIcebergGlue &&
+	if !(priorityCompactionWait < priorityCompactionWatcher && priorityCompactionWatcher < priorityIcebergExport && priorityIcebergExport < priorityIcebergGlue &&
 		priorityIcebergGlue < priorityIcebergCatalogDB && priorityIcebergCatalogDB < shutdown.PriorityCompaction) {
 		t.Fatal("the compaction wait and the Iceberg steps must run in that order, before the cluster coordinator")
 	}
@@ -152,5 +153,42 @@ func TestCompactionShutdownWaitsForACycleThatEnds1887(t *testing.T) {
 	}
 	if !f.began {
 		t.Fatal("BeginShutdown was not called")
+	}
+}
+
+// The coordinator skipped the wait (its deadline passed): the last step
+// before exit kills the cycle and waits for its release.
+func TestKillLeftoverCyclesAtExit1887(t *testing.T) {
+	var order []string
+	f := newFakeStopper(true, &order)
+	f.killDelay = 50 * time.Millisecond
+	killLeftoverCycles(f, zerolog.Nop())
+	if !f.killed {
+		t.Fatal("a cycle still running at exit was not killed")
+	}
+	if !f.WaitIdle(context.Background()) {
+		t.Fatal("exit did not wait for the release")
+	}
+	idle := newFakeStopper(false, &order)
+	killLeftoverCycles(idle, zerolog.Nop())
+	if idle.killed {
+		t.Fatal("an idle manager was killed")
+	}
+}
+
+// The kill grace never runs past the shutdown deadline, and has a floor.
+func TestGraceWithinTheDeadline1887(t *testing.T) {
+	if g := graceWithin(context.Background()); g != compactionKillGrace {
+		t.Fatalf("no deadline: %v, want %v", g, compactionKillGrace)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if g := graceWithin(ctx); g > time.Second || g < 900*time.Millisecond {
+		t.Fatalf("1s left: %v", g)
+	}
+	past, cancel2 := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel2()
+	if g := graceWithin(past); g != 100*time.Millisecond {
+		t.Fatalf("deadline passed: %v, want the 100ms floor", g)
 	}
 }

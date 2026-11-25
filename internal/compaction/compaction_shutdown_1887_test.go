@@ -8,9 +8,13 @@ package compaction
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/rs/zerolog"
 )
 
 func assertStoppedOutcome(t *testing.T, m *Manager, err error, starts *atomic.Int32) {
@@ -78,8 +82,9 @@ func TestShutdownStopsDiscoveryBetweenMeasurements1887(t *testing.T) {
 	}
 }
 
-// After BeginShutdown no claim is taken: not by a trigger, a scheduler tick,
-// or a deferred tick waking on a release.
+// After BeginShutdown ClaimCycle refuses, which is what every claim path (a
+// trigger, a scheduler tick, a deferred tick waking on a release) goes
+// through.
 func TestShutdownRefusesNewClaims1887(t *testing.T) {
 	manager, _, cleanup := setupTestManager(t)
 	defer cleanup()
@@ -117,8 +122,8 @@ func TestKillCyclesCancelsTheRunningBatch1887(t *testing.T) {
 	}
 }
 
-// Without BeginShutdown, a split between its halves goes on: the stop check
-// reads only the shutdown flag.
+// halt names shutdown before the pause, so a paused cluster's shutdown logs
+// and records "stopped".
 func TestHaltIsShutdownBeforePause1887(t *testing.T) {
 	manager, _, cleanup := setupTestManager(t)
 	defer cleanup()
@@ -131,5 +136,129 @@ func TestHaltIsShutdownBeforePause1887(t *testing.T) {
 	manager.BeginShutdown()
 	if !errors.Is(manager.halt(), ErrCompactionStopping) {
 		t.Fatal("halt during shutdown is not ErrCompactionStopping")
+	}
+}
+
+// Recovery stops between manifests: a manifest not reached stays for the
+// next start.
+func TestShutdownStopsRecoveryBetweenManifests1887(t *testing.T) {
+	m, backend, cleanup := setupTestManager(t)
+	defer cleanup()
+	ctx := context.Background()
+	m.ManifestManager = NewManifestManager(backend, zerolog.Nop())
+	const out = "db/cpu/2026/01/01/00/out_compacted.parquet"
+	if err := backend.Write(ctx, out, []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	mpath, err := m.ManifestManager.WriteManifest(ctx, &Manifest{
+		OutputPath: out, OutputSize: 4, InputFiles: []string{"db/cpu/2026/01/01/00/raw.parquet"},
+		Database: "db", Measurement: "cpu", PartitionPath: "db/cpu/2026/01/01/00",
+		Tier: "hourly", Status: ManifestStatusPending, CreatedAt: time.Now().UTC(), JobID: "j1887",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.BeginShutdown()
+	recovered, err := m.recoverOrphanedManifests(ctx, recoveryScope{})
+	if !errors.Is(err, ErrCompactionStopping) || recovered != 0 {
+		t.Fatalf("recovery during shutdown = (%d, %v), want (0, ErrCompactionStopping)", recovered, err)
+	}
+	if present, _ := backend.Exists(ctx, mpath); !present {
+		t.Fatal("the manifest was recovered after shutdown began")
+	}
+}
+
+// listingBackend calls onList for each directory listing.
+type listingBackend struct {
+	storage.Backend
+	onList func(prefix string)
+}
+
+func (b *listingBackend) ListDirectories(ctx context.Context, prefix string) ([]string, error) {
+	b.onList(prefix)
+	return b.Backend.(storage.DirectoryLister).ListDirectories(ctx, prefix)
+}
+
+// The measurement listing stops between databases.
+func TestShutdownStopsTheListingBetweenDatabases1887(t *testing.T) {
+	m, backend, cleanup := setupTestManager(t)
+	defer cleanup()
+	m.ManifestManager = nil
+	ctx := context.Background()
+	for _, p := range []string{"db1/cpu/2026/01/01/00/a.parquet", "db2/cpu/2026/01/01/00/a.parquet"} {
+		if err := backend.Write(ctx, p, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var listed []string
+	m.StorageBackend = &listingBackend{Backend: backend, onList: func(prefix string) {
+		if prefix == "" {
+			return // the database listing
+		}
+		listed = append(listed, prefix)
+		m.BeginShutdown() // shutdown begins while the first database is listed
+	}}
+	m.Tiers = []Tier{cycleTierIssue915{find: func(context.Context, string, string) ([]Candidate, error) {
+		t.Error("discovery ran after shutdown began")
+		return nil, nil
+	}}}
+	_, err := m.RunCompactionCycleForTiers(ctx, []string{"hourly"})
+	if !errors.Is(err, ErrCompactionStopping) {
+		t.Fatalf("err = %v, want ErrCompactionStopping", err)
+	}
+	if len(listed) != 1 || !strings.HasPrefix(listed[0], "db1") {
+		t.Fatalf("databases listed after the stop: %v, want only db1", listed)
+	}
+}
+
+// A split stops before its first half, and before its second: neither is a
+// failure or a too-wide strike, and the cycle ends "stopped".
+func TestShutdownStopsASplitBetweenItsHalves1887(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		stopAtFiles  int // BeginShutdown during the attempt with this many files
+		wantAttempts int32
+	}{
+		{"before the first half", 4, 1},
+		{"before the second half", 2, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := []string{"a.parquet", "b.parquet", "c.parquet", "d.parquet"}
+			var m *Manager
+			m, attempts := wideManager(t, &files, func(c Candidate) error {
+				if len(c.Files) == tc.stopAtFiles {
+					m.BeginShutdown()
+				}
+				if len(c.Files) == 4 {
+					return errMemory() // recoverable: split
+				}
+				return nil
+			})
+			rec := wideCycle(t, m)
+			if attempts.Load() != tc.wantAttempts {
+				t.Fatalf("attempts = %d, want %d", attempts.Load(), tc.wantAttempts)
+			}
+			if rec.Status != "stopped" || rec.Failed != 0 {
+				t.Fatalf("status %q failed %d, want stopped and 0", rec.Status, rec.Failed)
+			}
+			if len(m.TooWidePartitions()) != 0 {
+				t.Fatal("a split stopped for shutdown struck the partition as too wide")
+			}
+		})
+	}
+}
+
+// StopDispatchAll never blocks on a Stop already holding the scheduler (an
+// OnLoseCompactor stop waiting for its cycle): the hook runs first of all.
+func TestStopDispatchAllDoesNotBlockOnAStopInProgress1887(t *testing.T) {
+	s := &Scheduler{}
+	s.mu.Lock() // a Stop waiting for its cycle under the lock
+	defer s.mu.Unlock()
+	done := make(chan struct{})
+	go func() { StopDispatchAll(s, nil); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("StopDispatchAll blocked on a scheduler whose Stop holds its lock")
 	}
 }

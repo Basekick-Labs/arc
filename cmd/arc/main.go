@@ -2207,9 +2207,6 @@ func main() {
 				Msg("Daily compaction scheduler started")
 		}
 
-		// One hook for both: they share a cycle claim, and stopping one while
-		// the other's deferred tick still waits lets that tick start a cycle
-		// mid-shutdown when the first's cycle ends (#220).
 		// Shutdown stops compaction early and waits for its running cycle
 		// later, bounded (#1887): a triggered cycle too, not only the
 		// schedulers'. One step for both schedulers: they share a cycle
@@ -2572,7 +2569,9 @@ func main() {
 						// drain, which are components too (#1014). The schedulers
 						// that ask it whether they may run are hooks at
 						// PriorityScheduler, so they have already quiesced by the
-						// time any component runs.
+						// time any component runs; compaction's cycle is waited
+						// for by a component before it (priorityCompactionWait,
+						// #1887).
 						registerClusterCoordinatorShutdown(shutdownCoordinator, clusterCoordinator.Stop)
 
 						localNode := clusterCoordinator.GetLocalNode()
@@ -2758,11 +2757,12 @@ func main() {
 						// construct the watcher and schedulers on every node but only
 						// start them when the node holds the compactor lease.
 						//
-						// Shutdown ordering: the watcher is a hook, and the
-						// coordinator that owns Raft is a component, so the watcher
-						// drains any pending manifests BEFORE Raft goes away
-						// whatever its priority; PriorityCompaction - 1 keeps it
-						// after the schedulers that feed it.
+						// Shutdown ordering (#1887): the watcher is a component
+						// after the compaction wait (priorityCompactionWatcher),
+						// so its final drain sees the records of the batches that
+						// ended during the wait, and before the cluster
+						// coordinator (PriorityCompaction), so Raft is still up
+						// for them.
 						// The watcher itself was built before Start (see the
 						// compaction pause wiring above); nil when this node
 						// has none or its construction failed.
@@ -2781,10 +2781,10 @@ func main() {
 									Msg("Phase 4 compaction completion watcher started")
 							}
 
-							shutdownCoordinator.RegisterHook("compaction-completion-watcher", func(ctx context.Context) error {
+							shutdownCoordinator.Register("compaction-completion-watcher", shutdownFunc(func() error {
 								watcher.Stop()
 								return nil
-							}, shutdown.PriorityCompaction-1)
+							}), priorityCompactionWatcher)
 
 							// Phase 5: wire OnBecomeCompactor / OnLoseCompactor
 							// callbacks so the scheduler and watcher activate/deactivate
@@ -6547,7 +6547,14 @@ func main() {
 	log.Info().Str("signal", sig.String()).Msg("Initiating graceful shutdown...")
 
 	// Perform graceful shutdown of all components
-	if err := shutdownCoordinator.Shutdown(); err != nil {
+	shutdownErr := shutdownCoordinator.Shutdown()
+	// The coordinator skips its remaining components once its deadline
+	// passes, the compaction wait among them: no compaction child may
+	// outlive this process (#1887).
+	if compactionManager != nil {
+		killLeftoverCycles(compactionManager, log.Logger)
+	}
+	if err := shutdownErr; err != nil {
 		log.Error().Err(err).Msg("Shutdown completed with errors")
 		if code := exitCode.Load(); code != 0 {
 			os.Exit(int(code))
@@ -7193,7 +7200,9 @@ func registerFileRegistrarShutdown(coordinator *shutdown.Coordinator, stop func(
 // The cluster coordinator owns Raft. It must stop after the file registrar
 // has drained (so the final flush's files land in the manifest) and after the
 // tick-driven schedulers that ask it whether they may run — those are hooks
-// at PriorityScheduler and so already stopped. Registered as a component for
+// at PriorityScheduler and so already stopped, and compaction's running cycle
+// is waited for by an earlier component (priorityCompactionWait, #1887), as
+// is the completion watcher's final drain. Registered as a component for
 // the first reason: every hook runs before any component, so a hook here
 // would have stopped Raft before the buffer flushed (#1014).
 func registerClusterCoordinatorShutdown(coordinator *shutdown.Coordinator, stop func() error) {

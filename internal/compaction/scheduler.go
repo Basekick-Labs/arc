@@ -127,15 +127,15 @@ func (s *Scheduler) Start() error {
 		return nil
 	}
 
-	if s.running {
-		s.logger.Warn().Msg("Compaction scheduler already running")
-		return nil
-	}
-
 	// After shutdown began (#1887), a compactor-lease callback must not
 	// restart a scheduler the shutdown has stopped.
 	if s.manager != nil && s.manager.Stopping() {
 		s.logger.Info().Msg("Compaction scheduler not started: the server is shutting down")
+		return nil
+	}
+
+	if s.running {
+		s.logger.Warn().Msg("Compaction scheduler already running")
 		return nil
 	}
 
@@ -234,7 +234,13 @@ func StopDispatchAll(schedulers ...*Scheduler) {
 		if s == nil {
 			continue
 		}
-		s.mu.Lock()
+		// TryLock: a Stop already holding the lock (OnLoseCompactor's)
+		// waits for the running cycle under it, and has stopped dispatch
+		// itself. Blocking on it here would hold every later shutdown hook
+		// behind a batch.
+		if !s.mu.TryLock() {
+			continue
+		}
 		if s.running {
 			s.signalStopLocked()
 			if s.cron != nil {

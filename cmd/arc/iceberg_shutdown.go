@@ -34,7 +34,12 @@ import (
 //
 // The drain uses what is left of the shutdown budget, less a tenth for the
 // closes after it and, with Glue on, a twentieth for Glue's flush: nothing is
-// taken from the hooks' share. The drain and Glue's flush do network I/O
+// taken from the hooks' share. The compaction wait before it
+// (priorityCompactionWait, #1887) may use the budget up to a fifth before the
+// deadline when a batch overruns, which leaves the drain a tenth (a
+// twentieth with Glue). The trade is deliberate: a batch the wait kills is a
+// crash the next start recovers, and a child left running would race the
+// replacement process. The drain and Glue's flush do network I/O
 // among the components, each bounded by its own deadline.
 //
 // The hook's wait for the loop is bounded. When the loop does not end in

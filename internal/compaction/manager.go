@@ -1237,7 +1237,7 @@ func (m *Manager) notifyCompactedOutput(storageKey string) {
 
 // recoverOrphanedManifests wires cluster completion updates into storage recovery.
 func (m *Manager) recoverOrphanedManifests(ctx context.Context, scope recoveryScope) (int, error) {
-	hooks := recoveryHooks{}
+	hooks := recoveryHooks{stop: m.shutdownStop}
 	if m.CompletionDir != "" {
 		hooks.beforeInputDelete = m.writeRecoveredOutputWrittenManifest
 		hooks.afterInputDelete = m.writeRecoveredSourcesDeletedManifest
@@ -1957,6 +1957,15 @@ func (m *Manager) halt() error {
 	return nil
 }
 
+// shutdownStop is ErrCompactionStopping once BeginShutdown was called. The
+// pause does not stop recovery or a split: only shutdown does.
+func (m *Manager) shutdownStop() error {
+	if m.stopping.Load() {
+		return ErrCompactionStopping
+	}
+	return nil
+}
+
 // haltWhy is the end of a log line for halt's error.
 func haltWhy(err error) string {
 	if errors.Is(err, ErrCompactionStopping) {
@@ -2316,9 +2325,6 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 	// recoveryScope for why a tier-scoped recovery is wrong for the
 	// single-tier schedulers.
 	if m.ManifestManager != nil {
-		if herr := m.halt(); herr != nil {
-			return herr
-		}
 		recovered, err := m.recoverOrphanedManifests(ctx, recoveryScope{Databases: recoveryDatabases, Measurement: filterMeasurement})
 		// After recovery deleted what it could: a finished job whose
 		// manifest is gone is over.
@@ -2332,6 +2338,11 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
+			}
+			// Shutdown stopped recovery between two manifests (#1887).
+			if errors.Is(err, ErrCompactionStopping) {
+				m.logger.Info().Int64("cycle_id", cycleID).Msg("Manifest recovery stopped between manifests: the server is shutting down; the rest recover in a later cycle")
+				return ErrCompactionStopping
 			}
 			discoveryErrors.Add(1)
 			m.logger.Warn().Err(err).Msg("Manifest recovery encountered errors")
@@ -2533,8 +2544,9 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 			// manifest and storage disagreeing), so the cycle waits for
 			// them and ends "paused"; the batch just discovered counts
 			// as unstarted. Sub-batch splitting inside
-			// compactFilesAdaptively does not see the gate: those are
+			// compactFilesAdaptively does not see the pause: those are
 			// one job's inputs and splitting them is part of running it.
+			// Shutdown does stop a split between its halves (#1887).
 			if herr := m.halt(); herr != nil {
 				<-sem
 				m.logger.Info().
