@@ -385,6 +385,20 @@ func TestVisibleKeysDeduplicated1759(t *testing.T) {
 	noteVisibleKey(nil, "db/m")
 }
 
+// Both append sites record the key: the typed path and the record path.
+func TestVisibleBothAppendSitesRecordTheKey1759(t *testing.T) {
+	buf := outcomeBuffer(t, &pathFailStorage{}, 1000)
+	ctx, o := visibleCtx()
+	if err := buf.WriteColumnarRecord(ctx, "db", columnarVisibleRecord("msites", 3)); err != nil {
+		t.Fatal(err)
+	}
+	writeOutcomeBatch(t, buf, ctx, "msites2", 2)
+	writeOutcomeBatch(t, buf, context.Background(), "mlive", 7) // live: not this outcome's
+	if got := fmt.Sprint(o.vis.markedKeys()); got != "[db/msites db/msites2]" {
+		t.Fatalf("keys = %s, want [db/msites db/msites2]", got)
+	}
+}
+
 // B8: 64 visible waiters on one hot key, none due: a round takes no shard
 // lock (each answers not_due while the test holds the key's shard lock).
 func TestVisibleForceNotDueTakesNoShardLock1759(t *testing.T) {
@@ -578,12 +592,18 @@ func TestForceFlushKeyPrunedEntryIsNotADetach1759(t *testing.T) {
 // Every result but ledger_off is counted, under its source.
 func TestForceFlushKeyCountsResults1759(t *testing.T) {
 	off := newForceFixture(t, forceConfig(2, 100), nil)
-	before := forcedFlushCount(t, "read", "forced")
+	sum := func() (n int64) {
+		for _, r := range []string{"forced", "not_due", "over_budget", "nothing", "not_wanted", "closing"} {
+			n += forcedFlushCount(t, "read", r)
+		}
+		return n
+	}
+	before := sum()
 	off.write("m", 5)
 	if r, _ := off.buf.ForceFlushKey("db/m", time.Second, ForceRead, nil); r != LedgerOff {
 		t.Fatal(r)
 	}
-	if forcedFlushCount(t, "read", "forced") != before {
+	if sum() != before {
 		t.Fatal("ledger_off was counted")
 	}
 
