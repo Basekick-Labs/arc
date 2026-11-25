@@ -3236,11 +3236,16 @@ func main() {
 		server.RegisterMetricsRoutes(nil)
 	}
 
+	// x-arc-wait: visible (#1759), one instance for both write handlers so
+	// the waiter limit is the node's. From cfg only, not the cluster router.
+	waitVisible := api.NewWaitVisible(waitVisibleConfig(cfg))
+
 	// Register MessagePack handler with Arrow buffer
 	msgpackHandler := api.NewMsgPackHandler(logger.Get("msgpack"), arrowBuffer, server.GetMaxPayloadSize())
 	if authManager != nil && rbacManager != nil {
 		msgpackHandler.SetAuthAndRBAC(authManager, rbacManager)
 	}
+	msgpackHandler.SetWaitVisible(waitVisible)
 	msgpackHandler.RegisterRoutes(server.GetApp())
 
 	// Register Line Protocol handler
@@ -3250,6 +3255,7 @@ func main() {
 	}
 	// Bounds the Prometheus Remote Write body and its decoded size (#1383).
 	lineProtocolHandler.SetMaxPayloadSize(server.GetMaxPayloadSize())
+	lineProtocolHandler.SetWaitVisible(waitVisible)
 	lineProtocolHandler.RegisterRoutes(server.GetApp())
 
 	// Register the edge-sync hub receive endpoint (#569).

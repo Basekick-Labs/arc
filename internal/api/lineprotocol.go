@@ -38,6 +38,9 @@ type LineProtocolHandler struct {
 	// Cluster routing support
 	router *cluster.Router
 
+	// waitVisible serves x-arc-wait: visible on WriteSimple (#1759); nil: off.
+	waitVisible *WaitVisible
+
 	// maxPayloadSize is server.max_payload_size; 0 when not set (tests).
 	// Prometheus Remote Write bounds its body, its decoded size and the
 	// label bytes its samples repeat by it, at most
@@ -86,6 +89,11 @@ func (h *LineProtocolHandler) SetMaxPayloadSize(n int64) {
 	h.maxPayloadSize = n
 }
 
+// SetWaitVisible sets the node's x-arc-wait: visible support (#1759).
+func (h *LineProtocolHandler) SetWaitVisible(wv *WaitVisible) {
+	h.waitVisible = wv
+}
+
 // SetRouter sets the cluster router for request forwarding.
 // When set, write requests from reader nodes will be forwarded to writer nodes.
 func (h *LineProtocolHandler) SetRouter(router *cluster.Router) {
@@ -130,6 +138,10 @@ func (h *LineProtocolHandler) RegisterRoutes(app *fiber.App) {
 // POST /write?db=telegraf&rp=default&precision=ns
 func (h *LineProtocolHandler) WriteV1(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
+	if handled, err := refuseWaitVisible(c); handled {
+		h.totalErrors.Add(1)
+		return err
+	}
 
 	db := c.Query("db", "default")
 	precision := c.Query("precision", "ns")
@@ -140,13 +152,17 @@ func (h *LineProtocolHandler) WriteV1(c *fiber.Ctx) error {
 		db = headerDB
 	}
 
-	return h.handleWrite(c, db, precision)
+	return h.handleWrite(c, db, precision, nil)
 }
 
 // WriteInfluxDB handles InfluxDB 2.x compatible write requests
 // POST /api/v2/write?org=myorg&bucket=mybucket&precision=ns
 func (h *LineProtocolHandler) WriteInfluxDB(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
+	if handled, err := refuseWaitVisible(c); handled {
+		h.totalErrors.Add(1)
+		return err
+	}
 
 	bucket := c.Query("bucket", "default")
 	precision := c.Query("precision", "ns")
@@ -158,23 +174,30 @@ func (h *LineProtocolHandler) WriteInfluxDB(c *fiber.Ctx) error {
 		db = headerDB
 	}
 
-	return h.handleWrite(c, db, precision)
+	return h.handleWrite(c, db, precision, nil)
 }
 
 // WriteSimple handles simple write requests without query parameters
 // POST /api/v1/write/line-protocol
 func (h *LineProtocolHandler) WriteSimple(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
+	// x-arc-wait (#1759): refused here, before anything is forwarded or read.
+	vw, handled, err := h.waitVisible.begin(c)
+	if handled {
+		h.totalErrors.Add(1)
+		return err
+	}
 
 	db := c.Get("x-arc-database", "default")
 	precision := c.Query("precision", "ns")
 
-	return h.handleWrite(c, db, precision)
+	return h.handleWrite(c, db, precision, vw)
 }
 
 // handleWrite processes Line Protocol data and writes to the Arrow buffer.
 // precision controls timestamp interpretation: "ns" (default), "us", "ms", "s".
-func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string, precision string) error {
+// vw is the request's x-arc-wait: visible (#1759), nil when it does not wait.
+func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string, precision string, vw *visibleWrite) error {
 	// Copy the database name before it can escape the handler. Every caller
 	// sources `database` from Fiber's zero-copy c.Get / c.Query (aliases into the
 	// fasthttp request buffer, valid only for this handler). The Arrow-buffer
@@ -300,7 +323,7 @@ localProcessing:
 	}
 
 	if !h.buffer.HasDecimalColumns() {
-		return h.writeTyped(c, body, database, precision)
+		return h.writeTyped(c, body, database, precision, vw)
 	}
 
 	// Decimal columns (ingest.decimal_columns) are converted by the buffer's
@@ -413,12 +436,20 @@ localProcessing:
 	// so neither closing mid-request can split it (#1422). Any other failure
 	// part-way stops the write, answered with what was written
 	// (writeLPMeasurements, #1437).
+	// A visible write takes its waiter slot here (#1759): refused, nothing
+	// is written.
+	if !vw.acquire() {
+		h.totalErrors.Add(1)
+		return respondIngestRefused(c, ingest.ErrWaitVisibleBusy)
+	}
+	defer vw.release()
 	writeCtx, release, err := h.buffer.AdmitWholeRequest(c.Context(), int64(len(body)))
 	if err != nil {
 		h.totalErrors.Add(1)
 		return respondWriteRefused(c, err)
 	}
 	defer release()
+	writeCtx = vw.context(writeCtx)
 
 	// One buffer call per measurement, so a failure can follow measurements
 	// already buffered (#1437): see writeLPMeasurements.
@@ -429,6 +460,9 @@ localProcessing:
 		return len(record.Columns["time"]), lpWriteRecord(h.buffer, writeCtx, database, record)
 	})
 	if stop != nil {
+		if len(stop.written) > 0 {
+			vw.notWaited(c, visibleReasonStopped)
+		}
 		return h.answerLPStop(c, lpProtocolName, database, stop, drops)
 	}
 
@@ -444,9 +478,14 @@ localProcessing:
 	if dropped > 0 {
 		h.totalErrors.Add(1)
 		logPointDrops(h.logger, "Line protocol", database, drops)
+		vw.notWaited(c, visibleReasonPartial)
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": partialWriteMessage(drops, dropped, true),
 		})
+	}
+
+	if vw != nil {
+		return h.answerVisible(c, vw, release, written)
 	}
 
 	// InfluxDB returns 204 No Content on success
@@ -459,7 +498,7 @@ localProcessing:
 // key, two keys landing in one column, a value that does not fit its column's
 // type) is dropped, the rest are written, and the answer is a "partial write"
 // 400, as InfluxDB does.
-func (h *LineProtocolHandler) writeTyped(c *fiber.Ctx, body []byte, database, precision string) error {
+func (h *LineProtocolHandler) writeTyped(c *fiber.Ctx, body []byte, database, precision string, vw *visibleWrite) error {
 	batches, rows, drops, err := h.parser.ParseLPWriteKnown(body, precision, writableKnownColumns(c, h.rbacManager, database, h.buffer.KnownColumns(database)))
 	if err != nil {
 		h.totalErrors.Add(1)
@@ -522,12 +561,18 @@ func (h *LineProtocolHandler) writeTyped(c *fiber.Ctx, body []byte, database, pr
 	// fence and stream-takeover pauses, #1207) or the WAL volume is under disk
 	// pressure (#676), and check neither again per measurement (#1422); see
 	// the record path above.
+	if !vw.acquire() { // #1759, see the record path
+		h.totalErrors.Add(1)
+		return respondIngestRefused(c, ingest.ErrWaitVisibleBusy)
+	}
+	defer vw.release()
 	writeCtx, release, err := h.buffer.AdmitWholeRequest(c.Context(), int64(len(body)))
 	if err != nil {
 		h.totalErrors.Add(1)
 		return respondWriteRefused(c, err)
 	}
 	defer release()
+	writeCtx = vw.context(writeCtx)
 
 	// One buffer call per measurement, so a failure can follow measurements
 	// already buffered (#1437): see writeLPMeasurements.
@@ -536,6 +581,9 @@ func (h *LineProtocolHandler) writeTyped(c *fiber.Ctx, body []byte, database, pr
 		return rows[m], lpWriteTyped(h.buffer, writeCtx, database, m, batches[m], rows[m])
 	})
 	if stop != nil {
+		if len(stop.written) > 0 {
+			vw.notWaited(c, visibleReasonStopped)
+		}
 		return h.answerLPStop(c, lpProtocolName, database, stop, drops)
 	}
 
@@ -550,9 +598,22 @@ func (h *LineProtocolHandler) writeTyped(c *fiber.Ctx, body []byte, database, pr
 	if dropped > 0 {
 		h.totalErrors.Add(1)
 		h.logDrops(database, drops)
+		vw.notWaited(c, visibleReasonPartial)
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": partialWriteMessage(drops, dropped, true)})
 	}
+	if vw != nil {
+		return h.answerVisible(c, vw, release, total)
+	}
 	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// answerVisible answers a visible write that returned without error (#1759)
+// after releasing its WAL reservation and the request body: the parsed body
+// is a copy (decompressRequest), and nothing reads the raw body after it.
+func (h *LineProtocolHandler) answerVisible(c *fiber.Ctx, vw *visibleWrite, release func(), rows int) error {
+	release()
+	c.Request().ResetBody()
+	return vw.answer(c, int64(rows), true)
 }
 
 // logDrops logs a write's dropped points (see logPointDrops).

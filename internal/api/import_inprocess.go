@@ -37,6 +37,10 @@ const maxImportSize = 500 * 1024 * 1024 // 500MB
 // DuckDB sandbox allowlist.
 func (h *ImportHandler) handleCSVImport(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
+	// x-arc-wait is not supported on imports (#1759).
+	if handled, err := refuseWaitVisible(c); handled {
+		return err
+	}
 	if handled, err := h.forwardWriteIfNeeded(c); handled {
 		return err
 	}
@@ -389,6 +393,10 @@ func (h *ImportHandler) importCSV(c *fiber.Ctx, database, measurement string, up
 // ingests it through the ArrowBuffer pipeline. No DuckDB queries against the file.
 func (h *ImportHandler) handleParquetImport(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
+	// x-arc-wait is not supported on imports (#1759).
+	if handled, err := refuseWaitVisible(c); handled {
+		return err
+	}
 	if handled, err := h.forwardWriteIfNeeded(c); handled {
 		return err
 	}

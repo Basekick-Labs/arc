@@ -184,6 +184,10 @@ func (h *ImportHandler) RegisterRoutes(app *fiber.App) {
 // Uses the same ArrowBuffer ingest pipeline as streaming LP ingestion.
 func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
+	// x-arc-wait is not supported on imports (#1759).
+	if handled, err := refuseWaitVisible(c); handled {
+		return err
+	}
 	if handled, err := h.forwardWriteIfNeeded(c); handled {
 		return err
 	}
@@ -423,6 +427,10 @@ func (h *ImportHandler) importErrorResponse(c *fiber.Ctx, err error) error {
 // Uses the same ArrowBuffer ingest pipeline as streaming TLE ingestion.
 func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
+	// x-arc-wait is not supported on imports (#1759).
+	if handled, err := refuseWaitVisible(c); handled {
+		return err
+	}
 	if handled, err := h.forwardWriteIfNeeded(c); handled {
 		return err
 	}

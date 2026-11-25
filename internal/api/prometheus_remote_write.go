@@ -98,6 +98,10 @@ func (h *LineProtocolHandler) WritePrometheusRemoteWrite(c *fiber.Ctx) error {
 		}
 	}()
 
+	// x-arc-wait is not supported here (#1759).
+	if handled, err := refuseWaitVisible(c); handled {
+		return err
+	}
 	database := c.Query("db", "default")
 	if headerDB := c.Get("x-arc-database"); headerDB != "" {
 		database = headerDB

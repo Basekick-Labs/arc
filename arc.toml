@@ -173,6 +173,16 @@ default_sort_keys = ""
 # A refusal does not start a flush: keep an explicit value well above what
 # buffers hold before their size/age flush, or writes wait for the next one.
 # max_buffered_bytes = "0"   # or "auto", or a size such as "4GB"
+#
+# Wait until visible (#1759). With wait_visible_enabled = true, a write to
+# /api/v1/write/msgpack or /api/v1/write/line-protocol carrying the header
+# "x-arc-wait: visible" is answered once its rows are visible to a query on
+# this node: 204 with X-Arc-Visible: true. It waits for the rows' normal age or
+# size flush (up to max_buffer_age_ms plus the flush), at most 20 s; otherwise
+# 202 with X-Arc-Visible: false and X-Arc-Visible-Reason. Local storage only in
+# this version (object storage answers 202 storage_not_confirmable); refused
+# with 400 on a cluster. Off (the default): the header is refused with 403.
+# wait_visible_enabled = false
 
 # -----------------------------------------------------------------------------
 # Compaction

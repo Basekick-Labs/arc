@@ -79,6 +79,11 @@ func (h *TLEHandler) RegisterRoutes(app *fiber.App) {
 // handleWrite processes TLE data and writes to the Arrow buffer
 func (h *TLEHandler) handleWrite(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
+	// x-arc-wait is not supported here (#1759).
+	if handled, err := refuseWaitVisible(c); handled {
+		h.totalErrors.Add(1)
+		return err
+	}
 
 	// strings.Clone: c.Get is zero-copy (aliases the fasthttp header buffer);
 	// this database name is retained past the handler by the async Arrow buffer

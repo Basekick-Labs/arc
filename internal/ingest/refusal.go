@@ -45,6 +45,11 @@ const (
 	// when live ingestion is refused until it is renewed; counted in
 	// arc_license_write_refusals_total.
 	RefusalLicenseGrace = "license_grace"
+	// RefusalWaitVisibleBusy: the request asked to wait until its rows are
+	// visible (x-arc-wait: visible, #1759) and the node already has its
+	// limit of such writes waiting; counted in
+	// arc_ingest_wait_visible_total{outcome="busy"}.
+	RefusalWaitVisibleBusy = "wait_visible_busy"
 )
 
 // ErrLicenseWritesStopped refuses a live write on grace days 7-14 of an
@@ -102,6 +107,15 @@ var ErrImportQueueTimeout error = &WriteRefusal{
 var ErrBufferFull error = &WriteRefusal{
 	Reason: RefusalBufferFull,
 	Text:   "write refused: rows waiting to be flushed reached ingest.max_buffered_bytes (storage is not keeping up, see arc_buffer_bytes_buffered); nothing was written, retry",
+}
+
+// ErrWaitVisibleBusy refuses a write that asked to wait until its rows are
+// visible while the node's limit of such waiting writes is reached (#1759).
+// Checked before admission: nothing was written. Retryable, with or without
+// the header.
+var ErrWaitVisibleBusy error = &WriteRefusal{
+	Reason: RefusalWaitVisibleBusy,
+	Text:   "write refused: too many writes on this node are waiting until their rows are visible (x-arc-wait: visible); nothing was written, retry",
 }
 
 // ErrWALNotDurable refuses a live write whose WAL entry could not be made
@@ -249,6 +263,9 @@ func refusalLogMessage(reason string) string {
 	}
 	if reason == RefusalBufferFull || reason == "forwarded_"+RefusalBufferFull {
 		return "Writes refused on this node (retryable): rows waiting to be flushed reached ingest.max_buffered_bytes; logged once per reason every 30s, see arc_buffer_bytes_buffered and arc_ingest_buffer_full_rejections_total"
+	}
+	if reason == RefusalWaitVisibleBusy || reason == "forwarded_"+RefusalWaitVisibleBusy {
+		return "Writes refused on this node (retryable): too many writes waiting until their rows are visible (x-arc-wait: visible); logged once per reason every 30s, see arc_ingest_wait_visible_waiters and arc_ingest_wait_visible_total{outcome=\"busy\"}"
 	}
 	return "Writes refused on this node (retryable); logged once per reason every 30s, see arc_cluster_ingest_fenced_writes_total"
 }
