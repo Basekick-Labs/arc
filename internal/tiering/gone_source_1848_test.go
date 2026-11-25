@@ -32,3 +32,24 @@ func TestMigrationSkipsASourceRemovedSinceTheScan(t *testing.T) {
 		t.Fatal("a cold object appeared for a file that is gone")
 	}
 }
+
+// #1848 test gap: a file a re-home job took over after its flip (the job's
+// owned filter, not a compaction) loses its cold copy and is hot again.
+func TestDropTakenOverForARehomeJob1848(t *testing.T) {
+	m, _, cold, cleanup := setupIntegrationTest(t, true)
+	t.Cleanup(cleanup)
+	cold.seedRaw(missA, []byte("x"))
+	m.SetOwnedFilter(func(p string) bool { return p == missA })
+	var reported [][]string
+	m.SetOnColdRemoved(func(k []string) { reported = append(reported, k) })
+	kept := m.migrator.dropTakenOver(context.Background(), []MigrationCandidate{candidateFor(missA), candidateFor(missB)})
+	if len(kept) != 1 || kept[0].Path != missB {
+		t.Fatalf("kept %v; want only the file no job owns", kept)
+	}
+	if n, _ := cold.StatFile(context.Background(), missA); n >= 0 {
+		t.Fatal("the cold copy of the job's file was kept")
+	}
+	if len(reported) != 1 || len(reported[0]) != 1 || reported[0][0] != missA {
+		t.Fatalf("reported %v", reported)
+	}
+}
