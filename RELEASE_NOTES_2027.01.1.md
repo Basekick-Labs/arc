@@ -2,6 +2,24 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Change: compaction cycle ids carry the process they belong to, and the trigger can wait ([#1884](https://github.com/Basekick-Labs/arc/issues/1884))
+
+Compaction cycle ids are counted from 1 in each Arc process. A client that keeps an id across requests can read another cycle's record under the same number. That happens when Arc restarts between its trigger and its poll, or when the poll lands on another node behind a load balancer. This was seen with a CronJob: two triggers an hour apart, with a restart between them, both got `cycle_id: 1`.
+
+- **`boot_id`:** a random 16-hex value made once per process. These responses carry it: the trigger (its 200, and its 409 "already running"), `/cycles`, `/cycles/{id}`, `/history` and `/stats`. Arc also logs it once at startup, so cycle log lines from before and after a restart can be told apart.
+- **Lookups that send `boot_id`:**
+  - `GET /api/v1/compaction/cycles/{id}?boot_id=<x>` answers 404 with `"boot_id_mismatch": true` when `x` is not this process's, even if this process has a record with that number. It names this process's `boot_id`, and the lease holder on a cluster. The cause can be a restart or another node; the server cannot tell which.
+  - `GET /api/v1/compaction/history?cycle_id=<n>&boot_id=<x>` answers 200 with `cycle_retained: false`, `boot_id_mismatch: true` and no jobs.
+  - Without `boot_id`, or with it empty, nothing changes.
+- **`POST /api/v1/compaction/trigger?wait=<duration>`** (for example `90s`, `5m`, at most 10 minutes) answers when the cycle ends: 200 with the cycle's record. Check its `status`: a cycle that failed is a 200 too.
+  - If the wait runs out, it answers 202 with the trigger's answer and `"status": "running"`; the cycle carries on.
+  - If the server starts shutting down meanwhile, it answers 202 with `"status": "unknown"`; a manual cycle stops with the process.
+  - A wait that is not a positive duration is rejected with 400 before any cycle is claimed. Without `wait` the trigger answers at once, as before.
+  - A client that gives up early does not stop the server waiting: the answer is written when the cycle ends or the wait runs out.
+  - Behind a load balancer, keep the wait under its idle timeout (often 60 s), or the balancer answers 504 while the cycle carries on.
+
+Ids stay numeric and still restart at 1. Seeding them from the clock would have made `arcli compaction run --wait` report a cycle as finished after a restart, because it compares the id against `/stats`' `current_cycle_id`.
+
 ## Fix: files flushed at shutdown reach the Iceberg table, and Glue, before Arc exits ([#1886](https://github.com/Basekick-Labs/arc/issues/1886))
 
 On SIGTERM, ingest's final flush writes what is still buffered. The Iceberg export had already stopped by then, so the files from that flush were not added to their tables. Files waiting for their next ingest export (up to `iceberg.ingest_export_interval`, 60 s by default) were left out too, along with export requests the loop had taken but not served. The tables stayed behind the bucket until Arc started again; on a node that does not come back (decommissioned, scaled away) they stayed behind. Glue, stopped earlier still, never learned of a version published that late.

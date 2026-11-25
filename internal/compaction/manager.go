@@ -2,6 +2,8 @@ package compaction
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -317,7 +319,12 @@ type Manager struct {
 	// serialising a stats read behind the claim.
 	claimMu      sync.Mutex
 	cycleRunning atomic.Bool
-	cycleID      atomic.Int64
+
+	// bootID tells this process's cycle ids from another's (#1884): ids come
+	// from cycleID, which restarts at 1 with every process, so the same id can
+	// name two cycles across a restart, or on two nodes. Made once, here.
+	bootID  string
+	cycleID atomic.Int64
 	// cycleReleased is closed by the next claim release, and made when someone
 	// first waits for it (cycleReleaseSignal). Guarded by claimMu.
 	cycleReleased chan struct{}
@@ -525,6 +532,7 @@ func NewManager(cfg *ManagerConfig) *Manager {
 	}
 
 	m := &Manager{
+		bootID:           newBootID(),
 		OpenJobs:         NewOpenJobs(cfg.StorageBackend),
 		StorageBackend:   cfg.StorageBackend,
 		LockManager:      cfg.LockManager,
@@ -608,6 +616,9 @@ func NewManager(cfg *ManagerConfig) *Manager {
 			Msg("Compaction manager initialized (no tiers)")
 	}
 
+	// Logged once, so cycle log lines (which carry only cycle_id) from
+	// before and after a restart can be told apart (#1884).
+	m.logger.Info().Str("boot_id", m.bootID).Msg("Compaction manager ready: cycle ids are counted from 1 in this process")
 	return m
 }
 
@@ -2927,6 +2938,7 @@ func (m *Manager) Stats() map[string]interface{} {
 		"active_jobs":             m.activeJobs.Load(),
 		"cycle_running":           m.cycleRunning.Load(),
 		"current_cycle_id":        m.cycleID.Load(),
+		"boot_id":                 m.bootID,
 		"exclude_databases":       excluded,
 		"paused":                  m.Paused(),
 		"last_cycle": map[string]interface{}{
@@ -3678,3 +3690,20 @@ func (m *Manager) ClearTooWide(tier, partition string) int {
 	metrics.Get().SetCompactionPartitionsTooWide(int64(m.tooWide.memoized(m.TooWideSettings())))
 	return n
 }
+
+// newBootID is a random 16-hex-digit process id for BootID.
+func newBootID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand does not fail on supported platforms; a time-based id
+		// still tells two processes apart.
+		return fmt.Sprintf("%016x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// BootID identifies this process's cycle ids (#1884). A client that keeps a
+// cycle id across requests keeps this beside it: an id from another process
+// (a restart, or another node behind a load balancer) is another cycle even
+// when the number matches.
+func (m *Manager) BootID() string { return m.bootID }
