@@ -84,7 +84,7 @@ func (s *Scheduler) pendingFloor() time.Duration {
 // PendingTables implements metrics.IcebergTableLagSource: per table, how
 // long its oldest file waiting for an export has waited, from the earlier of
 // its first report since the last export that covered it (the ingest
-// trigger, standalone) and the write time of its oldest committed file not
+// trigger) and the write time of its oldest committed file not
 // yet published (every mode). Only tables past pendingFloor.
 func (s *Scheduler) PendingTables(n int, now time.Time) ([]metrics.IcebergTableLag, int) {
 	if !s.exportingNow() {
