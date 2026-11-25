@@ -3,6 +3,7 @@ package rehome
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -41,10 +42,14 @@ type ReplacedRecord struct {
 
 func replacedKey(id string) string { return ReplacedRoot + "/" + id + ".json" }
 
+// ErrReplacedInvalid: the job cannot be written as a replacement record (a
+// key that is not a data file of its measurement); trying again cannot help.
+var ErrReplacedInvalid = errors.New("the job cannot be recorded for the export")
+
 // validate reports whether every key of the record is a data file of its
 // database and measurement.
 func (rec *ReplacedRecord) validate(id string) error {
-	if rec.ID != id || rec.Database == "" || rec.Measurement == "" || len(rec.Outputs) == 0 {
+	if !validID(id) || rec.ID != id || rec.Database == "" || rec.Measurement == "" || len(rec.Outputs) == 0 {
 		return fmt.Errorf("incomplete record")
 	}
 	for _, k := range append([]string{rec.Source}, rec.Outputs...) {
@@ -71,7 +76,7 @@ func (r *Registry) KeepReplaced(ctx context.Context, j *Job) error {
 		rec.Outputs = append(rec.Outputs, o.Key)
 	}
 	if err := rec.validate(j.ID); err != nil {
-		return fmt.Errorf("the job's replacement record: %w", err)
+		return fmt.Errorf("%w: %v", ErrReplacedInvalid, err)
 	}
 	data, err := json.Marshal(rec)
 	if err != nil {
@@ -80,6 +85,10 @@ func (r *Registry) KeepReplaced(ctx context.Context, j *Job) error {
 	if err := r.store.Write(ctx, replacedKey(j.ID), data); err != nil {
 		return fmt.Errorf("write the job's replacement record: %w", err)
 	}
+	// In use from here: the file is written, and a restart reads it.
+	r.mu.Lock()
+	r.replacedAfter[rec.ID] = rec
+	r.mu.Unlock()
 	// Local storage: make the record durable before the old file goes. An
 	// object store has nothing to sync.
 	if syncer, ok := r.store.(interface {
@@ -87,13 +96,10 @@ func (r *Registry) KeepReplaced(ctx context.Context, j *Job) error {
 	}); ok {
 		for _, dir := range []string{ReplacedRoot, JournalRoot} {
 			if err := syncer.Sync(ctx, dir); err != nil && !storage.IsNotFound(err) && !os.IsNotExist(err) {
-				return fmt.Errorf("make the job's replacement record durable: %w", err)
+				return fmt.Errorf("the job's replacement record is written and in use, but could not be made durable: %w", err)
 			}
 		}
 	}
-	r.mu.Lock()
-	r.replacedAfter[rec.ID] = rec
-	r.mu.Unlock()
 	return nil
 }
 

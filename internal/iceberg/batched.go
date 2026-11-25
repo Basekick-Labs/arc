@@ -172,7 +172,7 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 	// first): a table that check removed names nothing.
 	defer func() {
 		if err == nil {
-			e.settleWaived(ctx, database, measurement)
+			e.settleWaived(ctx, database, measurement, res.commits > 0)
 		}
 	}()
 	// And at the end of the pass, however it ends (a pass can commit and
@@ -445,13 +445,14 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 	// An entry given its day is replaced by itself: it commits with its own removal, and
 	// brings no other file of its day into the first commit, which a real removal does.
 	anchored, free := splitAnchored(toBuild, withoutPaths(toRemove, redatedPaths), database, measurement)
-	// A re-home job's old file is among the removals (#1825): its rows are in
+	// A re-home job's old file is among the removals (#1825), or that of a job
+	// whose wait was waived (#1845, SetReplacedWaived): its rows are in
 	// new files in other directories, often other days. Those files go in the
 	// first commit with the removal, so no published version has the removal
 	// without them, and that commit is all or nothing below. Only those: the
 	// first commit is not chunked or time-budgeted, and a backlog of other
 	// new files folded into it could keep it from ever fitting in a pass.
-	swapOutputs, swap, waivedOutputs := e.replacedOutputs(database, measurement, toRemove)
+	swapOutputs, swap, waivedOutputs, swapRecorded := e.replacedOutputs(database, measurement, toRemove)
 	if swap {
 		kept := free[:0]
 		for _, p := range free {
@@ -554,9 +555,12 @@ func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res rec
 			moved = true
 			days, byDay := daysOfPaths(ve.paths, database, measurement)
 			if !byDay || round >= maxVanishRounds || anyUnknownDay(toRemove, database, measurement) ||
-				anyUnknownDay(anchored, database, measurement) || anyUnknownDay(dataFilePaths(cloned), database, measurement) || swap {
-				// swap: a re-home job's files span days, and deferring one
-				// of them would commit the old file's removal without it.
+				anyUnknownDay(anchored, database, measurement) || anyUnknownDay(dataFilePaths(cloned), database, measurement) || swapRecorded {
+				// swapRecorded: a re-home job's files span days, and deferring
+				// one of them would commit the old file's removal without it.
+				// Not for a job whose wait was waived (#1845): its old file is
+				// gone, and deferring every day on each vanish would keep the
+				// table naming it, which the waiver was given to get past.
 				days = nil
 			}
 			leave(ve.paths) // only for the cold-listing flag: commit 0 is already split from the free set

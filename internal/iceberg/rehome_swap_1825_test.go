@@ -583,3 +583,32 @@ func TestRehomeSwap1845_AWaivedJobsBadFileIsLeftOut(t *testing.T) {
 		t.Fatalf("a recorded job's file: err %v, want a refusal", err)
 	}
 }
+
+// A waived job's swap does not defer every day when a file vanishes: only the
+// vanished file's day waits, so the waiver still gets the old file's removal
+// past a file that keeps vanishing elsewhere (#1845 review).
+func TestRehomeSwap1845_AWaivedSwapDefersOnlyTheVanishedDay(t *testing.T) {
+	r := newSwapRig1825(t)
+	r.exp.SetReplacedWaived(func(string, string) map[string][]string {
+		return map[string][]string{r.old.Key: {r.out.Key}}
+	}, func(string, string, string) {})
+	// Day 3 loses a file this pass (x3, in the table, then gone from
+	// storage), and a new file of day 3 vanishes as it is read: day 3 is in
+	// commit 0, apart from the old file's and its new file's days.
+	x3 := r.write(3, "x3")
+	if _, err := r.exp.ReconcileMeasurementWithHint(context.Background(), "mydb", "cpu", r.sc, []FileRef{r.keep, r.old, x3}); err != nil {
+		t.Fatal(err)
+	}
+	removeFile(t, x3)
+	gone := r.write(3, "gone")
+	removeFile(t, gone)
+	res, err := r.pass(nil, r.keep, r.out, gone)
+	if err != nil {
+		t.Fatalf("a vanished file failed the pass: %v", err)
+	}
+	if res.settled {
+		t.Fatalf("result %+v, want not settled", res)
+	}
+	// Day 3 waits whole (x3 still named); the old file left with its new one.
+	r.holds(t, r.keep, r.out, x3)
+}

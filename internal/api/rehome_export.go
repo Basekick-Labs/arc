@@ -205,8 +205,18 @@ func (h *RehomeHandler) waitExport(ctx context.Context, job *rehome.Job) error {
 			// the old file goes. Without it the job still ends, as asked: a
 			// lost record only brings back the gap a waiver had before.
 			kerr := h.swap.Registry.KeepReplaced(ctx, job)
-			if kerr != nil && ctx.Err() == nil {
+			if kerr != nil && ctx.Err() == nil && !errors.Is(kerr, rehome.ErrReplacedInvalid) {
+				select {
+				case <-time.After(time.Second):
+				case <-ctx.Done():
+				}
 				kerr = h.swap.Registry.KeepReplaced(ctx, job)
+			}
+			if ctx.Err() != nil {
+				// Stopping: the job stays where it is, and recovery waits
+				// again (the waiver is given again after the restart)
+				// rather than remove the old file with no record.
+				return ctx.Err()
 			}
 			if kerr != nil {
 				log.Error().Err(kerr).Msg("Re-home: could not record the waived job's new files for the Iceberg export; the old file is removed as asked, and the export's commit of its removal is not tied to them: if that commit's pass stops part way, the table can be published for a while without some of the file's rows")

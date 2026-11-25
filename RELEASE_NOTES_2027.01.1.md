@@ -43,8 +43,11 @@ published the table without some of those rows for a while. The job now leaves a
 (`_rehome/replaced/<id>.json`, written and made durable before the old file is removed) that the
 export reads as it would a running job's: the old file's removal commits together with its new
 files. A new file that cannot be registered is logged and left out instead of holding the table
-(the old file is already gone). The export removes the record once the published table does not
-name the old file. The record is not a job: it holds no job slot and owns no file, and an older
+(the old file is already gone), and a file that vanishes during that pass holds back only its own
+day, not every day of the commit. The export removes the record once the published table does not
+name the old file, or the table is gone. If the record cannot be written, the old file is still
+removed as asked and the server logs an error; a server stopping at that moment keeps the job
+instead, and it waits again after the restart. The record is not a job: it holds no job slot and owns no file, and an older
 build ignores it. Not yet on a cluster, where the waived job's record lives in Raft and goes with
 the job.
 

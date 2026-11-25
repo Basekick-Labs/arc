@@ -409,8 +409,10 @@ func isOneOf(p, key string, keys []string) bool {
 // or a file of that commit vanished. nil: no such jobs.
 //
 // It is asked when the pass computes its diff, so it holds only while the
-// job is recorded; a job ended without the export's commit (its wait waived)
-// is answered by SetReplacedWaived.
+// job is recorded. A standalone job ended without the export's commit (its
+// wait waived) is answered by SetReplacedWaived; a cluster job ended that
+// way leaves its old file's removal to a pass that commits it like any
+// other.
 func (e *Exporter) SetReplaced(f func(database, measurement string) map[string][]string) {
 	e.replaced = f
 }
@@ -428,8 +430,23 @@ func (e *Exporter) SetReplacedWaived(f func(database, measurement string) map[st
 // settleWaived tells replacedDone of each waived job of the table whose old
 // file the published table no longer names. At the end of a pass that went
 // through, on the pass's goroutine.
-func (e *Exporter) settleWaived(ctx context.Context, database, measurement string) {
+//
+// Only after a pass that committed, or the table's first pass since the
+// start: a record the table cannot settle (its version never published) is
+// not read again on every pass. A record left is only a file.
+func (e *Exporter) settleWaived(ctx context.Context, database, measurement string, committed bool) {
 	if e.replacedWaived == nil || e.replacedDone == nil {
+		return
+	}
+	tkey := database + "\x00" + measurement
+	e.waivedMu.Lock()
+	first := !e.waivedChecked[tkey]
+	if e.waivedChecked == nil {
+		e.waivedChecked = map[string]bool{}
+	}
+	e.waivedChecked[tkey] = true
+	e.waivedMu.Unlock()
+	if !committed && !first {
 		return
 	}
 	for src := range e.replacedWaived(database, measurement) {
@@ -449,9 +466,11 @@ func (e *Exporter) settleWaived(ctx context.Context, database, measurement strin
 // waived holds the new files of the jobs among them whose wait was waived
 // (SetReplacedWaived) and no recorded job also names: those are left out
 // when they cannot be registered, not refused.
-func (e *Exporter) replacedOutputs(database, measurement string, toRemove []string) (outputs []string, hit bool, waived []string) {
+//
+// recorded reports whether a recorded job is among them, not only waived ones.
+func (e *Exporter) replacedOutputs(database, measurement string, toRemove []string) (outputs []string, hit bool, waived []string, recorded bool) {
 	if len(toRemove) == 0 {
-		return nil, false, nil
+		return nil, false, nil, false
 	}
 	removes := func(old string) bool {
 		for _, p := range toRemove {
@@ -466,7 +485,7 @@ func (e *Exporter) replacedOutputs(database, measurement string, toRemove []stri
 		for old, outs := range e.replaced(database, measurement) {
 			live[old] = true
 			if removes(old) {
-				outputs, hit = append(outputs, outs...), true
+				outputs, hit, recorded = append(outputs, outs...), true, true
 			}
 		}
 	}
@@ -479,5 +498,5 @@ func (e *Exporter) replacedOutputs(database, measurement string, toRemove []stri
 			waived = append(waived, outs...)
 		}
 	}
-	return outputs, hit, waived
+	return outputs, hit, waived, recorded
 }

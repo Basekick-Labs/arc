@@ -175,6 +175,9 @@ type exporterShared struct {
 	// published table does not name the old file (SetReplacedWaived, #1845).
 	replacedWaived func(database, measurement string) map[string][]string
 	replacedDone   func(database, measurement, source string)
+	// waivedChecked: the tables settleWaived has looked at since the start.
+	waivedMu      sync.Mutex
+	waivedChecked map[string]bool
 
 	// servedLayoutOnce caches the warehouse layout the published-state reads
 	// (published.go) check names against.
