@@ -467,6 +467,24 @@ func TestForceFlushKey_BudgetRecentDeferral(t *testing.T) {
 	f.expect("db/k", Forced)
 }
 
+// A clock stepped back after a deferral does not hold forcing off until it
+// catches up: a negative distance counts as expired.
+func TestForceFlushKey_BudgetDeferralClockStepBack(t *testing.T) {
+	cfg := forceConfig(4, 8)
+	f := newForceFixture(t, cfg, &ForceBudget{})
+	f.write("k", 10)
+
+	ghost := "db/ghost"
+	shard := f.buf.getShard(ghost)
+	shard.mu.Lock()
+	f.buf.markDeferredLocked(shard, ghost)
+	delete(shard.deferredKeys, ghost)
+	shard.mu.Unlock()
+
+	f.clock.Advance(-time.Hour)
+	f.expect("db/k", Forced)
+}
+
 func TestForceFlushKey_BudgetBufferedBytes(t *testing.T) {
 	cfg := forceConfig(4, 8)
 	cfg.MaxBufferedBytes = 1 << 40

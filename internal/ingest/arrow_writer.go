@@ -3092,8 +3092,8 @@ const (
 )
 
 // sendFlushLocked hands bufferKey's whole buffer to a flush worker with a
-// non-blocking send, or touches nothing. Caller holds shard.mu (write) and has
-// checked that the buffer has batches. It never marks the key deferred: that
+// non-blocking send, or touches nothing. Caller holds shard.mu (write); the
+// forced caller has checked that the buffer has batches. It never marks the key deferred: that
 // is the caller's decision, and the forced caller (ForceFlushKey, #1760) never
 // makes it, so a forced attempt cannot leave a deferral behind.
 //
@@ -5263,9 +5263,7 @@ func (b *ArrowBuffer) flushWorker(workerID int) {
 // runQueuedFlushTask flushes one task a worker took off the queue.
 func (b *ArrowBuffer) runQueuedFlushTask(workerID int, task flushTask) {
 	defer b.completeAsyncFlushTask(task.taskID)
-	// Registered after the completion so it runs before it: whoever waits for
-	// the task to complete then also sees its forced slot free. Deferred so
-	// that no exit, a panic included, leaks the slot (#1760).
+	// Deferred so that no exit, a panic included, leaks the slot (#1760).
 	defer b.releaseForcedTask(task)
 
 	metrics.Get().SetBufferQueueDepth(b.queueDepth.Add(-1))

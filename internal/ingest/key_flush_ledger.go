@@ -102,7 +102,9 @@ type keyFlushLedger struct {
 }
 
 type ledgerStripe struct {
-	mu   sync.Mutex
+	mu sync.Mutex
+	// keys is never pruned in this PR: nothing can enable the ledger yet.
+	// Pruning must land in the PR that first enables it (#1760 (b) or (a2)).
 	keys map[string]keyDetach
 }
 
@@ -189,8 +191,12 @@ func (b *ArrowBuffer) reserveForcedSlot(l *keyFlushLedger, now time.Time) bool {
 	if len(b.flushQueue) >= max(1, cap(b.flushQueue)/2) {
 		return false
 	}
-	if last := l.lastDeferredNano.Load(); last != 0 && now.UnixNano()-last < int64(b.maxBufferAge) {
-		return false
+	// Wall-clock nanoseconds: a clock stepped back gives a negative distance,
+	// which counts as expired rather than as a deferral that never ends.
+	if last := l.lastDeferredNano.Load(); last != 0 {
+		if d := now.UnixNano() - last; d >= 0 && d < int64(b.maxBufferAge) {
+			return false
+		}
 	}
 	if limit := b.maxBufferedBytes; limit > 0 && b.bufferBytesBuffered.Load() >= limit/2 {
 		return false
