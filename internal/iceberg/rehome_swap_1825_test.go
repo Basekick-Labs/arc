@@ -373,6 +373,11 @@ func TestReconcileAndConfirm1825_SpacedPassesStillAnswer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	const f0 = "mydb/cpu/2023/11/14/22/f0.parquet"
+	// The spacing runs from the end of the first pass, which is after the
+	// first question was put: measured from there, it is a floor whatever
+	// the first answer's own check costs (#1846; a slow runner measured from
+	// the first answer saw 81 ms).
+	first := time.Now()
 	if a, err := sched.ReconcileAndConfirm(ctx, "mydb", "cpu", f0); err != nil || !a.Named {
 		t.Fatalf("%+v %v", a, err)
 	}
@@ -380,13 +385,12 @@ func TestReconcileAndConfirm1825_SpacedPassesStillAnswer(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Straight after a pass that committed: inside the spacing.
-	start := time.Now()
 	a, err := sched.ReconcileAndConfirm(ctx, "mydb", "cpu", f0)
 	if err != nil || !a.Clear() {
 		t.Fatalf("a question inside the spacing: %+v, err %v", a, err)
 	}
-	if time.Since(start) < 100*time.Millisecond {
-		t.Fatalf("answered after %s: the spacing was not kept", time.Since(start))
+	if since := time.Since(first); since < requestMinSpacing {
+		t.Fatalf("answered %s after the first question: the spacing (%s) was not kept", since, requestMinSpacing)
 	}
 }
 

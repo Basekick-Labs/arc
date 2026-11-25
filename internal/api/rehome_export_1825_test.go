@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -442,4 +443,41 @@ func TestSwapAsksTheExportTwiceBeforeRefusing1825(t *testing.T) {
 			t.Fatalf("with %d failed pass(es): asked %d time(s) before the job, want 2", failures, asked)
 		}
 	}
+}
+
+// #1846: a waiver after the export answered once is honoured even when every
+// later question errors: the answer that counts is that a pass ran after
+// reads were switched, not the last one.
+func TestSwapExportWaiverAfterAnAnswerThenErrors1846(t *testing.T) {
+	r := newSwapRig(t)
+	var named atomic.Int32
+	withExport1825(t, r, func(n int, fileKey string) (RehomeExportAnswer, error) {
+		if fileKey == "" {
+			return RehomeExportAnswer{Clear: true}, nil
+		}
+		if named.Add(1) == 1 {
+			return RehomeExportAnswer{Why: "the published table still names the file"}, nil
+		}
+		return RehomeExportAnswer{}, errors.New("no answer")
+	})
+	id, _, _ := r.start()
+	for i := 0; named.Load() < 3; i++ {
+		if i > 4000 {
+			t.Fatal("the job never asked again after the first answer")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !r.sourceThere() {
+		t.Fatal("the old file went before the waiver")
+	}
+	if code, out := rehomeDo(t, r.app, "POST", "/api/v1/rehome/"+id+"/resume", "", `{"skip_export_wait":true}`); code != 202 {
+		t.Fatalf("waiving: %d %v", code, out)
+	}
+	if job := r.wait(id); job["state"] != "done" {
+		t.Fatalf("job: %v", job)
+	}
+	if r.sourceThere() || r.reg.Active() {
+		t.Fatal("after the waiver the old file or the record is still there")
+	}
+	r.requireOnce("after the waiver")
 }
