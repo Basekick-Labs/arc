@@ -481,3 +481,55 @@ func TestFilesAndLocal1825_AColdFileLeftOutBeforeTheListing(t *testing.T) {
 		t.Fatalf("files %v, exclusions read %d times; want the hot file and one listing", files, ex.calls)
 	}
 }
+
+// #1845 item 3: the question before a job writes in the table's metadata
+// directory, so a directory that cannot be written refuses the job before it
+// switches reads, not once it waits for the export.
+func TestReconcileAndConfirmProbesTheMetadataDirectory(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes through a read-only directory")
+	}
+	root, _, sched := confirmRig1825(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if a, err := sched.ReconcileAndConfirm(ctx, "mydb", "cpu", ""); err != nil || a.WriteErr != nil {
+		t.Fatalf("first pass: %+v, err %v", a, err)
+	}
+	var metaDir string
+	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && d.Name() == "version-hint.text" {
+			metaDir = filepath.Dir(p)
+		}
+		return nil
+	})
+	if metaDir == "" {
+		t.Fatal("no published metadata directory")
+	}
+	if err := os.Chmod(metaDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(metaDir, 0o700) })
+	a, err := sched.ReconcileAndConfirm(ctx, "mydb", "cpu", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, why := a.Verdict(false); ok || !strings.Contains(why, "metadata directory cannot be written") {
+		t.Fatalf("a read-only metadata directory: clear %v, why %q (%+v)", ok, why, a)
+	}
+	// A question naming a file is the wait, not the check: the probe is not its business.
+	if a, err = sched.ReconcileAndConfirm(ctx, "mydb", "cpu", "mydb/cpu/2023/11/14/22/f0.parquet"); err != nil || a.WriteErr != nil {
+		t.Fatalf("a question naming a file probed: %+v, err %v", a, err)
+	}
+	if err := os.Chmod(metaDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if a, err = sched.ReconcileAndConfirm(ctx, "mydb", "cpu", ""); err != nil {
+		t.Fatal(err)
+	} else if ok, why := a.Verdict(false); !ok {
+		t.Fatalf("writable again: %s", why)
+	}
+	left, _ := filepath.Glob(filepath.Join(metaDir, ".arc-write-probe-*"))
+	if len(left) != 0 {
+		t.Fatalf("probe left behind: %v", left)
+	}
+}

@@ -19,6 +19,18 @@ interval at 10, under a second for a table's first file), against 276–300 seco
 storage, rows written on the exporting node itself still wait for its timed pass (#1902).
 `iceberg.ingest_export_interval = 0` keeps the timed passes only.
 
+## Change: a re-home job checks it can write the Iceberg table before it starts ([#1845](https://github.com/Basekick-Labs/arc/issues/1845) item 3)
+
+**Who is affected:** re-home jobs with the Iceberg export on.
+
+Before a job changes anything for readers it asks the export for a pass of the table. A pass that
+needed no change wrote nothing, so a table whose metadata directory could not be written
+(read-only, or a full volume) passed the check, and the job only stopped later, waiting for an
+export that could not publish, with queries already switched to the new files. The check now also
+writes and deletes a small probe object (`.arc-write-probe-<random>`) in the table's metadata
+directory, and refuses the job with the error when that fails. On a cluster the exporting node
+runs the probe as part of its check before it acks the job.
+
 ## Fix: files a backup restore writes are read at once ([#1764](https://github.com/Basekick-Labs/arc/issues/1764))
 
 **Who is affected:** anyone restoring data files from a backup into measurements that already have

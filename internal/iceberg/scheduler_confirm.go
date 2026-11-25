@@ -2,10 +2,14 @@ package iceberg
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/basekick-labs/arc/internal/storage"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 
@@ -38,6 +42,9 @@ type PassAnswer struct {
 	// name. Named: that version names the file asked about.
 	Published bool
 	Named     bool
+	// WriteErr: on a question that names no file, the table's metadata
+	// directory could not be written (#1845 item 3).
+	WriteErr error
 }
 
 // Clear reports that the table, as published, does not name the file, or
@@ -56,6 +63,9 @@ const NotExportingReason = "this node is not the one exporting to Iceberg"
 // must have gone through, not only an earlier one's publish, since the job
 // is about to depend on the next one.
 func (a PassAnswer) Verdict(asked bool) (clear bool, why string) {
+	if !asked && a.WriteErr != nil {
+		return false, a.WriteErr.Error()
+	}
 	if a.Clear() && (asked || a.NotExported || a.Err == nil) {
 		return true, ""
 	}
@@ -257,6 +267,12 @@ func (s *Scheduler) serviceConfirms(ctx context.Context) {
 			default:
 				a.Published, a.Named = published, named
 			}
+			// A ready question (no key, #1845 item 3): a pass that needed no
+			// change wrote nothing, so a metadata directory that cannot be
+			// written would only show once the job waits for the export.
+			if w.key == "" && a.Err == nil && exists {
+				a.WriteErr = s.exporter.probeMetadataWrite(mctx, w.m.Database, w.m.Measurement)
+			}
 		}
 		cancel()
 		s.logger.Debug().Str("database", w.m.Database).Str("measurement", w.m.Measurement).Str("outcome", a.Outcome).
@@ -264,6 +280,36 @@ func (s *Scheduler) serviceConfirms(ctx context.Context) {
 			Msg("Iceberg reconcile for a re-home job")
 		w.ch <- a
 	}
+}
+
+// probeMetadataWrite writes and deletes a small object in the table's
+// metadata directory, where the export's next commit writes (#1845 item 3).
+// nil where the export writes no discovery files (no backend, or a warehouse
+// the backend cannot address): the catalog commit is all it writes there.
+// Loop goroutine only.
+func (e *Exporter) probeMetadataWrite(ctx context.Context, database, measurement string) error {
+	if e.backend == nil {
+		return nil
+	}
+	ctx = e.withAWS(ctx)
+	tbl, err := e.loadTableRecovering(ctx, e.tableIdent(database, measurement))
+	if err != nil {
+		return err
+	}
+	_, dirKey, ok := e.parseVersionAndMetaDir(tbl.MetadataLocation())
+	if !ok {
+		return nil
+	}
+	var nonce [8]byte
+	_, _ = rand.Read(nonce[:])
+	key := path.Join(dirKey, ".arc-write-probe-"+hex.EncodeToString(nonce[:]))
+	if err := e.backend.Write(ctx, key, []byte("probe")); err != nil {
+		return fmt.Errorf("the table's metadata directory cannot be written (%s): %w", dirKey, err)
+	}
+	if err := e.backend.Delete(ctx, key); err != nil && !storage.IsNotFound(err) {
+		e.logger.Warn().Err(err).Str("key", key).Msg("Iceberg: could not delete the write probe in the table's metadata directory; it is safe to remove by hand")
+	}
+	return nil
 }
 
 // publishedNames reports whether the table exists, whether its current
