@@ -561,9 +561,8 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 // cycle carries on whether or not anyone waits for it.
 const triggerWaitMax = 10 * time.Minute
 
-// cycleWaitPoll is how often a waiting trigger looks for the cycle's
-// record; a variable for tests.
-var cycleWaitPoll = 250 * time.Millisecond
+// cycleWaitPoll is how often a waiting trigger looks for the cycle's record.
+const cycleWaitPoll = 250 * time.Millisecond
 
 // parseTriggerWait reads ?wait: absent or empty means do not wait; otherwise
 // a Go duration ("90s", "5m"), positive, capped at triggerWaitMax.
@@ -579,20 +578,30 @@ func parseTriggerWait(raw string) (time.Duration, error) {
 }
 
 // waitForCycle holds the trigger's answer until the cycle's record says it
-// finished (200, the record), the wait runs out, or the server shuts down
-// (202, the trigger's answer with "status": "running"; the cycle carries
-// on). The record is looked up by this process's id, so the answer is this
-// cycle's.
+// finished (200, the record, whose status may be "failed"), or the wait runs
+// out (202, the trigger's answer with "status": "running": the cycle carries
+// on), or the server starts shutting down (202, "status": "unknown": a
+// manual cycle stops with the process). The record is looked up by this
+// process's id, so the answer is this cycle's.
+//
+// fasthttp does not tell a handler that its client went away: a caller that
+// gives up early leaves this loop polling until the cycle ends or the wait
+// runs out, and the answer is then written to nobody. Cheap (one lookup per
+// tick, admin-only route), and bounded by triggerWaitMax.
 func (h *CompactionHandler) waitForCycle(c *fiber.Ctx, id int64, wait time.Duration, running fiber.Map) error {
 	deadline := time.NewTimer(wait)
 	defer deadline.Stop()
 	tick := time.NewTicker(cycleWaitPoll)
 	defer tick.Stop()
 	for {
-		if rec, found, _, _, _ := h.manager.CycleLookup(id); found && !rec.FinishedAt.IsZero() {
-			out := cycleResponse(rec)
-			out["boot_id"] = h.manager.BootID()
-			return c.JSON(out)
+		// While this cycle still holds the claim it has not finished: skip
+		// the lookup, which copies the record under the manager's lock.
+		if !(h.manager.IsCycleRunning() && h.manager.RunningCycleID() == id) {
+			if rec, found, _, _, _ := h.manager.CycleLookup(id); found && !rec.FinishedAt.IsZero() {
+				out := cycleResponse(rec)
+				out["boot_id"] = h.manager.BootID()
+				return c.JSON(out)
+			}
 		}
 		select {
 		case <-tick.C:
@@ -600,7 +609,8 @@ func (h *CompactionHandler) waitForCycle(c *fiber.Ctx, id int64, wait time.Durat
 			running["message"] = "the cycle is still running after the wait; it carries on. Poll /api/v1/compaction/cycles/{id}?boot_id= for its outcome"
 			return c.Status(fiber.StatusAccepted).JSON(running)
 		case <-c.Context().Done():
-			running["message"] = "the server is shutting down; the cycle's outcome is not known to this request"
+			running["status"] = "unknown"
+			running["message"] = "the server is shutting down, and a manual cycle stops with the process; its outcome is not known to this request"
 			return c.Status(fiber.StatusAccepted).JSON(running)
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -168,5 +169,64 @@ func TestParseTriggerWait1884(t *testing.T) {
 		if (err != nil) != tc.wantErr || got != tc.want {
 			t.Errorf("parseTriggerWait(%q) = %v, %v; want %v, err=%v", tc.in, got, err, tc.want, tc.wantErr)
 		}
+	}
+}
+
+// A server shutting down answers a held wait at once, 202 with an unknown
+// outcome, rather than holding the shutdown.
+func TestTriggerWaitAnswersOnShutdown1884(t *testing.T) {
+	manager, _ := cyclesRig(t)
+	claim, err := manager.ClaimCycle()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer claim.Release()
+	h := NewCompactionHandler(manager, nil, nil, nil, nil, zerolog.Nop())
+	app := fiber.New()
+	app.Get("/w", func(c *fiber.Ctx) error {
+		return h.waitForCycle(c, claim.ID, time.Minute, fiber.Map{"status": "running", "cycle_id": claim.ID})
+	})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = app.Listener(ln) }()
+	type result struct {
+		status int
+		body   map[string]interface{}
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := http.Get("http://" + ln.Addr().String() + "/w")
+		if err != nil {
+			done <- result{err: err}
+			return
+		}
+		defer resp.Body.Close()
+		var body map[string]interface{}
+		_ = json.NewDecoder(resp.Body).Decode(&body)
+		done <- result{status: resp.StatusCode, body: body}
+	}()
+	time.Sleep(300 * time.Millisecond) // the request is held in the wait
+	start := time.Now()
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- app.ShutdownWithTimeout(10 * time.Second) }()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("request: %v", r.err)
+		}
+		if r.status != http.StatusAccepted || r.body["status"] != "unknown" {
+			t.Fatalf("status %d body %v; want 202 unknown", r.status, r.body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the held wait did not answer when the server shut down")
+	}
+	if err := <-shutdownDone; err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatalf("shutdown took %v with a held wait", took)
 	}
 }
