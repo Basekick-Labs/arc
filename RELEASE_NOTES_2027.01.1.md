@@ -2,6 +2,26 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: compaction stops at shutdown, and no compaction child outlives Arc ([#1887](https://github.com/Basekick-Labs/arc/issues/1887))
+
+Shutdown used to stop only the compaction schedulers. A cycle started with `POST /api/v1/compaction/trigger` kept running. The scheduler's stop waited for its running cycle with no bound, so a long batch could use up the whole shutdown budget. A compaction subprocess could also outlive Arc and run beside the replacement process, which treats that job's manifest as orphaned.
+
+Now shutdown handles compaction in two steps:
+
+- **Compaction stops first.** Before the readiness flag drops and before the HTTP drain:
+  - No new cycle starts. A trigger answers **503** with `"stopping": true`. "Already running" keeps its 409.
+  - A running cycle, scheduled or triggered, stops at its next boundary: before the next batch, measurement, database, manifest to recover, or half of a split batch. Its status is `"stopped"`. A stop is not counted as a failure, and a split stopped part way does not mark the partition as too wide.
+  - Batches already running keep going while requests drain and buffers flush.
+- **Arc waits for that batch later, with a bound.** The wait comes after the WAL closes and before the Iceberg export's drain, the cluster coordinator, storage and the databases. It lasts until a fifth of `server.shutdown_timeout` is left.
+  - If the batch is still running then, Arc kills its subprocess and waits for the cycle to finish its own clean-up.
+  - The next start recovers the killed job from its manifest, as after a crash.
+  - If the shutdown deadline passed before the wait could run, Arc kills the cycle as its last step before exiting. No compaction child is left running after Arc exits.
+- **On a cluster, the completion watcher drains after that wait.** Its final pass now sees the records of batches that ended during the wait, while Raft is still up. Before, a scheduled batch that ended after the watcher's final pass left its record unapplied.
+- When a batch overruns and is killed, the Iceberg export's final drain gets less of the budget: a tenth, or a twentieth with Glue on.
+- With auth off, an edge-sync node closes its own SQLite handle in a hook. A batch that ends during the wait then cannot record its output there. The manifest is kept and the next start re-applies it.
+
+Checked with the binary at `server.shutdown_timeout = 5`. A triggered cycle whose child was frozen (SIGSTOP) was killed 4.0 s after SIGTERM, and Arc exited cleanly with no child left. After restart, the next cycle compacted the partition.
+
 ## New: `telemetry.instance_id` and `telemetry.data_dir` ([#1885](https://github.com/Basekick-Labs/arc/issues/1885))
 
 Telemetry identifies an installation by a random id kept in `./data/.instance_id`, relative to the working directory. A deployment without a persistent disk got a new id on every start, and counted as a new installation each time. Examples are a pod with an `emptyDir`, or a container with nothing mounted at `/app/data`.

@@ -29,6 +29,13 @@ var ErrCycleAlreadyRunning = errors.New("compaction cycle already running")
 // for the scheduler, which logs it at Info.
 var ErrCompactionPaused = errors.New("compaction is paused cluster-wide")
 
+// ErrCompactionStopping is returned by a cycle that did not start, or stopped
+// at a batch boundary, because the server is shutting down (#1887), and by
+// ClaimCycle once shutdown has begun. Like the pause, a running batch is
+// never killed for it; only BeginShutdown's caller, at its deadline, cancels
+// what is still running (KillCycles).
+var ErrCompactionStopping = errors.New("compaction is stopping: the server is shutting down")
+
 // Where a cycle came from, recorded on its outcome so an operator can tell
 // their own trigger's cycle from the scheduler's. "unspecified" is the honest
 // label for the public RunCompactionCycle* family: the scheduler claims a cycle
@@ -320,6 +327,15 @@ type Manager struct {
 	claimMu      sync.Mutex
 	cycleRunning atomic.Bool
 
+	// stopping is set by BeginShutdown (#1887), under claimMu so no claim is
+	// taken after it: cycles stop at their next boundary, and ClaimCycle
+	// refuses. cycleKill cancels every cycle's context (KillCycles), the last
+	// resort at shutdown's deadline; cycleKillCtx is what runClaimed folds
+	// into each cycle's context.
+	stopping     atomic.Bool
+	cycleKillCtx context.Context
+	cycleKill    context.CancelFunc
+
 	// bootID tells this process's cycle ids from another's (#1884): ids come
 	// from cycleID, which restarts at 1 with every process, so the same id can
 	// name two cycles across a restart, or on two nodes. Made once, here.
@@ -531,7 +547,10 @@ func NewManager(cfg *ManagerConfig) *Manager {
 		excludeSet[db] = struct{}{}
 	}
 
+	killCtx, kill := context.WithCancel(context.Background())
 	m := &Manager{
+		cycleKillCtx:     killCtx,
+		cycleKill:        kill,
 		bootID:           newBootID(),
 		OpenJobs:         NewOpenJobs(cfg.StorageBackend),
 		StorageBackend:   cfg.StorageBackend,
@@ -1218,7 +1237,7 @@ func (m *Manager) notifyCompactedOutput(storageKey string) {
 
 // recoverOrphanedManifests wires cluster completion updates into storage recovery.
 func (m *Manager) recoverOrphanedManifests(ctx context.Context, scope recoveryScope) (int, error) {
-	hooks := recoveryHooks{}
+	hooks := recoveryHooks{stop: m.shutdownStop}
 	if m.CompletionDir != "" {
 		hooks.beforeInputDelete = m.writeRecoveredOutputWrittenManifest
 		hooks.afterInputDelete = m.writeRecoveredSourcesDeletedManifest
@@ -1796,9 +1815,19 @@ func (m *Manager) compactFilesAdaptively(ctx context.Context, candidate Candidat
 		Str("partition", candidate.PartitionPath).
 		Msg("Splitting batch after recoverable failure")
 
+	if m.stopping.Load() {
+		return ErrCompactionStopping
+	}
+
 	// Try first half
 	if err := m.compactFilesAdaptively(ctx, candidate, firstHalf, depth+1, errStderr, cycleID); err != nil {
 		return fmt.Errorf("first half failed: %w", err)
+	}
+
+	// Shutdown stops a split between its halves (#1887); the first half's
+	// output is committed, the second half's inputs stay for a later cycle.
+	if m.stopping.Load() {
+		return ErrCompactionStopping
 	}
 
 	// Try second half
@@ -1867,10 +1896,82 @@ func (m *Manager) ClaimCycle() (*CycleClaim, error) {
 	m.claimMu.Lock()
 	defer m.claimMu.Unlock()
 
+	if m.stopping.Load() {
+		return nil, ErrCompactionStopping
+	}
 	if !m.cycleRunning.CompareAndSwap(false, true) {
 		return nil, ErrCycleAlreadyRunning
 	}
 	return &CycleClaim{ID: m.cycleID.Add(1), m: m}, nil
+}
+
+// BeginShutdown stops compaction at its next boundary (#1887): no new cycle
+// is claimed, and a running one stops before its next batch, measurement or
+// split half, as for the cluster-wide pause. Batches already running finish.
+// Call early in shutdown, so they have the HTTP drain's time to do so.
+func (m *Manager) BeginShutdown() {
+	m.claimMu.Lock()
+	m.stopping.Store(true)
+	m.claimMu.Unlock()
+}
+
+// Stopping reports whether BeginShutdown was called.
+func (m *Manager) Stopping() bool { return m.stopping.Load() }
+
+// KillCycles cancels every running cycle's context: their subprocesses are
+// killed (exec.CommandContext). For shutdown's deadline only, after waiting:
+// a kill between a job's two commit phases is a crash, which the next start
+// recovers from the manifest. Call WaitIdle after it, so the cycle's own
+// clean-up runs while storage is still open.
+func (m *Manager) KillCycles() {
+	if m.cycleKill != nil {
+		m.cycleKill()
+	}
+}
+
+// WaitIdle waits until no cycle holds the claim, or ctx is done; it reports
+// whether the claim was free.
+func (m *Manager) WaitIdle(ctx context.Context) bool {
+	for {
+		released := m.cycleReleaseSignal()
+		if !m.cycleRunning.Load() {
+			return true
+		}
+		select {
+		case <-released:
+		case <-ctx.Done():
+			return !m.cycleRunning.Load()
+		}
+	}
+}
+
+// halt is why a cycle must stop at a boundary now: shutdown, the cluster
+// pause, or nil.
+func (m *Manager) halt() error {
+	if m.stopping.Load() {
+		return ErrCompactionStopping
+	}
+	if m.Paused() {
+		return ErrCompactionPaused
+	}
+	return nil
+}
+
+// shutdownStop is ErrCompactionStopping once BeginShutdown was called. The
+// pause does not stop recovery or a split: only shutdown does.
+func (m *Manager) shutdownStop() error {
+	if m.stopping.Load() {
+		return ErrCompactionStopping
+	}
+	return nil
+}
+
+// haltWhy is the end of a log line for halt's error.
+func haltWhy(err error) string {
+	if errors.Is(err, ErrCompactionStopping) {
+		return "the server is shutting down"
+	}
+	return "compaction is paused cluster-wide"
 }
 
 // RunningCycleID is the id of the cycle holding the claim, or of the most
@@ -1982,7 +2083,11 @@ func (m *Manager) runCycleInternal(ctx context.Context, source string, filterDat
 func (m *Manager) runCycleInternalFiltered(ctx context.Context, source string, filterDatabases []string, tierNames []string, filterMeasurement string) (int64, error) {
 	claim, err := m.ClaimCycle()
 	if err != nil {
-		m.logger.Warn().Msg("Compaction cycle already running, skipping")
+		if errors.Is(err, ErrCompactionStopping) {
+			m.logger.Info().Msg("Compaction cycle not started: the server is shutting down")
+		} else {
+			m.logger.Warn().Msg("Compaction cycle already running, skipping")
+		}
 		return 0, err
 	}
 	// Registered before runClaimed is called, and runClaimed's own finalizer
@@ -1997,6 +2102,13 @@ func (m *Manager) runCycleInternalFiltered(ctx context.Context, source string, f
 // runClaimed is the cycle body. The caller holds the claim and owns its
 // release; runErr is named because the finalizer mutates it.
 func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, filterDatabases []string, tierNames []string, filterMeasurement string) (runErr error) {
+	// Shutdown's last resort (KillCycles) cancels this cycle too (#1887).
+	if m.cycleKillCtx != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+		defer context.AfterFunc(m.cycleKillCtx, cancel)()
+	}
 	var active sync.WaitGroup
 	progress := &cycleProgress{}
 	discovered := &progress.discovered
@@ -2010,6 +2122,8 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 	// cannot set runErr, and the dispatch loop may already be waiting at the
 	// end of the tier, so it is checked there.
 	var pausedSkipped atomic.Bool
+	// stoppedSkipped is pausedSkipped for shutdown (#1887).
+	var stoppedSkipped atomic.Bool
 	// tooWideSeen is every (tier, partition) this cycle discovered, for
 	// pruning the too-wide memo after a full-scope cycle.
 	tooWideSeen := map[string]bool{}
@@ -2064,6 +2178,8 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 			status = "cancelled"
 		case errors.Is(runErr, ErrCompactionPaused):
 			status = "paused"
+		case errors.Is(runErr, ErrCompactionStopping):
+			status = "stopped"
 		case runErr != nil:
 			status = "failed"
 		}
@@ -2141,9 +2257,9 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 	// The cluster-wide compaction pause (#1087): a cycle that starts while a
 	// restore holds it would stop at its first batch boundary anyway, so it
 	// does not start. Recorded as a "paused" cycle so Stats shows why.
-	if m.Paused() {
-		m.logger.Info().Int64("cycle_id", cycleID).Msg("Compaction cycle not started: compaction is paused cluster-wide")
-		return ErrCompactionPaused
+	if herr := m.halt(); herr != nil {
+		m.logger.Info().Int64("cycle_id", cycleID).Msg("Compaction cycle not started: " + haltWhy(herr))
+		return herr
 	}
 
 	// Require explicit tier names
@@ -2223,6 +2339,11 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			// Shutdown stopped recovery between two manifests (#1887).
+			if errors.Is(err, ErrCompactionStopping) {
+				m.logger.Info().Int64("cycle_id", cycleID).Msg("Manifest recovery stopped between manifests: the server is shutting down; the rest recover in a later cycle")
+				return ErrCompactionStopping
+			}
 			discoveryErrors.Add(1)
 			m.logger.Warn().Err(err).Msg("Manifest recovery encountered errors")
 		}
@@ -2233,6 +2354,11 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 	for _, database := range databases {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		// Listing every database of a large store can take a while: shutdown
+		// (#1887) and the pause stop it between databases.
+		if herr := m.halt(); herr != nil {
+			return herr
 		}
 		if filterMeasurement != "" {
 			dbMeasurements[database] = []string{filterMeasurement}
@@ -2418,17 +2544,18 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 			// manifest and storage disagreeing), so the cycle waits for
 			// them and ends "paused"; the batch just discovered counts
 			// as unstarted. Sub-batch splitting inside
-			// compactFilesAdaptively does not see the gate: those are
+			// compactFilesAdaptively does not see the pause: those are
 			// one job's inputs and splitting them is part of running it.
-			if m.Paused() {
+			// Shutdown does stop a split between its halves (#1887).
+			if herr := m.halt(); herr != nil {
 				<-sem
 				m.logger.Info().
 					Int64("cycle_id", cycleID).
 					Str("tier", tierName).
 					Str("partition", candidate.PartitionPath).
-					Msg("Compaction cycle stopping at a batch boundary: compaction is paused cluster-wide")
+					Msg("Compaction cycle stopping at a batch boundary: " + haltWhy(herr))
 				wg.Wait()
-				return ErrCompactionPaused
+				return herr
 			}
 			wg.Add(1)
 			active.Add(1)
@@ -2460,8 +2587,12 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 					// (#1087) applies too; the remaining batches stay
 					// unstarted and the tier end turns this into
 					// ErrCompactionPaused.
-					if m.Paused() {
-						pausedSkipped.Store(true)
+					if herr := m.halt(); herr != nil {
+						if errors.Is(herr, ErrCompactionStopping) {
+							stoppedSkipped.Store(true)
+						} else {
+							pausedSkipped.Store(true)
+						}
 						return
 					}
 					// Count a batch only when its execution actually starts.
@@ -2475,6 +2606,13 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 					}
 
 					if err != nil {
+						// A split stopped between its halves for shutdown
+						// (#1887): not a failure, and no evidence the
+						// partition is too wide.
+						if errors.Is(err, ErrCompactionStopping) {
+							stoppedSkipped.Store(true)
+							return
+						}
 						// Before the interrupted check: errSlowAttempt
 						// wraps the cycle's context error.
 						if !struck && tooWideReason(err) != "" {
@@ -2534,14 +2672,14 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 				// discovery: the node acks the pause only once this cycle
 				// has ended, and listing every remaining measurement of a
 				// large store first would hold that ack for minutes.
-				if m.Paused() {
+				if herr := m.halt(); herr != nil {
 					m.logger.Info().
 						Int64("cycle_id", cycleID).
 						Str("tier", tierName).
 						Str("database", database).
-						Msg("Compaction cycle stopping between measurements: compaction is paused cluster-wide")
+						Msg("Compaction cycle stopping between measurements: " + haltWhy(herr))
 					wg.Wait()
-					return ErrCompactionPaused
+					return herr
 				}
 
 				candidates, err := tier.FindCandidates(ctx, database, meas)
@@ -2619,6 +2757,13 @@ func (m *Manager) runClaimed(ctx context.Context, cycleID int64, source string, 
 		wg.Wait()
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if stoppedSkipped.Load() {
+			m.logger.Info().
+				Int64("cycle_id", cycleID).
+				Str("tier", tierName).
+				Msg("Compaction cycle ended at a batch boundary: the server is shutting down")
+			return ErrCompactionStopping
 		}
 		if pausedSkipped.Load() {
 			m.logger.Info().
