@@ -535,6 +535,8 @@ func TestReconcileAndConfirmProbesTheMetadataDirectory(t *testing.T) {
 	left, _ := filepath.Glob(filepath.Join(metaDir, ".arc-write-probe-*"))
 	if len(left) != 0 {
 		t.Fatalf("probe left behind: %v", left)
+	}
+}
 
 // #1845 item 1: a job whose wait was waived still has its old file's removal
 // committed with its new files, and its record goes once the table, as
