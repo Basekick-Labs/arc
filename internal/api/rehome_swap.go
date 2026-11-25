@@ -905,6 +905,19 @@ func (h *RehomeHandler) recoverJob(ctx context.Context, store rehomeStore, job *
 				return cerr
 			}
 		}
+		// The Iceberg export is on but did not start this time (it failed
+		// to build, #1848 item 3): going on would switch reads and then
+		// wait for an export that never runs. Reads still use the source,
+		// so undoing costs nothing. Only whether it runs: the question a
+		// new job puts to a pass is not one for a job past its commit.
+		if h.exportExpected() {
+			if why := h.exportNotStarted(); why != "" {
+				if uerr := h.undo(ctx, job); uerr != nil {
+					return fmt.Errorf("the Iceberg export cannot publish the table (%s); undoing the job: %w", why, uerr)
+				}
+				return errExportRefused{why}
+			}
+		}
 		for _, o := range job.Outputs {
 			moved, err := h.outputInPlace(ctx, store, o)
 			if err != nil {

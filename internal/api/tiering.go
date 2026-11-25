@@ -271,6 +271,7 @@ func migrationResponse(c *fiber.Ctx, res tiering.MigrationResult) error {
 		"migrated":        res.Migrated,
 		"errors":          res.Failed,
 		"not_attempted":   res.NotAttempted,
+		"gone":            res.Gone,
 		"kept_hot_copies": res.Kept,
 		"timed_out":       res.TimedOut,
 	}
