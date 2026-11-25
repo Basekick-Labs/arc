@@ -188,7 +188,7 @@ type IngestConfig struct {
 	ShardCount            int      // Number of buffer shards for lock distribution (default: 32)
 	SortKeys              []string // Per-measurement sort keys: "measurement:col1,col2,time"
 	DefaultSortKeys       string   // Default sort keys for measurements not in SortKeys
-	FlushTimeoutSeconds   int      // Timeout per file of a flush: its storage write, registrations and WAL checkpoint (default: 30s; <= 0 means 30s). Not a cap on the whole flush (#1692).
+	FlushTimeoutSeconds   int      // Timeout per file of a flush: its storage write, schema registration and WAL checkpoint, and separately its tiering record (default: 30s; <= 0 means 30s). Not a cap on the whole flush (#1692, #1933).
 	DecimalColumns        []string // Per-measurement decimal columns: "measurement:col=precision,scale;col2=p,s"
 	DefaultDecimalColumns string   // Default decimal columns for unmapped measurements
 	// ImportWriteConcurrency is how many bulk imports (/api/v1/import/lp,
@@ -3116,7 +3116,7 @@ func normalizeTelemetry(t *TelemetryConfig) error {
 	}
 	id, err := uuid.Parse(t.InstanceID)
 	if err != nil {
-		return fmt.Errorf("telemetry.instance_id (ARC_TELEMETRY_INSTANCE_ID) must be a UUID; generate one with uuidgen, and give each node its own")
+		return fmt.Errorf("telemetry.instance_id (ARC_TELEMETRY_INSTANCE_ID) must be a UUID; generate one with uuidgen (a standalone node needs its own; on a cluster one value serves every node)")
 	}
 	// Placeholders anyone might copy would merge every installation that used
 	// them: the nil and max UUIDs, and the textbook example.

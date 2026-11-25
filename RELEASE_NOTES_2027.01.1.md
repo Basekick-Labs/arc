@@ -33,7 +33,15 @@ upgrade:
 
 Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1292](https://github.com/Basekick-Labs/arc/pull/1292). Thank you.
 
+## Fix: a single-hour flush registers its file in tiered storage after a slow write or at shutdown ([#1933](https://github.com/Basekick-Labs/arc/issues/1933))
+
+**Who is affected:** tiered storage (`tiered_storage.enabled`).
+
+A flush whose rows all fall in one hour recorded its file in the tiering metadata with the context its storage write had used. When that write outlasted `ingest.flush_timeout_seconds` but completed, or completed as shutdown cancelled the flush, the record failed with only a warning, and the file had no hot tier row until the next tier scan (at start-up and each migration cycle, daily by default). On a measurement whose tier rows were all cold, reads left out local files, so its new rows stayed invisible until then. The record now runs on its own context, bounded by its own `flush_timeout_seconds` and not cancelled with the flush, as the multi-hour path's already did ([#1693](https://github.com/Basekick-Labs/arc/issues/1693)); at shutdown, a write that completes as the flush is cancelled can add that record's time to the close. A record that still fails for another reason is unchanged: a warning, and the next scan registers the file.
+
 ## Fix: an import whose rows had no WAL copy answers only once they are stored, and fails if they were not ([#1888](https://github.com/Basekick-Labs/arc/issues/1888))
+
+**Who is affected:** nobody on a released version. In 26.09.x an import flushed every buffer on the node before it answered. This release made imports answer once their rows are handed to the flush (#1296, #1429), and this fix closes the gap that change opened before it shipped.
 
 A bulk import (Line Protocol, CSV, Parquet, TLE) answers once its rows are handed to the flush; the files follow as the flushes finish. With a WAL copy of every row that is a durable answer, because a failed flush is replayed from the WAL. Rows without a WAL copy are held only in memory, and a failed flush loses them. That happens with the WAL off (the default) or when a queued-mode WAL dropped the append. The import had already answered 200, and nothing told the client.
 
@@ -70,7 +78,7 @@ Shutdown used to stop only the compaction schedulers. A cycle started with `POST
 Now shutdown handles compaction in two steps:
 
 - **Compaction stops first.** Before the readiness flag drops and before the HTTP drain:
-  - No new cycle starts. A trigger answers **503** with `"stopping": true`. "Already running" keeps its 409.
+  - No new cycle starts. Every trigger answers **503** with `"stopping": true`, even while a cycle is running; outside shutdown, a trigger during a running cycle still answers 409.
   - A running cycle, scheduled or triggered, stops at its next boundary: before the next batch, measurement, database, manifest to recover, or half of a split batch. Its status is `"stopped"`. A stop is not counted as a failure, and a split stopped part way does not mark the partition as too wide.
   - Batches already running keep going while requests drain and buffers flush.
 - **Arc waits for that batch later, with a bound.** The wait comes after the WAL closes and before the Iceberg export's drain, the cluster coordinator, storage and the databases. It lasts until a fifth of `server.shutdown_timeout` is left.
