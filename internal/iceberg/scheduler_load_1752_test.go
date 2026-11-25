@@ -156,3 +156,27 @@ func TestPullForLoadBoundsAndOnlyLowers(t *testing.T) {
 		t.Fatal("pulled a table whose last export did not settle")
 	}
 }
+
+// A load for another table that arrives between serviceLoadWaiters' two
+// locked sections is left for the next turn, not skipped.
+func TestLoadArrivingMidServiceIsNotSkipped(t *testing.T) {
+	s := NewScheduler(SchedulerConfig{IngestInterval: time.Hour, LoadInterval: time.Second})
+	first, late := "db\x00a", "db\x00b"
+	s.ingestPending[first] = ingestReports{first: time.Now().Add(-time.Second)}
+	s.ingestPending[late] = ingestReports{first: time.Now().Add(-time.Second)}
+	s.loadWaiters[first] = []*loadWaiter{{loadAt: time.Now(), done: make(chan struct{})}}
+	w := &loadWaiter{loadAt: time.Now(), done: make(chan struct{})}
+	loadAfterSnapshot = func() {
+		s.reqMu.Lock()
+		s.loadWaiters[late] = append(s.loadWaiters[late], w)
+		s.reqMu.Unlock()
+	}
+	t.Cleanup(func() { loadAfterSnapshot = nil })
+	s.serviceLoadWaiters()
+	if w.closed {
+		t.Fatalf("a load that arrived mid-service was closed (outcome %d), want it left for the next turn", w.outcome)
+	}
+	if !s.loadWaiters[first][0].closed {
+		t.Fatal("the load in the snapshot was not decided (its table is not servable: no source)")
+	}
+}

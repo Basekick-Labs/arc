@@ -38,6 +38,10 @@ import (
 // storage; a load that waits longer reads the published version, as before.
 var loadFreshBudget = 2 * time.Second // a var for tests
 
+// loadAfterSnapshot, when set (tests only), runs between serviceLoadWaiters'
+// two locked sections.
+var loadAfterSnapshot func()
+
 // loadWaiter is one load waiting for its table. outcome is set once, under
 // reqMu, when done is closed.
 type loadWaiter struct {
@@ -166,13 +170,18 @@ func (s *Scheduler) serviceLoadWaiters() {
 		}
 	}
 	s.reqMu.Unlock()
+	// Every table looked at here gets an entry; a load that arrives for
+	// another table between the two locked sections is decided on the next
+	// turn (its wake brings one), not skipped for want of an answer.
 	servable := make(map[string]bool, len(undecided))
-	if len(undecided) > 0 && !s.pausedForRestore() {
-		for _, key := range undecided {
-			servable[key] = s.loadServableSoon(key)
-		}
+	paused := len(undecided) > 0 && s.pausedForRestore()
+	for _, key := range undecided {
+		servable[key] = !paused && s.loadServableSoon(key)
 	}
 
+	if loadAfterSnapshot != nil {
+		loadAfterSnapshot()
+	}
 	s.reqMu.Lock()
 	defer s.reqMu.Unlock()
 	now := time.Now()
@@ -193,6 +202,7 @@ func (s *Scheduler) serviceLoadWaiters() {
 				w.finishLocked(metrics.IcebergLoadFreshCovered)
 				continue
 			}
+			ok, looked := servable[key]
 			if w.decided {
 				if s.loadUnsettled[key] {
 					// The export it waited for did not settle: the next try
@@ -201,7 +211,10 @@ func (s *Scheduler) serviceLoadWaiters() {
 				}
 				continue
 			}
-			if !pulled && !s.pullForLoadLocked(key, servable[key], now, horizon, &dueSoon) {
+			if !looked {
+				continue // arrived after the snapshot above: the next turn decides
+			}
+			if !pulled && !s.pullForLoadLocked(key, ok, now, horizon, &dueSoon) {
 				w.finishLocked(metrics.IcebergLoadFreshSkipped)
 				continue
 			}
