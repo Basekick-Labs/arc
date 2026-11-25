@@ -74,6 +74,14 @@ func (c *Coordinator) rehomeJoinGate(req interface {
 			g.mu.Unlock()
 			return "a re-home job is in flight and this node does not take part in one (its release or configuration); retry when it has ended", nil
 		}
+		// With stream takeover on, every node must apply the same rule to
+		// a job's steps (#1872): a build without it would refuse what the
+		// others accept, and the manifests would part.
+		if !hasCapability(req.GetCapabilities(), raft.CapabilityRehomeStreamClaims) && fsm != nil &&
+			fsm.RehomeEnabled() && fsm.StreamClaimsEnabled() && !c.isMember(req.GetNodeID()) {
+			g.mu.Unlock()
+			return "this cluster moves files' rows with stream takeover on, and this node's release applies an older rule to it; upgrade it to join", nil
+		}
 		return "", g.mu.Unlock
 	}
 	enabled := fsm != nil && fsm.RehomeEnabled()

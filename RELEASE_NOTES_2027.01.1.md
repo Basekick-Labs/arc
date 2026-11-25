@@ -12,6 +12,17 @@ and a query could keep answering from a cache made before the restore ("this hou
 file list without them) for up to 60 seconds. A restore of data files now drops the query caches
 when it ends, whatever its outcome. Files an edge-sync hub receives were already read at once: on
 the hub's layout pruning never caches an empty hour, and the query reads the full glob.
+## New: moving a misfiled file's rows on a cluster with stream takeover on ([#1872](https://github.com/Basekick-Labs/arc/issues/1872))
+
+**Who is affected:** clusters with stream takeover on (`cluster.stream_takeover`) that run re-home
+jobs (#1825).
+
+A re-home job was refused whenever stream takeover was on. It now runs there for a file that carries
+no stream coverage, which is how it ends with takeover off: the job's new files are registered without
+coverage and the old file's batches stay settled, as after a compaction. A file that carries coverage
+(its rows settle a writer's batches, which a move cannot divide among the new files) is still refused,
+with the reason. Every node must run this release: while one runs an earlier one, jobs are refused
+with stream takeover on.
 
 ## Fix: on a cluster, a late row is read at once on every node, not only on the one that wrote it ([#1763](https://github.com/Basekick-Labs/arc/issues/1763))
 
@@ -359,7 +370,10 @@ At no step does a query on any node count a row twice or miss one.
   flight. A step that fails for a passing reason (a leader election, a storage error) is retried
   where it is.
 - **Refusals.** A job is refused while any node does not take part (an older release, or tiered
-  storage, the Iceberg export or edge sync on there), with stream takeover on, or for a file on
+  storage, the Iceberg export or edge sync on there), with stream takeover on for a file that
+  carries stream coverage (its rows settle a writer's batches, which a move cannot divide among
+  the new files; a file without coverage is moved as with takeover off,
+  [#1872](https://github.com/Basekick-Labs/arc/issues/1872)), or for a file on
   the cold tier; and a node that does not take part cannot join while a job is running. A node
   that crashes and comes back with one of those turned on while a job runs is let back in (it never
   left): its record says it is out of scope, and a job not yet switched to its new files is
