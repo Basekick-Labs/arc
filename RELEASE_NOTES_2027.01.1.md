@@ -15,6 +15,18 @@ On a cluster, nodes that do not export answer from the discovery files only, so 
 job still waits at them, as before: re-home with the warehouse outside the storage root is a
 standalone fix.
 
+## Change: an Iceberg pass that a compaction raced is retried within seconds, and counted ([#1755](https://github.com/Basekick-Labs/arc/issues/1755))
+
+**Who is affected:** deployments with the Iceberg export on.
+
+When a file vanishes during an export pass (a compaction, a DELETE or retention deletes it between
+the listing and the read), the pass leaves the files of that UTC day for the next pass; a day that
+also loses files that pass waits whole, new files included. That next pass came on the ordinary
+short interval, 30 seconds at the default `iceberg.reconcile_interval`. It now comes after 5
+seconds, then 10 and 20 if files keep vanishing, before the ordinary interval takes over. Such
+passes are counted in a new metric, `arc_iceberg_vanished_passes_total` (`iceberg_vanished_passes`
+in the JSON metrics), so how often a deployment hits the race can be seen.
+
 ## Fix: two re-home edges with tiered storage and the Iceberg export ([#1848](https://github.com/Basekick-Labs/arc/issues/1848))
 
 **Who is affected:** deployments with tiered storage or the Iceberg export on that run re-home
