@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 // One configured UUID gives each cluster node its own, stable id.
 func TestTelemetryInstanceIDPerNode1885(t *testing.T) {
@@ -20,5 +23,16 @@ func TestTelemetryInstanceIDPerNode1885(t *testing.T) {
 	}
 	if got := telemetryInstanceID(base, true, " "); got != base {
 		t.Fatalf("cluster without a node id: %q, want the configured id", got)
+	}
+}
+
+// Without a node id, the host name names the node.
+func TestTelemetryNodeName1885(t *testing.T) {
+	if got := telemetryNodeName(" reader-2 "); got != "reader-2" {
+		t.Fatalf("node id: %q", got)
+	}
+	host, _ := os.Hostname()
+	if got := telemetryNodeName(""); got != host {
+		t.Fatalf("no node id: %q, want the host name %q", got, host)
 	}
 }

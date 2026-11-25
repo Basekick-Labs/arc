@@ -2236,7 +2236,7 @@ func main() {
 			Endpoint:   cfg.Telemetry.Endpoint,
 			Interval:   time.Duration(cfg.Telemetry.IntervalSeconds) * time.Second,
 			DataDir:    cfg.Telemetry.DataDir,
-			InstanceID: telemetryInstanceID(cfg.Telemetry.InstanceID, cfg.Cluster.Enabled, cfg.Cluster.NodeID),
+			InstanceID: telemetryInstanceID(cfg.Telemetry.InstanceID, cfg.Cluster.Enabled, telemetryNodeName(cfg.Cluster.NodeID)),
 		}
 		telemetryCollector, err = telemetry.New(telemetryCfg, Version, logger.Get("telemetry"))
 		if err != nil {
@@ -7887,6 +7887,7 @@ func wireIcebergCold(src *iceberg.StorageWalkSource, exp *iceberg.Exporter, cold
 // UUID): one value set in a multi-replica template would otherwise make every
 // replica one instance, and a StatefulSet's node ids are stable.
 func telemetryInstanceID(configured string, clusterEnabled bool, nodeID string) string {
+	// nodeID comes from telemetryNodeName: cluster.node_id, or the host name.
 	if configured == "" || !clusterEnabled || strings.TrimSpace(nodeID) == "" {
 		return configured
 	}
@@ -7895,4 +7896,16 @@ func telemetryInstanceID(configured string, clusterEnabled bool, nodeID string) 
 		return configured // config validated it; not reached
 	}
 	return uuid.NewSHA1(ns, []byte(strings.TrimSpace(nodeID))).String()
+}
+
+// telemetryNodeName is the per-node name telemetryInstanceID derives from:
+// cluster.node_id when set, otherwise the host name, which is stable on a
+// StatefulSet pod and on a VM. The coordinator fills in a node id only later,
+// and its fallback includes the PID, which changes on every restart.
+func telemetryNodeName(nodeID string) string {
+	if n := strings.TrimSpace(nodeID); n != "" {
+		return n
+	}
+	h, _ := os.Hostname()
+	return h
 }

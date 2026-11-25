@@ -3104,6 +3104,12 @@ func normalizeTelemetry(t *TelemetryConfig) error {
 	if err != nil {
 		return fmt.Errorf("telemetry.instance_id (ARC_TELEMETRY_INSTANCE_ID) must be a UUID; generate one with uuidgen, and give each node its own")
 	}
+	// Placeholders anyone might copy would merge every installation that used
+	// them: the nil and max UUIDs, and the textbook example.
+	switch id {
+	case uuid.Nil, uuid.Max, uuid.MustParse("550e8400-e29b-41d4-a716-446655440000"):
+		return fmt.Errorf("telemetry.instance_id (ARC_TELEMETRY_INSTANCE_ID) is a placeholder UUID (%s); generate your own with uuidgen", id)
+	}
 	t.InstanceID = id.String()
 	return nil
 }

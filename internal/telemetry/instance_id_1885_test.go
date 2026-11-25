@@ -46,3 +46,15 @@ func TestInstanceIDFile1885(t *testing.T) {
 		t.Fatalf("whitespace file: %q, %v; want a fresh id", got, err)
 	}
 }
+
+// A read error other than a missing file is reported, not papered over with
+// a new id.
+func TestInstanceIDReadErrorIsReported1885(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, instanceIDFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if id, err := loadOrCreateInstanceID(dir); err == nil {
+		t.Fatalf("got id %q for an unreadable id file, want an error", id)
+	}
+}

@@ -17,6 +17,8 @@ func TestLoad_TelemetryInstanceID1885(t *testing.T) {
 		{name: "uuid upper case normalised", enabled: "true", id: "4F8A2C1E-9B3D-4E5F-8A7B-1C2D3E4F5A6B", wantID: "4f8a2c1e-9b3d-4e5f-8a7b-1c2d3e4f5a6b", wantDir: "./data"},
 		{name: "braced uuid normalised", enabled: "true", id: "{4f8a2c1e-9b3d-4e5f-8a7b-1c2d3e4f5a6b}", wantID: "4f8a2c1e-9b3d-4e5f-8a7b-1c2d3e4f5a6b", wantDir: "./data"},
 		{name: "free-form refused", enabled: "true", id: "acme-prod-eu1", wantErr: true},
+		{name: "nil uuid refused", enabled: "true", id: "00000000-0000-0000-0000-000000000000", wantErr: true},
+		{name: "textbook example refused", enabled: "true", id: "550e8400-e29b-41d4-a716-446655440000", wantErr: true},
 		{name: "telemetry off: not checked", enabled: "false", id: "acme-prod-eu1", wantID: "acme-prod-eu1", wantDir: "./data"},
 		{name: "data_dir set", enabled: "true", dir: "/var/lib/arc", wantDir: "/var/lib/arc"},
 		{name: "data_dir empty falls back", enabled: "true", dir: " ", wantDir: "./data"},
@@ -30,7 +32,7 @@ func TestLoad_TelemetryInstanceID1885(t *testing.T) {
 			}
 			cfg, err := Load()
 			if tc.wantErr {
-				if err == nil || !strings.Contains(err.Error(), "must be a UUID") {
+				if err == nil || !strings.Contains(err.Error(), "UUID") {
 					t.Fatalf("Load() error = %v, want a UUID error", err)
 				}
 				return

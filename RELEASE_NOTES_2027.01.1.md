@@ -7,10 +7,10 @@
 Telemetry identifies an installation by a random id kept in `./data/.instance_id`, relative to the working directory. A deployment without a persistent disk got a new id on every start, and counted as a new installation each time. Examples are a pod with an `emptyDir`, or a container with nothing mounted at `/app/data`.
 
 - **`telemetry.instance_id`** (`ARC_TELEMETRY_INSTANCE_ID`) is an id to use instead of the file; nothing is written to disk.
-  - It must be a UUID: generate one with `uuidgen`, and don't copy one from an example. A value that is not a UUID stops Arc at startup while telemetry is on.
+  - It must be a UUID: generate one with `uuidgen`, and don't copy one from an example. A value that is not a UUID, or is a placeholder (the nil or max UUID, or the textbook `550e8400-…` example), stops Arc at startup while telemetry is on.
   - It is stored in canonical form, so upper case or braces do not make a second id.
-  - Give each node its own. On a cluster with `cluster.node_id` set, Arc derives a per-node id from it, so one value in a multi-replica template still counts each replica once.
-  - Setting it on an installation that already has an id file changes its id, once.
+  - On a standalone node it is the id: give each installation its own. On a cluster, Arc derives a per-node id from it and `cluster.node_id` (or the host name when `node_id` is unset). So one value in a multi-replica template still counts each replica once.
+  - Setting it on an installation that already has an id file changes its id for as long as it is set; unsetting it brings the file's id back. A standalone node can keep its current id by setting the key to the file's contents.
 - **`telemetry.data_dir`** (`ARC_TELEMETRY_DATA_DIR`) is where the id file lives when no id is configured. The default is `./data`, as before; an empty value means the same. It does not follow `auth.db_path` or `storage.local_path`.
 - The id file is now written `0600`. A file that holds only whitespace is replaced with a new id instead of sending an empty one.
 
