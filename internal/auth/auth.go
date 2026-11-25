@@ -1987,7 +1987,7 @@ func (am *AuthManager) ForceAddRecoveryToken(ctx context.Context, tokenValue str
 
 	am.logger.Warn().Msg("ARC_AUTH_FORCE_BOOTSTRAP=true: adding recovery admin token (existing tokens preserved)")
 
-	token, err := am.CreateTokenWithValue(ctx, tokenValue, "arc-recovery", "Recovery admin token added via ARC_AUTH_FORCE_BOOTSTRAP", "read,write,delete,admin", nil)
+	token, err := am.CreateTokenWithValue(ctx, tokenValue, recoveryTokenName, "Recovery admin token added via ARC_AUTH_FORCE_BOOTSTRAP", "read,write,delete,admin", nil)
 	if err != nil {
 		if strings.Contains(err.Error(), "already exists") {
 			am.explainExistingRecoveryToken(tokenValue)
@@ -2115,6 +2115,11 @@ func (am *AuthManager) SharesDBPath(dbPath string) bool {
 	return resolve(am.dbPath) == resolve(dbPath)
 }
 
+// recoveryTokenName is the name auth.force_bootstrap gives its token. Names
+// are unique, so a second forced start cannot add another while one exists,
+// disabled (revoked) or not: it has to be deleted.
+const recoveryTokenName = "arc-recovery"
+
 // bootstrapState is what the auth database holds for a configured bootstrap
 // value (#1915).
 type bootstrapState int
@@ -2122,57 +2127,62 @@ type bootstrapState int
 const (
 	bootstrapAbsent   bootstrapState = iota // no token has this value
 	bootstrapEnabled                        // an enabled, unexpired token has it
-	bootstrapDisabled                       // a disabled token has it
+	bootstrapDisabled                       // a disabled (revoked) token has it
 	bootstrapExpired                        // an expired token has it
 	bootstrapUnknown                        // the database could not be read
 )
 
-// bootstrapValueState reports what the database holds for value, by prefix
-// and hash, without the side effects of VerifyToken: no cache entry, no
-// last_used_at write, no metrics. Rows with the legacy prefix are not
-// checked: a bootstrap value has always been stored with its own prefix, and
-// verifying a legacy hash logs a rotation warning in the FIPS build.
-func (am *AuthManager) bootstrapValueState(value string) bootstrapState {
-	rows, err := am.db.Query(`SELECT token_hash, enabled, expires_at FROM api_tokens WHERE token_prefix = ?`, tokenPrefix(value))
+// bootstrapValueState reports what the database holds for value, and the
+// name of the token that holds it, by prefix and hash, without the side
+// effects of VerifyToken: no cache entry, no last_used_at write, no metrics.
+// Rows with the legacy prefix (tokens from before prefixes, December 2025)
+// are not checked: the bootstrap has always stored its value with a prefix,
+// and verifying a legacy hash logs a rotation warning in the FIPS build. A
+// value equal to such an old token is reported absent.
+func (am *AuthManager) bootstrapValueState(value string) (bootstrapState, string) {
+	rows, err := am.db.Query(`SELECT name, token_hash, enabled, expires_at FROM api_tokens WHERE token_prefix = ?`, tokenPrefix(value))
 	if err != nil {
-		return bootstrapUnknown
+		return bootstrapUnknown, ""
 	}
 	defer rows.Close()
-	state := bootstrapAbsent
+	state, holder := bootstrapAbsent, ""
 	for rows.Next() {
 		var (
+			name      string
 			hash      string
 			enabled   bool
 			expiresAt sql.NullTime
 		)
-		if err := rows.Scan(&hash, &enabled, &expiresAt); err != nil {
-			return bootstrapUnknown
+		if err := rows.Scan(&name, &hash, &enabled, &expiresAt); err != nil {
+			continue // as VerifyToken does: one bad row does not hide the others
 		}
 		if !am.verifyTokenHash(value, hash) {
 			continue
 		}
 		switch {
 		case !enabled:
-			state = bootstrapDisabled
+			state, holder = bootstrapDisabled, name
 		case expiresAt.Valid && time.Now().After(expiresAt.Time):
-			state = bootstrapExpired
+			state, holder = bootstrapExpired, name
 		default:
-			return bootstrapEnabled
+			return bootstrapEnabled, name
 		}
 	}
 	if rows.Err() != nil {
-		return bootstrapUnknown
+		return bootstrapUnknown, ""
 	}
-	return state
+	return state, holder
 }
 
-// recoveryTokenExists reports whether a token named arc-recovery exists: a
-// second auth.force_bootstrap with another value cannot add one (the name is
-// unique) until it is revoked.
+// recoveryTokenExists reports whether a token named arc-recovery exists.
 func (am *AuthManager) recoveryTokenExists() bool {
 	var one int
-	return am.db.QueryRow(`SELECT 1 FROM api_tokens WHERE name = 'arc-recovery' LIMIT 1`).Scan(&one) == nil
+	return am.db.QueryRow(`SELECT 1 FROM api_tokens WHERE name = ? LIMIT 1`, recoveryTokenName).Scan(&one) == nil
 }
+
+// deleteRecoveryAdvice is how to clear an arc-recovery token out of the way:
+// revoking only disables it, and the name stays taken.
+const deleteRecoveryAdvice = "delete it through the API (DELETE /api/v1/auth/tokens/<id>; revoking only disables it and the name stays taken), then start again with auth.force_bootstrap=true"
 
 // explainSkippedBootstrap says why auth.bootstrap_token was not installed:
 // the auth database already had tokens (#1915). Before, a debug line; an
@@ -2187,19 +2197,26 @@ func (am *AuthManager) explainSkippedBootstrap(value string) {
 		am.logger.Info().Msg("auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN) is set and the cluster already has an admin token, so it was not installed. If that token is not the configured value, set auth.force_bootstrap=true for one start to add the value as a recovery token")
 		return
 	}
-	switch am.bootstrapValueState(value) {
+	state, holder := am.bootstrapValueState(value)
+	switch state {
 	case bootstrapEnabled:
 		am.logger.Debug().Msg("auth.bootstrap_token is already a valid token here — nothing to install")
-	case bootstrapDisabled:
-		am.logger.Warn().Msg("auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN) matches a token that is disabled, so requests with it get 401. Re-enable it through the API if that was not intended; auth.force_bootstrap will not bring it back")
-	case bootstrapExpired:
-		am.logger.Warn().Msg("auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN) matches a token that has expired, so requests with it get 401. Rotate it through the API, or set a new value with auth.force_bootstrap=true for one start")
+	case bootstrapDisabled, bootstrapExpired:
+		why := "is disabled (revoked)"
+		if state == bootstrapExpired {
+			why = "has expired"
+		}
+		msg := "auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN) matches a token that " + why + ", so requests with it get 401. To use the value again, set auth.force_bootstrap=true for one start, which adds it as a new recovery token"
+		if holder == recoveryTokenName {
+			msg = "auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN) matches the arc-recovery token, which " + why + ", so requests with it get 401. To use the value again, " + deleteRecoveryAdvice
+		}
+		am.logger.Warn().Msg(msg)
 	case bootstrapUnknown:
 		am.logger.Warn().Msg("auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN) was not installed because the auth database already has tokens, and whether it holds this value could not be checked")
 	default:
 		msg := "auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN) was NOT installed: the auth database already has tokens, and the value is not one of them, so requests with it get 401. To add it as a recovery admin token, set auth.force_bootstrap=true for one start, then remove it"
 		if am.recoveryTokenExists() {
-			msg += ". A token named arc-recovery from an earlier recovery already exists: revoke it through the API first, or the forced start cannot add another"
+			msg += ". A token named arc-recovery from an earlier recovery already exists, so first " + deleteRecoveryAdvice
 		}
 		am.logger.Warn().Msg(msg)
 	}
@@ -2208,11 +2225,20 @@ func (am *AuthManager) explainSkippedBootstrap(value string) {
 // explainExistingRecoveryToken is what a forced start says when arc-recovery
 // already exists (#1915). It used to say the caller "still holds the token
 // value they provided", which is true only if the existing token has that
-// value; a forced start with a new value added nothing and left it at 401.
+// value and is enabled; otherwise the forced start added nothing and the
+// value got 401.
 func (am *AuthManager) explainExistingRecoveryToken(value string) {
-	if am.getProposer() == nil && am.bootstrapValueState(value) == bootstrapAbsent {
-		am.logger.Warn().Msg("auth.force_bootstrap: a token named arc-recovery from an earlier recovery already exists with a different value, so this value was NOT added and requests with it get 401. Revoke the arc-recovery token through the API, then start again with auth.force_bootstrap=true")
+	if am.getProposer() != nil {
+		am.logger.Warn().Msg("auth.force_bootstrap: a token named arc-recovery already exists, so nothing was added. If it does not hold this value, " + deleteRecoveryAdvice)
 		return
 	}
-	am.logger.Warn().Msg("Recovery token already exists — no-op; use the API to revoke it after regaining access")
+	state, holder := am.bootstrapValueState(value)
+	switch {
+	case state == bootstrapEnabled:
+		am.logger.Warn().Msg("Recovery token already exists — no-op; use the API to revoke it after regaining access")
+	case holder == recoveryTokenName:
+		am.logger.Warn().Msg("auth.force_bootstrap: the arc-recovery token holds this value but is disabled or expired, so nothing was added and requests with it get 401. To use the value again, " + deleteRecoveryAdvice)
+	default:
+		am.logger.Warn().Msg("auth.force_bootstrap: a token named arc-recovery from an earlier recovery already exists with a different value, so this value was NOT added and requests with it get 401. To add it, " + deleteRecoveryAdvice)
+	}
 }

@@ -79,11 +79,17 @@ func TestBootstrapAlreadyInstalledIsQuiet1915(t *testing.T) {
 		t.Fatal(err)
 	}
 	buf.Reset()
+	misses := am.cacheMisses.Load()
 	if _, err := am.EnsureInitialTokenWithValue(ctx, valueA1915); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(buf.String(), `"level":"warn"`) {
 		t.Fatalf("warned on a normal restart:\n%s", buf.String())
+	}
+	// The check is not an authentication: VerifyToken would count a cache
+	// miss here and stamp last_used_at on the admin token at every start.
+	if got := am.cacheMisses.Load(); got != misses {
+		t.Fatalf("the restart's check went through VerifyToken (%d cache misses)", got-misses)
 	}
 }
 
@@ -103,8 +109,53 @@ func TestBootstrapMatchesDisabledToken1915(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := buf.String()
-	if !strings.Contains(out, "matches a token that is disabled") || strings.Contains(out, "was NOT installed") {
-		t.Fatalf("want the disabled-token warning:\n%s", out)
+	if !strings.Contains(out, "matches a token that is disabled") || !strings.Contains(out, "auth.force_bootstrap=true") ||
+		strings.Contains(out, "was NOT installed") || strings.Contains(out, "Re-enable") {
+		t.Fatalf("want the disabled-token warning pointing at force_bootstrap:\n%s", out)
+	}
+	// And force_bootstrap does bring the value back.
+	if got, err := am.ForceAddRecoveryToken(ctx, valueA1915); err != nil || got == "" {
+		t.Fatalf("forced start = %q, %v", got, err)
+	}
+	if am.VerifyToken(valueA1915) == nil {
+		t.Fatal("the value does not authenticate after the forced start")
+	}
+}
+
+// Revoking arc-recovery does not free its name: the advice is to delete
+// it, and after a delete the forced start adds the new value.
+func TestRecoveryTokenMustBeDeletedNotRevoked1915(t *testing.T) {
+	am, buf := newLoggedAuth1915(t)
+	ctx := context.Background()
+	if _, err := am.EnsureInitialToken(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := am.ForceAddRecoveryToken(ctx, valueA1915); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := am.db.Exec(`UPDATE api_tokens SET enabled = 0 WHERE name = 'arc-recovery'`); err != nil {
+		t.Fatal(err)
+	}
+	buf.Reset()
+	if got, _ := am.ForceAddRecoveryToken(ctx, valueB1915); got != "" {
+		t.Fatal("a forced start added a token while a revoked arc-recovery exists")
+	}
+	if out := buf.String(); !strings.Contains(out, "DELETE /api/v1/auth/tokens") || strings.Contains(out, "Revoke the") {
+		t.Fatalf("advice does not say to delete:\n%s", out)
+	}
+	// The value of the revoked arc-recovery itself: delete it, too.
+	buf.Reset()
+	if _, err := am.ForceAddRecoveryToken(ctx, valueA1915); err != nil {
+		t.Fatal(err)
+	}
+	if out := buf.String(); !strings.Contains(out, "holds this value but is disabled") {
+		t.Fatalf("want the disabled arc-recovery advice:\n%s", out)
+	}
+	if _, err := am.db.Exec(`DELETE FROM api_tokens WHERE name = 'arc-recovery'`); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := am.ForceAddRecoveryToken(ctx, valueB1915); err != nil || got == "" {
+		t.Fatalf("forced start after the delete = %q, %v", got, err)
 	}
 }
 
