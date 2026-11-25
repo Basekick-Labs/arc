@@ -6,7 +6,7 @@ import (
 )
 
 // A trigger after shutdown began answers 503 and claims nothing (#1887); a
-// trigger while a cycle runs keeps its 409.
+// trigger while a cycle runs outside shutdown keeps its 409.
 func TestTriggerRefusedDuringShutdown1887(t *testing.T) {
 	manager, app := cyclesRig(t)
 	before := manager.RunningCycleID()
