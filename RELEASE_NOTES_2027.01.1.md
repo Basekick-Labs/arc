@@ -2,6 +2,29 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: Arc no longer prints the admin token you configured at startup ([#1883](https://github.com/Basekick-Labs/arc/issues/1883))
+
+**Who is affected:** anyone who sets `auth.bootstrap_token` (`ARC_AUTH_BOOTSTRAP_TOKEN`), with or without
+`auth.force_bootstrap`.
+
+When Arc installed the initial admin token it printed a banner with the token value to stderr. That is
+right for a token Arc generated, because the operator has no other way to see it. When the value came
+from configuration the operator already has it, and printing it only copied a secret into the logs. On a
+deployment whose auth database is not persistent, such as a container with an ephemeral disk, the token
+is installed again on every start, so the value was printed on every start too.
+
+- The token value is printed only when Arc generated it.
+- For a configured token the banner says it was installed from configuration and leaves the value out.
+  With `auth.force_bootstrap` it keeps the recovery wording and the reminder to remove the setting.
+- The "FIRST RUN" wording appears only for a generated token.
+- `auth.force_bootstrap` without `auth.bootstrap_token` generates a token only when no tokens exist
+  (a first run), as before; the banner now says "FIRST RUN" for it instead of "RECOVERY TOKEN ADDED -
+  EXISTING TOKENS PRESERVED".
+
+No new configuration keys.
+
+Contributed by [@branson404](https://github.com/branson404) in [#1917](https://github.com/Basekick-Labs/arc/pull/1917).
+
 ## Fix: a rejected `auth.bootstrap_token` stops Arc instead of leaving it with no admin token ([#1915](https://github.com/Basekick-Labs/arc/issues/1915))
 
 **Action required on upgrade** if `auth.bootstrap_token` (`ARC_AUTH_BOOTSTRAP_TOKEN`) is set to a value shorter than 32 bytes once surrounding whitespace is removed, with auth on. Arc now refuses to start with that value, where it used to log `Failed to create initial admin token` at every start and run on. Such a value has never been installed: every path that stores a token requires 32 bytes. So a deployment that runs today uses another token, and the short value can simply be removed, or replaced with a 32-byte one (`openssl rand -hex 32`). A Helm install that passes the value through `existingSecret` is not checked at render time: its pods stop at startup with the message instead.
@@ -22,6 +45,7 @@ With a short value and auth on, Arc used to keep running with no admin token, so
 
 The check for whether the value is installed reads the token table directly. It does not stamp `last_used_at` on the admin token at every start, as authenticating with it would. On a cluster the check is not exact on a follower, so Arc logs what to do at Info without claiming the value is absent.
 
+
 ## Fix: re-home jobs run with `iceberg.warehouse` outside the storage root ([#1906](https://github.com/Basekick-Labs/arc/issues/1906))
 
 **Who is affected:** standalone deployments with the Iceberg export on and `iceberg.warehouse` set to
@@ -36,6 +60,7 @@ job still waits at them, as before: re-home with the warehouse outside the stora
 standalone fix.
 
 
+
 ## Change: an Iceberg pass that a compaction raced is retried within seconds, and counted ([#1755](https://github.com/Basekick-Labs/arc/issues/1755))
 
 **Who is affected:** deployments with the Iceberg export on.
@@ -47,7 +72,6 @@ short interval, 30 seconds at the default `iceberg.reconcile_interval`. It now c
 seconds, then 10 and 20 if files keep vanishing, before the ordinary interval takes over. Such
 passes are counted in a new metric, `arc_iceberg_vanished_passes_total` (`iceberg_vanished_passes`
 in the JSON metrics), so how often a deployment hits the race can be seen.
-
 
 ## Fix: two re-home edges with tiered storage and the Iceberg export ([#1848](https://github.com/Basekick-Labs/arc/issues/1848))
 
