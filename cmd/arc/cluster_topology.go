@@ -223,6 +223,16 @@ func icebergLoadInterval(seconds int, hasCoordinator, sharedStorage bool) time.D
 	return time.Duration(seconds) * time.Second
 }
 
+// icebergLoadEffective is the load interval where it can act: the REST
+// catalog is the only caller, and a load pulls forward only an append.
+// Elsewhere 0, so nothing changes, version retention included.
+func icebergLoadEffective(topology time.Duration, restCatalog, appendOn bool) time.Duration {
+	if !restCatalog || !appendOn {
+		return 0
+	}
+	return topology
+}
+
 // icebergReconcileConcurrency is how many tables' reconcile passes this node
 // runs at once (#1786).
 //

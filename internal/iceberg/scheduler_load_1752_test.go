@@ -3,6 +3,7 @@ package iceberg
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -54,6 +55,7 @@ func TestLoadServesAFileReportedBeforeIt(t *testing.T) {
 	if got := r.listings() - listed; got != 0 {
 		t.Fatalf("the load's export listed the measurement %d times, want 0 (an append)", got)
 	}
+	assertNoLoadWaiters(t, r.sched)
 }
 
 func TestLoadWithNothingReportedReturnsAtOnce(t *testing.T) {
@@ -126,6 +128,17 @@ func TestConcurrentLoadsShareOneExport(t *testing.T) {
 	}
 	if got := r.snapshotCount() - before; got != 1 {
 		t.Fatalf("8 loads made %d commits, want 1", got)
+	}
+	assertNoLoadWaiters(t, r.sched)
+}
+
+// Every load removes its waiter: a leak would skip every load past the cap.
+func assertNoLoadWaiters(t *testing.T, s *Scheduler) {
+	t.Helper()
+	s.reqMu.Lock()
+	defer s.reqMu.Unlock()
+	if s.loadWaiterN != 0 || len(s.loadWaiters) != 0 {
+		t.Fatalf("%d waiters counted, %d tables listed after every load returned", s.loadWaiterN, len(s.loadWaiters))
 	}
 }
 
@@ -358,5 +371,46 @@ func TestLoadOverTheGlobalCapDoesNotWait(t *testing.T) {
 	s.AwaitFreshForRead(context.Background(), "db", "m")
 	if took := time.Since(began); took > 100*time.Millisecond || len(s.loadWaiters[key]) != 0 {
 		t.Fatalf("waited %v, registered %d", took, len(s.loadWaiters[key]))
+	}
+}
+
+// timedPass sets inTimedPass for the whole pass, and clears it after.
+type passFlagSource struct {
+	*recordingSource
+	s    **Scheduler
+	seen atomic.Bool
+}
+
+func (p *passFlagSource) FilesAndLocal(ctx context.Context, m Measurement) ([]FileRef, []string, error) {
+	if (*p.s).inTimedPass.Load() {
+		p.seen.Store(true)
+	}
+	return p.recordingSource.FilesAndLocal(ctx, m)
+}
+
+func TestTimedPassMarksItself(t *testing.T) {
+	r := newAppendRig(t)
+	src := &passFlagSource{recordingSource: r.src}
+	src.s = &r.sched
+	r.sched = NewScheduler(SchedulerConfig{Exporter: r.exp, Source: src, Interval: time.Hour, Logger: r.sched.logger,
+		IngestInterval: time.Hour, IngestAppend: true, LoadInterval: time.Second})
+	r.sched.started = time.Now().Add(-time.Second)
+	r.newFile()
+	r.sched.timedPass(context.Background())
+	if !src.seen.Load() {
+		t.Fatal("inTimedPass was not set while the pass listed the measurement")
+	}
+	if r.sched.inTimedPass.Load() {
+		t.Fatal("inTimedPass still set after the pass")
+	}
+}
+
+// A dropped database lets its tables' loads go as skipped.
+func TestDroppedDatabaseSkipsLoads(t *testing.T) {
+	s, key := newLoadScheduler(t)
+	w := addWaiter(s, key, false)
+	s.forgetDatabase("db")
+	if !w.closed || w.outcome != metrics.IcebergLoadFreshSkipped {
+		t.Fatalf("closed %v outcome %d, want skipped", w.closed, w.outcome)
 	}
 }

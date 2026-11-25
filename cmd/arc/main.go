@@ -4947,10 +4947,7 @@ func main() {
 		// load pulls forward only an append. Elsewhere it changes nothing,
 		// not even version retention (icebergLoadTopology says why).
 		icebergLoadTopology := icebergLoadInterval(cfg.Iceberg.LoadExportMinInterval, clusterCoordinator != nil, icebergSharedWarehouse)
-		icebergLoadEvery := icebergLoadTopology
-		if !cfg.Iceberg.RESTCatalogEnabled || !cfg.Iceberg.IngestAppendEnabled {
-			icebergLoadEvery = 0
-		}
+		icebergLoadEvery := icebergLoadEffective(icebergLoadTopology, cfg.Iceberg.RESTCatalogEnabled, cfg.Iceberg.IngestAppendEnabled)
 		icebergIngestEvery := icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil) +
 			icebergArrivalInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil)
 		// Versions are kept by the shortest time two ingest exports of a
