@@ -191,6 +191,12 @@ func TestVisibleSettlesThroughCloseDrain1759(t *testing.T) {
 	close(gate)
 	<-done
 	o.Seal()
+	// The worker, freed by the gate, can take the queued task before the
+	// drain does; then the drain returns first. Either one runs
+	// flushRecordsAsync, so wait for whichever has it.
+	for deadline := time.Now().Add(5 * time.Second); !o.Resolved() && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
 	if !o.Resolved() || countsOf(o).settled != 1 {
 		t.Fatalf("after the drain: resolved %v, counts %+v", o.Resolved(), countsOf(o))
 	}
