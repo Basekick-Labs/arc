@@ -76,7 +76,23 @@ func startGated(t *testing.T, r *appendRig, src FileSetSourceWithSchema, g Write
 	r.newFile()
 	r.sched.Start()
 	t.Cleanup(r.sched.Stop)
-	waitUntil(t, "the start-up pass did not run", func() bool { return r.listings() >= 1 })
+	// Until the start-up pass has published the file, not just listed it:
+	// a pass still running would answer the tests' gate checks itself.
+	waitUntil(t, "the start-up pass did not publish the file", func() bool { return r.tableFiles() >= 1 })
+}
+
+// tableFiles is how many data files the published table holds, 0 while it
+// does not exist yet (no t.Fatal: polled while the loop runs).
+func (r *appendRig) tableFiles() int {
+	tbl, err := r.exp.catalog.LoadTable(context.Background(), r.exp.tableIdent("mydb", "cpu"))
+	if err != nil {
+		return 0
+	}
+	tasks, err := tbl.Scan().PlanFiles(context.Background())
+	if err != nil {
+		return 0
+	}
+	return len(tasks)
 }
 
 func waitUntil(t *testing.T, what string, cond func() bool) {
