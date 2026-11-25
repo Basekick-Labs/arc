@@ -27,9 +27,8 @@ func TestGroupedTopNRecognized(t *testing.T) {
 			[]OrderKey{{Pos: 2}}, 0, false},
 		{"SELECT host, max(x) FROM cpu GROUP BY host ORDER BY host ASC NULLS LAST, MAX(x) desc",
 			[]OrderKey{{Pos: 1}, {Pos: 2, Desc: true}}, 0, false},
-		// A predicate-argument aggregate by position (never by expression);
-		// moments stay bucket-keyed (agg-6a), so the refused-target declines
-		// below use a bucket key too — a tag key would decline for that reason.
+		// A predicate-argument aggregate by position (never by expression). The
+		// refused-target declines below hold under a tag key too (tag_keyed_test.go).
 		{"SELECT date_trunc('hour', time), count_if(x > 1) FROM cpu GROUP BY 1 ORDER BY 2 DESC LIMIT 3",
 			[]OrderKey{{Pos: 2, Desc: true}}, 3, true},
 		{"SELECT host, count(*) FROM cpu GROUP BY host ORDER BY 2 DESC LIMIT 2147483647",

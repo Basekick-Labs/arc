@@ -290,3 +290,45 @@ func TestSummaryFromManifest_CarriesIncompletenessCounts(t *testing.T) {
 		}
 	}
 }
+
+// #1555: the listing carries the cluster cross-check's reconciled-skip count
+// and whether the check ran, so a client can subtract the reconciled skips
+// the way restore does. Both stay out of the JSON when zero/false, so a
+// standalone backup's entry is unchanged.
+func TestSummaryFromManifest_CarriesReconciledSkips(t *testing.T) {
+	summaryJSON := func(m *Manifest) map[string]any {
+		t.Helper()
+		data, err := json.Marshal(SummaryFromManifest(m))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	got := summaryJSON(&Manifest{BackupID: "b", TotalFiles: 21, SkippedFiles: 3, SkippedReconciled: 2, ClusterManifestChecked: true})
+	for key, want := range map[string]any{"skipped_files": float64(3), "skipped_reconciled": float64(2), "cluster_manifest_checked": true} {
+		if got[key] != want {
+			t.Errorf("listing %s = %v, want %v (json: %v)", key, got[key], want, got)
+		}
+	}
+	got = summaryJSON(&Manifest{BackupID: "b", TotalFiles: 21})
+	for _, key := range []string{"skipped_reconciled", "cluster_manifest_checked"} {
+		if v, ok := got[key]; ok {
+			t.Errorf("listing carries %s = %v for a standalone backup, want it omitted", key, v)
+		}
+	}
+}
+
+// The listing summarises the merged run manifest, so a reconciled skip on a
+// non-default leg must survive the merge into the listing entry (#1555).
+func TestMergedRunSummaryCarriesReconciledSkips(t *testing.T) {
+	def := &Manifest{BackupID: "b1", IsDefaultTarget: true, ClusterManifestChecked: true, SkippedFiles: 1}
+	other := &Manifest{BackupID: "b1", ClusterManifestChecked: true, SkippedFiles: 3, SkippedReconciled: 2}
+	s := SummaryFromManifest(mergeRunManifests([]*Manifest{def, other}))
+	if s.SkippedFiles != 4 || s.SkippedReconciled != 2 || !s.ClusterManifestChecked {
+		t.Errorf("summary skipped=%d reconciled=%d checked=%v, want 4, 2, true", s.SkippedFiles, s.SkippedReconciled, s.ClusterManifestChecked)
+	}
+}

@@ -2,6 +2,7 @@ package raft
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -249,6 +250,39 @@ const (
 	// CommandColdMarkReset: an admin clearing the seed (and a backend
 	// conflict) so the next cold listing seeds again.
 	CommandColdMarkReset
+	// Query governance policies (#1627), see governance_policies.go.
+	// CommandEnableGovernancePolicies turns their flag on once every node
+	// supports them; CommandSetGovernancePolicy creates or replaces a
+	// token's policy and CommandDeleteGovernancePolicy removes it, once
+	// seeded.
+	CommandEnableGovernancePolicies
+	CommandSetGovernancePolicy
+	CommandDeleteGovernancePolicy
+	// CommandIcebergPathsChanged: the primary writer naming directories whose
+	// cold objects it removed, for the Iceberg export (#1728). No state; see
+	// iceberg_notice.go.
+	CommandIcebergPathsChanged
+	// CommandIcebergDatabaseDropped: the primary writer saying a database
+	// DELETE completed, so every node with a node-local Iceberg warehouse
+	// drops its own tables of it (#1731). No state; see iceberg_notice.go.
+	CommandIcebergDatabaseDropped
+	// Re-home on a shared object store (#1825), see rehome.go.
+	// CommandEnableRehome turns it on once every node supports it and
+	// compaction commit is on; the others drive one job.
+	CommandEnableRehome
+	CommandStageRehome
+	CommandAdvanceRehome
+	CommandAckRehome
+	CommandClaimRehomeFinisher
+	CommandEndRehome
+	// Read fences for staged compaction on a shared object store (#1852),
+	// see compaction_fences.go.
+	CommandEnableCompactionFences
+	CommandReadFence
+	CommandAdvanceCompaction
+	// CommandBackupMark: a backup or restore running on a node (#1857), see
+	// rehome_backup.go.
+	CommandBackupMark
 )
 
 // Command represents a command to be applied to the FSM.
@@ -640,6 +674,12 @@ type FSMSnapshot struct {
 	ClusterPolicies *clusterPoliciesState `json:"cluster_policies,omitempty"`
 	// ColdMark: the #1552 cold mark. nil in an older snapshot.
 	ColdMark *coldMarkState `json:"cold_mark,omitempty"`
+	// Rehome: the #1825 flag and jobs. nil in an older snapshot, or before
+	// the flag was applied.
+	Rehome *rehomeState `json:"rehome,omitempty"`
+	// CompactionFences: the #1852 flag and every node's read fence. nil in
+	// an older snapshot, or before the flag was applied.
+	CompactionFences *compactionFencesState `json:"compaction_fences,omitempty"`
 }
 
 // ClusterFSM implements the raft.FSM interface for cluster state management.
@@ -859,6 +899,18 @@ type ClusterFSM struct {
 	staged           map[string]*StagedCompaction
 	// stagedPaths: input and output paths of staged jobs -> job (derived).
 	stagedPaths map[string]string
+	// Re-home (#1825), under mu; see rehome.go. rehomePaths: source and
+	// output paths of jobs -> job (derived); rehomeGen: the log index of the
+	// last re-home change.
+	rehomeEnabled bool
+	rehomeJobs    map[string]*RehomeJob
+	rehomePaths   map[string]string
+	rehomeGen     uint64
+	backupMarks   map[string]*BackupMark
+	// Compaction read fences (#1852), under mu; see compaction_fences.go.
+	compactionFences bool
+	readFences       map[string]uint64
+	lastWaiver       uint64
 	// clusterPolicies is the #1324 flag; policiesSeeded the kinds whose
 	// policies live here; tieringPolicies by database. See
 	// cluster_policies.go.
@@ -884,6 +936,10 @@ type ClusterFSM struct {
 	cqEnabled bool
 	cqs       map[int64]*CQEntry
 	cqSeq     int64
+	// Governance policies (#1627) by token ID, see governance_policies.go.
+	governanceEnabled  bool
+	governancePolicies map[int64]*GovernancePolicyEntry
+	governanceSeq      int64
 	// policyAdoptChoice: an admin's pending choice of node, per kind.
 	policyAdoptChoice map[string]*PolicyAdoptChoice
 	// onPoliciesChanged: AddPoliciesChangedCallback.
@@ -894,6 +950,9 @@ type ClusterFSM struct {
 	onCompactionStaged    func(StagedCompaction)
 	onCompactionGone      func(StagedCompaction)
 	onCompactionCommitted func(job string, output FileEntry)
+	onRehomeChanged       func(RehomeJob)
+	onRehomeEnded         func(RehomeJob)
+	onReadFenceWaived     func(node string)
 	pendingEvents         []func()
 
 	// Callbacks for state changes
@@ -906,6 +965,9 @@ type ClusterFSM struct {
 	onFileRegistered     func(*FileEntry)
 	onFileContentChanged func(*FileEntry)
 	onFileDeleted        func(path string, reason string)
+	onIcebergPaths       func(keys []string)
+	// onIcebergDatabaseDropped observes CommandIcebergDatabaseDropped (#1731).
+	onIcebergDatabaseDropped func(database string)
 	// Auth-state callbacks: invoked from every node's apply path so the
 	// node's local AuthManager can materialise the change into its
 	// SQLite cache (and invalidate the in-memory verify-token cache).
@@ -976,6 +1038,10 @@ func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 		takeover:                newTakeoverState(),
 		staged:                  map[string]*StagedCompaction{},
 		stagedPaths:             map[string]string{},
+		rehomeJobs:              map[string]*RehomeJob{},
+		backupMarks:             map[string]*BackupMark{},
+		readFences:              map[string]uint64{},
+		rehomePaths:             map[string]string{},
 		policiesSeeded:          map[string]bool{},
 		tieringPolicies:         map[string]*TieringPolicyEntry{},
 		policyCollecting:        map[string]*PolicyCollect{},
@@ -984,6 +1050,7 @@ func NewClusterFSM(logger zerolog.Logger) *ClusterFSM {
 		retentionSeededIDs:      map[int64]bool{},
 		policyAdoptChoice:       map[string]*PolicyAdoptChoice{},
 		cqs:                     map[int64]*CQEntry{},
+		governancePolicies:      map[int64]*GovernancePolicyEntry{},
 
 		logger: logger.With().Str("component", "cluster-fsm").Logger(),
 	}
@@ -1267,6 +1334,16 @@ func (f *ClusterFSM) GetTokenByID(id int64) *TokenEntry {
 	return &copy
 }
 
+// TokenIDByName returns the ID of the token with this name, through the
+// tokensByName index. #1630: a node-local rename must not take a cluster
+// token's name.
+func (f *ClusterFSM) TokenIDByName(name string) (int64, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	id, ok := f.tokensByName[name]
+	return id, ok
+}
+
 // TokenCount returns the number of tokens currently in the FSM.
 func (f *ClusterFSM) TokenCount() int {
 	f.mu.RLock()
@@ -1393,7 +1470,7 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 	case CommandAwaitAdoption:
 		return f.applyAwaitAdoption(cmd.Payload)
 	case CommandEnableRetentionPolicies:
-		return f.applyEnableRetentionPolicies(cmd.Payload)
+		return f.applyEnablePolicyKind(PolicyKindRetention, cmd.Payload)
 	case CommandCreateRetentionPolicy:
 		return f.policiesChangedIfApplied(f.applyCreateRetentionPolicy(cmd.Payload))
 	case CommandUpdateRetentionPolicy:
@@ -1403,7 +1480,7 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 	case CommandChoosePolicyAdoption:
 		return f.applyChoosePolicyAdoption(cmd.Payload)
 	case CommandEnableCQPolicies:
-		return f.applyEnableCQPolicies(cmd.Payload)
+		return f.applyEnablePolicyKind(PolicyKindCQ, cmd.Payload)
 	case CommandCreateCQ:
 		return f.policiesChangedIfApplied(f.applyCreateCQ(cmd.Payload))
 	case CommandUpdateCQ:
@@ -1414,6 +1491,16 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		// No mirror signal: a watermark moves at every run, and the mirrors
 		// pick it up on their periodic pass.
 		return f.applySetCQWatermark(cmd.Payload)
+	case CommandEnableGovernancePolicies:
+		return f.applyEnablePolicyKind(PolicyKindGovernance, cmd.Payload)
+	case CommandSetGovernancePolicy:
+		return f.policiesChangedIfApplied(f.applySetGovernancePolicy(cmd.Payload))
+	case CommandDeleteGovernancePolicy:
+		return f.policiesChangedIfApplied(f.applyDeleteGovernancePolicy(cmd.Payload))
+	case CommandIcebergPathsChanged:
+		return f.applyIcebergPathsChanged(cmd.Payload)
+	case CommandIcebergDatabaseDropped:
+		return f.applyIcebergDatabaseDropped(cmd.Payload)
 	case CommandEnableColdMark:
 		return f.applyEnableColdMark(cmd.Payload)
 	case CommandColdMarkAdd:
@@ -1480,6 +1567,32 @@ func (f *ClusterFSM) Apply(log *raft.Log) interface{} {
 		return f.applySetCompactionPause(cmd.Payload)
 	case CommandAckCompactionPause:
 		return f.applyAckCompactionPause(cmd.Payload)
+	case CommandEnableRehome:
+		return f.applyEnableRehome(cmd.Payload, log.Index)
+	case CommandStageRehome:
+		defer f.deliverCompactionEvents()
+		return f.applyStageRehome(cmd.Payload, log.Index)
+	case CommandAdvanceRehome:
+		defer f.deliverCompactionEvents()
+		return f.applyAdvanceRehome(cmd.Payload, log.Index)
+	case CommandAckRehome:
+		defer f.deliverCompactionEvents()
+		return f.applyAckRehome(cmd.Payload, log.Index)
+	case CommandClaimRehomeFinisher:
+		defer f.deliverCompactionEvents()
+		return f.applyClaimRehomeFinisher(cmd.Payload, log.Index)
+	case CommandEndRehome:
+		defer f.deliverCompactionEvents()
+		return f.applyEndRehome(cmd.Payload, log.Index)
+	case CommandEnableCompactionFences:
+		return f.applyEnableCompactionFences(cmd.Payload)
+	case CommandReadFence:
+		defer f.deliverCompactionEvents()
+		return f.applyReadFence(cmd.Payload, log.Index)
+	case CommandAdvanceCompaction:
+		return f.applyAdvanceCompaction(cmd.Payload, log.Index)
+	case CommandBackupMark:
+		return f.applyBackupMark(cmd.Payload)
 
 	default:
 		return fmt.Errorf("unknown command type: %d", cmd.Type)
@@ -1722,9 +1835,15 @@ func (f *ClusterFSM) applyRemoveNode(payload []byte) interface{} {
 			}
 		}
 	}
+	// Anything cleared here for p.NodeID must also be counted by
+	// ReferencesNode, or the operator removal 404s for exactly the IDs this
+	// would clean up (#1619; TestReferencesNodeFalseAfterRemoval).
 	removed := f.nodes[p.NodeID]
 	delete(f.nodes, p.NodeID)
 	f.compactionNodeRemovedLocked(p.NodeID)
+	f.rehomeNodeRemovedLocked(p.NodeID, f.applyStarted.Load())
+	f.backupMarksNodeRemovedLocked(p.NodeID)
+	delete(f.readFences, p.NodeID)
 	// A removed node no longer holds the cold mark fence or counts toward
 	// its liveness (#1552).
 	f.coldMarkNodeRemovedLocked(p.NodeID)
@@ -1759,6 +1878,103 @@ func (f *ClusterFSM) applyRemoveNode(payload []byte) interface{} {
 	}
 
 	return nil
+}
+
+// ReferencesNode reports whether the cluster state still names id as a node:
+// the node table, a designation (primary writer, compactor lease), a map keyed
+// by node ID, or anything applyRemoveNode and its helpers clear for a removed
+// node. The operator removal (DELETE /api/v1/cluster/nodes/:id) answers 404
+// only for an ID this returns false for and that the registry and the Raft
+// configuration do not hold either (#1619), so the two must stay in step: a
+// structure applyRemoveNode starts acting on belongs here too, or that removal
+// is refused for exactly the IDs it would clean up.
+//
+// A departed writer is the case that needs this most: after a graceful leave
+// it is in none of the node table, the registry or the Raft configuration, yet
+// its instances and claims stay pinned to it until an operator removal (or the
+// departed TTL) gives them up.
+//
+// Attribution kept as history is deliberately not membership, because a
+// removal leaves it as it is and it outlives the node: FileEntry.OriginNodeID,
+// a retired instance's Origin, an ended claim's By, ReportedBy, delete
+// records, policy sources and adoption choices, the cold mark's AckWanted and
+// the pause's RequestedBy. Counting those would keep every removed node a
+// member forever. For the same reason an instance a removal already orphaned
+// (OriginGone) does not count.
+//
+// Two sources are wider than the removal on purpose: the compactor lease and
+// the pause acks are keyed by node ID but applyRemoveNode does not clear them,
+// so a removed node that still holds either answers 200 (a no-op removal) on a
+// retry until the lease moves or the pause ends. Counting them is the
+// conservative side: the old behaviour. Do not "fix" that by dropping them
+// unless applyRemoveNode starts clearing them.
+func (f *ClusterFSM) ReferencesNode(id string) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	if _, ok := f.nodes[id]; ok {
+		return true
+	}
+	if id == f.primaryWriterID || id == f.activeCompactorID {
+		return true
+	}
+	if _, ok := f.compactionPause.Acks[id]; ok {
+		return true
+	}
+	// rehomeNodeRemovedLocked
+	if f.rehomeReferencesLocked(id) {
+		return true
+	}
+	// backupMarksNodeRemovedLocked
+	for _, m := range f.backupMarks {
+		if m.Node == id {
+			return true
+		}
+	}
+	// readFences (applyRemoveNode)
+	if _, ok := f.readFences[id]; ok {
+		return true
+	}
+	// compactionNodeRemovedLocked
+	for _, s := range f.staged {
+		if s.Origin == id {
+			return true
+		}
+		for _, h := range s.Holders {
+			if h == id {
+				return true
+			}
+		}
+	}
+	// coldMarkNodeRemovedLocked
+	if st := f.coldMark; st != nil {
+		if _, ok := st.Alive[id]; ok {
+			return true
+		}
+		if _, ok := st.Acked[id]; ok {
+			return true
+		}
+	}
+	// takeoverNodeRemovedLocked
+	if t := f.takeover; t != nil {
+		if _, ok := t.departed[id]; ok {
+			return true
+		}
+		if _, ok := t.current[id]; ok {
+			return true
+		}
+		for _, in := range t.instances {
+			if in.Origin == id && in.Status != InstanceRetired && !in.OriginGone {
+				return true
+			}
+		}
+		for _, c := range t.claims {
+			if c.By == id && !c.Done && !c.Released {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (f *ClusterFSM) applyUpdateNode(payload []byte) interface{} {
@@ -1953,7 +2169,7 @@ func (f *ClusterFSM) applyRegisterFileStruct(p RegisterFilePayload, logIndex uin
 	}
 
 	f.mu.Lock()
-	if f.adoptRefusedLocked(p) {
+	if f.adoptRefusedLocked(p) || f.rehomeOwnsLocked(p.File.Path) || f.compactionFencedOwnsLocked(p.File.Path) {
 		f.mu.Unlock()
 		return &ManifestChangedError{Paths: []string{p.File.Path}}
 	}
@@ -2050,7 +2266,7 @@ func (f *ClusterFSM) applyDeleteFileStruct(p DeleteFilePayload) interface{} {
 	}
 
 	f.mu.Lock()
-	if p.ExpectSHA != "" && f.compactionCommit && !f.registeredAtLocked(p.Path, p.ExpectSHA) {
+	if (p.ExpectSHA != "" && f.compactionCommit && !f.registeredAtLocked(p.Path, p.ExpectSHA)) || f.rehomeOwnsLocked(p.Path) || f.compactionFencedOwnsLocked(p.Path) {
 		f.mu.Unlock()
 		return &ManifestChangedError{Paths: []string{p.Path}}
 	}
@@ -2144,7 +2360,7 @@ func (f *ClusterFSM) applyUpdateFileStruct(p UpdateFilePayload, logIndex uint64)
 	}
 
 	f.mu.Lock()
-	if f.updateRefusedLocked(p) {
+	if f.updateRefusedLocked(p) || f.rehomeOwnsLocked(p.File.Path) || f.compactionFencedOwnsLocked(p.File.Path) {
 		f.mu.Unlock()
 		return &ManifestChangedError{Paths: []string{p.File.Path}}
 	}
@@ -2412,6 +2628,23 @@ func (f *ClusterFSM) applyBatchFileOps(payload []byte, logIndex uint64) interfac
 	return nil
 }
 
+// ErrTokenNameExists matches (errors.Is) the FSM's refusal of a token create
+// or rename to a name another token holds. On the leader the refusal reaches
+// the proposer typed; a follower gets only its text from the leader's
+// forward-apply ack, which internal/cluster's wrapApplyError recognises. #1625.
+var ErrTokenNameExists = errors.New("token name already exists")
+
+// tokenNameExistsError is that refusal. Its text is the one the FSM has always
+// returned, byte for byte: older followers, ensureFirstToken and the recovery
+// token match "already exists" in it, so it must not change.
+type tokenNameExistsError struct{ name string }
+
+func (e *tokenNameExistsError) Error() string {
+	return fmt.Sprintf("token name %q already exists", e.name)
+}
+
+func (e *tokenNameExistsError) Is(target error) bool { return target == ErrTokenNameExists }
+
 // rejectToken centralises FSM-side rejection of a malformed token command.
 // Same shape as rejectManifestPath: log at Error, bump counters, return a
 // wrapped validation error. The security property — entry does NOT land in
@@ -2611,7 +2844,7 @@ func (f *ClusterFSM) applyCreateToken(payload []byte, logIndex uint64) interface
 			Str("name", entry.Name).
 			Uint64("log_index", logIndex).
 			Msg("Duplicate token name create refused")
-		return fmt.Errorf("create token: token name %q already exists", entry.Name)
+		return fmt.Errorf("create token: %w", &tokenNameExistsError{name: entry.Name})
 	}
 	f.tokens[entry.ID] = &entry
 	f.tokensByPrefix[entry.TokenPrefix] = append(f.tokensByPrefix[entry.TokenPrefix], entry.ID)
@@ -2679,7 +2912,16 @@ func (f *ClusterFSM) applyUpdateToken(payload []byte, logIndex uint64) interface
 		// loop, so a linear scan was a future scaling bottleneck).
 		if otherID, exists := f.tokensByName[p.Name]; exists && otherID != p.ID {
 			f.mu.Unlock()
-			return f.rejectToken("update", p.ID, logIndex, fmt.Errorf("token name %q already exists", p.Name))
+			// A taken name is a client error (409), not a malformed
+			// command: logged at Debug and not counted as a rejected
+			// token, as the create's duplicate-name refusal. Same text as
+			// rejectToken produced. #1625.
+			f.logger.Debug().
+				Str("name", p.Name).
+				Int64("token_id", p.ID).
+				Uint64("log_index", logIndex).
+				Msg("Duplicate token name rename refused")
+			return fmt.Errorf("update token: %w", &tokenNameExistsError{name: p.Name})
 		}
 		// Maintain the name index: drop the old binding, add the new one.
 		delete(f.tokensByName, entry.Name)
@@ -2815,14 +3057,24 @@ func (f *ClusterFSM) applyDeleteToken(payload []byte, logIndex uint64) interface
 		}
 		delete(f.tokenMembershipsByToken, p.ID)
 	}
+	// A governance policy never outlives its token (#1627): the token's ID
+	// is a log index, and a later token can never take it, but a policy
+	// left behind would be listed and mirrored for no one.
+	droppedGovernance := f.dropGovernancePolicyLocked(p.ID)
 
 	callback := f.onTokenDeleted
 	f.mu.Unlock()
+	if droppedGovernance {
+		f.firePoliciesChanged()
+	}
 
 	metrics.Get().IncClusterAuthApplyDelete()
 	logEvt := f.logger.Info().Int64("token_id", p.ID)
 	if cascadedMemberships > 0 {
 		logEvt = logEvt.Int("cascaded_memberships", cascadedMemberships)
+	}
+	if droppedGovernance {
+		logEvt = logEvt.Bool("governance_policy_dropped", true)
 	}
 	logEvt.Msg("Token deleted from cluster auth state")
 	// Serialised with the reconcile against SQLite (#1336).
@@ -2876,8 +3128,15 @@ func (f *ClusterFSM) applyRotateToken(payload []byte, logIndex uint64) interface
 		}
 		f.tokensByPrefix[p.NewPrefix] = append(f.tokensByPrefix[p.NewPrefix], p.ID)
 	}
+	// A token's governance policy is enforced only for the token whose hash
+	// it was set for (#1627): a rotate changes that hash, so the readers of
+	// the governance state rebuild.
+	_, hasGovernance := f.governancePolicies[p.ID]
 	callback := f.onTokenRotated
 	f.mu.Unlock()
+	if hasGovernance {
+		f.firePoliciesChanged()
+	}
 
 	metrics.Get().IncClusterAuthApplyRotate()
 	f.logger.Info().Int64("token_id", p.ID).Uint64("lsn", logIndex).Msg("Token rotated in cluster auth state")
@@ -2964,6 +3223,8 @@ func (f *ClusterFSM) Snapshot() (raft.FSMSnapshot, error) {
 
 	return &fsmSnapshot{
 		compactionCommit: f.snapshotCompactionCommitLocked(),
+		rehome:           f.snapshotRehomeLocked(),
+		compactionFences: f.snapshotCompactionFencesLocked(),
 		clusterPolicies:  f.snapshotClusterPoliciesLocked(),
 		coldMark:         f.snapshotColdMarkLocked(),
 		streamClaims:     claimsState,
@@ -3330,6 +3591,8 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 	f.takeover.gen = prevGen + 1
 	f.refreshUnackedDeletesLocked()
 	f.restoreCompactionCommitLocked(snapshot.CompactionCommit)
+	f.restoreRehomeLocked(snapshot.Rehome)
+	f.restoreCompactionFencesLocked(snapshot.CompactionFences)
 	f.restoreClusterPoliciesLocked(snapshot.ClusterPolicies)
 	f.restoreColdMarkLocked(snapshot.ColdMark)
 	onCompactionPauseChanged := f.onCompactionPauseChanged
@@ -3362,6 +3625,9 @@ func (f *ClusterFSM) Restore(rc io.ReadCloser) error {
 		f.tokensByPrefix[entry.TokenPrefix] = append(f.tokensByPrefix[entry.TokenPrefix], id)
 		f.tokensByName[entry.Name] = id
 	}
+	// A governance policy never outlives its token (#1627), even in a
+	// snapshot that says otherwise: nothing would ever drop it.
+	f.dropOrphanGovernancePoliciesLocked()
 
 	// Phase A.1: install RBAC primary maps + rebuild all secondary
 	// indices from scratch (we never persist them — they're derived).
@@ -3588,6 +3854,21 @@ func (f *ClusterFSM) HasFile(path string) bool {
 	defer f.mu.RUnlock()
 	_, ok := f.files[path]
 	return ok
+}
+
+// HasFileWithPrefix reports whether any manifest path starts with prefix,
+// without copying entries: a walk under the read lock that stops at the first
+// match (#1731's drop guard, rare; a hub's spoke files are indexed under the
+// spoke's own database, so filesByDB cannot answer it).
+func (f *ClusterFSM) HasFileWithPrefix(prefix string) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	for p := range f.files {
+		if strings.HasPrefix(p, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *ClusterFSM) GetFile(path string) (*FileEntry, bool) {
@@ -3848,6 +4129,8 @@ type fsmSnapshot struct {
 	appliedIndex           uint64
 	streamClaims           *streamClaimsState
 	compactionCommit       *compactionCommitState
+	rehome                 *rehomeState
+	compactionFences       *compactionFencesState
 	clusterPolicies        *clusterPoliciesState
 	coldMark               *coldMarkState
 }
@@ -3870,6 +4153,8 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
 		AppliedIndex:           s.appliedIndex,
 		StreamClaims:           s.streamClaims,
 		CompactionCommit:       s.compactionCommit,
+		Rehome:                 s.rehome,
+		CompactionFences:       s.compactionFences,
 		ClusterPolicies:        s.clusterPolicies,
 		ColdMark:               s.coldMark,
 	}

@@ -29,6 +29,10 @@ type Coordinator struct {
 	components []namedComponent
 	hooks      []namedHook
 
+	// componentReserve is the part of timeout kept for the components
+	// (SetComponentReserve). Zero: hooks and components share one deadline.
+	componentReserve time.Duration
+
 	// Shutdown state
 	shutdownOnce sync.Once
 	triggerOnce  sync.Once // Separate Once for TriggerShutdown to prevent race condition
@@ -91,6 +95,24 @@ func (c *Coordinator) RegisterHook(name string, hook ShutdownFunc, priority int)
 		Msg("Registered shutdown hook")
 }
 
+// SetComponentReserve keeps reserve of the budget for the components: the
+// hooks run on a context whose deadline is the shutdown deadline minus
+// reserve, and a hook that overruns it no longer costs the components their
+// turn (#1644). A hook that starts after that deadline still runs, on an
+// expired context, so a hook that stops a scheduler still stops it before the
+// components it uses close; one that waits on its context returns at once.
+// The components keep the full deadline and are skipped only when it passes.
+// A reserve of zero, or one not below the timeout, keeps the single deadline.
+func (c *Coordinator) SetComponentReserve(reserve time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if reserve <= 0 || reserve >= c.timeout {
+		c.componentReserve = 0
+		return
+	}
+	c.componentReserve = reserve
+}
+
 // WaitForSignal blocks until a shutdown signal is received
 func (c *Coordinator) WaitForSignal() os.Signal {
 	quit := make(chan os.Signal, 1)
@@ -130,6 +152,7 @@ func (c *Coordinator) Shutdown() error {
 
 		// Sort components by priority (lowest first)
 		c.mu.Lock()
+		reserve := c.componentReserve
 		components := make([]namedComponent, len(c.components))
 		copy(components, c.components)
 		hooks := make([]namedHook, len(c.hooks))
@@ -140,15 +163,36 @@ func (c *Coordinator) Shutdown() error {
 		sortComponentsByPriority(components)
 		sortHooksByPriority(hooks)
 
+		// The hooks' deadline: the shutdown deadline, less the components'
+		// reserve when one is set.
+		hookCtx := ctx
+		if reserve > 0 {
+			var hookCancel context.CancelFunc
+			hookCtx, hookCancel = context.WithTimeout(ctx, c.timeout-reserve)
+			defer hookCancel()
+		}
+		hookWindowLogged := false
+
 		// Execute hooks first
 		for _, h := range hooks {
-			select {
-			case <-ctx.Done():
+			// The full deadline first: once it passes, hookCtx (its child)
+			// has passed too, and a select over both would pick at random.
+			if ctx.Err() != nil {
 				c.logger.Warn().
 					Str("hook", h.name).
 					Msg("Shutdown timeout reached, skipping remaining hooks")
 				shutdownErr = ctx.Err()
 				return
+			}
+			select {
+			case <-hookCtx.Done():
+				if !hookWindowLogged {
+					hookWindowLogged = true
+					c.logger.Warn().
+						Str("hook", h.name).
+						Dur("components_reserve", reserve).
+						Msg("Shutdown hooks overran their share of the budget; the remaining hooks run on an expired context")
+				}
 			default:
 			}
 
@@ -157,7 +201,7 @@ func (c *Coordinator) Shutdown() error {
 				Int("priority", h.priority).
 				Msg("Executing shutdown hook")
 
-			if err := h.hook(ctx); err != nil {
+			if err := h.hook(hookCtx); err != nil {
 				c.logger.Error().
 					Err(err).
 					Str("hook", h.name).

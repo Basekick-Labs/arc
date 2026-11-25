@@ -31,6 +31,7 @@ import (
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/pruning"
 	"github.com/basekick-labs/arc/internal/queryregistry"
+	"github.com/basekick-labs/arc/internal/readgate"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
@@ -174,7 +175,9 @@ func isClientError(err error) bool {
 // streamErrEvent picks the right zerolog level for a stream-truncation
 // error: Warn for client-side events, Error for server-side failures.
 func (h *QueryHandler) streamErrEvent(err error) *zerolog.Event {
-	if isClientError(err) {
+	// A file removed while the engine read it is the data changing under the
+	// query, not a server fault; the router has already logged its path (#1357).
+	if _, vanished := vanishedEnginePath(err); vanished || isClientError(err) {
 		return h.logger.Warn()
 	}
 	return h.logger.Error()
@@ -822,6 +825,12 @@ func stripSQLComments(sql string, hasComments bool) string {
 
 // QueryHandler handles SQL query endpoints
 type QueryHandler struct {
+	// lifetime is the context read requests run on (SetLifetime); nil
+	// leaves them on Fiber's background context.
+	lifetime context.Context
+	// warehouse names the Iceberg warehouse's directories in the storage
+	// root, which the listings leave out (#1626); nil with Iceberg off.
+	warehouse   WarehouseDirs
 	db          *database.DuckDB
 	storage     storage.Backend
 	pruner      *pruning.PartitionPruner
@@ -835,6 +844,10 @@ type QueryHandler struct {
 	// openCompactions lists compaction jobs whose output and inputs can both
 	// be in storage (compaction.OpenJobs); nil without a compaction manager.
 	openCompactions OpenCompactions
+	// reads counts the reads in flight on this handler's routes, on Flight
+	// SQL (which goes through them) and on the continuous queries that share
+	// it (Reads). Never nil after NewQueryHandler.
+	reads *readgate.Gate
 	// vanishedInvalidatedAt rate-limits the cache wipe after a partition
 	// removed mid-query (UnixNano; see invalidateAfterVanished).
 	vanishedInvalidatedAt atomic.Int64
@@ -876,9 +889,16 @@ type QueryHandler struct {
 	// query handler's Stats endpoint and as a Prometheus counter so operators
 	// can alert on a non-zero rate without inferring from HTTP error logs.
 	gate503Total atomic.Int64
+	// readLease503Total counts reads refused while this node held no read
+	// lease (refuseRead); readLease503LogLastNano samples its log line.
+	readLease503Total       atomic.Int64
+	readLease503LogLastNano atomic.Int64
 
 	// Tiering support for multi-tier query routing (hot/cold)
 	tieringManager *tiering.Manager
+	// coldRemoval overrides, in tests, whether cold files were removed
+	// recently and what the cold backend is (coldGlobAfterRemoval).
+	coldRemoval func() (recent bool, cold storage.Backend)
 	// coldDatabases overrides coldDatabaseSource in tests.
 	coldDatabases func(context.Context) ([]string, error)
 
@@ -1176,6 +1196,7 @@ func NewQueryHandler(db *database.DuckDB, storage storage.Backend, logger zerolo
 	}
 
 	return &QueryHandler{
+		reads:              &readgate.Gate{},
 		db:                 db,
 		storage:            storage,
 		pruner:             pruner,
@@ -1306,6 +1327,42 @@ func (h *QueryHandler) SetRouter(router *cluster.Router) {
 	h.router = router
 }
 
+// readLeaseReadiness is a coordinator that can say whether this node may
+// serve reads at all (cluster.Coordinator.ReadReady).
+type readLeaseReadiness interface {
+	ReadReady() (bool, string)
+}
+
+// The gate must not silently turn off: a coordinator that stopped
+// satisfying the interface would pass every read.
+var _ readLeaseReadiness = (*cluster.Coordinator)(nil)
+
+// forwardsOnly reports a request this node sends to a peer instead of reading
+// itself (a compactor forwards queries): the peer applies its own gate.
+func (h *QueryHandler) forwardsOnly(c *fiber.Ctx) bool {
+	return h.router != nil && QueryForwardDecision(h.router, c) == ForwardToPeer
+}
+
+// refuseRead answers a read with 503 while this node may not serve reads.
+func (h *QueryHandler) refuseRead(c *fiber.Ctx, why string) error {
+	total := h.readLease503Total.Add(1)
+	now := time.Now().UnixNano()
+	last := h.readLease503LogLastNano.Load()
+	if now-last >= gate503LogIntervalNanos && h.readLease503LogLastNano.CompareAndSwap(last, now) {
+		h.logger.Warn().Int64("refused_total", total).Str("path", c.Path()).Str("why", why).
+			Msg("Read refused: this node's cluster state may be behind the leader's (sampled at 1Hz)")
+	}
+	c.Set("Retry-After", "1")
+	// Logged above, sampled: a node cut off from its leader refuses every
+	// read, and one Error line per query would bury everything else.
+	c.Locals(ingestRefusedLocal, true)
+	return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+		"success": false,
+		"error":   "cluster_state_not_synced",
+		"message": "This node cannot serve reads now: " + why + ". Retry shortly, or send the query to another node.",
+	})
+}
+
 // replicationReadiness is the subset of cluster.Coordinator the query gate
 // consumes. Defining the interface here (rather than depending on the
 // concrete *cluster.Coordinator) keeps the gate independently testable —
@@ -1317,10 +1374,11 @@ type replicationReadiness interface {
 }
 
 // SetCluster wires the cluster coordinator and the query-gate-on-catchup
-// behavior flag into the query handler. Consulted by checkReplicationReady
-// to short-circuit queries with 503 while peer file replication is still
-// draining (#392). Both arguments are optional — nil coordinator OR
-// gate=false makes the gate a no-op.
+// behavior flag into the query handler. Consulted by checkReplicationReady,
+// which refuses reads with 503 while this node holds no read lease on a
+// shared-object-store cluster (always), and while peer file replication is
+// still draining (only with queryGateOnCatchup, #392). A nil coordinator
+// makes both no-ops.
 //
 // Initialization-only: must be called once during process startup before
 // the HTTP server starts accepting requests. Order relative to
@@ -1354,22 +1412,30 @@ const gate503RetryAfterSeconds = "5"
 // second to prevent log floods during sustained catch-up.
 const gate503LogIntervalNanos = int64(time.Second)
 
-// checkReplicationReady is Fiber middleware that short-circuits user-facing
-// read endpoints with 503 when peer file replication is still draining and
-// the operator has opted into the gate via cluster.query_gate_on_catchup.
+// checkReplicationReady is Fiber middleware in front of every user-facing read
+// endpoint. It answers 503 in two cases:
 //
-// Returns c.Next() (no-op pass-through) when:
-//   - the gate is disabled (queryGateOnCatchup=false), OR
-//   - the coordinator is nil (OSS / standalone), OR
-//   - Coordinator.ReplicationReady() reports the puller is fully drained.
+//   - always, on a cluster whose nodes share one object store, while this
+//     node holds no read lease: its cluster state may be behind the leader's,
+//     and it would leave the wrong files out of the read
+//     (cluster/read_lease.go, #1852). A request this node only forwards to a
+//     peer is not refused here: the peer answers for itself;
+//   - when the operator opted into the catch-up gate
+//     (cluster.query_gate_on_catchup) and peer file replication is still
+//     draining (#392). The body then carries the puller's catch-up status.
 //
-// Returns 503 with a structured body and Retry-After header otherwise. The
-// body includes the puller's catch-up status so clients can implement
-// bounded retry without scraping logs or polling /api/v1/cluster separately.
-// Each gated 503 increments gate503Total and emits at most one sampled Warn
-// per second so operators can alert on a non-zero rate. See #392.
+// Otherwise, and always with no coordinator (OSS, standalone), it passes the
+// request on. Each refusal is counted and logged at most once a second.
 func (h *QueryHandler) checkReplicationReady(c *fiber.Ctx) error {
-	if !h.queryGateOnCatchup || h.coordinator == nil {
+	if h.coordinator == nil {
+		return c.Next()
+	}
+	if rr, ok := h.coordinator.(readLeaseReadiness); ok && !h.forwardsOnly(c) {
+		if ready, why := rr.ReadReady(); !ready {
+			return h.refuseRead(c, why)
+		}
+	}
+	if !h.queryGateOnCatchup {
 		return c.Next()
 	}
 	if h.coordinator.ReplicationReady() {
@@ -1405,6 +1471,19 @@ func (h *QueryHandler) checkReplicationReady(c *fiber.Ctx) error {
 // rate without inferring from HTTP error logs.
 func (h *QueryHandler) QueryGate503Total() int64 {
 	return h.gate503Total.Load()
+}
+
+// SetWarehouseLayout hides the Iceberg warehouse's directories from SHOW
+// DATABASES, SHOW TABLES and GET /api/v1/measurements (#1626), as
+// DatabasesHandler.SetWarehouseLayout does from the database routes.
+func (h *QueryHandler) SetWarehouseLayout(l WarehouseDirs) { h.warehouse = l }
+
+func (h *QueryHandler) isWarehouseDir(name string) bool {
+	return h.warehouse != nil && h.warehouse.IsWarehouseRootDir(name)
+}
+
+func (h *QueryHandler) isWarehouseMeasurement(db, m string) bool {
+	return h.warehouse != nil && h.warehouse.IsWarehouseMeasurement(db, m)
 }
 
 // SetTieringManager sets the tiering manager for multi-tier query routing.
@@ -1612,6 +1691,49 @@ func (h *QueryHandler) SetQueryRegistry(registry *queryregistry.Registry) {
 	h.queryRegistry = registry
 }
 
+// SetLifetime sets the context the read endpoints run their queries on when
+// the request carries none of its own: api.Server.QueryLifetime, which
+// shutdown cancels once its grace is over (#1644). Call before serving.
+// Without it a query ends only at its timeout or its client's disconnect.
+func (h *QueryHandler) SetLifetime(ctx context.Context) {
+	h.lifetime = ctx
+}
+
+// shuttingDown reports whether the handler's lifetime is over: shutdown has
+// cancelled the queries still running (#1644).
+func (h *QueryHandler) shuttingDown() bool {
+	return h.lifetime != nil && h.lifetime.Err() != nil
+}
+
+// endedByShutdown reports whether a cancelled query was ended by shutdown
+// (the handler's lifetime is over) rather than by Cancel() or its client.
+// If so, it closes out queryID in the registry, which nothing else does for
+// a shutdown cancel.
+func (h *QueryHandler) endedByShutdown(queryID string) bool {
+	if !h.shuttingDown() {
+		return false
+	}
+	if h.queryRegistry != nil && queryID != "" {
+		h.queryRegistry.CancelWithReason(queryID, "server shutting down")
+	}
+	return true
+}
+
+// bindQueryLifetime wraps next (the read-auth middleware) so the request's
+// user context is the handler's lifetime. Every query derives its DuckDB
+// context from c.UserContext(), so ending the lifetime ends the query, and
+// the Arrow and MessagePack streams that run after the handler returns. A
+// context already set is kept: the Flight SQL bridge sets its own, which its
+// shutdown cancels.
+func (h *QueryHandler) bindQueryLifetime(next fiber.Handler) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		if h.lifetime != nil && c.UserContext() == context.Background() {
+			c.SetUserContext(h.lifetime)
+		}
+		return next(c)
+	}
+}
+
 // OpenCompactions is what the query layer needs from the compactions a read
 // must account for: compaction.OpenJobs on this node, and in a cluster the
 // coordinator's committed jobs and pending local deletes
@@ -1622,8 +1744,27 @@ type OpenCompactions interface {
 	Generation() uint64
 }
 
+// StopReads cancels every read in flight on this node and every read that
+// binds until ResumeReads, recording why in the query registry: the node lost
+// its cluster read lease (#1825).
+func (h *QueryHandler) StopReads(reason string) {
+	h.reads.CancelAll()
+	if h.queryRegistry != nil {
+		h.queryRegistry.CancelAllWithReason(reason)
+	}
+}
+
+// ResumeReads lets reads run again after StopReads.
+func (h *QueryHandler) ResumeReads() { h.reads.Reopen() }
+
 // SetOpenCompactions wires the compaction jobs a read must account for.
 func (h *QueryHandler) SetOpenCompactions(oc OpenCompactions) { h.openCompactions = oc }
+
+// Reads is the count of reads in flight: every query this handler serves
+// enters it before its SQL is built and leaves when the handler returns,
+// which is after its statement has run (internal/readgate).
+// Other readers of data files (continuous queries) share it.
+func (h *QueryHandler) Reads() *readgate.Gate { return h.reads }
 
 func (h *QueryHandler) openCompactionsGeneration() uint64 {
 	if h.openCompactions == nil {
@@ -1635,12 +1776,6 @@ func (h *QueryHandler) openCompactionsGeneration() uint64 {
 // openCompactionFileColumn names the file column the exclusion reads. Not
 // "filename": DuckDB refuses that option on a file that has such a column.
 const openCompactionFileColumn = "__arc_file"
-
-// excludeOpenCompactions is wrapOpenCompactions with this handler's
-// registry and storage.
-func (h *QueryHandler) excludeOpenCompactions(ctx context.Context, expr, database, measurement string) string {
-	return wrapOpenCompactions(ctx, h.openCompactions, h.storage, expr, database, measurement)
-}
 
 // openCompactionExclusions is the storage keys a read of database.measurement
 // must leave out (wrapOpenCompactions), for readers that list files
@@ -1662,29 +1797,115 @@ func (h *QueryHandler) openCompactionExclusions(ctx context.Context, prefix stri
 // The excluded files are still opened: DuckDB does not skip a file by its
 // name column. The result is volatile.
 func wrapOpenCompactions(ctx context.Context, oc OpenCompactions, backend storage.Backend, expr, database, measurement string) string {
-	if oc == nil || backend == nil || database == "" || measurement == "" {
+	if backend == nil {
 		return expr
+	}
+	return snapshotOpenCompactions(ctx, oc, database, measurement).apply(backend, nil, expr)
+}
+
+// readExclusions is what a read of one measurement must leave out,
+// snapshotted before the read's path list is built. keys are storage keys;
+// coldKeys are those of them that name a file in cold storage, which a read
+// knows by its cold address (a re-home job's source on the cold tier, #1825).
+type readExclusions struct {
+	keys     []string
+	coldKeys []string
+}
+
+// TieredExcluder is an OpenCompactions source that says, in the same answer
+// as the keys to leave out, which of them are files in cold storage
+// (rehome.Registry). One call: a source asked twice could change between the
+// answers, and a read would leave out both a file and its replacements, or
+// neither.
+type TieredExcluder interface {
+	ExcludedTiered(ctx context.Context, prefix string) (keys, coldKeys []string)
+}
+
+// snapshotOpenCompactions reads the exclusions for one measurement.
+func snapshotOpenCompactions(ctx context.Context, oc OpenCompactions, database, measurement string) readExclusions {
+	if oc == nil || database == "" || measurement == "" {
+		return readExclusions{}
 	}
 	prefix := database + "/" + measurement + "/"
 	if !oc.Open(prefix) {
-		return expr
+		return readExclusions{}
 	}
-	// An open job on this measurement: whatever this read leaves out now,
-	// its output can appear before the next one, so it is never cached.
 	pruning.MarkVolatile(ctx)
-	keys := oc.ExcludedFor(ctx, prefix)
-	if len(keys) == 0 {
+	if te, ok := oc.(TieredExcluder); ok {
+		keys, cold := te.ExcludedTiered(ctx, prefix)
+		return readExclusions{keys: keys, coldKeys: cold}
+	}
+	return readExclusions{keys: oc.ExcludedFor(ctx, prefix)}
+}
+
+// apply filters expr, which contains one read_parquet(...) call and ends with
+// it, by file name. Every key is named by its address on backend (the hot
+// tier); a cold key also by its address on cold, the name a multi-tier read
+// reports it under. With a cold key and no cold backend there is no cold
+// glob in expr either, so nothing of that file is read.
+func (e readExclusions) apply(backend, cold storage.Backend, expr string) string {
+	if backend == nil || len(e.keys) == 0 {
 		return expr
 	}
-	quoted := make([]string, 0, len(keys))
-	for _, k := range keys {
+	quoted := make([]string, 0, len(e.keys)+len(e.coldKeys))
+	for _, k := range e.keys {
 		uri, err := storage.ObjectURI(backend, k)
 		if err != nil {
 			continue
 		}
 		quoted = append(quoted, sqlutil.QuoteStringLiteral(uri))
 	}
+	if cold != nil {
+		for _, k := range e.coldKeys {
+			uri, err := storage.ObjectURI(cold, k)
+			if err != nil {
+				continue
+			}
+			quoted = append(quoted, sqlutil.QuoteStringLiteral(uri))
+		}
+	}
 	return sqlutil.ExcludeFiles(expr, openCompactionFileColumn, quoted)
+}
+
+// coldRemovalWindow is how long after Arc removed cold files an empty cold
+// glob is taken for a read planned before the removal (coldGlobAfterRemoval):
+// longer than the caches that could still offer the cold tier to a new read.
+const coldRemovalWindow = time.Minute
+
+// coldGlobAfterRemoval reports a glob under the cold tier's root that matched
+// nothing while Arc is removing cold files, or shortly after.
+func (h *QueryHandler) coldGlobAfterRemoval(pattern string) bool {
+	var cold storage.Backend
+	if h.coldRemoval != nil {
+		recent, backend := h.coldRemoval()
+		if !recent {
+			return false
+		}
+		cold = backend
+	} else {
+		if h.tieringManager == nil || !h.tieringManager.ColdRemovalRecent(coldRemovalWindow) {
+			return false
+		}
+		cold = h.coldBackendForReads()
+	}
+	if cold == nil {
+		return false
+	}
+	// The root is what every cold key's address starts with.
+	uri, err := storage.ObjectURI(cold, "x")
+	if err != nil {
+		return false
+	}
+	root := strings.TrimSuffix(uri, "x")
+	return root != "" && strings.HasPrefix(pattern, root)
+}
+
+// coldBackendForReads is the cold tier's backend, or nil when there is none.
+func (h *QueryHandler) coldBackendForReads() storage.Backend {
+	if h.tieringManager == nil {
+		return nil
+	}
+	return h.tieringManager.GetBackendForTier(tiering.TierCold)
 }
 
 // SetFileTimePruning enables file-level time pruning on the partition pruner
@@ -1692,6 +1913,15 @@ func wrapOpenCompactions(ctx context.Context, oc OpenCompactions, backend storag
 // construction, like SetStorageBackend.
 func (h *QueryHandler) SetFileTimePruning(enabled bool, margin time.Duration) {
 	h.pruner.SetFileTimePruning(enabled, margin)
+}
+
+// FilePublished tells the query caches that a file for the measurement, in
+// the hour partitionTime falls in, is now in storage: what they hold for that
+// measurement stops being used, unless the hour is the current one, whose
+// absence is never cached (pruning/publish.go, #1757). It is one atomic add:
+// safe to call from an ingest flush worker for every file it writes.
+func (h *QueryHandler) FilePublished(database, measurement string, partitionTime time.Time) {
+	h.pruner.FilePublished(database, measurement, partitionTime)
 }
 
 // InvalidateCaches clears all internal caches (partition pruner and SQL transform cache).
@@ -2230,8 +2460,10 @@ func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
 	// route-level middleware. The read-auth middleware admits a token that
 	// holds read on anything (not just any valid token); each handler then
 	// checks every table it reads (checkQueryPermissions and friends). The
-	// catch-up gate is a no-op unless cluster.query_gate_on_catchup is true
-	// AND the coordinator reports peer file replication is still drifting.
+	// gate (checkReplicationReady) refuses reads on a shared-object-store
+	// cluster node that holds no read lease, and, only with
+	// cluster.query_gate_on_catchup, while peer file replication is still
+	// drifting.
 	//
 	// withAnyResourceReadAuth resolves to auth.RequireAnyResourcePermission,
 	// which asks RBAC when it is wired, or a no-op passthrough when auth is
@@ -2240,7 +2472,11 @@ func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
 	// authority comes from RBAC alone (#1559). SetAuthAndRBAC runs before
 	// RegisterRoutes (cmd/arc/main.go), so both managers are already set here:
 	// the checker is captured now, not looked up per request.
-	readAuth := withAnyResourceReadAuth(h.authManager, h.rbacManager)
+	//
+	// Each read also runs on the handler's lifetime (bindQueryLifetime), so
+	// shutdown can end the queries still running when its grace is over
+	// (#1644). The rebuild route is a write and keeps its own context.
+	readAuth := h.bindQueryLifetime(withAnyResourceReadAuth(h.authManager, h.rbacManager))
 	app.Post("/api/v1/query", readAuth, h.checkReplicationReady, h.executeQuery)
 	// Same execution pipeline as /api/v1/query, but the response is
 	// streamed as MessagePack instead of JSON — columnar, typed, and
@@ -2475,6 +2711,11 @@ localProcessing:
 	}
 	deadline := requestDeadline(effectiveTimeout)
 
+	// A read in flight, from before its SQL is built until its statement is
+	// bound (internal/readgate): a job that swaps files waits for it.
+	entered, leave := h.reads.EnterAt()
+	// Held until an arcx-served stream ends, when there is one (#1858).
+	defer holdRead(c.Context(), leave)()
 	// Convert SQL to storage paths
 	transformCtx, cancelTransform := transformContext(c.Context(), deadline)
 	convertedSQL, cached, emittedRefs, err := h.getTransformedSQLForQueryWithRefs(transformCtx, req.SQL, headerDB)
@@ -2543,6 +2784,8 @@ localProcessing:
 	if cancel == nil {
 		ctx, cancel = context.WithCancel(ctx)
 	}
+	// Stopped if this node loses its cluster read lease (readgate.Bind).
+	cancel = h.reads.Bind(entered, ctx, cancel)
 	recordDisconnect := h.watchQueryClientDisconnect(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathSQLJSON)
 
 	// arcx router hook. Decides eligibility on the RAW req.SQL (date_trunc
@@ -2609,7 +2852,11 @@ localProcessing:
 				h.queryRegistry.RecordRowCap(queryID, reachedRowCap(governanceMaxRows, int64(rc)))
 				h.queryRegistry.Complete(queryID, rc)
 			}
-			onFail = func(msg string) { h.queryRegistry.Fail(queryID, msg) }
+			onFail = func(msg string) {
+				if !h.endedByShutdown(queryID) {
+					h.queryRegistry.Fail(queryID, msg)
+				}
+			}
 			onTimeout = func() { h.queryRegistry.TimedOut(queryID) }
 		}
 		_, handled := arrowDispatch(h, c, ctx, cancel, convertedSQL, profileMode, governanceMaxRows, start, timestamp, onComplete, onFail, onTimeout)
@@ -2696,9 +2943,19 @@ localProcessing:
 				Timestamp:       timestamp,
 			})
 		}
+		if ctxErr == context.Canceled && h.endedByShutdown(queryID) {
+			h.logger.Warn().Str("sql", sqlutil.ForLog(req.SQL)).Str("query_id", queryID).Msg("Query cancelled at shutdown")
+			return c.Status(fiber.StatusServiceUnavailable).JSON(QueryResponse{
+				Success:         false,
+				Error:           "Server shutting down",
+				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+				Timestamp:       timestamp,
+			})
+		}
 		if h.queryRegistry != nil && queryID != "" {
 			if ctxErr == context.Canceled {
-				// Already marked as cancelled by Cancel() — no-op
+				// Cancelled by Cancel() (DELETE /api/v1/queries/:id or a
+				// client disconnect), which recorded it — no-op.
 			} else {
 				h.queryRegistry.Fail(queryID, "Query execution failed")
 			}
@@ -2913,6 +3170,20 @@ const vanishedPartitionMessage = "data read by this query was removed while it r
 // compaction deleting a batch's inputs while a query reads the hour (#1355).
 // That is the same condition and gets the same answer.
 //
+// One more pattern ends in "**/*.parquet" and is NOT the measurement's: the
+// day-wide glob a day is read through when its listing FAILED
+// (pruning.IsDayWideGlob). It was never listed, so its matching nothing is
+// not a removal; but it stood in for that day's partitions, and an empty
+// answer for it would be the whole query's. It gets the retryable answer,
+// with its own log line, since the client message's "removed while it ran"
+// is not what happened.
+// Measured through the built binary on SeaweedFS S3 (DuckDB 1.5.6,
+// 2026-11-21): DuckDB names that glob as Arc wrote it,
+// "s3://bucket/prefix/db/m/2026/11/17/**/*.parquet", and the query answers
+// 503 where it would have answered an empty result. The same holds for
+// azure:// (DuckDB's azure extension, on the Azurite emulator) and gs://
+// (Google Cloud Storage); see pruning's canWidenDay for those runs.
+//
 // A "**" glob can still be one of several patterns a tiered read combines,
 // so an empty answer for it is only as right as it was before this check.
 func (h *QueryHandler) classifyNoFiles(err error) noFilesKind {
@@ -2927,11 +3198,51 @@ func (h *QueryHandler) classifyNoFiles(err error) noFilesKind {
 		return noFilesOther
 	}
 	pattern, ok := noFilesPattern(err)
-	if !ok || strings.HasSuffix(pattern, "**/*.parquet") {
+	// A day read through one recursive glob because its listing failed
+	// (pruning.IsDayWideGlob) also ends in "**/*.parquet". It matching
+	// nothing does not mean the measurement is empty: it stood in for that
+	// day's partitions, and an empty answer for it would be the whole
+	// query's answer. It is a pruned partition like any other.
+	if !ok {
 		return noFilesEmpty
+	}
+	if strings.HasSuffix(pattern, "**/*.parquet") {
+		// The date shape is checked without a root first, so a query on an
+		// empty measurement does not derive the storage root for nothing.
+		switch {
+		case h.coldGlobAfterRemoval(pattern):
+			// The measurement's glob on the cold tier, matching nothing
+			// while Arc removes cold files or just has: the read was
+			// planned when the last cold file was still there. Its other
+			// paths hold rows (the files that replaced it, #1825), and an
+			// empty answer would leave them out.
+			h.logger.Warn().Str("pattern", pattern).
+				Msg("A measurement's cold files were removed while a query that read them was being planned; answering 503 so the query is retried without the cold tier")
+		case !pruning.IsDayWideGlob(pattern, "") || !pruning.IsDayWideGlob(pattern, h.storageRoot()):
+			return noFilesEmpty
+		default:
+			h.logger.Warn().Str("pattern", pattern).
+				Msg("A day was read whole because its storage listing failed, and it holds no files; answering 503 so the query is retried once the listing works")
+		}
 	}
 	h.invalidateAfterVanished(pattern, false)
 	return noFilesVanished
+}
+
+// storageRoot is the root every glob of the primary storage is built under
+// ("s3://bucket/prefix/", a local directory with its separator), or "" when
+// it cannot be derived. It is GetStoragePath's own root, taken from a path
+// it builds, so the two cannot disagree.
+func (h *QueryHandler) storageRoot() string {
+	if h.storage == nil {
+		return ""
+	}
+	const tail = "d/m/**/*.parquet"
+	path, err := storage.GetStoragePath(h.storage, "d", "m")
+	if err != nil || !strings.HasSuffix(path, tail) {
+		return ""
+	}
+	return strings.TrimSuffix(path, tail)
 }
 
 // vanishedFile returns the file a DuckDB scan could not open because it no
@@ -3651,6 +3962,11 @@ func (h *QueryHandler) getTransformedSQLWithRefs(ctx context.Context, sql, heade
 	// reported by the rewriters through ctx, since they run inside regexp
 	// replacement closures that can only return a string.
 	ctx, pathFailure := withStoragePathFailure(ctx)
+	// Each measurement's publish generation is read when the transform first
+	// names it, before its files are listed: the cached SQL must go stale
+	// with a file published during the transform as well as after it
+	// (pruning/publish.go, #1757).
+	pathFailure.stampOf = h.pruner.PublishStamp
 
 	// Transform using appropriate method
 	var transformed string
@@ -3680,7 +3996,17 @@ func (h *QueryHandler) getTransformedSQLWithRefs(ctx context.Context, sql, heade
 	// cached: a raised query.max_sql_length would otherwise multiply its
 	// memory bound. Transforming is linear, so re-running it is cheap.
 	if !volatile.Volatile && len(sql) <= transformCacheMaxSQLLength && !storageFoldsNames(h.storage) {
-		h.queryCache.SetWithMetadata(cacheKey, transformed, encodeStoragePathReferences(refs))
+		// The entry is a miss once a file is published, outside the current
+		// hour, for any measurement the SQL reads: its path lists were made
+		// before that file existed.
+		stamps := make([]pruning.PublishStamp, 0, len(refs))
+		for _, ref := range refs {
+			stamps = append(stamps, pathFailure.stamps[ref])
+		}
+		pruner := h.pruner
+		coldOnly := pathFailure.coldOnly
+		h.queryCache.SetWithMetadataCheck(cacheKey, transformed, encodeStoragePathReferences(refs),
+			func() bool { return !pruner.StampsCurrent(stamps) || h.gainedHotTier(coldOnly) })
 	}
 	return transformed, false, refs, nil
 }
@@ -4024,6 +4350,16 @@ func makeIdentResolver(identNames map[string]string) func(string) (string, bool)
 type storagePathFailure struct {
 	err     error
 	emitted map[TableReference]struct{}
+	// stampOf, when set, reads a measurement's publish generation; stamps
+	// holds it for each reference as read when the reference was first
+	// recorded, which is before any of its files are listed (#1757).
+	stampOf func(database, measurement string) pruning.PublishStamp
+	stamps  map[TableReference]pruning.PublishStamp
+	// coldOnly: measurements this transform read with the hot tier left
+	// out, because no tier row said hot, with each one's tier version as read
+	// before that lookup (#1765). The cached SQL goes stale once a version
+	// moves.
+	coldOnly []coldOnlyRef
 }
 
 // errColdTierUnavailable refuses a read that needs the cold tier on a node
@@ -4237,9 +4573,41 @@ func recordStoragePathFailure(ctx context.Context, err error) {
 	}
 }
 
+// coldOnlyRef is a measurement read without its hot tier, and its tier
+// version as read before the tier lookup that decided it.
+type coldOnlyRef struct {
+	ref     TableReference
+	version uint64
+}
+
+// recordColdOnly notes a measurement the transform read without its hot tier.
+// The first version kept, as for publish stamps: a change between two uses of
+// one table must still make the SQL stale.
+func recordColdOnly(ctx context.Context, database, measurement string, version uint64) {
+	if f, ok := ctx.Value(storagePathCtxKey{}).(*storagePathFailure); ok {
+		ref := TableReference{Database: database, Measurement: measurement}
+		for _, r := range f.coldOnly {
+			if r.ref == ref {
+				return
+			}
+		}
+		f.coldOnly = append(f.coldOnly, coldOnlyRef{ref: ref, version: version})
+	}
+}
+
 func recordStoragePathEmission(ctx context.Context, database, measurement string) {
 	if f, ok := ctx.Value(storagePathCtxKey{}).(*storagePathFailure); ok {
-		f.emitted[TableReference{Database: database, Measurement: measurement}] = struct{}{}
+		ref := TableReference{Database: database, Measurement: measurement}
+		if _, seen := f.emitted[ref]; !seen && f.stampOf != nil {
+			if f.stamps == nil {
+				f.stamps = make(map[TableReference]pruning.PublishStamp)
+			}
+			// The first time the reference is seen, never a later one: a
+			// file published between two uses of the same table must still
+			// make the cached SQL stale.
+			f.stamps[ref] = f.stampOf(database, measurement)
+		}
+		f.emitted[ref] = struct{}{}
 	}
 }
 
@@ -4397,7 +4765,21 @@ func joinKeyword(prefix string) string {
 // If tiering is enabled and cold tier has data, builds a UNION ALL query across tiers.
 func (h *QueryHandler) buildReadParquetExpr(ctx context.Context, path, originalSQL, keyword string) string {
 	db, meas := h.extractDBMeasurementFromPath(path)
-	return h.excludeOpenCompactions(ctx, h.buildReadParquetExprRaw(ctx, path, originalSQL, keyword), db, meas)
+	// The exclusions are read before the path list is built, not after: a
+	// list built first could miss a directory that did not exist yet, and
+	// then be paired with exclusions read after a job put files there and
+	// switched reads to them, leaving out both sides (#1825).
+	//
+	// The price is the other pairing: a replacement that lands after the
+	// snapshot, while the file it replaces is still there when the statement
+	// binds, is read beside it, and its rows count twice. Every source
+	// excludes a file only once its replacement is in storage, so this order
+	// can count twice and never zero; the window existed before
+	// (compaction/open_jobs.go) and now also spans the build of the path
+	// list. Twice is the side to err on: it is visible, and the next read is
+	// right.
+	excl := snapshotOpenCompactions(ctx, h.openCompactions, db, meas)
+	return excl.apply(h.storage, h.coldBackendForReads(), h.buildReadParquetExprRaw(ctx, path, originalSQL, keyword))
 }
 
 // buildReadParquetExprRaw is buildReadParquetExpr without the open
@@ -4463,7 +4845,9 @@ func (h *QueryHandler) buildReadParquetExprRaw(ctx context.Context, path, origin
 // This is the tiering-aware version used by the fast path that takes database and measurement
 // separately instead of a pre-constructed path, allowing proper tiering metadata lookup.
 func (h *QueryHandler) buildReadParquetExprForMeasurement(ctx context.Context, database, measurement, originalSQL, keyword string) string {
-	return h.excludeOpenCompactions(ctx, h.buildReadParquetExprForMeasurementRaw(ctx, database, measurement, originalSQL, keyword), database, measurement)
+	// Exclusions first, then the path list: see buildReadParquetExpr.
+	excl := snapshotOpenCompactions(ctx, h.openCompactions, database, measurement)
+	return excl.apply(h.storage, h.coldBackendForReads(), h.buildReadParquetExprForMeasurementRaw(ctx, database, measurement, originalSQL, keyword))
 }
 
 // buildReadParquetExprForMeasurementRaw is buildReadParquetExprForMeasurement
@@ -4678,6 +5062,11 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 
 	// Query metadata to find which tiers actually have data for this measurement
 	tiers := h.multiTierView()
+	// Read before the lookup: a change after it moves this (#1765).
+	var tierVersion uint64
+	if vv, ok := tiers.(tierVersionView); ok {
+		tierVersion = vv.TierVersion(database, measurement)
+	}
 	actualTiers, err := tiers.TiersForMeasurement(ctx, database, measurement)
 	if err != nil {
 		h.logger.Warn().Err(err).
@@ -4747,7 +5136,10 @@ func (h *QueryHandler) buildMultiTierReadParquet(ctx context.Context, database, 
 		// replication drainer drops the query caches for a measurement whose
 		// tier rows it changes, so a node that acquires hot rows for a
 		// measurement it is only receiving does not keep serving a cold-only
-		// read.
+		// read. And the cached transform goes stale once the measurement has
+		// a hot row (#1765): its first hot file, written on this node, is
+		// otherwise left out of a repeated query for up to the cache TTL.
+		recordColdOnly(ctx, database, measurement, tierVersion)
 		h.logger.Debug().
 			Str("database", database).
 			Str("measurement", measurement).
@@ -5394,10 +5786,10 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time, visibl
 		}
 	}
 
-	// Filter out hidden directories
+	// Filter out hidden directories, and the Iceberg warehouse's (#1626)
 	filtered := make([]string, 0)
 	for _, db := range databases {
-		if !strings.HasPrefix(db, ".") && !strings.HasPrefix(db, "_") {
+		if !strings.HasPrefix(db, ".") && !strings.HasPrefix(db, "_") && !h.isWarehouseDir(db) {
 			filtered = append(filtered, db)
 		}
 	}
@@ -5544,10 +5936,13 @@ func (h *QueryHandler) handleShowTables(c *fiber.Ctx, start time.Time, database 
 		}
 	}
 
-	// Filter out hidden tables
+	// Filter out hidden tables. An Iceberg warehouse directory is not a
+	// database, so it has no tables, as an unknown database has none; a nested
+	// warehouse is not a table of the database it sits in (#1626).
 	filtered := make([]string, 0)
+	warehouseDB := h.isWarehouseDir(database)
 	for _, table := range tables {
-		if !strings.HasPrefix(table, ".") && !strings.HasPrefix(table, "_") {
+		if !warehouseDB && !strings.HasPrefix(table, ".") && !strings.HasPrefix(table, "_") && !h.isWarehouseMeasurement(database, table) {
 			filtered = append(filtered, table)
 		}
 	}
@@ -5856,6 +6251,10 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	}
 	deadline := requestDeadline(effectiveTimeout)
 
+	// A read in flight, from before its SQL is built until its statement is
+	// bound (internal/readgate): a job that swaps files waits for it.
+	entered, leave := h.reads.EnterAt()
+	defer leave()
 	// Convert SQL to storage paths (with caching)
 	transformCtx, cancelTransform := transformContext(c.Context(), deadline)
 	convertedSQL, _, emittedRefs, err := h.getTransformedSQLWithRefs(transformCtx, req.SQL, headerDB)
@@ -5898,8 +6297,11 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	var cancel context.CancelFunc
 	if !deadline.IsZero() {
 		ctx, cancel = context.WithDeadline(ctx, deadline)
-		defer cancel()
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
 	}
+	// Stopped if this node loses its cluster read lease (readgate.Bind).
+	defer h.reads.Bind(entered, ctx, cancel)()
 
 	// Execute count query with timeout support
 	rows, err := h.db.QueryContext(ctx, countSQL)
@@ -6100,7 +6502,7 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 	}
 
 	for _, dbEntry := range dbEntries {
-		if !dbEntry.IsDir() || strings.HasPrefix(dbEntry.Name(), ".") || strings.HasPrefix(dbEntry.Name(), "_") {
+		if !dbEntry.IsDir() || strings.HasPrefix(dbEntry.Name(), ".") || strings.HasPrefix(dbEntry.Name(), "_") || h.isWarehouseDir(dbEntry.Name()) {
 			continue
 		}
 
@@ -6126,7 +6528,7 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 		}
 
 		for _, measurementEntry := range measurementEntries {
-			if !measurementEntry.IsDir() || strings.HasPrefix(measurementEntry.Name(), ".") || strings.HasPrefix(measurementEntry.Name(), "_") {
+			if !measurementEntry.IsDir() || strings.HasPrefix(measurementEntry.Name(), ".") || strings.HasPrefix(measurementEntry.Name(), "_") || h.isWarehouseMeasurement(dbName, measurementEntry.Name()) {
 				continue
 			}
 
@@ -6210,7 +6612,10 @@ func (h *QueryHandler) checkQueryGovernance(c *fiber.Ctx) (maxRows int, timeout 
 	m := metrics.Get()
 	// One decision over every limit: a refused query is counted against none
 	// of them (#1524).
-	result := h.governanceManager.Admit(tokenInfo.ID)
+	// The token's stored-hash fingerprint names it to the cluster's policies
+	// (#1627): a pre-cluster local token sharing a cluster token's ID gets
+	// this node's defaults, not that token's policy.
+	result := h.governanceManager.AdmitToken(tokenInfo.ID, tokenInfo.Fingerprint)
 	if !result.Allowed {
 		c.Set("Retry-After", strconv.Itoa(result.RetryAfterSec))
 		m.IncQueryErrors()
@@ -6457,6 +6862,10 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	}
 	deadline := requestDeadline(effectiveTimeout)
 
+	// A read in flight, from before its SQL is built until its statement is
+	// bound (internal/readgate): a job that swaps files waits for it.
+	entered, leave := h.reads.EnterAt()
+	defer leave()
 	// Convert SQL to storage paths (with caching)
 	// Note: This endpoint builds its own db.measurement SQL, so no header optimization
 	transformCtx, cancelTransform := transformContext(c.Context(), deadline)
@@ -6553,6 +6962,8 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	if cancel == nil {
 		ctx, cancel = context.WithCancel(ctx)
 	}
+	// Stopped if this node loses its cluster read lease (readgate.Bind).
+	cancel = h.reads.Bind(entered, ctx, cancel)
 	recordDisconnect := h.watchQueryClientDisconnect(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathSQLJSON)
 
 	// Dispositions for the Arrow JSON path, which owns the response once it
@@ -6733,4 +7144,38 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		}
 	}, outcome.fail)
 	return nil
+}
+
+// gainedHotTier reports whether a measurement a cached transform read with
+// its hot tier left out may have changed tiers since (#1765). It runs on every
+// hit of such a transform, under the transform cache's lock, so it reads
+// memory only: the measurement's tier version, which moves whenever its tier
+// rows may have changed (a recorded file, a migration).
+func (h *QueryHandler) gainedHotTier(coldOnly []coldOnlyRef) bool {
+	if len(coldOnly) == 0 {
+		return false
+	}
+	view, ok := h.multiTierView().(tierVersionView)
+	if !ok {
+		return false
+	}
+	for _, c := range coldOnly {
+		if view.TierVersion(c.ref.Database, c.ref.Measurement) != c.version {
+			return true
+		}
+	}
+	return false
+}
+
+// tierVersionView is a tier view whose per-measurement version can be read
+// without I/O.
+type tierVersionView interface {
+	TierVersion(database, measurement string) uint64
+}
+
+func (v tieringTierView) TierVersion(database, measurement string) uint64 {
+	if v.m == nil || v.m.GetMetadata() == nil {
+		return 0
+	}
+	return v.m.GetMetadata().TierVersion(database, measurement)
 }

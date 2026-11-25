@@ -17,79 +17,6 @@ import (
 // Retention policies, cluster-wide (#1324 stage 2): the coordinator side. See
 // raft/retention_policies.go.
 
-// retentionPoliciesJoinGate is clusterPoliciesJoinGate for retention's own
-// flag.
-func (c *Coordinator) retentionPoliciesJoinGate(req interface {
-	GetNodeID() string
-	GetCapabilities() []string
-}) (why string, release func()) {
-	fsm := c.raftNode.FSM()
-	g := &c.retentionPolicies
-	g.mu.Lock()
-	if hasCapability(req.GetCapabilities(), raft.CapabilityClusterRetention) {
-		return "", g.mu.Unlock
-	}
-	enabled := fsm != nil && fsm.RetentionPoliciesEnabled()
-	if !enabled && g.inFlight {
-		if err := c.barrierWithin(streamClaimsJoinBarrier); err != nil {
-			g.mu.Unlock()
-			return "the cluster could not confirm its retention policies state; retry the join", nil
-		}
-		enabled = fsm != nil && fsm.RetentionPoliciesEnabled()
-	}
-	if !enabled {
-		return "", g.mu.Unlock
-	}
-	g.mu.Unlock()
-	return "cluster-wide retention policies are enabled in this cluster: the node must run a release that supports them", nil
-}
-
-// maybeEnableRetentionPolicies proposes retention's flag from the leader once
-// every node supports it.
-func (c *Coordinator) maybeEnableRetentionPolicies() {
-	if c.raftNode == nil {
-		return
-	}
-	fsm := c.raftNode.FSM()
-	if fsm == nil || !fsm.ClusterPoliciesEnabled() || fsm.RetentionPoliciesEnabled() || !c.raftNode.IsLeader() {
-		return
-	}
-	g := &c.retentionPolicies
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	nodes, blockers := capabilityCandidates(fsm.GetAllNodes(), c.raftNode.ConfigurationServerIDs, raft.CapabilityClusterRetention)
-	g.blockers.Store(&blockers)
-	if len(blockers) > 0 {
-		return
-	}
-	raw, err := json.Marshal(raft.EnableRetentionPoliciesPayload{Nodes: nodes, Now: time.Now().UTC()})
-	if err != nil {
-		return
-	}
-	g.inFlight = true
-	if err := c.raftNode.Apply(&raft.Command{Type: raft.CommandEnableRetentionPolicies, Payload: raw}, 5*time.Second); err != nil {
-		c.logger.Warn().Err(err).Msg("Proposing cluster-wide retention policies failed; retrying")
-		return
-	}
-	c.logger.Info().Int("nodes", len(nodes)).Msg("Cluster-wide retention policies enabled: every node supports them")
-}
-
-// policyKindActive reports whether kind can be adopted here: the flag, and
-// for retention its own flag too.
-func (c *Coordinator) policyKindActive(kind string) bool {
-	fsm := c.fsmOrNil()
-	if fsm == nil || !fsm.ClusterPoliciesEnabled() {
-		return false
-	}
-	switch kind {
-	case raft.PolicyKindRetention:
-		return fsm.RetentionPoliciesEnabled()
-	case raft.PolicyKindCQ:
-		return fsm.CQPoliciesEnabled()
-	}
-	return true
-}
-
 // RetentionPoliciesSeeded reports whether retention policies live in the
 // cluster state. Until then they stay in each node's SQLite, as before.
 func (c *Coordinator) RetentionPoliciesSeeded() bool {
@@ -426,13 +353,10 @@ func (c *Coordinator) ChooseRetentionAdoption(node, hash, by string) error {
 }
 
 // ChoosePolicyAdoption records an admin's choice of node whose policies of
-// kind (retention or cq) the cluster adopts. Leader only.
+// kind (one with a flag of its own) the cluster adopts. Leader only.
 func (c *Coordinator) ChoosePolicyAdoption(kind, node, hash, by string) error {
 	if !c.policyKindActive(kind) {
-		if kind == raft.PolicyKindCQ {
-			return ErrCQPoliciesNotEnabled
-		}
-		return ErrRetentionPoliciesNotEnabled
+		return policyKindNotEnabled(kind)
 	}
 	if !c.raftNode.IsLeader() {
 		return ErrNotLeaderForTopology

@@ -13,6 +13,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
@@ -36,6 +37,12 @@ type LineProtocolHandler struct {
 
 	// Cluster routing support
 	router *cluster.Router
+
+	// maxPayloadSize is server.max_payload_size; 0 when not set (tests).
+	// Prometheus Remote Write bounds its body, its decoded size and the
+	// label bytes its samples repeat by it, at most
+	// maxRemoteWritePayloadBytes (remoteWritePayloadLimit).
+	maxPayloadSize int64
 
 	// Stats
 	totalRequests     atomic.Int64
@@ -73,6 +80,12 @@ func (h *LineProtocolHandler) SetAuthAndRBAC(authManager *auth.AuthManager, rbac
 	h.rbacManager = rbacManager
 }
 
+// SetMaxPayloadSize sets server.max_payload_size, which bounds a Prometheus
+// Remote Write request (see remoteWritePayloadLimit).
+func (h *LineProtocolHandler) SetMaxPayloadSize(n int64) {
+	h.maxPayloadSize = n
+}
+
 // SetRouter sets the cluster router for request forwarding.
 // When set, write requests from reader nodes will be forwarded to writer nodes.
 func (h *LineProtocolHandler) SetRouter(router *cluster.Router) {
@@ -101,6 +114,8 @@ func (h *LineProtocolHandler) RegisterRoutes(app *fiber.App) {
 	app.Post("/api/v2/write", writeAuth, h.WriteInfluxDB)
 	// Arc native endpoint (uses x-arc-database header)
 	app.Post("/api/v1/write/line-protocol", writeAuth, h.WriteSimple)
+	// Prometheus Remote Write 1.0 endpoint.
+	app.Post(prometheusRemoteWritePath, writeAuth, h.WritePrometheusRemoteWrite)
 	// Flush endpoint — admin-gated.
 	app.Post("/api/v1/write/line-protocol/flush", adminAuth, h.Flush)
 
@@ -176,6 +191,10 @@ func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string, precisi
 			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
 		})
 	}
+	if storage.IsWarehouseRootName(database) {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": warehouseDatabaseError(database)})
+	}
 
 	// Validate precision parameter
 	switch precision {
@@ -200,7 +219,10 @@ func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string, precisi
 	case ForwardToPeer:
 		h.logger.Debug().Msg("Forwarding Line Protocol write request to writer node")
 
-		httpReq, err := BuildHTTPRequest(c)
+		// Built only here, once the write is forwarded (#1629), on the
+		// router's lifetime: a write-class forward needs no cancel of its own.
+		fctx := h.router.Lifetime()
+		httpReq, release, err := BuildHTTPRequest(c, fctx)
 		if err != nil {
 			h.logger.Error().Err(err).Msg("Failed to build HTTP request for forwarding")
 			h.totalErrors.Add(1)
@@ -209,7 +231,9 @@ func (h *LineProtocolHandler) handleWrite(c *fiber.Ctx, database string, precisi
 			})
 		}
 
-		resp, err := h.router.RouteWrite(c.Context(), httpReq)
+		defer release()
+
+		resp, err := h.router.RouteWrite(fctx, httpReq)
 		if err == cluster.ErrLocalNodeCanHandle {
 			// Fall through to local processing
 			goto localProcessing
@@ -405,7 +429,7 @@ localProcessing:
 		return len(record.Columns["time"]), lpWriteRecord(h.buffer, writeCtx, database, record)
 	})
 	if stop != nil {
-		return h.answerLPStop(c, database, stop, drops)
+		return h.answerLPStop(c, lpProtocolName, database, stop, drops)
 	}
 
 	// Record global metrics
@@ -512,7 +536,7 @@ func (h *LineProtocolHandler) writeTyped(c *fiber.Ctx, body []byte, database, pr
 		return rows[m], lpWriteTyped(h.buffer, writeCtx, database, m, batches[m], rows[m])
 	})
 	if stop != nil {
-		return h.answerLPStop(c, database, stop, drops)
+		return h.answerLPStop(c, lpProtocolName, database, stop, drops)
 	}
 
 	m := metrics.Get()
@@ -602,6 +626,9 @@ var (
 // lpStop is a line-protocol write whose buffer call for measurement failed.
 // written are the measurements buffered before it, in write order; empty when
 // nothing was.
+// lpProtocolName is line protocol's name in logs and answers.
+const lpProtocolName = "Line protocol"
+
 type lpStop struct {
 	measurement string
 	err         error
@@ -661,17 +688,30 @@ func (h *LineProtocolHandler) writeLPMeasurements(measurements []string, rows, d
 // answerLPStop answers a line-protocol write that stopped. With nothing
 // written it is the answer the failure always had: nothing was written, so a
 // refusal's "retry" is true. With part written, see respondWriteStopped.
-func (h *LineProtocolHandler) answerLPStop(c *fiber.Ctx, database string, stop *lpStop, drops []ingest.LPDrop) error {
-	h.totalErrors.Add(1)
+//
+// protocol names the write in logs. The line-protocol counters move only for
+// lpProtocolName, the remote-write records counter only for
+// remoteWriteProtocolName; the remote-write handler counts its requests and
+// errors itself.
+func (h *LineProtocolHandler) answerLPStop(c *fiber.Ctx, protocol, database string, stop *lpStop, drops []ingest.LPDrop) error {
+	lp := protocol == lpProtocolName
+	if lp {
+		h.totalErrors.Add(1)
+	}
 	err := stop.err
 	if len(stop.written) > 0 {
 		if len(drops) > 0 {
-			logPointDrops(h.logger, "Line protocol", database, drops)
+			logPointDrops(h.logger, protocol, database, drops)
 		}
 		m := metrics.Get()
-		m.IncLineProtocolRecords(stop.rowsWritten)
+		switch protocol {
+		case lpProtocolName:
+			m.IncLineProtocolRecords(stop.rowsWritten)
+		case remoteWriteProtocolName:
+			m.IncPromRemoteWriteRecords(stop.rowsWritten)
+		}
 		m.IncIngestRecords(stop.rowsWritten)
-		return respondWriteStopped(c, h.logger, "Line protocol", database, &ingest.WriteStoppedError{
+		return respondWriteStopped(c, h.logger, protocol, database, &ingest.WriteStoppedError{
 			Err: err, RowsWritten: stop.rowsWritten, RecordsWritten: stop.rowsWritten,
 			// In name order already: both paths write the sorted list.
 			Written: stop.written, StoppedAt: stop.measurement, Drops: drops,

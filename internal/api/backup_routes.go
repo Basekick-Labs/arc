@@ -39,6 +39,29 @@ type BackupHandler struct {
 	operationTimeout time.Duration
 	logger           zerolog.Logger
 	activeOperation  atomic.Pointer[string]
+	// rehomeBlock keeps re-home jobs and a backup or restore apart
+	// (SetRehomeBlock, #1825); rehomeRelease is the block the running
+	// operation holds.
+	rehomeBlock   func(prefix string) (release func(), ok bool)
+	rehomeRelease atomic.Pointer[func()]
+}
+
+// SetRehomeBlock gives the handler the block a backup or a restore takes over
+// every data file while it runs: it is refused while a re-home job is in
+// flight, and no job begins while it is held. A backup taken mid-job would
+// copy the job's staged files as data and miss either the file being moved
+// or the files replacing it. nil: no such jobs.
+func (h *BackupHandler) SetRehomeBlock(fn func(prefix string) (release func(), ok bool)) {
+	h.rehomeBlock = fn
+}
+
+// releaseOperation frees the backup/restore slot and the block on re-home
+// jobs taken with it.
+func (h *BackupHandler) releaseOperation() {
+	if rel := h.rehomeRelease.Swap(nil); rel != nil {
+		(*rel)()
+	}
+	h.activeOperation.Store(nil)
 }
 
 // NewBackupHandler creates a new backup handler.
@@ -314,7 +337,7 @@ func (h *BackupHandler) CreateBackup(c *fiber.Ctx) error {
 	// Run backup asynchronously — Fiber recycles c.Context() after the handler
 	// returns, so we must use a detached context.
 	go func() {
-		defer h.activeOperation.Store(nil)
+		defer h.releaseOperation()
 		ctx, cancel := context.WithTimeout(context.Background(), h.operationTimeout)
 		defer cancel()
 		if _, err := h.manager.CreateBackup(ctx, opts); err != nil {
@@ -492,7 +515,7 @@ func (h *BackupHandler) DeleteBackup(c *fiber.Ctx) error {
 	if !acquired {
 		return err
 	}
-	defer h.activeOperation.Store(nil)
+	defer h.releaseOperation()
 
 	ctx, cancel := context.WithTimeout(c.Context(), 30*time.Second)
 	defer cancel()
@@ -507,16 +530,29 @@ func (h *BackupHandler) DeleteBackup(c *fiber.Ctx) error {
 			}
 			return h.operationConflict(c, operation)
 		}
-		// The manager's error now names the destination (#1085 stage B2b-1), and
-		// the target is a field as well so an operator with more than one
-		// configured store can tell which one failed. The status code is
-		// deliberately left at 500: splitting it into 404/503 the way GET
-		// /:id does is a separate change this stage did not scope, and no
-		// behaviour here depends on the distinction.
-		h.logger.Error().Err(err).Str("backup_id", id).Strs("targets", h.manager.TargetNames()).
+		// An unknown id and an unreachable destination are different answers
+		// (#1122), as for GET /:id: 404 means the id is wrong, 503 that a
+		// destination is down and the delete can be run again.
+		if errors.Is(err, backup.ErrBackupNotFound) {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"error": "Backup not found",
+			})
+		}
+		targets := h.manager.TargetNames()
+		var unreachable *backup.TargetsUnreachableError
+		if errors.As(err, &unreachable) {
+			targets = unreachable.Targets
+		}
+		h.logger.Error().Err(err).Str("backup_id", id).Strs("targets", targets).
 			Msg("Failed to delete backup")
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to delete backup",
+		target := h.manager.TargetName()
+		if len(targets) > 0 {
+			target = targets[0]
+		}
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error":   fmt.Sprintf("could not delete backup %s from %s (unreachable, or a file could not be deleted); run the delete again", id, describeTargets(targets)),
+			"target":  target,
+			"targets": targets,
 		})
 	}
 
@@ -716,7 +752,7 @@ func (h *BackupHandler) RestoreBackup(c *fiber.Ctx) error {
 
 	// Run restore asynchronously — detached context (Fiber recycles c.Context()).
 	go func() {
-		defer h.activeOperation.Store(nil)
+		defer h.releaseOperation()
 		ctx, cancel := context.WithTimeout(context.Background(), h.operationTimeout)
 		defer cancel()
 		if _, err := h.manager.RestoreBackup(ctx, opts); err != nil {
@@ -762,6 +798,17 @@ func (h *BackupHandler) acquireOperation(c *fiber.Ctx, operation string) (bool, 
 			held = *active
 		}
 		return false, h.operationConflict(c, held)
+	}
+	if h.rehomeBlock != nil {
+		release, ok := h.rehomeBlock("")
+		if !ok {
+			h.activeOperation.Store(nil)
+			return false, c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"error":  "A re-home job, or a compaction being finished on the cluster, is in flight (GET /api/v1/rehome, GET /api/v1/cluster), or this node could not record the backup in the cluster (the server log says which); a backup or restore started now could copy a file and the files replacing it, or neither. Retry once the job has ended",
+				"status": "refused",
+			})
+		}
+		h.rehomeRelease.Store(&release)
 	}
 	return true, nil
 }

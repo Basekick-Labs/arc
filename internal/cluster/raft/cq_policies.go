@@ -114,10 +114,7 @@ type DeleteCQPayload struct {
 
 // EnableCQPoliciesPayload turns the CQ flag on; Nodes as in
 // EnableClusterPoliciesPayload.
-type EnableCQPoliciesPayload struct {
-	Nodes []string  `json:"nodes"`
-	Now   time.Time `json:"now"`
-}
+type EnableCQPoliciesPayload = EnablePolicyKindPayload
 
 // SetCQWatermarkPayload moves a CQ's watermark from From (nil: unset) to To,
 // only if it still is From: a compare-and-set, so a manual reset and a
@@ -158,38 +155,6 @@ func (f *ClusterFSM) CQPoliciesEnabled() bool {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return f.clusterPolicies && f.cqEnabled
-}
-
-func (f *ClusterFSM) applyEnableCQPolicies(payload []byte) interface{} {
-	var p EnableCQPoliciesPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
-		return fmt.Errorf("failed to unmarshal enable continuous query policies payload: %w", err)
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if !f.clusterPolicies {
-		return errors.New("enable continuous query policies: cluster policies are not enabled")
-	}
-	if f.cqEnabled {
-		return nil
-	}
-	listed := map[string]bool{}
-	for _, n := range p.Nodes {
-		listed[n] = true
-	}
-	var missing []string
-	for id := range f.nodes {
-		if !listed[id] {
-			missing = append(missing, id)
-		}
-	}
-	if len(missing) > 0 {
-		sort.Strings(missing)
-		return fmt.Errorf("enable continuous query policies: nodes %v are not known to support it", missing)
-	}
-	f.cqEnabled = true
-	f.logger.Info().Int("nodes", len(f.nodes)).Msg("Cluster-wide continuous queries enabled")
-	return nil
 }
 
 // CQ returns a copy of continuous query id.
@@ -455,8 +420,8 @@ func (f *ClusterFSM) applySetCQWatermark(payload []byte) interface{} {
 
 // validCQSeed checks a CQ seed before it is applied, as validRetentionSeed.
 func validCQSeed(p *SeedPoliciesPayload) error {
-	if len(p.Tiering) > 0 || len(p.Retention) > 0 {
-		return errors.New("tiering or retention rows in a continuous query seed")
+	if len(p.Tiering) > 0 || len(p.Retention) > 0 || len(p.Governance) > 0 {
+		return errors.New("tiering, retention or governance rows in a continuous query seed")
 	}
 	if len(p.CQ) > MaxSeedCQs {
 		return fmt.Errorf("%d continuous queries exceed %d", len(p.CQ), MaxSeedCQs)

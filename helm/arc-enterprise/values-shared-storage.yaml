@@ -36,17 +36,19 @@ seaweedfs:
     size: 100Gi
 
 writer:
-  # In shared-storage mode the writer pods all accept writes concurrently
-  # (Pattern 2 multi-writer) — a Kubernetes Service load-balances incoming
-  # writes across all healthy writer pods, and each writer PUTs to the
-  # shared bucket independently. Singleton background tasks (retention,
-  # CQ, delete) run on whichever pod is the cluster Raft leader.
-  #   replicas: 3 — the default, and the minimum for HA: the LB routes
-  #                 writes round-robin across all healthy pods, and losing
-  #                 one still leaves a spare. Arc logs a warning below 3.
-  #   replicas: 1 — single writer (lowest cost, NOT highly available: this
-  #                 pattern suppresses Raft writer promotion on purpose, so
-  #                 a writer loss stops ingest until an operator restores it)
+  # With storage.shared.multiWriter=true (the default) the writer pods all
+  # accept writes concurrently (Pattern 2 multi-writer; the licence must
+  # include shared_storage_multi_writer) — a Kubernetes Service
+  # load-balances incoming writes across all healthy writer pods, and each
+  # writer PUTs to the shared bucket independently. Singleton background
+  # tasks (retention, CQ, delete) run on whichever pod is the Raft leader.
+  # With storage.shared.multiWriter=false one elected primary takes writes,
+  # the other writer pods forward to it, and cluster.failover.enabled
+  # replaces a lost primary; no multi-writer licence is needed.
+  #   replicas: 3 — the default, and the minimum for HA: losing one still
+  #                 leaves a spare. Arc logs a warning below 3.
+  #   replicas: 1 — single writer (lowest cost, NOT highly available: a
+  #                 writer loss stops ingest until it is restored)
   #   replicas: 2 — REFUSED by _validation.tpl: writers are the Raft voters,
   #                 so one failure leaves no quorum as well as no spare
   replicas: 3

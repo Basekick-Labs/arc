@@ -957,3 +957,49 @@ func (n *Node) ConfigurationServerIDs() ([]string, error) {
 	}
 	return ids, nil
 }
+
+// HeartbeatFailures registers fn for the leader's heartbeat observations:
+// failed (with the peer's last contact) and resumed (#1852). fn runs on its
+// own goroutine; it must not block for long. A nil Raft registers nothing
+// and returns a no-op stop.
+// A peer added or removed from the configuration is reported as resumed: a
+// record of its failures from before does not apply to it.
+func (n *Node) HeartbeatFailures(fn func(peer string, failed bool, lastContact time.Time)) (stop func()) {
+	n.mu.RLock()
+	r := n.raft
+	n.mu.RUnlock()
+	if r == nil {
+		return func() {}
+	}
+	ch := make(chan raft.Observation, 64)
+	obs := raft.NewObserver(ch, false, func(o *raft.Observation) bool {
+		switch o.Data.(type) {
+		case raft.FailedHeartbeatObservation, raft.ResumedHeartbeatObservation, raft.PeerObservation:
+			return true
+		}
+		return false
+	})
+	r.RegisterObserver(obs)
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case o := <-ch:
+				switch d := o.Data.(type) {
+				case raft.FailedHeartbeatObservation:
+					fn(string(d.PeerID), true, d.LastContact)
+				case raft.ResumedHeartbeatObservation:
+					fn(string(d.PeerID), false, time.Time{})
+				case raft.PeerObservation:
+					fn(string(d.Peer.ID), false, time.Time{})
+				}
+			}
+		}
+	}()
+	return func() {
+		r.DeregisterObserver(obs)
+		close(done)
+	}
+}

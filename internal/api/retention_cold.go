@@ -37,12 +37,17 @@ type coldRetention struct {
 	discoveryErr string // the candidate query itself failed
 	samples      []string
 
-	// Rows whose cold object was already gone. Not an error: the cold sync
-	// keeps such rows (it never retires one), so retention cleans them up.
+	// Rows whose cold object was already gone. Not an error: on the primary
+	// the cold sync keeps such rows (only a reader's retires them, #1563), so
+	// retention cleans them up.
 	staleRetired  int
 	staleReverted int // the file is in hot storage; the row now says hot
 
 	removed int // objects deleted or rows changed: the query caches must go
+	// removedPaths are the cold keys gone (deleted, already missing, or
+	// reverted to hot): reported once per run, for the query caches and, in
+	// a cluster, the Iceberg exporter's cold listing (#1728).
+	removedPaths []string
 }
 
 const coldRetentionSampleCap = 32
@@ -122,7 +127,25 @@ func (h *RetentionHandler) deleteOldColdFiles(ctx context.Context, c *coldRetent
 	}
 	var rows int64
 	var deleted, retire []string
+	// A file a re-home job in flight owns (#1825) is left for the next run,
+	// in every branch below: the delete, and the handling of a row whose
+	// object is gone. The claim is held from before the file is looked at
+	// until the run moves on, so a job cannot take the file in between.
+	release := func() {}
+	defer func() { release() }()
 	for _, f := range c.files[measurement] {
+		release()
+		release = func() {}
+		if !dryRun && h.rehomeClaim != nil {
+			r, free := h.rehomeClaim(f.Path)
+			if !free {
+				r()
+				h.logger.Info().Str("file", f.Path).Str("tier", string(tiering.TierCold)).
+					Msg("Retention leaves a file a re-home job in flight owns for its next run")
+				continue
+			}
+			release = r
+		}
 		if err := ctx.Err(); err != nil {
 			if !dryRun {
 				h.finishColdMeasurement(ctx, c, deleted, retire)
@@ -156,6 +179,7 @@ func (h *RetentionHandler) deleteOldColdFiles(ctx context.Context, c *coldRetent
 				} else {
 					c.staleReverted++
 					c.removed++
+					c.removedPaths = append(c.removedPaths, f.Path) // gone from cold
 				}
 			default:
 				retire = append(retire, f.Path)
@@ -184,6 +208,16 @@ func (h *RetentionHandler) deleteOldColdFiles(ctx context.Context, c *coldRetent
 			rows += rowCount
 			deleted = append(deleted, f.Path)
 			continue
+		}
+		// Receipts before the delete (#1186). Cold copies of spoke files were
+		// marked compacted when they migrated (#687); deleting them leaves
+		// nothing, so they become removed. On failure keep the file for the
+		// next run rather than delete it unmarked.
+		if h.onSpokeFilesRemoved != nil {
+			if err := h.onSpokeFilesRemoved(ctx, []string{f.Path}); err != nil {
+				c.skip(f.Path, fmt.Errorf("mark edge-sync receipt removed: %w", err))
+				continue
+			}
 		}
 		del := c.backend.Delete
 		if h.coldDeleteHook != nil {
@@ -226,6 +260,7 @@ func (h *RetentionHandler) finishColdMeasurement(ctx context.Context, c *coldRet
 		c.staleRetired += len(missing)
 	}
 	c.removed += len(deleted) + len(missing)
+	c.removedPaths = append(c.removedPaths, paths...)
 }
 
 // notifyColdRemoved drops the query caches once, at the end of a run that
@@ -233,8 +268,8 @@ func (h *RetentionHandler) finishColdMeasurement(ctx context.Context, c *coldRet
 // a cold glob that now matches nothing. Once per run rather than per
 // measurement, because it drops every measurement's cached transforms.
 func (h *RetentionHandler) notifyColdRemoved(c *coldRetention) {
-	if c.removed > 0 && h.coldTier != nil {
-		h.coldTier.NotifyColdFilesRemoved(c.removed)
+	if len(c.removedPaths) > 0 && h.coldTier != nil {
+		h.coldTier.NotifyColdFilesRemoved(c.removedPaths)
 	}
 }
 

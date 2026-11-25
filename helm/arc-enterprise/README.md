@@ -1,6 +1,6 @@
 # Arc Enterprise Helm Chart
 
-Multi-node Arc Enterprise deployment for Kubernetes with role separation (writer / reader / compactor), high availability, and a choice of storage pattern (shared object storage with Pattern 2 multi-writer, or per-node local storage with Pattern 1 single-writer + writer-failover).
+Multi-node Arc Enterprise deployment for Kubernetes with role separation (writer / reader / compactor), high availability, and a choice of storage pattern (shared object storage, multi-writer or single-writer, or per-node local storage with Pattern 1 single-writer + writer-failover).
 
 ## Prerequisites
 
@@ -219,7 +219,7 @@ kubectl create secret tls arc-cluster-tls --cert=server.crt --key=server.key -n 
 
 Arc Enterprise offers two HA models depending on which storage pattern you chose.
 
-#### Shared storage (Pattern 2 multi-writer) — `storage.mode: shared`
+#### Shared storage, multi-writer (Pattern 2) — `storage.mode: shared` (default `storage.shared.multiWriter: true`)
 
 All writer pods accept writes concurrently behind a Kubernetes Service load
 balancer. There is no "primary writer" to fail over to — every writer is a
@@ -233,8 +233,8 @@ writer:
   # failover is delegated to the Kubernetes Service + /ready probe.
 ```
 
-In shared-storage mode, `cluster.shared_storage_mode=true` is set
-automatically by the chart (see `templates/_helpers.tpl`). This:
+With `storage.shared.multiWriter: true` (the default), the chart sets
+`cluster.shared_storage_mode=true` (see `templates/_helpers.tpl`). This:
 
 - Suppresses Arc's in-cluster writer-failover health-check loop (the
   Kubernetes Service does the work).
@@ -242,7 +242,39 @@ automatically by the chart (see `templates/_helpers.tpl`). This:
   deletes) to gate on the cluster Raft leader instead of on a singleton
   "primary writer." Leader change is sub-second on healthy clusters.
 - Requires the Enterprise license to include the
-  `shared_storage_multi_writer` feature; startup refuses otherwise.
+  `shared_storage_multi_writer` feature, at any writer count; startup
+  refuses otherwise.
+
+#### Shared storage, single writer — `storage.shared.multiWriter: false`
+
+Without the multi-writer licence feature, run shared storage as a single
+writer:
+
+```yaml
+storage:
+  mode: shared
+  shared:
+    multiWriter: false
+writer:
+  replicas: 3                              # one primary, two standbys
+cluster:
+  failover:
+    enabled: true                          # replaces a lost primary (writer_failover feature)
+```
+
+Arc elects one primary writer, which takes every write; the other writer
+pods are standbys that forward writes reaching them to the primary. The
+singleton tasks (retention, continuous queries, deletes, tiering migration)
+run on the primary. With `cluster.failover.enabled` (and the
+`writer_failover` licence feature) a lost primary is replaced; without it,
+ingest stops until an operator restores it. This needs the `clustering`
+licence feature, not `shared_storage_multi_writer`.
+
+Switching a running cluster between `multiWriter: true` and `false` is not
+a rolling change. While pods of both modes run, more than one node can
+accept writes and run the singleton tasks. Restart all writer pods together
+(scale the writer StatefulSet to 0, upgrade, scale back), and expect writes
+to pause until a primary is elected.
 
 #### Local storage (Pattern 1) — `storage.mode: local`
 
@@ -269,9 +301,9 @@ cluster:
 Three writers buy you **two** HA properties at once:
 
 1. **Ingest HA**: a writer crash is routed around by the Service. In
-   shared-storage mode the surviving writers keep taking traffic; in local
-   storage mode the surviving writers are the failover pool, and one of them
-   is promoted. Readers are **not** promotion candidates in either mode, so
+   multi-writer shared storage the surviving writers keep taking traffic; in
+   single-writer shared storage and in local storage the surviving writers
+   are the failover pool, and one of them is promoted. Readers are **not** promotion candidates in either mode, so
    the pool is made of writer-role pods or it does not exist.
 2. **A spare that survives the first failure**: two writers absorb exactly
    one loss and leave you with a single writer, no promotion candidate, and

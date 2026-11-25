@@ -131,6 +131,13 @@ type CompactionCommitStatus struct {
 	// Repair: the last shared object store manifest repair this node ran
 	// as leader (#1207).
 	Repair *ManifestRepairStatus `json:"manifest_repair,omitempty"`
+	// Read fences (#1852): whether they are on, the nodes whose fence is
+	// behind the newest phase a committed job waits on (a node the leader
+	// cannot reach is waived after 30 s), and on the leader what keeps the
+	// flag off.
+	FencesEnabled  bool     `json:"read_fences_enabled"`
+	FencesBehind   []string `json:"read_fences_behind,omitempty"`
+	FencesBlocking []string `json:"read_fences_blocking_nodes,omitempty"`
 }
 
 // CompactionCommitStatus reports the flag, the staged jobs, and on the
@@ -156,5 +163,14 @@ func (c *Coordinator) CompactionCommitStatus() CompactionCommitStatus {
 		st.Blocking = *b
 	}
 	st.Repair = c.manifestRepairStatus()
+	if fsm := c.raftNode.FSM(); fsm != nil {
+		st.FencesEnabled = fsm.CompactionFencesEnabled()
+		if top := fsm.FenceTop(); top > 0 {
+			st.FencesBehind = fsm.FencesBehind(top)
+		}
+		if b := c.fencesGate.blockers.Load(); b != nil && !st.FencesEnabled && c.raftNode.IsLeader() {
+			st.FencesBlocking = *b
+		}
+	}
 	return st
 }

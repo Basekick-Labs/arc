@@ -42,7 +42,10 @@ type MetadataStore struct {
 	logger zerolog.Logger
 
 	// Cache for GetTiersForMeasurement - keyed by "database/measurement"
-	tierCache    map[string]*tierCacheEntry
+	tierCache map[string]*tierCacheEntry
+	// tierVersions moves per measurement on every invalidateTierCache
+	// (TierVersion, #1765); entries are never removed (one per measurement).
+	tierVersions map[string]uint64
 	tierCacheGen uint64
 	tierCacheMu  sync.RWMutex
 }
@@ -50,9 +53,10 @@ type MetadataStore struct {
 // NewMetadataStore creates a new metadata store using the provided SQLite connection
 func NewMetadataStore(db *sql.DB, logger zerolog.Logger) (*MetadataStore, error) {
 	store := &MetadataStore{
-		db:        db,
-		logger:    logger.With().Str("component", "tiering-metadata").Logger(),
-		tierCache: make(map[string]*tierCacheEntry),
+		db:           db,
+		logger:       logger.With().Str("component", "tiering-metadata").Logger(),
+		tierCache:    make(map[string]*tierCacheEntry),
+		tierVersions: make(map[string]uint64),
 	}
 
 	if err := store.initSchema(); err != nil {
@@ -155,6 +159,7 @@ func (s *MetadataStore) invalidateTierCache(database, measurement string) {
 	s.tierCacheMu.Lock()
 	delete(s.tierCache, cacheKey)
 	s.tierCacheGen++
+	s.tierVersions[cacheKey]++
 	s.tierCacheMu.Unlock()
 }
 
@@ -1281,6 +1286,55 @@ func (s *MetadataStore) DeleteFileInTier(ctx context.Context, path string, tier 
 	return true, nil
 }
 
+// retireColdRowsChunk bounds one DELETE's IN list.
+const retireColdRowsChunk = 500
+
+// RetireColdRowsIfUnquarantined deletes the rows of paths that are still cold
+// and not quarantined, one statement per chunk of retireColdRowsChunk, and
+// invalidates the tier cache once per database/measurement it touched (one
+// invalidation per row would discard every concurrent tier-cache fill on a
+// node serving queries, #1188). Returns the paths it deleted, including those
+// deleted before an error. A quarantined row is the record that a key is
+// unusable (#758) and is never retired here.
+func (s *MetadataStore) RetireColdRowsIfUnquarantined(ctx context.Context, paths []string) ([]string, error) {
+	touched := make(map[tierCacheScope]struct{})
+	defer s.invalidateTierCacheScopes(touched)
+	var deleted []string
+	for start := 0; start < len(paths); start += retireColdRowsChunk {
+		if err := ctx.Err(); err != nil {
+			return deleted, err
+		}
+		chunk := paths[start:min(start+retireColdRowsChunk, len(paths))]
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, string(TierCold))
+		for _, p := range chunk {
+			args = append(args, p)
+		}
+		rows, err := s.db.QueryContext(ctx, `DELETE FROM tier_files WHERE tier = ? AND quarantined_at IS NULL AND path IN (?`+
+			strings.Repeat(",?", len(chunk)-1)+`) RETURNING path, database, measurement`, args...)
+		if err != nil {
+			return deleted, fmt.Errorf("failed to retire cold rows: %w", err)
+		}
+		for rows.Next() {
+			var path, database, measurement string
+			if err := rows.Scan(&path, &database, &measurement); err != nil {
+				rows.Close()
+				return deleted, fmt.Errorf("failed to retire cold rows: %w", err)
+			}
+			deleted = append(deleted, path)
+			if database != "" && measurement != "" {
+				touched[tierCacheScope{database: database, measurement: measurement}] = struct{}{}
+			}
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return deleted, fmt.Errorf("failed to retire cold rows: %w", err)
+		}
+	}
+	return deleted, nil
+}
+
 // hotRowsPage returns up to limit hot rows that are not quarantined, with an
 // id above afterID, in id order: the stale-row walk reads them a page at a
 // time rather than every hot row in one statement, which held the store's
@@ -1535,6 +1589,16 @@ func (s *MetadataStore) GetTiersForMeasurement(ctx context.Context, database, me
 		result[tier] = true
 	}
 	return result, nil
+}
+
+// TierVersion is a counter that moves whenever the tier rows of the
+// measurement may have changed (invalidateTierCache), read from memory only.
+// A caller that must not do I/O, such as the SQL transform cache's staleness
+// check, which runs under the cache's lock, compares two readings (#1765).
+func (s *MetadataStore) TierVersion(database, measurement string) uint64 {
+	s.tierCacheMu.RLock()
+	defer s.tierCacheMu.RUnlock()
+	return s.tierVersions[database+"/"+measurement]
 }
 
 // readTierSet is GetTiersForMeasurement without the cache: the tiers that have

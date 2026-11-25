@@ -47,6 +47,17 @@ type OutboxManifest interface {
 	StreamClaimsEnabled() bool
 }
 
+// fencedOwnedChecker reports a path a compaction being finished under read
+// fences owns (Coordinator, #1852).
+type fencedOwnedChecker interface {
+	CompactionFencedOwns(path string) bool
+}
+
+// rehomeOwnedChecker reports a path a re-home job owns (Coordinator).
+type rehomeOwnedChecker interface {
+	RehomeOwnsPath(path string) bool
+}
+
 // consumedInputChecker is the optional part of OutboxManifest that knows the
 // inputs of the compactions it has not finished (#1358). The coordinator
 // implements it.
@@ -1037,6 +1048,7 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 	// an input of a compaction this FSM has not caught up with yet, so sync
 	// first, once per attempt; a fresh entry costs no barrier (#1358 review).
 	consumed, _ := manifest.(consumedInputChecker)
+	rehomed, _ := manifest.(rehomeOwnedChecker)
 	if consumed != nil && len(toCheck) > 0 && !synced {
 		bctx, cancel := context.WithTimeout(ctx, outboxAttemptTimeout)
 		synced = manifest.SyncManifest(bctx) == nil
@@ -1054,6 +1066,33 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 		// committed-and-removed case above does.
 		if consumed != nil && checked[e] && !synced {
 			// Unsynced, the check could miss a compaction that consumed it.
+			deferred = append(deferred, e)
+			continue
+		}
+		// A path a re-home job owns (#1825): the job staged it registered,
+		// and only the job changes it, so registering it again is either
+		// a no-op or, once the job removed it, its resurrection. Settled.
+		// One superseding an owned file (a DELETE rewrite of a job's source)
+		// waits: the job reverts when it sees the rewrite, and the batch
+		// must not carry a refused op meanwhile.
+		if rehomed != nil && rehomed.RehomeOwnsPath(e.rec.Path) {
+			r.markInManifest(e)
+			r.logger.Warn().Str("path", e.rec.Path).
+				Msg("Pending file is owned by a re-home job; not registered again (the job registered it, or removed it)")
+			settled = append(settled, e)
+			continue
+		}
+		if rehomed != nil && e.rec.Supersedes != "" && rehomed.RehomeOwnsPath(e.rec.Supersedes) {
+			deferred = append(deferred, e)
+			continue
+		}
+		// A path a compaction being finished under read fences owns
+		// (#1852): the cluster refuses it until the job's inputs are gone,
+		// and the whole batch with it. Deferred, not settled: once the job
+		// ends the entry settles (a consumed input, or an object gone) or
+		// registers.
+		if fenced, ok := manifest.(fencedOwnedChecker); ok && (fenced.CompactionFencedOwns(e.rec.Path) ||
+			(e.rec.Supersedes != "" && fenced.CompactionFencedOwns(e.rec.Supersedes))) {
 			deferred = append(deferred, e)
 			continue
 		}

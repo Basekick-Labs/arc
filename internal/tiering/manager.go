@@ -29,6 +29,9 @@ type Manager struct {
 	// production. It lets a test cancel at an exact point inside the fallback
 	// instead of polling for a row that a fast runner may finish past.
 	afterColdFallbackRow func()
+	// beforeReaderColdRetire is a test seam: when set, a reader's retirement
+	// pass calls it between its check of a cold row and the delete (#1563).
+	beforeReaderColdRetire func(path string)
 
 	// onMigrationComplete, when set, runs after a migration cycle that moved
 	// or deleted at least one tier file. The query layer uses it to invalidate
@@ -59,6 +62,16 @@ type Manager struct {
 	// spoke re-uploads a duplicate. An error return means the caller MUST NOT
 	// delete the files. Guarded by callbackMu.
 	onHotFilesRemoved func(paths []string) error
+
+	// onPathsChanged, when set, is told the hot paths a migration batch moved
+	// to the cold tier (main.go: the Iceberg scheduler's
+	// RequestReconcilePaths, #1727). Guarded by callbackMu.
+	onPathsChanged func(keys []string)
+
+	// onColdRemoved, when set, is told the cold-tier keys this node removed
+	// or found gone (main.go, in a cluster: a Raft notice for the Iceberg
+	// exporter, #1728). Guarded by callbackMu.
+	onColdRemoved func(keys []string)
 
 	// scanRunning serializes ScanTiers across its exported callers: the
 	// startup scan and POST /api/v1/tiering/scan. The endpoint has no
@@ -110,7 +123,9 @@ type Manager struct {
 	// manifest, when non-nil, is told about every hot copy tiering removes,
 	// before it is removed. See ManagerConfig. manifestMu serializes
 	// proposals and guards lastManifestProposal, which paces them.
-	manifest             ManifestCoordinator
+	manifest ManifestCoordinator
+	// owned reports a file a re-home job owns (SetOwnedFilter); nil: none.
+	owned                func(path string) bool
 	manifestMu           sync.Mutex
 	lastManifestProposal time.Time
 
@@ -126,6 +141,14 @@ type Manager struct {
 	coldMissingStarted time.Time
 	coldRemovals       atomic.Int32
 	coldRemovalGen     atomic.Uint64
+	// coldRemovalEndedAt is when the last such run ended (unix nanoseconds),
+	// for ColdRemovalRecent.
+	coldRemovalEndedAt atomic.Int64
+	// coldRetired is the cold rows retired lately, by path, with when: what
+	// a cold sync must not record again from a listing taken before the
+	// removal (noteColdRetired, dropRetiredSince).
+	coldRetiredMu sync.Mutex
+	coldRetired   map[string]time.Time
 
 	// tierEvent* carry the registration reports the cluster layer makes for
 	// files this node did not write itself — pulled from a peer, or unlinked
@@ -165,6 +188,10 @@ type Manager struct {
 	// trigger must not overlap (see ErrMigrationCycleRunning).
 	cycleRunning atomic.Bool
 	stopCh       chan struct{}
+	// apiOps counts API-triggered migrations and reconciliations in
+	// flight, so Stop waits for them before the metadata DB can close under
+	// them (#1830). The scheduled cycle is waited on by scheduler.Stop.
+	apiOps sync.WaitGroup
 
 	logger zerolog.Logger
 	mu     sync.RWMutex
@@ -187,10 +214,13 @@ type ManagerConfig struct {
 
 	// ClusterGate, when non-nil, restricts storage mutation (migrate, delete,
 	// orphan reconciliation) to the primary writer. main.go wires it where
-	// nodes share data — shared-storage mode, and per-node storage with file
+	// nodes share data — a hot bucket (with or without
+	// cluster.shared_storage_mode, #1603), and per-node storage with file
 	// replication: there the primary's manifest deletes unlink every
-	// replica, so only one node may migrate. A local-storage cluster
-	// without replication shares nothing and stays ungated.
+	// replica, so only one node may migrate. In a local-storage cluster
+	// without replication, which is neither supported pattern, only its
+	// readers and compactors are gated (#1599): each writer migrates the hot
+	// files on its own disk.
 	//
 	// It does NOT switch the cold-tier metadata sync on or off. That used to
 	// be written here and was the one place in the package claiming it; the
@@ -241,6 +271,13 @@ func NewManager(cfg *ManagerConfig) (*Manager, error) {
 	}
 	if cfg.Config == nil {
 		return nil, fmt.Errorf("configuration is required")
+	}
+	if mt, st := cfg.Config.MigrationTimeout, cfg.Config.ScanTimeout; mt > 0 && st > mt {
+		// The pre-migration scan runs inside the cycle's context, so it gets
+		// the shorter of the two. Not an error: an operator may want a short
+		// cycle and accept that the in-cycle scan is cut (#1112).
+		logger.Warn().Dur("migration_timeout", mt).Dur("scan_timeout", st).
+			Msg("tiered_storage.migration_timeout is shorter than scan_timeout: the scan inside each migration cycle is cut at migration_timeout, and a scan that never finishes never retires stale hot rows")
 	}
 
 	// Validate license
@@ -358,18 +395,46 @@ func (m *Manager) Stop() error {
 	m.tierEventWG.Wait()
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if !m.running.Load() {
+		m.mu.Unlock()
 		return nil
 	}
 
 	close(m.stopCh)
 	m.scheduler.Stop()
 	m.running.Store(false)
+	m.mu.Unlock()
+
+	// stopCh ends their release contexts and stops new copies; their HTTP
+	// request contexts were cancelled by the server's shutdown. Wait,
+	// outside m.mu, so they do not touch the metadata DB after the caller
+	// closes it — bounded, so a stuck object store cannot hold shutdown.
+	done := make(chan struct{})
+	go func() { m.apiOps.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(apiOpsStopWait):
+		m.logger.Warn().Dur("waited", apiOpsStopWait).Msg("A migration or reconciliation requested through the API was still running when tiering stopped")
+	}
 
 	m.logger.Info().Msg("Tiering manager stopped")
 	return nil
+}
+
+// apiOpsStopWait bounds how long Stop waits for API-triggered work.
+const apiOpsStopWait = 60 * time.Second
+
+// stopping reports whether Stop has begun. Nil-safe for hand-built managers.
+func (m *Manager) stopping() bool {
+	if m == nil || m.stopCh == nil {
+		return false
+	}
+	select {
+	case <-m.stopCh:
+		return true
+	default:
+		return false
+	}
 }
 
 // IsRunning returns true if the manager is running
@@ -522,32 +587,9 @@ func (m *Manager) runCycle(ctx context.Context) error {
 			// the sweep retrying that key), and worth saying out loud.
 			m.logger.Debug().Msg("Cold tier is not usable on this node; orphan and manifest reconciliation are skipped this cycle")
 		} else {
-			orphansFound, orphansDeleted, orphanErrors = m.migrator.ReconcileOrphanedFiles(ctx)
-			totalErrors += orphanErrors
-
-			// Manifest entries for files already in cold — migrated before the
-			// manifest was kept in step, or whose manifest step failed — keep
-			// peer replication pulling their replicas back.
-			//
-			// The rows are read here, once, on the only node and the only path
-			// that sweeps (#1188). The cold sync used to hand them over, which
-			// made every sync — on readers, at startup, from the API, and on
-			// cycles that never get this far — load every cold row a second
-			// time. Read after this cycle's migration and orphan sweep, so the
-			// set can differ from what the sync saw; every difference is one
-			// ReconcileManifest's own guards decide (tier still cold, not
-			// quarantined, migrated_at settled, cold object stat'd against the
-			// manifest size). A row this cycle migrated is stamped now and is
-			// unsettled, unless MigrateTier ran past manifestSettle; the sweep
-			// then still sends its receipts first and stats the cold object.
-			coldRows, err := m.loadSweepColdRows(ctx)
-			if err != nil {
-				m.logger.Warn().Err(err).Msg("Manifest reconciliation skipped: could not load the cold rows; retried next cycle")
-				totalErrors++
-			} else if _, err := m.migrator.ReconcileManifest(ctx, coldRows); err != nil {
-				m.logger.Warn().Err(err).Msg("Manifest reconciliation stopped; remaining entries are retried next cycle")
-				totalErrors++
-			}
+			rr := m.reconcileSweeps(ctx, orphanReconcileWindow)
+			orphansFound, orphansDeleted, orphanErrors = rr.OrphansFound, rr.OrphansDeleted, rr.OrphanErrors
+			totalErrors += rr.Errors
 		}
 	}
 	if orphansFound > 0 || orphanErrors > 0 {
@@ -557,7 +599,58 @@ func (m *Manager) runCycle(ctx context.Context) error {
 			Int("errors", orphanErrors).
 			Msg("Orphaned hot file reconciliation completed")
 	}
+	return m.finishCycle(ctx, startTime, totalMigrated, totalErrors, orphansDeleted, scanResult)
+}
 
+// ReconcileResult is what the reconcile sweeps did.
+type ReconcileResult struct {
+	ColdSynced             int `json:"cold_synced"`
+	OrphansFound           int `json:"orphans_found"`
+	OrphansDeleted         int `json:"orphans_deleted"`
+	OrphanErrors           int `json:"-"`
+	ManifestEntriesRemoved int `json:"manifest_entries_removed"`
+	Errors                 int `json:"errors"`
+}
+
+// reconcileSweeps runs the cycle's two reconciliation sweeps: hot copies of
+// files migrated within window whose rows say cold (verified against the cold
+// object, manifest first), then manifest entries of settled cold files.
+func (m *Manager) reconcileSweeps(ctx context.Context, window time.Duration) ReconcileResult {
+	var r ReconcileResult
+	r.OrphansFound, r.OrphansDeleted, r.OrphanErrors = m.migrator.reconcileOrphanedFiles(ctx, window)
+	r.Errors += r.OrphanErrors
+	// Manifest entries for files already in cold — migrated before the
+	// manifest was kept in step, or whose manifest step failed — keep
+	// peer replication pulling their replicas back.
+	//
+	// The rows are read here, once, on the only node and the only path
+	// that sweeps (#1188). The cold sync used to hand them over, which
+	// made every sync — on readers, at startup, from the API, and on
+	// cycles that never get this far — load every cold row a second
+	// time. Read after this cycle's migration and orphan sweep, so the
+	// set can differ from what the sync saw; every difference is one
+	// ReconcileManifest's own guards decide (tier still cold, not
+	// quarantined, migrated_at settled, cold object stat'd against the
+	// manifest size). A row this cycle migrated is stamped now and is
+	// unsettled, unless MigrateTier ran past manifestSettle; the sweep
+	// then still sends its receipts first and stats the cold object.
+	coldRows, err := m.loadSweepColdRows(ctx)
+	if err != nil {
+		m.logger.Warn().Err(err).Msg("Manifest reconciliation skipped: could not load the cold rows; retried next cycle")
+		r.Errors++
+	} else if n, err := m.migrator.ReconcileManifest(ctx, coldRows); err != nil {
+		r.ManifestEntriesRemoved = n
+		m.logger.Warn().Err(err).Msg("Manifest reconciliation stopped; remaining entries are retried next cycle")
+		r.Errors++
+	} else {
+		r.ManifestEntriesRemoved = n
+	}
+	return r
+}
+
+// finishCycle is the tail of runCycle: history cleanup, the summary line and
+// the cache invalidation.
+func (m *Manager) finishCycle(ctx context.Context, startTime time.Time, totalMigrated, totalErrors, orphansDeleted int, scanResult *ScanResult) error {
 	// Cleanup old migration history records. Reached only past the gate, so
 	// a node that never leads keeps whatever history it wrote before it was
 	// gated until it next leads; bounded by that history's size.
@@ -613,6 +706,47 @@ func (m *Manager) MigrationGate() (gated bool, role string) {
 		return false, ""
 	}
 	return !m.clusterGate.IsPrimaryWriter(), m.clusterGate.Role()
+}
+
+// SetOnPathsChanged sets onPathsChanged.
+func (m *Manager) SetOnPathsChanged(fn func(keys []string)) {
+	m.callbackMu.Lock()
+	defer m.callbackMu.Unlock()
+	m.onPathsChanged = fn
+}
+
+// SetOnColdRemoved sets onColdRemoved.
+func (m *Manager) SetOnColdRemoved(fn func(keys []string)) {
+	m.callbackMu.Lock()
+	defer m.callbackMu.Unlock()
+	m.onColdRemoved = fn
+}
+
+// reportColdRemoved tells onColdRemoved which cold objects are gone. Called
+// after the deletes.
+func (m *Manager) reportColdRemoved(paths []string) {
+	if m == nil || len(paths) == 0 {
+		return
+	}
+	m.callbackMu.Lock()
+	fn := m.onColdRemoved
+	m.callbackMu.Unlock()
+	if fn != nil {
+		fn(paths)
+	}
+}
+
+// notifyPathsChanged tells onPathsChanged which hot paths moved.
+func (m *Manager) notifyPathsChanged(paths []string) {
+	if len(paths) == 0 {
+		return
+	}
+	m.callbackMu.Lock()
+	fn := m.onPathsChanged
+	m.callbackMu.Unlock()
+	if fn != nil {
+		fn(paths)
+	}
 }
 
 // notifyMigrationComplete fires the registered callback when a cycle changed
@@ -775,26 +909,100 @@ func (m *Manager) PreviewMigration(ctx context.Context, fromTier, toTier Tier, d
 // TriggerFilteredMigration runs a manual migration against an optional
 // database/measurement filter. It shares the cycle guard with the scheduler
 // so a manual request cannot race a scheduled migration.
-func (m *Manager) TriggerFilteredMigration(ctx context.Context, fromTier, toTier Tier, database, measurement string) (int, int, error) {
+func (m *Manager) TriggerFilteredMigration(ctx context.Context, fromTier, toTier Tier, database, measurement string) (MigrationResult, error) {
 	if m.roleGated() {
-		return 0, 0, ErrMigrationRoleGated
+		return MigrationResult{}, ErrMigrationRoleGated
 	}
 	if m.licenseClient != nil && !m.licenseClient.CanUseTieredStorage() {
-		return 0, 0, nil
+		return MigrationResult{}, nil
 	}
 	if fromTier != TierHot || toTier != TierCold {
-		return 0, 0, fmt.Errorf("unsupported migration: %s -> %s (only hot -> cold supported)", fromTier, toTier)
+		return MigrationResult{}, fmt.Errorf("unsupported migration: %s -> %s (only hot -> cold supported)", fromTier, toTier)
 	}
 	if !m.coldTierUsable() {
-		return 0, 0, fmt.Errorf("cold tier is not enabled")
+		return MigrationResult{}, fmt.Errorf("cold tier is not enabled")
 	}
 	if !m.cycleRunning.CompareAndSwap(false, true) {
-		return 0, 0, ErrMigrationCycleRunning
+		return MigrationResult{}, ErrMigrationCycleRunning
 	}
 	defer m.cycleRunning.Store(false)
+	m.apiOps.Add(1)
+	defer m.apiOps.Done()
 
-	migrated, failed := m.migrator.MigrateTierFiltered(ctx, fromTier, toTier, database, measurement)
-	return migrated, failed, nil
+	return m.migrator.MigrateTierFilteredResult(ctx, fromTier, toTier, database, measurement), nil
+}
+
+// ErrColdSyncFailed reports a reconcile that did not run because the cold
+// tier could not be listed: reconciling from an incomplete view could miss
+// the files it exists for, and runCycle refuses for the same reason.
+var ErrColdSyncFailed = errors.New("cold tier could not be listed; reconciliation did not run")
+
+// ErrColdTierDisabled reports a reconcile on a node without a usable cold tier.
+var ErrColdTierDisabled = errors.New("cold tier is not enabled on this node")
+
+// maxReconcileWindow bounds the orphan sweep's look-back a caller may ask for.
+const maxReconcileWindow = 365 * 24 * time.Hour
+
+// Reconcile runs the migration cycle's reconciliation on demand (#1830): the
+// cold metadata sync and hot scan, then the orphan sweep over files migrated
+// within window (the cycle's 48 h when zero) and the manifest sweep. It
+// finishes files an API-driven deployment migrated but could not release (a
+// manifest update that failed), which before this only the scheduled cycle
+// reached. Gated like a migration: the primary writer only, one at a time
+// with any migration on this node, and only with a usable cold tier.
+func (m *Manager) Reconcile(ctx context.Context, window time.Duration) (ReconcileResult, error) {
+	if m.roleGated() {
+		return ReconcileResult{}, ErrMigrationRoleGated
+	}
+	if m.licenseClient != nil && !m.licenseClient.CanUseTieredStorage() {
+		return ReconcileResult{}, nil
+	}
+	if !m.coldTierUsable() {
+		return ReconcileResult{}, ErrColdTierDisabled
+	}
+	if window <= 0 {
+		window = orphanReconcileWindow
+	}
+	if window > maxReconcileWindow {
+		window = maxReconcileWindow
+	}
+	if !m.cycleRunning.CompareAndSwap(false, true) {
+		return ReconcileResult{}, ErrMigrationCycleRunning
+	}
+	defer m.cycleRunning.Store(false)
+	m.apiOps.Add(1)
+	defer m.apiOps.Done()
+
+	// The sync first: after a writer failover this node's rows for files the
+	// old primary migrated still say hot until a listing flips them, and the
+	// orphan sweep reads only rows that already say cold.
+	scanResult, err := func() (*ScanResult, error) {
+		scanCtx, cancel := context.WithTimeout(ctx, m.scanBudget())
+		defer cancel()
+		return m.scanTiers(scanCtx)
+	}()
+	if scanResult.ColdSyncFailed {
+		m.logger.Warn().Err(err).Msg("Reconciliation did not run: the cold tier could not be listed")
+		// What the partial sync and the scan did write still changes what
+		// this node reads, as in runCycle.
+		m.notifyMigrationComplete(scanResult.ColdSynced+scanResult.HotRowsWritten, 0)
+		return ReconcileResult{}, ErrColdSyncFailed
+	}
+	if err != nil {
+		m.logger.Warn().Err(err).Msg("Hot scan before reconciliation failed; reconciling with the rows the cold sync wrote")
+	}
+	r := m.reconcileSweeps(ctx, window)
+	r.ColdSynced = scanResult.ColdSynced
+	m.logger.Info().
+		Int("cold_synced", r.ColdSynced).
+		Int("orphans_found", r.OrphansFound).
+		Int("orphans_deleted", r.OrphansDeleted).
+		Int("manifest_entries_removed", r.ManifestEntriesRemoved).
+		Int("errors", r.Errors).
+		Dur("window", window).
+		Msg("Reconciliation completed")
+	m.notifyMigrationComplete(scanResult.ColdSynced+scanResult.HotRowsWritten, r.OrphansDeleted)
+	return r, nil
 }
 
 // ColdTierMissing reports a cold tier that is configured on but has no
@@ -934,6 +1142,9 @@ func (m *Manager) RetireColdRows(ctx context.Context, paths []string) (int, erro
 		return 0, nil
 	}
 	removed := 0
+	// Noted before the rows go, so a cold sync that is listing now does not
+	// record them again from a listing that still shows the objects.
+	m.noteColdRetired(paths)
 	for _, path := range paths {
 		ok, err := m.metadata.DeleteFileInTier(ctx, path, TierCold, time.Time{})
 		if err != nil {
@@ -956,14 +1167,17 @@ func (m *Manager) RevertColdRowToHot(ctx context.Context, path string) error {
 	return m.metadata.UpdateTier(ctx, path, TierHot)
 }
 
-// NotifyColdFilesRemoved drops the query caches after retention removed cold
-// objects. A cached read can still name the cold tier's glob, and a glob that
-// now matches nothing turns the whole read into "no files".
-func (m *Manager) NotifyColdFilesRemoved(n int) {
-	if m == nil {
+// NotifyColdFilesRemoved drops the query caches after retention or a DELETE
+// removed cold objects (or retired rows whose object was already gone). A
+// cached read can still name the cold tier's glob, and a glob that now matches
+// nothing turns the whole read into "no files". The keys also go to
+// onColdRemoved (#1728).
+func (m *Manager) NotifyColdFilesRemoved(paths []string) {
+	if m == nil || len(paths) == 0 {
 		return
 	}
-	m.notifyMigrationComplete(n, 0)
+	m.notifyMigrationComplete(len(paths), 0)
+	m.reportColdRemoved(paths)
 }
 
 // GetStatus returns the current tiering status
@@ -1109,6 +1323,21 @@ func (m *Manager) scanBudget() time.Duration {
 // cannot carry a zero.
 func (m *Manager) ScanBudget() time.Duration { return m.scanBudget() }
 
+// defaultMigrationTimeout is the budget for one migration cycle when no
+// configuration supplies one, matching the tiered_storage.migration_timeout
+// default for the same reason defaultScanTimeout matches scan_timeout's.
+const defaultMigrationTimeout = 2 * time.Hour
+
+// MigrationBudget is how long one migration cycle may take, scheduled or
+// triggered through the API (#1112). Read through here, never off the config
+// struct, for the reason scanBudget gives; nil-safe for the same reason.
+func (m *Manager) MigrationBudget() time.Duration {
+	if m != nil && m.config != nil && m.config.MigrationTimeout > 0 {
+		return m.config.MigrationTimeout
+	}
+	return defaultMigrationTimeout
+}
+
 // recordScan stores a COPY of the result. The caller keeps the pointer it
 // passed and hands it to HTTP responses and callbacks; storing that pointer
 // would let a later in-place annotation rewrite what this node reports as its
@@ -1211,10 +1440,15 @@ const coldTierMetadataBatchSize = 1000
 // already-migrated files as candidates.
 //
 // Rows are normally only added or flipped to cold. A cold row whose object is
-// gone is reported, never reverted, for the same reason the hot scan never
-// downgrades (#683): the object may be mid-move, and a hot copy is still
-// read through the hot glob. Redundant cold objects are removed only when
-// this node is the primary and the metadata row is still hot.
+// gone is left to the primary on a standalone node or the primary writer,
+// whose DELETE and retention runs retire it, and is reported there (#1551).
+// On a cluster reader, nothing else ever would: it is pointed back at a hot
+// copy that the manifest still lists, or retired when neither copy exists
+// (#1563, cold_retire_reader.go). Neither can act on an object that is
+// mid-move, because every cold writer writes the object before the row and
+// both re-check the object at the moment they act. Redundant cold objects are
+// removed only when this node is the primary and the metadata row is still
+// hot.
 // Returns how many rows changed.
 //
 // Rows are written in transactions of coldTierMetadataBatchSize, and the tier
@@ -1245,6 +1479,14 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 	// Decided before the listing: only a listing that started after the
 	// cold mark's fence may seed it (#1552).
 	seed := m.beginColdMarkSeed()
+	// Taken before the listing: a cold removal that overlaps this sync (a
+	// DELETE, retention, a re-home job) deletes an object this listing may
+	// still show, and retires its row before the rows are read below. The
+	// object would look like "listed, no row" and be recorded again, as a
+	// cold row with no object: reported lost, though nothing was (#1825).
+	// Rows retired from here on are not recorded by this sync
+	// (dropRetiredSince).
+	listingStarted := time.Now()
 	objects, err := lister.ListObjects(ctx, "")
 	if err != nil {
 		return 0, fmt.Errorf("failed to list cold objects: %w", err)
@@ -1272,9 +1514,12 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 	// db/measurement/**/*.parquet, so an object under one of them that this
 	// sync cannot parse is cold data with no row (#1550).
 	coldScopes := make(map[string]struct{})
+	// Cold rows per scope, for the share a reader's retirement takes (#1563).
+	coldRowsByScope := make(map[string]int)
 	for path := range unseen {
 		if scope, ok := measurementScope(path); ok {
 			coldScopes[scope] = struct{}{}
+			coldRowsByScope[scope]++
 		}
 	}
 	cleaned := m.cleanupHotOnlyColdCopies(ctx, objects, unseen)
@@ -1298,6 +1543,16 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 		touched := make(map[tierCacheScope]struct{})
 		defer m.metadata.invalidateTierCacheScopes(touched)
 		defer func() { batch = batch[:0] }()
+
+		// A file whose cold row was retired since the listing began was
+		// removed under it (a DELETE, retention, a re-home job): the listing
+		// may still show it, and it must not be recorded again.
+		if kept := m.dropRetiredSince(batch, listingStarted); len(kept) != len(batch) {
+			batch = kept
+			if len(batch) == 0 {
+				return nil
+			}
+		}
 
 		notWritten, batchScopes, err := m.metadata.recordColdFilesBatch(ctx, batch, time.Time{})
 		if err != nil {
@@ -1458,9 +1713,20 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 	// unseen now holds exactly those: every listed path was deleted from it
 	// above, and it never held a quarantined row. The database is the key's
 	// first segment, as every writer of a tier row lays it out.
+	//
+	// For every database on a cluster reader, not only hot-only ones (#1563).
+	// A row lands here with its hot path still in the manifest when the
+	// primary rolled a move back before unlinking the hot copy: a compaction
+	// took the file over (dropTakenOver), a copy failed and was cleaned up,
+	// or it stopped between the flip and the unlink. Nothing tells a reader,
+	// which then refused its own hot registration over the cold row, and a
+	// measurement whose only hot file it was lost its hot glob there. During
+	// a migration the cold object exists, so the row is not in unseen; after
+	// a completed one the manifest entry is gone, so the size match below
+	// fails and the row is left to retirement.
 	for path, size := range unseen {
 		database, _, _ := strings.Cut(path, "/")
-		if !m.IsHotOnly(ctx, database) {
+		if !m.roleGated() && !m.IsHotOnly(ctx, database) {
 			continue
 		}
 		if m.manifest != nil {
@@ -1487,6 +1753,31 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 		}
 	}
 
+	// A cluster reader retires what the primary removed (#1563).
+	if len(unseen) > 0 && m.roleGated() {
+		if ok, why := m.readerRetireAllowed(authGen, objectCount); !ok {
+			m.logger.Warn().Int("rows", len(unseen)).Str("reason", why).
+				Msg("Cold tier rows have no object in cold storage; not retiring them on this reader")
+		} else {
+			res := m.retireUnseenColdRows(ctx, unseen)
+			synced += res.retired
+			switch {
+			case res.retired > 0:
+				m.logger.Info().Int("retired", res.retired).Strs("sample", res.sample).
+					Int("left", len(unseen)).Int("unchecked", res.unchecked).Int("failed", res.failed).
+					Msg("Retired cold tier rows whose cold object and hot copy are both gone (removed by the primary, or outside Arc); rows left are retried by the next cold sync")
+			case res.unchecked > 0 || res.failed > 0:
+				m.logger.Warn().Int("unchecked", res.unchecked).Int("failed", res.failed).
+					Msg("Could not check or retire cold tier rows whose object is gone; the next cold sync tries again")
+			}
+			for scope, n := range res.byScope {
+				if total := coldRowsByScope[scope]; total > 0 && 2*n > total {
+					m.logger.Warn().Str("scope", scope).Int("retired", n).Int("cold_rows", total).
+						Msg("This sync retired more than half of a measurement's cold rows. Expected after a large DELETE or retention run on the primary; otherwise check for a bucket lifecycle/expiry rule or deletes outside Arc on the cold prefix")
+				}
+			}
+		}
+	}
 	if len(unseen) > 0 {
 		sample := make([]string, 0, 5)
 		for p := range unseen {
@@ -1498,7 +1789,7 @@ func (m *Manager) syncColdTierMetadata(ctx context.Context) (int, error) {
 		m.logger.Warn().
 			Int("count", len(unseen)).
 			Strs("sample", sample).
-			Msg("Cold tier rows have no object in cold storage; left as-is (a hot copy, if any, is still read)")
+			Msg("Cold tier rows have no object in cold storage; left as-is (a hot copy, if any, is still read). A cluster reader retires those with no hot copy once it can confirm both are gone")
 	}
 	m.checkMissingColdObjects(ctx, unseen)
 	seed.finish(ctx, m)
@@ -1544,7 +1835,7 @@ func (m *Manager) cleanupHotOnlyColdCopies(ctx context.Context, objects []storag
 			m.logger.Warn().Err(err).Str("path", object.Path).Msg("Could not inspect hot-only migration copy; preserving it")
 			continue
 		}
-		if file == nil || file.Tier != TierHot || file.Database != info.Database || file.QuarantinedAt != nil || file.SizeBytes != object.Size || m.heldByCompaction(file.Path) {
+		if file == nil || file.Tier != TierHot || file.Database != info.Database || file.QuarantinedAt != nil || file.SizeBytes != object.Size || m.heldElsewhere(file.Path) {
 			continue
 		}
 		if m.manifest != nil {
@@ -1557,7 +1848,7 @@ func (m *Manager) cleanupHotOnlyColdCopies(ctx context.Context, objects []storag
 			m.logger.Warn().Err(err).Str("path", file.Path).Msg("Could not verify hot copy for hot-only cold object; preserving it")
 			continue
 		}
-		if !hotExists || !m.IsHotOnly(ctx, info.Database) || m.roleGated() || m.heldByCompaction(file.Path) {
+		if !hotExists || !m.IsHotOnly(ctx, info.Database) || m.roleGated() || m.heldElsewhere(file.Path) {
 			continue
 		}
 		// runCycle holds cycleRunning across this pass, so migration cannot

@@ -193,6 +193,17 @@ func TestClassifyEvent(t *testing.T) {
 		{"POST", "/api/v1/auth/tokens", 201, "token.created"},
 		{"DELETE", "/api/v1/auth/tokens/abc", 200, "token.deleted"},
 		{"POST", "/api/v1/auth/tokens/abc/rotate", 200, "token.rotated"},
+		// #1630: a revoke and a team addition were filed as token.created,
+		// a team removal as token.deleted, an update as api.patch.
+		{"POST", "/api/v1/auth/tokens/5/revoke", 200, "token.revoked"},
+		{"POST", "/api/v1/auth/tokens/5/revoke/", 200, "token.revoked"},
+		{"POST", "/api/v1/auth/tokens/5/rotate/", 200, "token.rotated"},
+		{"PATCH", "/api/v1/auth/tokens/5", 200, "token.updated"},
+		{"POST", "/api/v1/auth/tokens/5/teams", 201, "token.team_added"},
+		{"DELETE", "/api/v1/auth/tokens/5/teams/3", 200, "token.team_removed"},
+		{"POST", "/api/v1/auth/tokens/", 201, "token.created"},
+		{"GET", "/api/v1/auth/tokens/5", 200, "api.get"},
+		{"POST", "/api/v1/auth/tokensfoo", 200, "api.post"},
 		{"POST", "/api/v1/query", 200, "data.query"},
 		{"POST", "/write", 204, "data.write"},
 		{"POST", "/api/v2/write", 204, "data.write"},
@@ -208,6 +219,11 @@ func TestClassifyEvent(t *testing.T) {
 		{"POST", "/api/v1/import", 200, "data.import"},
 		{"PUT", "/api/v1/mqtt/config", 200, "mqtt.put"},
 		{"POST", "/api/v1/compaction/trigger", 200, "compaction.triggered"},
+		{"POST", "/api/v1/rehome", 202, "rehome.started"},
+		{"POST", "/api/v1/rehome/", 202, "rehome.started"},
+		{"GET", "/api/v1/rehome", 200, "rehome.get"},
+		{"GET", "/api/v1/rehome/abc", 200, "rehome.get"},
+		{"POST", "/api/v1/rehomefoo", 200, "api.post"},
 		// #1168: every compaction method used to classify as
 		// "compaction.triggered". The seven read routes now carry their own
 		// method, so a status poll is no longer recorded as a trigger. HEAD

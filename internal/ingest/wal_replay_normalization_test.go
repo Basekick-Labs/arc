@@ -28,7 +28,9 @@ func newReplayTestBuffer(t *testing.T, tmpDir string) *ArrowBuffer {
 		t.Fatalf("storage: %v", err)
 	}
 	t.Cleanup(func() { localStorage.Close() })
-	return NewArrowBuffer(cfg, localStorage, zerolog.Nop())
+	buf := NewArrowBuffer(cfg, localStorage, zerolog.Nop())
+	stopAtEnd(t, buf)
+	return buf
 }
 
 func parquetPaths(t *testing.T, tmpDir string) []string {

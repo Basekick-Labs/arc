@@ -307,17 +307,16 @@ Call as: include "arc-enterprise.commonClusterEnv" .
 - name: ARC_CLUSTER_FAILOVER_ENABLED
   value: "true"
 {{- end }}
-{{- if eq .Values.storage.mode "shared" }}
+{{- if eq (include "arc-enterprise.sharedMultiWriter" .) "true" }}
 {{- /*
-Pattern 2 multi-writer: all RoleWriter pods accept writes
-concurrently and PUT to the shared object-storage bucket. Writer
-failover is suppressed (LB does failover via Kubernetes Service
-load-balancing + /ready). Singleton background tasks (retention,
-CQ, delete, tiering migration) run on whichever pod is the cluster Raft leader.
-Requires Enterprise license with the shared_storage_multi_writer
-feature. Single-writer deployments (writer.replicas=1) with shared
-storage continue to work unchanged — Pattern 2 mode is a no-op for
-them. See docs/progress/2026-05-26-multi-writer-pattern2.md.
+Pattern 2 multi-writer: all RoleWriter pods accept writes concurrently and
+PUT to the shared object-storage bucket. Writer failover is suppressed (the
+Kubernetes Service and /ready do failover). Singleton background tasks
+(retention, CQ, delete, tiering migration) run on the cluster Raft leader.
+Requires the shared_storage_multi_writer licence feature, at any writer
+count. With storage.shared.multiWriter=false the flag is not set: one
+elected primary writer takes writes, and no multi-writer licence is needed
+(#1606). See docs/progress/2026-05-26-multi-writer-pattern2.md.
 */}}
 - name: ARC_CLUSTER_SHARED_STORAGE_MODE
   value: "true"
@@ -477,3 +476,45 @@ args:
     esac
     cd /app && exec ./arc
 {{- end }}
+
+{{/*
+"true" when this is a shared-storage install running Pattern 2 multi-writer
+(storage.shared.multiWriter, default true), "false" otherwise. An explicit
+false is tested with kindIs: `default` would turn false into the default.
+An absent or null value (an upgrade with --reuse-values from a release
+without it) means true.
+*/}}
+{{- define "arc-enterprise.sharedMultiWriter" -}}
+{{- $shared := .Values.storage.shared | default dict -}}
+{{- if ne .Values.storage.mode "shared" -}}
+false
+{{- else if and (kindIs "bool" $shared.multiWriter) (not $shared.multiWriter) -}}
+false
+{{- else -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+The Flight SQL container port (flight_sql.port), refused at render time when
+it is not a valid port or collides with the HTTP (8000), coordinator (9100) or
+Raft (9200) port, or when writer/reader extraEnv sets ARC_FLIGHT_SQL_*, which
+would move the listener away from the container and Service ports.
+*/}}
+{{- define "arc-enterprise.flightSqlPort" -}}
+{{- $p := int .Values.flightSql.port -}}
+{{- if or (lt $p 1) (gt $p 65535) -}}
+{{- fail (printf "flightSql.port must be between 1 and 65535 (got %d)" $p) -}}
+{{- end -}}
+{{- if has $p (list 8000 9100 9200) -}}
+{{- fail (printf "flightSql.port %d collides with an Arc port (8000 HTTP, 9100 coordinator, 9200 Raft)" $p) -}}
+{{- end -}}
+{{- range $role := list "writer" "reader" -}}
+{{- range (index $.Values $role).extraEnv -}}
+{{- if hasPrefix "ARC_FLIGHT_SQL_" (toString .name) -}}
+{{- fail (printf "set the Flight SQL listener with flightSql.*, not %s.extraEnv (%s): the container and Service ports follow flightSql.port" $role .name) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $p -}}
+{{- end -}}

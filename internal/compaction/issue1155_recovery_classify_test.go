@@ -86,23 +86,26 @@ func TestRecoveryParksAManifestWhosePermanentFailureCannotClear(t *testing.T) {
 	}
 }
 
-// sizeBlindBackend embeds the Backend INTERFACE, so only Backend's methods are
-// in its static method set and ObjectLister is not promoted -- the established
-// shape for a fake that hides an optional interface. That skips the size check
-// in recoverLoadedManifest, which is the gap the hook's own byte count covers.
-// Arc's three real backends all implement ObjectLister; this proves the
-// handling does not depend on that.
+// sizeBlindBackend reports whatever size it is told to for every file, so
+// the stored-size check in recoverLoadedManifest passes on an output whose
+// bytes are short. That leaves the completion hook's own byte count as the
+// only check that sees the short output, which is the gap it covers.
 type sizeBlindBackend struct {
 	storage.Backend
+	reportSize int64
 }
 
-// TestRecoveryDiscardsAShortOutputWithoutObjectLister: the stored output is
-// shorter than the manifest records, and the backend cannot be asked for sizes,
-// so the hook's byte count is the only check that sees it. It must reach the
-// same partial-upload handling the ObjectLister path uses -- delete the output
-// and the manifest so the next cycle redoes the job -- rather than parking or
-// looping.
-func TestRecoveryDiscardsAShortOutputWithoutObjectLister(t *testing.T) {
+func (b *sizeBlindBackend) StatFile(context.Context, string) (int64, error) {
+	return b.reportSize, nil
+}
+
+// TestRecoveryDiscardsAnOutputTheHookReadsShort: the stored output is
+// shorter than the manifest records, and the backend's size answer agrees
+// with the manifest, so the hook's byte count is the only check that sees it.
+// It must reach the same partial-upload handling the size check uses --
+// delete the output and the manifest so the next cycle redoes the job --
+// rather than parking or looping.
+func TestRecoveryDiscardsAnOutputTheHookReadsShort(t *testing.T) {
 	root := t.TempDir()
 	completionDir := filepath.Join(root, ".completion", "pending")
 
@@ -111,10 +114,7 @@ func TestRecoveryDiscardsAShortOutputWithoutObjectLister(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = local.Close() })
-	backend := &sizeBlindBackend{Backend: local}
-	if _, isLister := interface{}(backend).(storage.ObjectLister); isLister {
-		t.Fatal("precondition: the backend must NOT implement ObjectLister, or the hook is not the check under test")
-	}
+	backend := &sizeBlindBackend{Backend: local, reportSize: 99999}
 
 	ctx := context.Background()
 	outputPath := "db/cpu/2026/01/02/03/compacted.parquet"

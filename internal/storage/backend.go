@@ -58,6 +58,14 @@ func IsStoreNotFound(err error) bool {
 // BlobNotFound ResponseError on Azure).
 var ErrObjectNotFound = errors.New("file not found")
 
+// ErrNoContentLength is a StatFile or ObjectSHA failure on an object store
+// whose response for an existing object carried no length, and whose listing
+// of that exact key reported no size either (#1812). It is an error, not a
+// size of 0: an empty object and an unknown size are different answers, and a
+// caller comparing sizes (compaction recovery, the object finisher) would
+// otherwise read the object as the wrong one.
+var ErrNoContentLength = errors.New("storage: the object store response carries no content length")
+
 // IsNotFound reports whether err is a backend saying the key names no object.
 //
 // It accepts the wrapped sentinel, a wrapped fs not-exist, and the typed
@@ -105,7 +113,9 @@ type Backend interface {
 	// StatFile returns the byte size of the committed file at path.
 	// Returns -1 (and nil error) if the committed file does not exist. Staged
 	// partials are exposed separately through StagingInspector.
-	// Returns a non-nil error only for unexpected backend failures.
+	// Returns a non-nil error only for unexpected backend failures, which
+	// include an object store that reports no size for an existing object
+	// (ErrNoContentLength): never a size of 0 for an unknown size.
 	StatFile(ctx context.Context, path string) (int64, error)
 
 	// List lists all objects with the given prefix
@@ -192,6 +202,24 @@ type DirectoryLister interface {
 	ListDirectories(ctx context.Context, prefix string) ([]string, error)
 }
 
+// LevelLister lists ONE level under a prefix: the names of the directories
+// directly under it and of the objects directly in it, neither recursed into.
+// Both are bare names (one path segment), not keys.
+//
+// It is the listing ListDirectories already performs: an object store's
+// delimiter listing returns the level's own objects alongside its common
+// prefixes, and ListDirectories discards them. A caller that needs to know
+// whether a directory holds files of its own (as opposed to files somewhere
+// beneath it) asks this instead of List, whose cost is every object under
+// the prefix.
+//
+// files leaves out names this backend would refuse as a key segment and, on
+// local disk, dot-prefixed names, as List does for the keys it returns; a
+// name is never a deeper key. dirs is exactly ListDirectories' result.
+type LevelLister interface {
+	ListLevel(ctx context.Context, prefix string) (dirs []string, files []string, err error)
+}
+
 // BatchDeleter supports efficient batch deletion of multiple objects.
 // Implementations should handle batching internally (e.g., S3 supports up to 1000 objects per batch).
 type BatchDeleter interface {
@@ -218,7 +246,10 @@ var ErrAdoptUnsupported = errors.New("storage: local file cannot be adopted in p
 // the caller must not read it afterwards. That is the point of the interface
 // and the reason it is opt-in rather than part of Backend. A backend that
 // copies bytes must not implement it, and a caller that still needs the file
-// must not use it.
+// must not use it. The source is also consumed by a failure after the move,
+// when the moved file could not be made durable and was removed (#1618): the
+// caller must treat any error other than ErrAdoptUnsupported as "the source
+// may be gone".
 //
 // ErrAdoptUnsupported means "this pair of paths cannot be adopted, copy
 // instead" and is not a failure. Any other error is a real one.

@@ -10,6 +10,8 @@
 [![Discord](https://img.shields.io/badge/discord-join-7289da?logo=discord)](https://discord.gg/nxnWfUxsdm)
 [![GitHub](https://img.shields.io/github/stars/basekick-labs/arc?style=social)](https://github.com/basekick-labs/arc)
 
+[![Grump found nothing to complain about](https://grump.run/badge.svg)](https://grump.run/?utm_source=github&utm_medium=readme&utm_campaign=basekick-arc)
+
 Open, SQL-native time-series database for telemetry you need to keep. Arc ingests 38M+ records/sec, stores data as standard Parquet on infrastructure you own, and lets you query recent and historical data together. InfluxDB Line Protocol and Telegraf compatible. Single binary. AGPL-3.0.
 
 > **Prefer a UI?** [**Arc Launchpad**](https://github.com/Basekick-Labs/launchpad) is a self-hosted web console for the Arc instances you run — SQL console, schema explorer, logs, monitoring, and management for tokens, retention, alerts, continuous queries, and MQTT ingestion. Deploy it alongside Arc with Docker Compose. [Docs](https://docs.basekick.net/launchpad).
@@ -147,6 +149,8 @@ Benefits:
 
 Arc speaks three wire formats from the same query engine. **Arrow IPC** is the throughput leader for analytical clients (Grafana, pyarrow, polars) that can take an Arrow dependency — zero-copy from the engine's internal columnar buffers. **MessagePack** (columnar, stable as of 26.09.1) is the choice for clients that don't speak Arrow but want smaller bytes and faster decode than JSON — same envelope shape as JSON, native binary types for timestamps and binary columns. **JSON** stays the default for ergonomic compatibility.
 
+An optional Arrow Flight SQL listener exposes the same read-only query path over gRPC for ADBC and other Flight SQL clients. See the [Flight SQL guide](docs/operations/flight-sql.md) for setup and authentication.
+
 Benchmark: Arc 27.01.1 (main at b4d98a31, October 2026), M3 Max, `query_suite` from arc-benchmarks, 5 iterations per query, latency is p50 in milliseconds. One session, one dataset: a 532.6M-row `cpu` measurement (60 s of `sustained_bench` msgpack ingest spread over 24 hours, hourly-compacted: 25 hour partitions, 100 files), so the three columns are apples-to-apples.
 
 | Query | JSON (ms) | MessagePack (ms) | Arrow IPC (ms) | msgpack vs JSON | Arrow vs JSON |
@@ -234,8 +238,8 @@ Linux packages run on glibc 2.34 or newer: Ubuntu 22.04+, Debian 12+, RHEL/Rocky
 ### Debian/Ubuntu
 
 ```bash
-wget https://github.com/basekick-labs/arc/releases/download/v26.09.3/arc_26.09.3_amd64.deb
-sudo dpkg -i arc_26.09.3_amd64.deb
+wget https://github.com/basekick-labs/arc/releases/download/v26.09.4/arc_26.09.4_amd64.deb
+sudo dpkg -i arc_26.09.4_amd64.deb
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
@@ -245,8 +249,8 @@ The RPMs are signed with the Basekick Labs package key from 26.09.4, fingerprint
 
 ```bash
 sudo rpm --import https://raw.githubusercontent.com/Basekick-Labs/arc/main/deploy/packaging/RPM-GPG-KEY-basekick
-wget https://github.com/basekick-labs/arc/releases/download/v26.09.3/arc-26.09.3-1.x86_64.rpm
-sudo dnf install -y ./arc-26.09.3-1.x86_64.rpm
+wget https://github.com/basekick-labs/arc/releases/download/v26.09.4/arc-26.09.4-1.x86_64.rpm
+sudo dnf install -y ./arc-26.09.4-1.x86_64.rpm
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
@@ -255,15 +259,15 @@ sudo systemctl enable arc && sudo systemctl start arc
 Works on Arch Linux and Arch-based distros such as Omarchy (x86_64 and aarch64).
 
 ```bash
-wget https://github.com/basekick-labs/arc/releases/download/v26.09.3/arc-26.09.3-1-x86_64.pkg.tar.zst
-sudo pacman -U arc-26.09.3-1-x86_64.pkg.tar.zst
+wget https://github.com/basekick-labs/arc/releases/download/v26.09.4/arc-26.09.4-1-x86_64.pkg.tar.zst
+sudo pacman -U arc-26.09.4-1-x86_64.pkg.tar.zst
 sudo systemctl enable arc && sudo systemctl start arc
 ```
 
 ### Kubernetes (Helm)
 
 ```bash
-helm install arc https://github.com/basekick-labs/arc/releases/download/v26.09.3/arc-26.09.3.tgz
+helm install arc https://github.com/basekick-labs/arc/releases/download/v26.09.4/arc-26.09.4.tgz
 ```
 
 ### Build from Source
@@ -330,7 +334,7 @@ CMVP-certified; Arc itself is not a CMVP-listed module. See the
 - **Columnar storage**: Parquet format with full analytical SQL engine
 - **Workloads**: Industrial IoT, manufacturing, energy, fleet telemetry, aerospace, observability, and event analytics
 
-- **Ingestion**: MessagePack columnar (fastest), InfluxDB Line Protocol, MQTT, TLE (satellite telemetry)
+- **Ingestion**: MessagePack columnar (fastest), [Prometheus Remote Write 1.0](docs/integrations/prometheus-remote-write.md), InfluxDB Line Protocol, MQTT, TLE (satellite telemetry)
 - **Query**: Full analytical SQL; JSON, columnar MessagePack, and Apache Arrow IPC responses
 - **Compaction**: Tiered (hourly/daily) automatic Parquet file merging —
   10x storage reduction; see [hourly compaction tuning](docs/operations/compaction.md)

@@ -14,6 +14,7 @@ import (
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/cluster/raft"
+	"github.com/basekick-labs/arc/internal/compaction"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/fieldschema"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -25,20 +26,29 @@ import (
 
 // DatabasesHandler handles database management API endpoints
 type DatabasesHandler struct {
+	// rehomeBlock keeps a database delete and the re-home jobs on its files
+	// apart (SetRehomeBlock).
+	rehomeBlock func(prefix string) (release func(), ok bool)
 	// onFilesRemoved invalidates the query caches (and the cluster's) after
 	// a database's files were removed: see SetOnFilesRemoved.
 	onFilesRemoved func()
-	storage        storage.Backend
-	requestTimeout time.Duration
-	deleteConfig   *config.DeleteConfig
-	coordinator    DatabaseDeleteCoordinator
-	gateNonPrimary bool
-	tieringManager databaseTieringManager
-	authManager    *auth.AuthManager
-	rbacManager    RBACChecker
-	logger         zerolog.Logger
-	icebergDropper IcebergCatalogDropper
-	fieldSchema    *fieldschema.Registry // optional, #914: anchors die with their database
+	// onPathsChanged, when set, is told the storage prefixes a database delete
+	// changed (SetOnPathsChanged).
+	onPathsChanged func(keys []string)
+	// onSpokeNamespaceRemoved marks an edge-sync spoke's receipts removed
+	// before its namespace is deleted (#1186); nil unless this node is an
+	// edge-sync hub. See SetOnSpokeNamespaceRemoved.
+	onSpokeNamespaceRemoved func(ctx context.Context, name string) error
+	storage                 storage.Backend
+	requestTimeout          time.Duration
+	deleteConfig            *config.DeleteConfig
+	coordinator             DatabaseDeleteCoordinator
+	tieringManager          databaseTieringManager
+	authManager             *auth.AuthManager
+	rbacManager             RBACChecker
+	logger                  zerolog.Logger
+	icebergDropper          IcebergCatalogDropper
+	fieldSchema             *fieldschema.Registry // optional, #914: anchors die with their database
 	// flusher and pending: a database deletion flushes the rows acknowledged
 	// before it and withdraws its pending registrations (#1207 d1).
 	flusher DeleteFlusher
@@ -47,6 +57,45 @@ type DatabasesHandler struct {
 	// compactor) to one that can, and a create from a node that does not
 	// ingest to the writer; nil outside a cluster.
 	router *cluster.Router
+	// warehouse names the Iceberg warehouse's directories in the storage root,
+	// which are not databases (#1626); nil when Iceberg export is off.
+	warehouse WarehouseDirs
+}
+
+// WarehouseDirs names the directories the Iceberg warehouse occupies in the
+// storage root (iceberg.WarehouseLayout). Both methods must answer false on a
+// nil receiver.
+type WarehouseDirs interface {
+	// IsWarehouseRootDir: a top-level directory that is the warehouse's, not a
+	// database: a namespace directory, or a subdirectory warehouse.
+	IsWarehouseRootDir(name string) bool
+	// IsWarehouseMeasurement: the measurement directory a nested warehouse
+	// ("<root>/db/m/…") occupies.
+	IsWarehouseMeasurement(db, m string) bool
+	// ContainsWarehouse: database db holds a nested warehouse; its path
+	// relative to the storage root.
+	ContainsWarehouse(db string) (string, bool)
+}
+
+// SetWarehouseLayout hides the Iceberg warehouse's directories from the
+// database routes (#1626): not listed, 404 to GET, 403 to DELETE, 400 to a
+// create. Wired only with Iceberg export on.
+func (h *DatabasesHandler) SetWarehouseLayout(l WarehouseDirs) { h.warehouse = l }
+
+func (h *DatabasesHandler) isWarehouseDir(name string) bool {
+	return h.warehouse != nil && h.warehouse.IsWarehouseRootDir(name)
+}
+
+func (h *DatabasesHandler) isWarehouseMeasurement(db, m string) bool {
+	return h.warehouse != nil && h.warehouse.IsWarehouseMeasurement(db, m)
+}
+
+// warehouseDatabaseError is the refusal every writer gives a database named
+// after the Iceberg warehouse directory, whose files would land inside the
+// warehouse (#1626). No apostrophe: see continuous_query.go's note on the
+// log masking of quoted spans.
+func warehouseDatabaseError(name string) string {
+	return fmt.Sprintf("database name %q is reserved for the Iceberg warehouse", name)
 }
 
 // SetRouter installs the cluster router the listings and creates forward
@@ -108,18 +157,17 @@ const databaseDeleteManifestChunkSize = 200
 const databaseDeleteManifestReason = "database:delete"
 
 // SetCoordinator wires cluster manifest updates into database deletion, and
-// with gateNonPrimary the primary-writer admission check. Pass gateNonPrimary
-// under the same condition the tiering manager's writer gate is wired
-// (shared storage or replication), so a cluster answers the same way whether
-// tiered storage is enabled or not: without either, nodes share nothing, the
-// manifest delete unlinks nothing on peers, and each node may delete its own
-// files. Call before RegisterRoutes, alongside the other handler wiring.
-func (h *DatabasesHandler) SetCoordinator(c DatabaseDeleteCoordinator, gateNonPrimary bool) {
+// the primary-writer admission check. Every cluster gets the check: even a
+// local-storage cluster without replication shares the cold tier, and a
+// database delete removes every cold object of the database and its manifest
+// entries for every node, so it is one node's job, like a row DELETE or
+// retention (#1599). It runs whether or not tiered storage is enabled. Call
+// before RegisterRoutes, alongside the other handler wiring.
+func (h *DatabasesHandler) SetCoordinator(c DatabaseDeleteCoordinator) {
 	if c == nil {
 		return
 	}
 	h.coordinator = c
-	h.gateNonPrimary = gateNonPrimary
 }
 
 // SetFieldSchema installs the field schema registry so deleting a database
@@ -244,6 +292,10 @@ var reservedDatabaseNames = map[string]bool{
 // export is disabled.
 type IcebergCatalogDropper interface {
 	DropDatabase(ctx context.Context, database string) error
+	// OwnsMetadataKey reports a key the database DELETE must leave for
+	// DropDatabase: a colocated Iceberg table's metadata (#1676), which
+	// DropDatabase removes after writing its drop markers (#1611).
+	OwnsMetadataKey(key string) bool
 }
 
 // SetIcebergDropper wires catalog cleanup into database deletion.
@@ -266,6 +318,16 @@ func (h *DatabasesHandler) storageContext(c *fiber.Ctx, timeout time.Duration) (
 		timeout = 30 * time.Second
 	}
 	return context.WithTimeout(c.Context(), timeout)
+}
+
+// SetOnSpokeNamespaceRemoved wires the edge-sync hub's receipt marking into
+// database delete (#1186). It runs before anything is removed, whether or not
+// tiering is wired, so a confirmed delete of a spoke namespace sticks: the
+// spoke's receipts say removed, reconcile keeps answering "present", and the
+// spoke does not re-send what was deleted. For a name that is not a spoke
+// the mark matches no receipt. A failure refuses the delete.
+func (h *DatabasesHandler) SetOnSpokeNamespaceRemoved(fn func(ctx context.Context, name string) error) {
+	h.onSpokeNamespaceRemoved = fn
 }
 
 // SetTieringManager sets the tiering manager for multi-tier database/measurement listing.
@@ -391,7 +453,9 @@ func (h *DatabasesHandler) handleCreate(c *fiber.Ctx) error {
 		})
 	}
 
-	if reservedDatabaseNames[strings.ToLower(req.Name)] {
+	// The Iceberg warehouse directory is refused like a reserved name: the
+	// marker would be written inside the warehouse (#1626).
+	if reservedDatabaseNames[strings.ToLower(req.Name)] || h.isWarehouseDir(req.Name) {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Database name '" + req.Name + "' is reserved",
 		})
@@ -448,14 +512,18 @@ func (h *DatabasesHandler) forwardCreate(c *fiber.Ctx) (bool, error) {
 	case ForwardAlreadyForwarded:
 		return true, RespondAlreadyForwarded(c)
 	case ForwardToPeer:
-		req, err := BuildHTTPRequest(c)
+		// Built only here, once the create is forwarded (#1629), on the
+		// router's lifetime: a write-class forward needs no cancel of its own.
+		fctx := h.router.Lifetime()
+		req, release, err := BuildHTTPRequest(c, fctx)
 		if err != nil {
 			h.logger.Error().Err(err).Msg("Failed to build database create request for forwarding")
 			return true, c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"error": "Failed to prepare request for forwarding",
 			})
 		}
-		resp, err := h.router.RouteDatabaseCreate(c.Context(), req)
+		defer release()
+		resp, err := h.router.RouteDatabaseCreate(fctx, req)
 		if errors.Is(err, cluster.ErrLocalNodeCanHandle) {
 			return false, nil
 		}
@@ -529,8 +597,9 @@ func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
 			"error": fmt.Sprintf("invalid database name %q", name),
 		})
 	}
-	// Arc's own state, not a database: the list hides it, so this does too (#1012).
-	if storage.IsReservedRootDir(name) {
+	// Arc's own state, not a database: the list hides it, so this does too
+	// (#1012). The Iceberg warehouse's directories likewise (#1626).
+	if storage.IsReservedRootDir(name) || h.isWarehouseDir(name) {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "Database '" + name + "' not found",
 		})
@@ -605,7 +674,7 @@ func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
 			"error": fmt.Sprintf("invalid database name %q", name),
 		})
 	}
-	if storage.IsReservedRootDir(name) {
+	if storage.IsReservedRootDir(name) || h.isWarehouseDir(name) {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "Database '" + name + "' not found",
 		})
@@ -697,6 +766,12 @@ func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
 }
 
 // handleDelete handles DELETE /api/v1/databases/:name
+// SetRehomeBlock gives the handler the block a database delete takes over the
+// database's files against re-home jobs (#1825). nil: no such jobs.
+func (h *DatabasesHandler) SetRehomeBlock(fn func(prefix string) (release func(), ok bool)) {
+	h.rehomeBlock = fn
+}
+
 func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	// Check if delete is enabled
 	if h.deleteConfig == nil || !h.deleteConfig.Enabled {
@@ -735,9 +810,48 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	// _schema and _compaction_state included). The second matters more now
 	// than it did: this handler no longer only unlinks local hot files, it
 	// also deletes cold objects and proposes cluster-wide manifest removals.
-	if reservedDatabaseNames[strings.ToLower(name)] || storage.IsReservedRootDir(name) {
+	// The Iceberg warehouse's directories are a third: deleting one would
+	// remove the exported tables' metadata (#1626).
+	if reservedDatabaseNames[strings.ToLower(name)] || storage.IsReservedRootDir(name) || h.isWarehouseDir(name) {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 			"error": "Cannot delete reserved database '" + name + "'",
+		})
+	}
+	// Kept apart from a re-home job on a file of this database (#1825): the
+	// delete would remove the file the job is moving, or the files it writes,
+	// under it. Held for the whole delete, so no job begins meanwhile.
+	if h.rehomeBlock != nil {
+		release, ok := h.rehomeBlock(name + "/")
+		if !ok {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"error": "A re-home job, or a compaction being finished on the cluster, is in flight on a file of database '" + name + "' (GET /api/v1/rehome, GET /api/v1/cluster); retry once it has ended",
+			})
+		}
+		defer release()
+	}
+	// A database holding a nested Iceberg warehouse ("<root>/db/m/…") is
+	// refused whole: its delete lists and removes every file under it, the
+	// warehouse's metadata for every exported table included. Filtering the
+	// warehouse out instead is not safe: user files can land under it too.
+	if h.warehouse != nil {
+		if rel, ok := h.warehouse.ContainsWarehouse(name); ok {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+				"error": "Cannot delete database '" + name + "': it contains the Iceberg warehouse '" + rel + "' (iceberg.warehouse); move the warehouse first",
+			})
+		}
+	}
+	// Refuse a node that is not the primary writer, as the row delete API and
+	// retention do (#1094). Checked before the tier reservation, and whether
+	// or not tiering runs here: in a local-storage cluster without
+	// replication a writer's tiering is ungated, so BeginDatabaseDelete alone
+	// would admit a standby writer (#1599).
+	if h.coordinator != nil && !h.coordinator.IsPrimaryWriter() {
+		role := h.coordinator.Role()
+		h.logger.Warn().Str("database", name).Str("role", role).
+			Msg("Database deletion rejected: this node is not the primary writer")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": fmt.Sprintf("database delete rejected: node role %q is not primary writer; route to the primary writer", role),
+			"role":  role,
 		})
 	}
 	if h.tieringManager != nil {
@@ -768,18 +882,6 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 			})
 		}
 		defer release()
-	} else if h.coordinator != nil && h.gateNonPrimary && !h.coordinator.IsPrimaryWriter() {
-		// No tiering manager: nothing above gated the request, so refuse a
-		// node that is not the primary writer here, as the row delete API and
-		// retention do (#1094). With tiering enabled, BeginDatabaseDelete
-		// already answers this case.
-		role := h.coordinator.Role()
-		h.logger.Warn().Str("database", name).Str("role", role).
-			Msg("Database deletion rejected: this node is not the primary writer")
-		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-			"error": fmt.Sprintf("database delete rejected: node role %q is not primary writer; route to the primary writer", role),
-			"role":  role,
-		})
 	}
 
 	ctx, cancel := h.storageContext(c, h.requestTimeout)
@@ -804,11 +906,21 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		// repeating the DELETE clears the residue; the 404 contract stands.
 		// That residue includes the empty directories an earlier version's
 		// delete left on local storage, which keep the database listed (#1425).
-		h.dropIcebergCatalog(ctx, name)
+		icebergErr := h.dropIcebergCatalog(ctx, name)
+		h.noticeIcebergDatabaseDropped(ctx, name)
 		removeEmptyDirectories(ctx, h.storage, name, h.logger)
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+		removeDatabaseStateDirectories(ctx, h.storage, name, h.logger)
+		notFound := fiber.Map{
 			"error": "Database '" + name + "' not found",
-		})
+		}
+		if icebergErr != nil {
+			// A repeat after a drop that could not run (#1789), refused
+			// again: still a 404, since there is no such database, with what
+			// is left of it.
+			notFound["iceberg_cleanup"] = "pending: the database's Iceberg tables were not dropped (" + icebergErr.Error() +
+				"); repeat the DELETE to drop them"
+		}
+		return c.Status(fiber.StatusNotFound).JSON(notFound)
 	}
 
 	// Rows acknowledged before the deletion and not in a file yet are flushed
@@ -884,6 +996,21 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 	files = h.withoutLateFlushes(ctx, name, files, preListed)
+	if h.icebergDropper != nil {
+		// A colocated Iceberg table's metadata sits in the measurement's own
+		// directory (#1676). DropDatabase removes it after writing its drop
+		// markers; deleting it here first would leave another node's catalog
+		// row pointing at metadata that is gone with no marker to say why
+		// (#1611). It is never in the cluster manifest, so leaving it out of
+		// the manifest deletes changes nothing there either.
+		kept := files[:0]
+		for _, f := range files {
+			if !h.icebergDropper.OwnsMetadataKey(f) {
+				kept = append(kept, f)
+			}
+		}
+		files = kept
+	}
 	var manifestEntries []*raft.FileEntry
 	if h.coordinator != nil && h.tieringManager == nil {
 		// The snapshot below is this node's FSM, which can trail the leader;
@@ -900,6 +1027,17 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	// database is not abandoned after the same fixed timeout as a small one.
 	cancel()
 	ctx, cancel = h.storageContext(c, h.requestTimeout*time.Duration(len(files)+len(manifestEntries)+2))
+	if h.onSpokeNamespaceRemoved != nil {
+		// Before the manifest and storage removals (#687 ordering): a delete
+		// that fails after this leaves receipts saying removed over files
+		// that still exist, which reconcile answers "present" either way.
+		if err := h.onSpokeNamespaceRemoved(ctx, name); err != nil {
+			h.logger.Error().Err(err).Str("database", name).Msg("Failed to mark edge-sync receipts removed; database not deleted")
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to prepare database deletion",
+			})
+		}
+	}
 	if h.tieringManager != nil {
 		// #1091: the tiering manager removes the manifest entries itself
 		// (hot listing plus manifest snapshot, chunked, edge-sync spoke paths
@@ -1008,10 +1146,22 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	// storage (#1425). An object store's prefixes cannot be removed through
 	// the backend; the listings leave out a database with nothing in it.
 	removeEmptyDirectories(ctx, h.storage, name, h.logger)
+	// And the empty directories its anchors and compaction manifests leave
+	// under the reserved roots. After a partial failure the anchors are kept
+	// (above), so their directory is not empty and stays.
+	removeDatabaseStateDirectories(ctx, h.storage, name, h.logger)
 
 	// Cached pruned path lists may name the removed files, partial or not.
 	if h.onFilesRemoved != nil {
 		h.onFilesRemoved()
+	}
+	// A delete that stops part-way returns below without dropping the
+	// catalog, leaving the export's tables naming what it removed; the
+	// scheduler maps the database's directory onto them (#1727). A delete
+	// that completes drops the tables below: no request then, since there is
+	// nothing left to reconcile.
+	if len(deleteErrors) > 0 && h.onPathsChanged != nil {
+		h.onPathsChanged([]string{name + "/"})
 	}
 
 	if len(deleteErrors) > 0 {
@@ -1028,16 +1178,24 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
-	// Iceberg catalog cleanup AFTER file deletion (#639 item 3): with the
-	// files gone, a racing reconcile pass can only empty tables, never
-	// recreate them. Failures are logged, not returned: the files are already
-	// deleted and catalog residue equals the pre-fix status quo.
+	// Iceberg catalog cleanup AFTER file deletion (#639 item 3): an export
+	// that starts after the drop then lists a database with no files. The
+	// drop waits for the exports of the database's tables that are running
+	// and none starts until it is done (#1789). A failure does not fail the
+	// request, since the files are already deleted, but the response says the
+	// tables are still there and that repeating the DELETE drops them.
 	//
 	// Now reached only on a fully successful deletion. A partial failure keeps
 	// the database -- marker, anchors and catalog -- so the retry finds it and
 	// finishes the job, rather than stranding a catalog entry for a database
 	// whose files are half gone.
-	h.dropIcebergCatalog(ctx, name)
+	icebergErr := h.dropIcebergCatalog(ctx, name)
+	h.noticeIcebergDatabaseDropped(ctx, name)
+	// The colocated Iceberg metadata DropDatabase just removed kept its
+	// measurement directories, and so the database, listed (#1676, #1425).
+	if h.icebergDropper != nil {
+		removeEmptyDirectories(ctx, h.storage, name, h.logger)
+	}
 
 	h.logger.Info().
 		Str("database", name).
@@ -1056,6 +1214,11 @@ func (h *DatabasesHandler) handleDelete(c *fiber.Ctx) error {
 	if len(unflushed) > 0 {
 		// allow_unreachable: the rows these nodes hold were left.
 		resp["unflushed_nodes"] = unflushed
+	}
+	if icebergErr != nil {
+		// The data is deleted; the database's Iceberg tables are not.
+		resp["iceberg_cleanup"] = "pending: the database's Iceberg tables were not dropped (" + icebergErr.Error() +
+			"); repeat the DELETE to drop them"
 	}
 	return c.JSON(resp)
 }
@@ -1222,7 +1385,7 @@ func (h *DatabasesHandler) listDatabases(ctx context.Context) ([]string, error) 
 	// Filter out hidden directories and sort
 	filtered := make([]string, 0, len(databases))
 	for _, db := range databases {
-		if !strings.HasPrefix(db, ".") && !strings.HasPrefix(db, "_") {
+		if !strings.HasPrefix(db, ".") && !strings.HasPrefix(db, "_") && !h.isWarehouseDir(db) {
 			filtered = append(filtered, db)
 		}
 	}
@@ -1269,6 +1432,9 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 			} else {
 				// Add any databases that only exist in cold tier
 				for _, db := range coldDatabases {
+					if h.isWarehouseDir(db) {
+						continue // not a database, as listDatabases (#1626)
+					}
 					if dbMeasurements[db] == nil {
 						dbMeasurements[db] = make(map[string]bool)
 					}
@@ -1313,8 +1479,9 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 		}
 		hasContent[db] = true
 
-		// Skip hidden measurements (like .arc-database marker)
-		if strings.HasPrefix(measurement, ".") || strings.HasPrefix(measurement, "_") {
+		// Skip hidden measurements (like .arc-database marker), and the
+		// directory a nested Iceberg warehouse occupies (#1626).
+		if strings.HasPrefix(measurement, ".") || strings.HasPrefix(measurement, "_") || h.isWarehouseMeasurement(db, measurement) {
 			continue
 		}
 
@@ -1359,7 +1526,7 @@ func (h *DatabasesHandler) listDatabasesWithMeasurementCounts(ctx context.Contex
 					continue
 				}
 				for _, m := range coldMeasurements {
-					if !strings.HasPrefix(m, ".") && !strings.HasPrefix(m, "_") {
+					if !strings.HasPrefix(m, ".") && !strings.HasPrefix(m, "_") && !h.isWarehouseMeasurement(db, m) {
 						dbMeasurements[db][m] = true
 					}
 				}
@@ -1439,7 +1606,7 @@ func (h *DatabasesHandler) listMeasurements(ctx context.Context, database string
 	// Filter out hidden directories and sort
 	filtered := make([]string, 0, len(measurementSet))
 	for m := range measurementSet {
-		if !strings.HasPrefix(m, ".") && !strings.HasPrefix(m, "_") {
+		if !strings.HasPrefix(m, ".") && !strings.HasPrefix(m, "_") && !h.isWarehouseMeasurement(database, m) {
 			filtered = append(filtered, m)
 		}
 	}
@@ -1482,6 +1649,44 @@ func (h *DatabasesHandler) databaseExists(ctx context.Context, name string) (boo
 	}
 
 	return h.databaseHasContent(ctx, name)
+}
+
+// ErrDatabaseNotFound and ErrInvalidDatabaseName are CheckDatabase's
+// answers, so a caller keeps the database routes' statuses: 404 and 400.
+var (
+	ErrDatabaseNotFound    = errors.New("database not found")
+	ErrInvalidDatabaseName = errors.New("invalid database name")
+)
+
+// CheckDatabase reports whether a database exists by the rule GET
+// /api/v1/databases/:name answers with, in its order (#1626):
+//   - ErrInvalidDatabaseName: not a safe storage segment (GET: 400);
+//   - the storage name-spelling error, as is (GET: 400 with its text, #1509);
+//   - ErrDatabaseNotFound: a reserved root directory, an Iceberg warehouse
+//     directory, or no marker, file, cold-tier row or manifest entry (404);
+//   - any other error: the check itself failed (500).
+//
+// It looks only at this node: on a cluster that keeps data per node, a
+// database created through POST /api/v1/databases is a marker on the
+// writer's disk, which a reader or compactor does not see.
+func (h *DatabasesHandler) CheckDatabase(ctx context.Context, name string) error {
+	if !isSafeStoragePathSegment(name) {
+		return ErrInvalidDatabaseName
+	}
+	if storage.IsReservedRootDir(name) || h.isWarehouseDir(name) {
+		return ErrDatabaseNotFound
+	}
+	if err := databaseSpellingError(h.storage, name); err != nil {
+		return err
+	}
+	exists, err := h.databaseExists(ctx, name)
+	if err != nil {
+		return fmt.Errorf("check database %q: %w", name, err)
+	}
+	if !exists {
+		return ErrDatabaseNotFound
+	}
+	return nil
 }
 
 // databaseHasHotFiles reports whether the backend holds a listable file under
@@ -1676,16 +1881,44 @@ func extractSubdirectories(files []string, prefix string) []string {
 }
 
 // dropIcebergCatalog is the nil-safe, logged wrapper around the wired
-// catalog dropper.
-func (h *DatabasesHandler) dropIcebergCatalog(ctx context.Context, name string) {
+// catalog dropper. It returns the dropper's error for the caller to report:
+// the files are deleted either way, and the database's Iceberg tables are
+// not, or not all of them (the drop waits for an export of them in progress
+// and gives up when that does not end in time, #1789; or it failed part way;
+// or, on a shared bucket, it ran past its deadline, #1792).
+func (h *DatabasesHandler) dropIcebergCatalog(ctx context.Context, name string) error {
 	if h.icebergDropper == nil {
-		return
+		return nil
 	}
-	if err := h.icebergDropper.DropDatabase(ctx, name); err != nil {
+	err := h.icebergDropper.DropDatabase(ctx, name)
+	if err != nil {
 		h.logger.Warn().Err(err).Str("database", name).
 			Msg("Iceberg catalog cleanup after database drop failed; re-running the DELETE retries it")
 	} else {
 		h.logger.Info().Str("database", name).Msg("Iceberg catalog artifacts removed for dropped database")
+	}
+	return err
+}
+
+// icebergDropNotifier is the coordinator's database-drop notice (#1731).
+type icebergDropNotifier interface {
+	ProposeIcebergDatabaseDropped(ctx context.Context, database string) error
+}
+
+// noticeIcebergDatabaseDropped tells every node that the database DELETE
+// completed, so a node with a node-local Iceberg warehouse drops its own
+// tables of it (#1731): this node's drop above covers only its own. Sent
+// whether or not this node exports to Iceberg, and on the 404 re-run too,
+// so repeating a DELETE re-sends it. A failure is logged, never returned:
+// the database is deleted.
+func (h *DatabasesHandler) noticeIcebergDatabaseDropped(ctx context.Context, name string) {
+	n, ok := h.coordinator.(icebergDropNotifier)
+	if !ok || n == nil {
+		return
+	}
+	if err := n.ProposeIcebergDatabaseDropped(ctx, name); err != nil {
+		h.logger.Warn().Err(err).Str("database", name).
+			Msg("Could not tell the cluster's nodes to drop their Iceberg tables of the deleted database; repeating the DELETE (it answers 404) sends it again")
 	}
 }
 
@@ -1723,6 +1956,46 @@ func removeEmptyDirectoryTree(ctx context.Context, lister storage.DirectoryListe
 	}
 }
 
+// removeDatabaseStateDirectories removes the directories a deleted database
+// leaves under the roots holding Arc's own state, when they hold nothing:
+// _schema/<db>/ (its field-schema anchors, deleted by
+// fieldschema.Registry.DeleteDatabase) and _compaction_state/<tier>/<db>/ (its
+// compaction manifests, deleted as each job commits). Each path is the
+// database's own segment joined under the root, never a prefix match, so a
+// database "db" never touches "db2". The tiers are listed one level deep; a
+// database's directory under a tier can hold nested ones (an edge-sync
+// spoke's databases), removed bottom-up when empty. Like
+// removeEmptyDirectories: local storage only, a directory that holds anything
+// stays (any manifest left in it, in flight or parked .quarantined, or an
+// anchor a concurrent ingest just wrote). LocalBackend.Write recreates a
+// directory removed under it and retries (on macOS the removal can surface
+// as EINVAL rather than ENOENT, handled the same way, #1767); recreating the
+// chain is retried once per level, so one removal walking bottom-up past the
+// levels it recreates cannot fail it (#1804). Two removers at once (two
+// concurrent DELETEs of the same database) still can, and the next anchor
+// flush or compaction cycle repeats the write. The tier directories and the
+// roots, which other databases share, stay.
+func removeDatabaseStateDirectories(ctx context.Context, backend storage.Backend, name string, logger zerolog.Logger) {
+	// Checked first so an object store, which has no directories to remove,
+	// is not sent a listing request on every delete.
+	if _, ok := backend.(storage.DirectoryRemover); !ok {
+		return
+	}
+	lister, ok := backend.(storage.DirectoryLister)
+	if !ok {
+		return
+	}
+	removeEmptyDirectories(ctx, backend, strings.TrimSuffix(fieldschema.AnchorPrefixForDatabase(name), "/"), logger)
+	tiers, err := lister.ListDirectories(ctx, compaction.ManifestBasePath+"/")
+	if err != nil {
+		logger.Debug().Err(err).Str("database", name).Msg("Could not list compaction state tiers to remove the database's directories")
+		return
+	}
+	for _, tier := range tiers {
+		removeEmptyDirectories(ctx, backend, compaction.ManifestBasePath+"/"+tier+"/"+name, logger)
+	}
+}
+
 // reclaimStagedPartials deletes write-staging partials under prefix and returns
 // how many were removed.
 //
@@ -1757,4 +2030,11 @@ func reclaimStagedPartials(ctx context.Context, backend storage.Backend, prefix 
 // files: the query caches hold pruned partition lists naming them.
 func (h *DatabasesHandler) SetOnFilesRemoved(fn func()) {
 	h.onFilesRemoved = fn
+}
+
+// SetOnPathsChanged sets the function told which storage prefixes a database
+// delete changed (main.go: the Iceberg scheduler's RequestReconcilePaths,
+// #1727).
+func (h *DatabasesHandler) SetOnPathsChanged(fn func(keys []string)) {
+	h.onPathsChanged = fn
 }

@@ -163,6 +163,12 @@ type StagedCompaction struct {
 	PauseGen uint64    `json:"pause_gen,omitempty"`
 	At       time.Time `json:"at"`
 	Index    uint64    `json:"index"`
+	// Acked: an object job committed with read fences on (#1852,
+	// compaction_fences.go); Phase is where it is and PhaseIndex the log
+	// index that set it.
+	Acked      bool   `json:"acked,omitempty"`
+	Phase      string `json:"phase,omitempty"`
+	PhaseIndex uint64 `json:"phase_index,omitempty"`
 }
 
 // EnableCompactionCommitPayload turns the flag on; see
@@ -416,6 +422,7 @@ func (f *ClusterFSM) ObjectStagedSignature() uint64 {
 		h := fnv.New64a()
 		h.Write([]byte(s.Job))
 		h.Write([]byte{boolByte(s.Finalizing), boolByte(s.Finalized)})
+		h.Write([]byte(s.Phase)) // an Acked job's reads change with its phase
 		sig += h.Sum64()
 	}
 	return sig
@@ -535,11 +542,13 @@ func (f *ClusterFSM) applyStageCompaction(payload []byte, logIndex uint64) inter
 	}
 	// Two staged jobs over one file could both stage; only one could commit,
 	// and the other would have made every node pull its output for nothing.
-	if _, taken := f.stagedPaths[p.Output.Path]; taken {
+	if _, taken := f.stagedPaths[p.Output.Path]; taken || f.rehomeOwnsLocked(p.Output.Path) {
 		return &CompactionConflictError{Job: p.Job, Reason: CompactionInputStaged}
 	}
 	for _, in := range p.Inputs {
-		if _, taken := f.stagedPaths[in.Path]; taken {
+		// A re-home job's source or output: the job would replace what
+		// the compaction merges (#1825).
+		if _, taken := f.stagedPaths[in.Path]; taken || f.rehomeOwnsLocked(in.Path) {
 			return &CompactionConflictError{Job: p.Job, Reason: CompactionInputStaged}
 		}
 	}
@@ -678,6 +687,9 @@ func (f *ClusterFSM) applyCommitCompaction(payload []byte, logIndex uint64) inte
 	}
 	if s.Object {
 		s.Finalizing, s.Holders, s.FinalizingAt = true, nil, p.Now
+		if f.compactionFences {
+			s.Acked, s.Phase, s.PhaseIndex = true, PhaseCommitted, logIndex
+		}
 	} else {
 		f.unstageLocked(p.Job, false)
 	}
@@ -738,6 +750,11 @@ func (f *ClusterFSM) applyFinalizeCompaction(payload []byte) interface{} {
 	if e, reg := f.files[s.Output.Path]; !reg || e.CompactionJob != p.Job || e.SHA256 != s.Output.SHA256 {
 		return &CompactionConflictError{Job: p.Job, Reason: CompactionOutputGone}
 	}
+	if s.Acked && (s.Phase != PhaseRemoved || !f.fencesAtLocked(s.PhaseIndex)) {
+		// Every node must have dropped the caches that may name the input
+		// objects just deleted before the job, and its exclusions, end.
+		return &CompactionConflictError{Job: p.Job, Reason: CompactionFencesBehind}
+	}
 	s.Finalized = true
 	return nil
 }
@@ -758,6 +775,11 @@ func (f *ClusterFSM) applyCleanupCompaction(payload []byte) interface{} {
 	}
 	if s.FinisherNode != p.By {
 		return &CompactionConflictError{Job: p.Job, Reason: CompactionNotFinisher}
+	}
+	if s.Acked && (s.Phase != PhaseRemoved || !f.fencesAtLocked(s.PhaseIndex)) {
+		// Whatever the ending, every node dropped the caches that may name
+		// the deleted inputs before the job's exclusions go (#1852).
+		return &CompactionConflictError{Job: p.Job, Reason: CompactionFencesBehind}
 	}
 	if !s.Finalized {
 		e, reg := f.files[s.Output.Path]
@@ -795,6 +817,12 @@ func (f *ClusterFSM) applyRevertCompaction(payload []byte, logIndex uint64) inte
 	if s.FinisherNode != p.By {
 		f.mu.Unlock()
 		return &CompactionConflictError{Job: p.Job, Reason: CompactionNotFinisher}
+	}
+	if s.Acked && (s.Phase != PhaseReverting || !f.fencesAtLocked(s.PhaseIndex)) {
+		// Its output object is deleted and every node dropped the caches
+		// that may name it first (#1852).
+		f.mu.Unlock()
+		return &CompactionConflictError{Job: p.Job, Reason: CompactionFencesBehind}
 	}
 	// Not refused under a compaction pause: a committed job drains through
 	// it (the pause is acknowledged only once none is finalizing), and a
@@ -917,6 +945,13 @@ func (f *ClusterFSM) manifestCASRefusalsLocked(ops []BatchFileOp, decoded []any)
 	}
 	var refused []string
 	for i, op := range ops {
+		// A path a re-home job owns changes only by the job's own latch
+		// (rehome.go): a DELETE, retention or repair that read it before
+		// the job began is refused, as for content that changed.
+		if p := batchOpPath(op.Type, decoded[i]); p != "" && (f.rehomeOwnsLocked(p) || f.compactionFencedOwnsLocked(p)) {
+			refused = append(refused, p)
+			continue
+		}
 		switch op.Type {
 		case CommandRegisterFile:
 			rp := decoded[i].(RegisterFilePayload)
@@ -938,6 +973,19 @@ func (f *ClusterFSM) manifestCASRefusalsLocked(ops []BatchFileOp, decoded []any)
 		}
 	}
 	return refused
+}
+
+// batchOpPath is the path a batch op changes.
+func batchOpPath(t CommandType, decoded any) string {
+	switch t {
+	case CommandRegisterFile:
+		return decoded.(RegisterFilePayload).File.Path
+	case CommandDeleteFile:
+		return decoded.(DeleteFilePayload).Path
+	case CommandUpdateFile:
+		return decoded.(UpdateFilePayload).File.Path
+	}
+	return ""
 }
 
 // registeredAtLocked reports whether path is registered, at sha when sha is

@@ -44,9 +44,15 @@ type RetentionHandler struct {
 	// onFilesRemoved invalidates the query caches (and the cluster's) after
 	// files were removed or rewritten: see SetOnFilesRemoved.
 	onFilesRemoved func()
-	storage        storage.Backend
-	config         *config.RetentionConfig
-	db             *sql.DB // SQLite for policy metadata
+	// onPathsChanged, when set, is told the storage prefixes a run changed
+	// (SetOnPathsChanged).
+	onPathsChanged func(keys []string)
+	// onSpokeFilesRemoved marks edge-sync receipts removed before retention
+	// deletes the files (#1186); nil unless this node is an edge-sync hub.
+	onSpokeFilesRemoved func(ctx context.Context, paths []string) error
+	storage             storage.Backend
+	config              *config.RetentionConfig
+	db                  *sql.DB // SQLite for policy metadata
 	// ownsDB records whether this handler opened db itself. When retention
 	// shares the auth database (the default), the handle is borrowed and Close
 	// must leave it to its owner.
@@ -70,6 +76,10 @@ type RetentionHandler struct {
 	// clusterOwned: this node's table has been the cluster's mirror (the
 	// retention_cluster_state marker), so its own rows are never run again.
 	clusterOwned atomic.Bool
+	// rehomeClaim claims a file retention is about to delete, against the
+	// re-home jobs in flight (SetRehomeClaim, #1825): free is false when a
+	// job owns the file. nil: no such jobs.
+	rehomeClaim func(path string) (release func(), free bool)
 }
 
 // RetentionPolicy represents a retention policy
@@ -319,6 +329,12 @@ func NewRetentionHandler(storage storage.Backend, duckdb *database.DuckDB, cfg *
 // not disappear, and the scheduler replays them forever. Without this the only
 // signal is a listing error buried in a scheduled run hours later, attributed
 // to storage rather than to the policy.
+// SetRehomeClaim gives retention the claim it takes on a file before
+// deleting it, so a re-home job and retention never act on one file (#1825).
+func (h *RetentionHandler) SetRehomeClaim(fn func(path string) (release func(), free bool)) {
+	h.rehomeClaim = fn
+}
+
 func (h *RetentionHandler) warnUnusablePolicies() {
 	// Inactive rows are included: a disabled policy with a broken name is one
 	// toggle away from failing, and the point is to report it before then.
@@ -371,7 +387,7 @@ type coldRetentionTier interface {
 	GetColdFilesForRetention(ctx context.Context, database string, cutoff time.Time) ([]tiering.FileMetadata, error)
 	RetireColdRows(ctx context.Context, paths []string) (int, error)
 	RevertColdRowToHot(ctx context.Context, path string) error
-	NotifyColdFilesRemoved(n int)
+	NotifyColdFilesRemoved(paths []string)
 }
 
 // SetTieringManager makes retention apply its policies to the cold tier too.
@@ -817,6 +833,7 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 		totalSkipped += skipped
 		totalSkipped += discovery.unusable.counts[measurement]
 		if err != nil {
+			h.measurementChanged(false, filesDeleted, policy.Database, measurement) // partial progress
 			h.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to process measurement")
 			// Abort on any error — manifest failures are non-transient (Raft quorum loss)
 			// and continuing would produce orphaned manifest entries with no retry path.
@@ -832,6 +849,7 @@ func (h *RetentionHandler) ExecutePolicy(ctx context.Context, policyID int64) (*
 		coldRows, coldFiles, coldErr := h.deleteOldColdFiles(ctx, cold, measurement, cutoffDate, false)
 		totalDeleted += coldRows
 		totalFilesDeleted += coldFiles
+		h.measurementChanged(false, filesDeleted+coldFiles, policy.Database, measurement)
 		if coldErr != nil {
 			if executionID > 0 {
 				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), coldErr.Error())
@@ -1033,6 +1051,7 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 		totalDeleted += deleted
 		totalFilesDeleted += filesDeleted
 		if err != nil {
+			h.measurementChanged(req.DryRun, filesDeleted, policy.Database, measurement) // partial progress
 			h.logger.Error().Err(err).Str("measurement", measurement).Msg("Failed to process measurement")
 			if !req.DryRun && executionID > 0 {
 				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), err.Error())
@@ -1047,6 +1066,7 @@ func (h *RetentionHandler) handleExecute(c *fiber.Ctx) error {
 		coldRows, coldFiles, coldErr := h.deleteOldColdFiles(c.Context(), cold, measurement, cutoffDate, req.DryRun)
 		totalDeleted += coldRows
 		totalFilesDeleted += coldFiles
+		h.measurementChanged(req.DryRun, filesDeleted+coldFiles, policy.Database, measurement)
 		if coldErr != nil {
 			if !req.DryRun && executionID > 0 {
 				h.recordExecutionComplete(executionID, "failed", totalDeleted, float64(time.Since(start).Milliseconds()), coldErr.Error())
@@ -1117,6 +1137,14 @@ func (h *RetentionHandler) handleGetExecutions(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid policy ID"})
 	}
 
+	// An ID with no policy has no history to list: 404, as GET /:id answers,
+	// rather than a 200 with an empty one.
+	if _, err := h.getPolicy(int64(policyID)); errors.Is(err, errRetentionNotCaughtUp) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	} else if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Retention policy not found"})
+	}
+
 	limit := c.QueryInt("limit", 50)
 
 	rows, err := h.db.Query(`
@@ -1133,7 +1161,8 @@ func (h *RetentionHandler) handleGetExecutions(c *fiber.Ctx) error {
 	}
 	defer rows.Close()
 
-	var executions []RetentionExecution
+	// Non-nil, so a policy that has not run yet lists [], not null.
+	executions := []RetentionExecution{}
 	for rows.Next() {
 		var ex RetentionExecution
 		var executionDurationMs sql.NullFloat64
@@ -1372,6 +1401,17 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 	var eligibleRows []int64   // row counts parallel to eligiblePaths
 
 	for _, relativePath := range parquetFiles {
+		// A file a re-home job in flight owns (#1825) is left for the next
+		// run: the job is replacing it, or writing it. Not counted as
+		// skipped, which reports files that can never be processed.
+		if h.rehomeClaim != nil {
+			release, free := h.rehomeClaim(relativePath)
+			release()
+			if !free {
+				h.logger.Info().Str("file", relativePath).Msg("Retention leaves a file a re-home job in flight owns for its next run")
+				continue
+			}
+		}
 		fullPath, err := readParquetPath(h.storage, relativePath)
 		if err != nil {
 			// Counted, not just logged. A file that can never be resolved is
@@ -1437,6 +1477,22 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 		var ops []raft.BatchFileOp
 		subPaths := chunk // default: all chunk paths (no coordinator)
 		subRows := eligibleRows[i:end]
+		// Edge-sync receipts first (#1186), before the manifest and storage
+		// removals, as tiering marks before it deletes (#687): unmarked, the
+		// spoke would re-send these files and the next pass would delete them
+		// again. A failure aborts the cycle like a manifest failure; marks
+		// already written over files still present are harmless (reconcile
+		// answers "present" either way) and the next run deletes them.
+		if h.onSpokeFilesRemoved != nil {
+			if err := h.onSpokeFilesRemoved(ctx, chunk); err != nil {
+				h.logger.Error().Err(err).Int("count", len(chunk)).Int("chunk_start", i).
+					Msg("Failed to mark edge-sync receipts removed; aborting retention cycle")
+				if len(deletedFilePaths) > 0 {
+					h.cleanupEmptyDirectories(ctx, deletedFilePaths)
+				}
+				return deletedRows, deletedFiles, skipped, fmt.Errorf("failed to mark edge-sync receipts removed: %w", err)
+			}
+		}
 		if h.coordinator != nil {
 			ops = make([]raft.BatchFileOp, 0, len(chunk))
 			subPaths = make([]string, 0, len(chunk))
@@ -1464,7 +1520,20 @@ func (h *RetentionHandler) deleteOldFiles(ctx context.Context, database, measure
 		}
 
 		for j, relativePath := range subPaths {
-			if err := h.storage.Delete(ctx, relativePath); err != nil {
+			// Claimed across the check and the delete: the scan above ran
+			// some time ago, and a re-home job that began since owns the
+			// file. While the claim is held no job can begin on it.
+			release := func() {}
+			if h.rehomeClaim != nil {
+				var free bool
+				if release, free = h.rehomeClaim(relativePath); !free {
+					h.logger.Info().Str("file", relativePath).Msg("Retention leaves a file a re-home job in flight owns for its next run")
+					continue
+				}
+			}
+			err := h.storage.Delete(ctx, relativePath)
+			release()
+			if err != nil {
 				// Storage errors are transient (network blip, file already gone) —
 				// log as Warn and continue so one bad file doesn't abort the cycle.
 				h.logger.Warn().Err(err).Str("file", relativePath).Msg("Failed to delete file from storage; skipping")
@@ -1638,12 +1707,37 @@ func retentionManifestReason[T int | int64](policyID T) string {
 	return fmt.Sprintf("retention:%d", policyID)
 }
 
+// SetOnSpokeFilesRemoved wires the edge-sync hub's receipt marking into
+// retention (#1186), hot and cold. It runs before files are deleted; paths
+// outside a spoke namespace match no receipt.
+func (h *RetentionHandler) SetOnSpokeFilesRemoved(fn func(ctx context.Context, paths []string) error) {
+	h.onSpokeFilesRemoved = fn
+}
+
 // SetOnFilesRemoved sets the function called after this handler removed or
 // rewrote parquet files: the query caches hold pruned partition lists, and one
 // naming a removed hour makes DuckDB report "No files found", which a query
 // answers with a retryable 503 (classifyNoFiles) until the cache is cleared.
 func (h *RetentionHandler) SetOnFilesRemoved(fn func()) {
 	h.onFilesRemoved = fn
+}
+
+// SetOnPathsChanged sets the function told which storage prefixes a retention
+// run changed (main.go: the Iceberg scheduler's RequestReconcilePaths, #1727).
+func (h *RetentionHandler) SetOnPathsChanged(fn func(keys []string)) {
+	h.onPathsChanged = fn
+}
+
+// measurementChanged reports a measurement whose files the run removed, right
+// after its own deletes rather than at the end of the run, which can be long
+// with serial object-store deletes. Reported as the measurement's directory:
+// the scheduler maps it onto the tables it knows (on a hub, a spoke's data is
+// "{spoke}/{db}/..."). Not for a dry run or a measurement nothing left.
+func (h *RetentionHandler) measurementChanged(dryRun bool, files int, database, measurement string) {
+	if dryRun || files <= 0 || h.onPathsChanged == nil || database == "" || measurement == "" {
+		return
+	}
+	h.onPathsChanged([]string{database + "/" + measurement + "/"})
 }
 
 // clearCachesAfterRun clears DuckDB's cache_httpfs cache (ClearHTTPCache) and,

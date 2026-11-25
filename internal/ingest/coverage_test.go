@@ -79,7 +79,7 @@ func newCoverageBuffer(t *testing.T, maxBufferSize int, reg *coverageRegistrar) 
 	t.Cleanup(func() { _ = w.Close() })
 	cfg := &config.IngestConfig{
 		MaxBufferSize:  maxBufferSize,
-		MaxBufferAgeMS: 600000,
+		MaxBufferAgeMS: noAgeFlushMS, // publish-delay tests backdate these buffers
 		Compression:    "snappy",
 		ShardCount:     4,
 		FlushWorkers:   2,

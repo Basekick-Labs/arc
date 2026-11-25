@@ -68,7 +68,9 @@ type Deps struct {
 	// the single-batch concat is the serial tail this slice removes). The api side
 	// owns the governance cap/timeout, the metrics/onComplete callbacks, and the
 	// runtime.KeepAlive that holds the FFI-backed reader alive across the async wire
-	// writer (its Release is a no-op; the arcx buffers free on a GC finalizer). `start`
+	// writer, and it releases the reader when the writer is done (Release frees the
+	// current batch and drops the engine stream; only the stream struct has a GC
+	// cleanup). `start`
 	// is when the query began (BEFORE the engine ran) so execution_time_ms covers the
 	// engine work. Returns true if it served. nil in shadow-only wiring.
 	ServeStream func(c *fiber.Ctx, reader array.RecordReader, start time.Time) bool
@@ -249,7 +251,7 @@ func Run(c *fiber.Ctx, d Decision, h Handler, mode Mode, start time.Time) (handl
 	}
 	ctx := c.UserContext()
 
-	engineSQL, ok := h.buildEngineSQL(ctx, d)
+	plan, ok := h.planEngine(ctx, d)
 	if !ok {
 		// No files / expansion failed — let DuckDB's normal no-files path handle it.
 		return false
@@ -257,10 +259,10 @@ func Run(c *fiber.Ctx, d Decision, h Handler, mode Mode, start time.Time) (handl
 
 	switch mode {
 	case ModeShadow:
-		h.runShadowAsync(ctx, d, engineSQL)
+		h.runShadowAsync(ctx, d, plan.sql)
 		return false // DuckDB always serves in shadow
 	case ModeServe:
-		return h.runServe(c, ctx, d, engineSQL, start)
+		return h.runServe(c, ctx, d, plan, start)
 	default:
 		return false
 	}
@@ -277,27 +279,32 @@ func RunArrow(ctx context.Context, d Decision, h Handler, mode Mode) (reader arr
 	if !d.Eligible || mode == ModeOff {
 		return nil, false
 	}
-	engineSQL, ok := h.buildEngineSQL(ctx, d)
+	plan, ok := h.planEngine(ctx, d)
 	if !ok {
 		return nil, false
 	}
 	switch mode {
 	case ModeShadow:
-		h.runShadowAsync(ctx, d, engineSQL)
+		h.runShadowAsync(ctx, d, plan.sql)
 		return nil, false // DuckDB serves in shadow
 	case ModeServe:
-		r, err := arcxengine.QueryStream(engineSQL, d.Ctx)
+		r, err := arcxengine.QueryStream(plan.sql, d.Ctx)
 		if err != nil {
-			if _, unsupported := err.(arcxengine.ErrUnsupported); !unsupported {
-				h.Logger.Error().Err(err).Str("shape", d.Shape).Str("sql", sqlutil.ForLog(engineSQL)).
+			if _, unsupported := err.(arcxengine.ErrUnsupported); !unsupported && !h.logRemovedBeforeRead(d, plan, err) {
+				h.Logger.Error().Err(err).Str("shape", d.Shape).Str("sql", sqlutil.ForLog(plan.sql)).
 					Msg("arcx serve (arrow): engine ERROR; falling back to DuckDB")
 				h.Metrics.ArcxServeError(d.Shape)
 			}
 			return nil, false
 		}
-		// caller owns r: it drains the reader to the IPC wire and MUST
-		// runtime.KeepAlive(r) past the last batch (the FFI-backed batches free on a
-		// GC finalizer; Release is a no-op) — the FFI use-after-free cliff.
+		// A file removed while the stream runs surfaces from Err as a
+		// *FileVanishedError (#1357).
+		r = h.vanishChecked(r, d, plan)
+		// caller owns r: it streams the reader to the IPC wire, MUST Release it
+		// when done (a reader stopped before EOF, at the governance cap or on a
+		// cancel, otherwise leaks its current batch and keeps the engine's
+		// workers until a GC), and MUST runtime.KeepAlive(r) past the last batch
+		// — the FFI use-after-free cliff.
 		return r, true
 	default:
 		return nil, false
@@ -309,12 +316,28 @@ func RunArrow(ctx context.Context, d Decision, h Handler, mode Mode) (reader arr
 // parts. Returns ok=false if the backend isn't local (the engine has no
 // object-store reader yet — Phase 4) or no parquet files exist.
 func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
+	plan, ok := h.planEngine(ctx, d)
+	return plan.sql, ok
+}
+
+// enginePlan is the engine SQL and the files it names: entries are
+// backend-relative and each file's absolute path is basePath + "/" + entry,
+// exactly the string written into the SQL. The serve path keeps them to tell
+// a file removed mid-read from an engine fault (vanishedPlanFile).
+type enginePlan struct {
+	sql      string
+	basePath string
+	entries  []string
+}
+
+// planEngine is buildEngineSQL keeping the file list.
+func (h Deps) planEngine(ctx context.Context, d Decision) (enginePlan, bool) {
 	// Local-FS only: the engine opens local files directly and has no S3/Azure
 	// reader. A non-local backend must decline (→ DuckDB), not be handed paths it
 	// can't open. This is a correctness gate, not an optimization.
 	local, ok := h.Storage.(*storage.LocalBackend)
 	if !ok {
-		return "", false
+		return enginePlan{}, false
 	}
 	basePath := local.GetBasePath()
 
@@ -324,7 +347,7 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 	)
 	if err != nil {
 		h.Logger.Warn().Err(err).Str("prefix", prefix).Msg("arcx: storage list failed; declining")
-		return "", false
+		return enginePlan{}, false
 	}
 	var arr strings.Builder
 	arr.WriteByte('[')
@@ -341,16 +364,25 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 	}
 	arr.WriteByte(']')
 	if n == 0 {
-		return "", false
+		return enginePlan{}, false
 	}
 
+	sql, ok := engineSQLFor(d, arr.String())
+	if !ok {
+		return enginePlan{}, false
+	}
+	return enginePlan{sql: sql, basePath: basePath, entries: entries}, true
+}
+
+// engineSQLFor builds the arcx SQL for a decision over a quoted path array.
+func engineSQLFor(d Decision, pathArray string) (string, bool) {
 	switch d.Shape {
 	case ShapeCountStar:
 		as, ok := aliasSuffix(d.AggAlias)
 		if !ok {
 			return "", false
 		}
-		return "SELECT count(*)" + as + " FROM read_parquet(" + arr.String() + ")", true
+		return "SELECT count(*)" + as + " FROM read_parquet(" + pathArray + ")", true
 	case ShapeDateTruncCent:
 		// Unit spelling preserved verbatim so the engine reproduces DuckDB's
 		// derived column name. Column is the "time" convention (F1). An optional
@@ -360,7 +392,7 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 		b.WriteString("SELECT date_trunc('")
 		b.WriteString(escapeStringLiteral(d.Unit))
 		b.WriteString("', time), count(*) FROM read_parquet(")
-		b.WriteString(arr.String())
+		b.WriteString(pathArray)
 		b.WriteByte(')')
 		if d.WhereText != "" {
 			b.WriteString(" WHERE ")
@@ -380,13 +412,13 @@ func (h Deps) buildEngineSQL(ctx context.Context, d Decision) (string, bool) {
 		if !ok {
 			return "", false
 		}
-		return "SELECT " + fn + "(" + d.Col + ")" + as + " FROM read_parquet(" + arr.String() + ")", true
+		return "SELECT " + fn + "(" + d.Col + ")" + as + " FROM read_parquet(" + pathArray + ")", true
 	case ShapeScan:
-		return buildScanSQL(d, arr.String())
+		return buildScanSQL(d, pathArray)
 	case ShapeScanAgg:
-		return buildScanAggSQL(d, arr.String())
+		return buildScanAggSQL(d, pathArray)
 	case ShapeScanAggGrouped:
-		return buildGroupedSQL(d, arr.String())
+		return buildGroupedSQL(d, pathArray)
 	default:
 		return "", false
 	}
@@ -621,9 +653,13 @@ func isAggItem(item string) bool {
 	inner := item[open+1 : len(item)-1]
 	fn := item[:open]
 	switch {
-	// `count` also takes a map subscript `m['k']` (map-2); every other unary
+	// `count` also takes a map subscript `m['k']` (map-2) and the cd-1 form
+	// `DISTINCT <col>` (exactly readCountDistinct's emission); every other unary
 	// aggregate (agg-1 set, mean, the agg-6a moments) stays bare.
 	case fn == "count":
+		if col, ok := strings.CutPrefix(inner, "DISTINCT "); ok {
+			return isColumnRef(col)
+		}
 		return isColumnRef(inner)
 	// agg-7: `quantile_*(col, q)` — exactly a bare ident and a fraction.
 	case quantileAggFns[fn]:
@@ -666,6 +702,19 @@ func isOracleUnstableItem(item string) bool {
 	// orders of magnitude across thread counts (plan-adversarial M1).
 	for _, p := range []string{"covar_pop(", "covar_samp(", "regr_sxy(", "regr_intercept(",
 		"fsum(", "sumkahan(", "kahan_sum(", "favg("} {
+		if strings.HasPrefix(item, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// isPinnedNaNItem: the three bivariate aggregates whose DuckDB answer for ±Inf input
+// depends on its own partitioning (arcX moments-nd M3). arcx pins them to NaN on any
+// non-finite input, so arcx NaN vs a DuckDB ±Inf on these is the known divergence and
+// is filed as `oraclediff:` (WARN), not a mismatch alarm.
+func isPinnedNaNItem(item string) bool {
+	for _, p := range []string{"covar_pop(", "covar_samp(", "regr_sxy("} {
 		if strings.HasPrefix(item, p) {
 			return true
 		}
@@ -854,9 +903,13 @@ func (h Deps) runShadow(ctx context.Context, d Decision, engineSQL string) {
 	}
 	rec, err := drainReaderToRecord(reader, ShadowMaxRows)
 	// KeepAlive: the reader (holding FFI-backed arcx buffers) must stay reachable until
-	// AFTER the drain reads the last batch — Release is a no-op; the stream frees on a GC
-	// finalizer, so an early finalize is a use-after-free.
+	// AFTER the drain reads the last batch, so an early collection is a use-after-free.
+	// Release afterwards: a drain stopped at ShadowMaxRows has not reached EOF, and the
+	// reader's current batch (no GC cleanup of its own) and the engine stream (whose
+	// Drop stops arcx's workers) are freed only by Release. drainReaderToRecord has
+	// already copied what it needs into rec.
 	runtime.KeepAlive(reader)
+	reader.Release()
 	if errors.Is(err, errShadowTruncated) {
 		// Too big to compare in memory. A SKIP, not an error and not a mismatch — arcx
 		// may well be correct here; we simply declined to hold the result. Alarming would
@@ -1099,28 +1152,61 @@ func (h Deps) compareToOracle(ctx context.Context, d Decision, rec arrow.Record)
 // runServe streams arcx's result for a green shape. Falls back (handled=false) on
 // decline; on a real error it alarms and falls back too (Phase 1 keeps DuckDB the
 // safety net rather than surfacing arcx errors to users).
-func (h Deps) runServe(c *fiber.Ctx, ctx context.Context, d Decision, engineSQL string, start time.Time) bool {
-	reader, err := arcxengine.QueryStream(engineSQL, d.Ctx)
+func (h Deps) runServe(c *fiber.Ctx, ctx context.Context, d Decision, plan enginePlan, start time.Time) bool {
+	reader, err := arcxengine.QueryStream(plan.sql, d.Ctx)
 	if err != nil {
 		if _, unsupported := err.(arcxengine.ErrUnsupported); unsupported {
 			return false // silent fallback — normal router contract
 		}
-		h.Logger.Error().Err(err).Str("shape", d.Shape).Str("sql", sqlutil.ForLog(engineSQL)).
+		if h.logRemovedBeforeRead(d, plan, err) {
+			return false
+		}
+		h.Logger.Error().Err(err).Str("shape", d.Shape).Str("sql", sqlutil.ForLog(plan.sql)).
 			Msg("arcx serve: engine ERROR; falling back to DuckDB")
 		h.Metrics.ArcxShadowError(d.Shape)
 		return false
 	}
 	if h.ServeStream == nil {
-		// No streamer wired (shadow-only build/config) — release the reader (its
-		// Release is a no-op; the stream frees on GC finalizer) and fall back.
+		// No streamer wired (shadow-only build/config) — release the reader (this
+		// frees its current batch and drops the engine stream) and fall back.
 		reader.Release()
 		return false
 	}
 	// ServeStream owns the reader across the async wire writer: it must
-	// runtime.KeepAlive(reader) until AFTER the last batch is encoded, because the
-	// imported reader's Release is a no-op and the FFI-backed batches free on a GC
-	// finalizer — a reader that goes unreachable mid-encode is the design doc's FFI
-	// use-after-free cliff. The router does NOT defer-release here; the reader's
-	// lifetime is the streamer's, held for the in-flight response.
-	return h.ServeStream(c, reader, start)
+	// runtime.KeepAlive(reader) until AFTER the last batch is encoded — a reader
+	// that goes unreachable mid-encode is the design doc's FFI use-after-free
+	// cliff — and it releases the reader when the writer is done. The router does
+	// NOT defer-release here; the reader's lifetime is the streamer's, held for the
+	// in-flight response.
+	// A file removed while the stream runs surfaces from Err as a
+	// *FileVanishedError (#1357).
+	return h.ServeStream(c, h.vanishChecked(reader, d, plan), start)
+}
+
+// vanishChecked wraps a serve-mode engine reader so a mid-stream failure
+// caused by a removed plan file is reported as a *FileVanishedError, and
+// logged once here with the path and the engine's own text: the error the
+// api writes to the client and to its own log line carries neither.
+func (h Deps) vanishChecked(r array.RecordReader, d Decision, plan enginePlan) array.RecordReader {
+	shape, logger := d.Shape, h.Logger // the closure lives as long as the stream
+	return wrapVanishCheck(r, plan.basePath, plan.entries, func(path string, cause error) {
+		logger.Warn().Err(cause).Str("shape", shape).Str("path", path).
+			Msg("arcx serve: a file the query was reading was removed while it ran (compaction, retention or a delete); the client is told to retry")
+	})
+}
+
+// logRemovedBeforeRead handles an engine error from QueryStream that a removed
+// plan file explains (aggregate shapes and ORDER BY scans execute inside
+// QueryStream, so this is where their removed file shows up). It logs at Warn
+// rather than as an engine ERROR and reports true; the caller falls back to
+// DuckDB, which lists the files again and answers the query (or its own 503 if
+// it races another removal).
+func (h Deps) logRemovedBeforeRead(d Decision, plan enginePlan, err error) bool {
+	path, ok := vanishedPlanFile(err, plan.basePath, plan.entries)
+	if !ok {
+		return false
+	}
+	h.Logger.Warn().Err(err).Str("shape", d.Shape).Str("path", path).
+		Msg("arcx serve: a file the query planned was removed before arcx read it (compaction, retention or a delete); falling back to DuckDB")
+	return true
 }

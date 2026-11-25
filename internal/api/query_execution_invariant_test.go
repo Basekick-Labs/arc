@@ -87,7 +87,8 @@ func TestQueryExecutionOutcomeInvariant(t *testing.T) {
 				t.Cleanup(func() { arcxArrowDispatch = originalDispatch })
 				h.queryTimeout = time.Second
 				arcxArrowDispatch = func(_ *QueryHandler, _ *fiber.Ctx, ctx context.Context,
-					_ context.CancelFunc, _, _, _ string, _ func(int), _ func(string)) bool {
+					_ context.CancelFunc, _ time.Time, _, _, _ string, _ int,
+					_ func(int64), _ func(), _ func(int), _ func(string)) bool {
 					<-ctx.Done()
 					return false
 				}

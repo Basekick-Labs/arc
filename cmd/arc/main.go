@@ -41,12 +41,14 @@ import (
 	"github.com/basekick-labs/arc/internal/mqtt"
 	"github.com/basekick-labs/arc/internal/queryregistry"
 	"github.com/basekick-labs/arc/internal/reconciliation"
+	"github.com/basekick-labs/arc/internal/rehome"
 	"github.com/basekick-labs/arc/internal/scheduler"
 	"github.com/basekick-labs/arc/internal/shutdown"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/telemetry"
 	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/basekick-labs/arc/internal/wal"
+	"github.com/gofiber/fiber/v2"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -79,6 +81,29 @@ const cacheInvalidateHMACTolerance = security.HMACTimestampTolerance
 // server.shutdown_timeout is missing or non-positive. It matches the key's
 // own default (internal/config/config.go, setDefaults).
 const defaultShutdownTimeout = 30 * time.Second
+
+// shutdownComponentReserve is the part of the shutdown budget the components
+// keep (shutdown.Coordinator.SetComponentReserve): half for the arrow
+// buffer's Close, whose budget is also half, plus a tenth for the WAL's final
+// sync and the closes after it (#1644).
+func shutdownComponentReserve(timeout time.Duration) time.Duration {
+	return timeout/2 + timeout/10
+}
+
+// readyDrainGraceWithin bounds the cluster ready drain to half of what is
+// left of the hooks' share, so the HTTP drain after it keeps a grace of its
+// own (#1644).
+func readyDrainGraceWithin(ctx context.Context, grace time.Duration) time.Duration {
+	if deadline, ok := ctx.Deadline(); ok {
+		if half := time.Until(deadline) / 2; half < grace {
+			grace = half
+		}
+	}
+	if grace < 0 {
+		grace = 0
+	}
+	return grace
+}
 
 // Seams for applyLicenseCoreLimits' tests. CI runners cannot be given a CPU
 // quota, and runtime.NumCPU() cannot be set at all, so without these the
@@ -444,6 +469,12 @@ func main() {
 		shutdownTimeout = defaultShutdownTimeout
 	}
 	shutdownCoordinator := shutdown.New(shutdownTimeout, logger.Get("shutdown"))
+	// The components (buffer flush, WAL, database) keep their share of the
+	// budget whatever the hooks spend (#1644): half for the arrow buffer's
+	// Close (SetCloseBudget below) and a tenth for what closes after it. The
+	// hooks — the cluster ready drain, the Flight SQL and HTTP drains, the
+	// scheduler stops — share the rest.
+	shutdownCoordinator.SetComponentReserve(shutdownComponentReserve(shutdownTimeout))
 
 	// Opt-in pprof on a localhost listener (no-op unless ARC_DEBUG_PPROF=1).
 	// Replaces the previous behaviour where pprof was unconditionally
@@ -839,17 +870,15 @@ func main() {
 
 	// Test query
 	log.Info().Msg("Testing DuckDB connection...")
-	rows, err := db.Query("SELECT 'Hello from Arc in Go!' as message, version() as duckdb_version")
-	if err != nil {
+	message, version, found, err := checkDuckDB(db)
+	var scanErr duckDBCheckScanError
+	switch {
+	case errors.As(err, &scanErr):
+		log.Fatal().Err(err).Msg("Failed to scan result")
+	case err != nil:
 		log.Fatal().Err(err).Msg("Failed to execute test query")
 	}
-	defer rows.Close()
-
-	var message, version string
-	if rows.Next() {
-		if err := rows.Scan(&message, &version); err != nil {
-			log.Fatal().Err(err).Msg("Failed to scan result")
-		}
+	if found {
 		log.Info().
 			Str("message", message).
 			Str("duckdb_version", version).
@@ -1030,6 +1059,117 @@ func main() {
 	shutdownCoordinator.Register("storage", storageBackend, shutdown.PriorityStorage)
 	logStorageReady()
 
+	// The re-home jobs a stopped process left (#1825), read before anything
+	// lists data files: the registry is what keeps compaction, DELETE and
+	// retention off a job's files and tells reads which side of a swap to
+	// leave out. A journal that cannot be read stops the start: guessing
+	// would let compaction merge a file with the files replacing it. The
+	// jobs are taken up further down (rehomeHandler.Recover).
+	rehomeRegistry := rehome.NewRegistry(storageBackend)
+	// A few tries: on an object store this is one LIST of a prefix that is
+	// empty on every deployment today, and a blip must not stop the start.
+	var seedErr error
+	for try := 0; try < 5; try++ {
+		if try > 0 {
+			time.Sleep(time.Duration(try) * time.Second)
+		}
+		if seedErr = rehomeRegistry.Seed(context.Background()); seedErr == nil {
+			break
+		}
+		log.Warn().Err(seedErr).Int("try", try+1).Msg("Could not read the re-home job journal; trying again")
+	}
+	// On a cluster whose nodes share one object store, jobs run through the
+	// cluster record (#1825 slice 4b). Every such node reads what the record
+	// says to leave out, keeps off the files it owns and acks its states,
+	// whatever its configuration: a node restarted with the Iceberg export on
+	// stays in the Raft configuration, and must not read both sides of a job
+	// in flight. A node advertises that it can run under a job
+	// (rehomeCfgInScope) only with edge sync off and the Iceberg export off or
+	// following the compactor lease (cluster.failover_enabled, #1870); tiered
+	// storage is in scope for a file on the hot tier (#1869).
+	rehomeSharedCluster := cfg.Cluster.Enabled && cluster.IsSharedObjectStore(storageBackend)
+	// A cluster on local storage with replication on (#1860): every node
+	// holds its own copy of each file and does each step of a job on it.
+	rehomeLocalCluster := cfg.Cluster.Enabled && storageBackend != nil && storageBackend.Type() == "local" && cfg.Cluster.ReplicationEnabled
+	rehomeCfgInScope := (rehomeSharedCluster || rehomeLocalCluster) &&
+		// The Iceberg export (#1870): with the compactor lease, so one node
+		// exports and the export follows it.
+		(!cfg.Iceberg.Enabled || cfg.Cluster.FailoverEnabled) &&
+		!(cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Active() || cfg.EdgeSync.Spoke.Active())
+	// The cluster's side of ownership, bound once the coordinator runs:
+	// compaction is wired before it exists.
+	var rehomeClusterSrc atomic.Pointer[cluster.RehomeSource]
+	rehomeOwns := func(key string) bool {
+		if rehomeRegistry.Owns(key) {
+			return true
+		}
+		s := rehomeClusterSrc.Load()
+		return s != nil && s.Owns(key)
+	}
+	rehomeClaim := func(key string) (func(), bool) {
+		release, ok := rehomeRegistry.Claim(key)
+		if !ok {
+			return release, false
+		}
+		if s := rehomeClusterSrc.Load(); s != nil && s.Owns(key) {
+			release()
+			return func() {}, false
+		}
+		return release, true
+	}
+	rehomeBlock := func(prefix string) (func(), bool) {
+		release, ok := rehomeRegistry.Block(prefix)
+		if !ok {
+			return release, false
+		}
+		s := rehomeClusterSrc.Load()
+		if s != nil && prefix == "" {
+			// A backup or a restore (#1857): recorded in the cluster first,
+			// so a job is not staged under it on any node, then checked
+			// against the jobs already staged.
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			endMark, err := s.BeginBackupMark(ctx)
+			cancel()
+			if err != nil {
+				log.Warn().Err(err).Msg("A backup or restore could not record itself in the cluster; it is refused")
+				release()
+				return func() {}, false
+			}
+			local := release
+			release = func() {
+				endMark()
+				local()
+			}
+		}
+		if s != nil && s.OwnsUnder(prefix) {
+			release()
+			return func() {}, false
+		}
+		return release, true
+	}
+	if seedErr != nil {
+		log.Fatal().Err(seedErr).Msg("Could not read the re-home job journal")
+	}
+
+	// #1626: a database named after a subdirectory Iceberg warehouse would
+	// write inside it. Set before any writer starts (MQTT subscriptions start
+	// below, long before the Iceberg block), from the same warehouse URI the
+	// exporter is given.
+	if cfg.Iceberg.Enabled {
+		storage.SetWarehouseRootName(iceberg.LayoutFor(storageBackend, icebergWarehouseURI(cfg.Iceberg.Warehouse, storageBackend), cfg.Iceberg.NamespacePrefix).RootName())
+	}
+
+	// Peer file replication copies files between per-node disks. On a shared
+	// object store every node already reads every file, and the puller only
+	// HEADs the whole manifest every catch-up interval and can hold the
+	// catch-up query gate shut on a file no peer can serve (#1605). Ignored
+	// here, before anything reads the flag, as Helm's shared mode does.
+	if ignoreReplicationOnObjectStore(cfg.Cluster.Enabled, cfg.Cluster.ReplicationEnabled, cluster.IsSharedObjectStore(storageBackend)) {
+		log.Warn().Str("backend", cfg.Storage.Backend).
+			Msg("cluster.replication_enabled is ignored on an object-store backend: every node already reads the shared bucket, so there is nothing to replicate. Set it to false to silence this")
+		cfg.Cluster.ReplicationEnabled = false
+	}
+
 	// Pattern 2 shared-storage multi-writer mode startup validation.
 	// Refuses to start under four conditions that would silently break
 	// the multi-writer invariant:
@@ -1078,6 +1218,20 @@ func main() {
 		log.Info().
 			Str("backend", cfg.Storage.Backend).
 			Msg("Pattern 2 shared-storage multi-writer mode enabled (singleton tasks gate on Raft leader; writer failover suppressed)")
+	}
+	// The single-writer form of Pattern 2: an object-store cluster without
+	// the flag (#1603). Shared-storage mode refuses a standalone role above;
+	// so does this, for the same reason, but only with a clustering licence:
+	// without one no coordinator is built, nothing is gated, and the node
+	// runs as a standalone node does (the no-coordinator Warn below says so).
+	// No Raft means no elected primary.
+	if objectStoreCluster(cfg.Cluster.Enabled, cfg.Storage.Backend) && !cfg.Cluster.SharedStorageMode {
+		if role, roleErr := cluster.ResolveRole(cfg.Cluster.Role); roleErr == nil && role == cluster.RoleStandalone && licenseHasClustering(licenseClient) {
+			log.Fatal().Str("role", cfg.Cluster.Role).Str("backend", cfg.Storage.Backend).Msg(objectStoreClusterStandaloneRoleError)
+		}
+		if cfg.Cluster.RaftDataDir == "" {
+			log.Warn().Str("backend", cfg.Storage.Backend).Msg(objectStoreClusterNoRaftWarning)
+		}
 	}
 
 	// Initialize WAL writer (if enabled) - recovery happens after ArrowBuffer is ready
@@ -1167,6 +1321,10 @@ func main() {
 	arrowBuffer.SetFutureStampMargin(time.Duration(cfg.Query.FileTimePruningMarginSeconds) * time.Second)
 	if walWriter != nil {
 		arrowBuffer.SetWAL(walWriter)
+		// Before WAL recovery: a cluster node neither writes nor adopts flush
+		// intents (#1646); there an adopted file would also need the manifest
+		// registration a crash may have skipped.
+		arrowBuffer.SetClusterMode(cfg.Cluster.Enabled)
 	}
 	if walDisk != nil {
 		arrowBuffer.SetWALDiskGate(walDisk)
@@ -1235,9 +1393,12 @@ func main() {
 	// time only means more records stay in the WAL to be replayed, which is
 	// recoverable; starving the WAL writer's sync is not.
 	//
-	// Note this does not account for what the hooks already spent before any
-	// component ran — in cluster mode ready-flag-off alone holds 10s. Close
-	// bounds itself; it cannot see the coordinator's remaining time.
+	// The coordinator keeps this half, plus a tenth for what closes after
+	// the buffer, out of the hooks' reach (SetComponentReserve, #1644): the
+	// hooks run on a deadline that leaves it, so a long HTTP drain or the
+	// cluster ready drain no longer eats into it. A hook that overruns that
+	// deadline by more than the tenth still can; Close bounds itself and
+	// cannot see the coordinator's remaining time.
 	//
 	// shutdownTimeout is the validated duration (server.shutdown_timeout with
 	// the non-positive fallback already applied above), not the raw config int.
@@ -1382,6 +1543,7 @@ func main() {
 			TrackedRowCallback:             createTrackedWALRecoveryCallback(arrowBuffer, logger.Get("wal-recovery")),
 			ValidateTrackedRows:            validateTrackedWALRecoveryRows,
 			CheckpointRecovered:            checkpointRecovered,
+			AdoptIntent:                    arrowBuffer.AdoptFlushedFile,
 			BeforeDelete:                   arrowBuffer.NewRecoveryFlushBarrier(),
 			BarrierBatchFiles:              16,
 			BarrierBatchRows:               cfg.Ingest.MaxBufferSize,
@@ -1559,6 +1721,7 @@ func main() {
 							TrackedRowCallback:             createTrackedWALRecoveryCallback(arrowBuffer, walLogger),
 							ValidateTrackedRows:            validateTrackedWALRecoveryRows,
 							CheckpointRecovered:            checkpointRecovered,
+							AdoptIntent:                    arrowBuffer.AdoptFlushedFile,
 							BeforeDelete:                   arrowBuffer.NewRecoveryFlushBarrier(),
 							BarrierBatchFiles:              16,
 							BarrierBatchRows:               cfg.Ingest.MaxBufferSize,
@@ -1925,7 +2088,9 @@ func main() {
 			MaxConcurrent:    cfg.Compaction.MaxConcurrent,
 			CycleTimeout:     cfg.Compaction.CycleTimeout,
 			MaxFilesPerBatch: cfg.Compaction.MaxFilesPerBatch,
-			ExcludeDatabases: cfg.Compaction.ExcludeDatabases,
+			// compaction.refuse_misfiled_inputs (#1825), default true.
+			MergeMisfiledInputs: !cfg.Compaction.RefuseMisfiledInputs,
+			ExcludeDatabases:    cfg.Compaction.ExcludeDatabases,
 			// Per-subprocess DuckDB bounds. Config resolves the "auto"
 			// sentinels at load time. memory_limit: when
 			// database.memory_limit is set explicitly it is that
@@ -1964,7 +2129,7 @@ func main() {
 		// epoch from an earlier gated period must be invalidated here, or
 		// re-enabling sync later would classify this period's compacted
 		// outputs as delivered when their inputs may never have synced.
-		if !cfg.EdgeSync.Spoke.Enabled && !cfg.EdgeSync.Spoke.Bundle.Enabled {
+		if !cfg.EdgeSync.Spoke.Active() {
 			if metaDB, ownsMetaDB, err := sharedSQLiteHandle(authManager, cfg.Auth.DBPath); err == nil {
 				if _, err := metaDB.Exec(`DELETE FROM sync_meta WHERE key = 'compaction_defer_epoch'`); err != nil &&
 					!strings.Contains(err.Error(), "no such table") {
@@ -1984,7 +2149,7 @@ func main() {
 		// window (slow startup: WAL recovery can take minutes) must defer
 		// everything rather than run one unfiltered cycle that consumes
 		// undelivered raws.
-		if (cfg.EdgeSync.Spoke.Enabled || cfg.EdgeSync.Spoke.Bundle.Enabled) &&
+		if cfg.EdgeSync.Spoke.Active() &&
 			cfg.EdgeSync.Spoke.DeferCompactionUntilSynced {
 			compactionManager.SetSyncEligibility(func(ctx context.Context, paths []string) (map[string]bool, error) {
 				return nil, fmt.Errorf("edge sync ledger not ready yet; deferring compaction (startup)")
@@ -1995,6 +2160,8 @@ func main() {
 		// CleanupOrphanedTempDirs skips the Phase 4 reserved ".completion"
 		// subdirectory so a crash that left pending completion manifests on
 		// disk doesn't silently lose them on restart.
+		// Files a re-home job in flight owns stay out of compaction (#1825).
+		compactionManager.SetOwnedFilter(rehomeOwns)
 		if err := compactionManager.CleanupOrphanedTempDirs(); err != nil {
 			log.Warn().Err(err).Msg("Failed to cleanup orphaned compaction temp directories")
 		}
@@ -2119,6 +2286,9 @@ func main() {
 	// Initialize Cluster Coordinator (Enterprise feature)
 	// Clustering enables role-based node separation: writer, reader, compactor
 	var clusterCoordinator *cluster.Coordinator
+	// What losing and retaking the cluster read lease do on a node that
+	// takes part in re-home jobs, bound once the query handler exists.
+	var rehomeLeaseLost, rehomeLeaseSynced atomic.Pointer[func()]
 	// completionWatcher is the Phase 4 completion watcher, built BEFORE the
 	// coordinator starts (inside the cluster block below) so the compaction
 	// pause quiescer (#1087) can see the pending commits on disk from the
@@ -2295,9 +2465,14 @@ func main() {
 							completionWatcher = watcher
 							if compactionManager != nil {
 								watcher.SetStagedObservers(compactionManager.BeforeStagedCommit, compactionManager.FinishStaged)
+								watcher.SetStagedIntoObserver(compactionManager.FinishStagedInto)
 								watcher.SetStagedFinished(compactionManager.StagedFinished)
+								watcher.SetStagedSettled(compactionManager.MeasurementCompacted)
 								compactionManager.SetStagedCommit(clusterCoordinator.StagedCompactionMode,
 									clusterCoordinator.CompactionInputLookup, watcher.LocallyStagedInput)
+								// Crash recovery un-registers an output before
+								// it removes it from storage (#1811).
+								compactionManager.SetOutputRetractor(watcher.RetractOutput)
 							}
 							// A typed nil would be a non-nil interface.
 							var holder cluster.StagedRegistrationHolder
@@ -2361,9 +2536,44 @@ func main() {
 					// buffered rows of the scope first (#1265). Before Start, so
 					// no request finds the node without its buffer.
 					clusterCoordinator.SetDeleteScopeFlusher(deleteFlusher(arrowBuffer, walWriter))
+					// Re-home (#1825): whether this node takes part in jobs,
+					// advertised at join; and, when it does, what losing and
+					// retaking the read lease do to its reads and caches
+					// (bound to the query handler once it exists).
+					// With the Iceberg export on, only where it follows the
+					// compactor lease (the failover manager runs: a licence
+					// with writer failover, #1870).
+					clusterCoordinator.SetRehomeInScope(rehomeCfgInScope && (!cfg.Iceberg.Enabled || clusterCoordinator.HasCompactorFailover()))
+					// Whether this node exports to Iceberg when it holds the
+					// compactor lease: re-home jobs check an exporter exists.
+					clusterCoordinator.SetIcebergOn(cfg.Iceberg.Enabled)
+					if rehomeLocalCluster {
+						// Before Start: a delete replayed from the log at start
+						// must leave the source of a job this node records to
+						// the job (#1860).
+						clusterCoordinator.SetRehomeLocalRecords(rehomeRegistry.HasCluster)
+						clusterCoordinator.SetRehomeLocalSources(rehomeRegistry.ClusterSource)
+					}
+					if rehomeSharedCluster {
+						clusterCoordinator.SetReadLeaseHooks(func() {
+							if fn := rehomeLeaseLost.Load(); fn != nil {
+								(*fn)()
+							}
+						}, func() {
+							if fn := rehomeLeaseSynced.Load(); fn != nil {
+								(*fn)()
+							}
+						})
+					}
 					if err := clusterCoordinator.Start(); err != nil {
 						log.Error().Err(err).Msg("Failed to start cluster coordinator - running in standalone mode")
 						arrowBuffer.SetIngestGate(nil)
+						// No cluster manifest to keep in step after all: crash
+						// recovery must not wait on a coordinator that never
+						// ran before it removes an output (#1811).
+						if compactionManager != nil {
+							compactionManager.SetOutputRetractor(nil)
+						}
 						clusterCoordinator = nil
 					} else {
 						// The coordinator is a COMPONENT: it owns Raft and must
@@ -2731,47 +2941,112 @@ func main() {
 	// Register base routes
 	server.RegisterRoutes()
 
+	// Initialize Audit Logging (Enterprise feature - requires valid license).
+	// Built here, before any API route; installed with Use right after the
+	// auth middleware (or, with auth off, before the first route below), so
+	// it sees the caller's identity and wraps every route registered after
+	// it. Until #1630 it was installed after the auth and RBAC routes, which
+	// therefore were never audited. checkAuditCoverage verifies the order at
+	// startup.
+	var auditLogger *audit.Logger
+	var auditMiddleware fiber.Handler
+	// Middleware the Flight SQL bridge runs after auth, as the main app does
+	// (internal/api/flight_sql.go): the audit middleware when audit is on.
+	var flightSQLMiddleware []fiber.Handler
+	if cfg.AuditLog.Enabled {
+		if licenseClient == nil {
+			log.Warn().Msg("Audit logging requires enterprise license - feature disabled")
+		} else if !licenseClient.CanUseAuditLogging() {
+			log.Warn().Msg("License does not include audit_logging feature - feature disabled")
+		} else {
+			// Share the auth manager's SQLite handle when there is one. Audit
+			// and auth are enabled independently (this block is gated on the
+			// license, not on cfg.Auth.Enabled), so authManager may be nil —
+			// sharedSQLiteHandle falls back to a dedicated handle we own.
+			auditDB, auditOwnsDB, err := sharedSQLiteHandle(authManager, cfg.Auth.DBPath)
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to open audit database - feature disabled")
+			} else {
+				auditLogger, err = audit.NewLogger(&audit.LoggerConfig{
+					DB:     auditDB,
+					Config: &cfg.AuditLog,
+					Logger: logger.Get("audit"),
+				})
+				if err != nil {
+					log.Error().Err(err).Msg("Failed to create audit logger - feature disabled")
+					if auditOwnsDB {
+						auditDB.Close()
+					}
+				} else {
+					auditLogger.Start()
+					shutdownCoordinator.RegisterHook("audit", func(ctx context.Context) error {
+						auditLogger.Stop()
+						// audit.Logger never closes its DB — it may be borrowed.
+						// Close it here only when this block opened it.
+						if auditOwnsDB {
+							return auditDB.Close()
+						}
+						return nil
+					}, shutdown.PriorityCompaction)
+
+					// Installed below, after the auth middleware. The Flight SQL
+					// bridge gets the same middleware (flightSQLMiddleware).
+					auditMiddleware = audit.Middleware(auditLogger, cfg.AuditLog.IncludeReads)
+					flightSQLMiddleware = append(flightSQLMiddleware, auditMiddleware)
+
+					log.Info().
+						Int("retention_days", cfg.AuditLog.RetentionDays).
+						Bool("include_reads", cfg.AuditLog.IncludeReads).
+						Msg("Audit logging enabled")
+				}
+			}
+		}
+	}
+
+	// The paths the auth middleware lets through without a token. The audit
+	// coverage check (below, before the server starts) allows them ahead of
+	// the audit middleware: they are registered before it on purpose.
+	metricsPublic, metricsGuarded := metricsAccess(authManager != nil, cfg.Auth.MetricsPublic)
+	authPublicRoutes, authPublicPrefixes := authPublicPaths(metricsPublic)
+	// The metrics routes' own guard (Server.RegisterMetricsRoutes): only
+	// when they need a token.
+	var metricsGuard *auth.AuthManager
+	if metricsGuarded {
+		metricsGuard = authManager
+	}
+
 	// Apply auth middleware if enabled
 	var rbacManager *auth.RBACManager
 	if authManager != nil {
 		middlewareConfig := auth.DefaultMiddlewareConfig()
 		middlewareConfig.AuthManager = authManager
-		// Add public routes that don't need auth
-		// Note: /api/v1/internal/cache/invalidate is public because cluster peers
-		// call it without an auth token after compaction. Access is gated by
-		// HMAC-SHA256 validation in the handler (see handleCacheInvalidate); the
-		// receiver refuses every request when cluster.shared_secret is empty.
-		middlewareConfig.PublicRoutes = append(middlewareConfig.PublicRoutes, "/health", "/ready", "/ready/write", "/api/v1/auth/verify", api.CacheInvalidatePath)
-		// /metrics stays public — Prometheus scrapers expect it. It is
-		// already in auth.DefaultMiddlewareConfig().PublicPrefixes, so no
-		// further append is needed here. /debug/pprof is intentionally NOT
-		// here: pprof is no longer mounted on the public Fiber app
-		// (internal/api/server.go). The opt-in localhost pprof listener
-		// runs on a separate port; see startDebugPprofIfEnabled.
-		//
-		// The JSON metrics endpoints (/api/v1/metrics and its sub-paths) are
-		// deliberately public, equivalent to the existing Prometheus /metrics
-		// surface: aggregate operational counters plus Go runtime/GC stats and
-		// host-arch fingerprinting (go_version/os/arch). They expose no queries,
-		// database/measurement names, file paths, or credentials, and monitoring
-		// dashboards poll them without a token. Whitelist them explicitly so
-		// their public status is an auditable decision, not an accident of
-		// registration order (they were previously reachable only because
-		// RegisterRoutes runs before this middleware; see GHSA-m3qr-fvp4-78xj).
-		// /api/v1/logs, by contrast, is NOT public — it is registered with admin
-		// auth below.
-		middlewareConfig.PublicPrefixes = append(middlewareConfig.PublicPrefixes, "/api/v1/metrics")
+		// The public routes and prefixes, and why each is public, are in
+		// authPublicPaths (cmd/arc/audit_coverage.go).
+		middlewareConfig.PublicRoutes = authPublicRoutes
+		middlewareConfig.PublicPrefixes = authPublicPrefixes
 		// A peer forwards a request with a signed identity instead of the
 		// caller's credential (#1305).
 		if clusterCoordinator != nil {
 			middlewareConfig.ForwardIdentity = api.ForwardIdentityVerifier(clusterCoordinator)
 		}
 		server.GetApp().Use(auth.NewMiddleware(middlewareConfig))
+		// Audit next: after auth, so it records the caller; before every
+		// route below, so it sees them (#1630). 401s answered by the auth
+		// middleware itself never reach it.
+		if auditMiddleware != nil {
+			server.GetApp().Use(auditMiddleware)
+		}
 
 		// Register the admin-authenticated logs route AFTER the auth
 		// middleware so it sits later in the Fiber stack and is actually
 		// gated (GHSA-m3qr-fvp4-78xj).
 		server.RegisterLogsRoute(authManager)
+		// Metrics after auth and audit too: public only with
+		// auth.metrics_public (authPublicPaths).
+		server.RegisterMetricsRoutes(metricsGuard)
+		if cfg.Auth.MetricsPublic {
+			log.Warn().Msg("auth.metrics_public is on: /metrics and /api/v1/metrics are served without a token")
+		}
 
 		// Initialize RBAC Manager (Enterprise feature)
 		rbacManager = auth.NewRBACManager(&auth.RBACManagerConfig{
@@ -2785,6 +3060,9 @@ func main() {
 			MaxCascadeDescendants: cfg.Cluster.RBACMaxCascadeDescendants,
 		})
 		shutdownCoordinator.Register("rbac", rbacManager, shutdown.PriorityAuth)
+		// RBAC's per-token cache reads api_tokens.raft_materialised; drop
+		// it when this node writes a token's row (#1630).
+		authManager.SetTokenRowChangedHook(rbacManager.InvalidateTokenCache)
 		if rbacManager.IsRBACEnabled() {
 			log.Info().Msg("Enterprise RBAC enabled")
 		}
@@ -2958,59 +3236,13 @@ func main() {
 		// Authentication disabled: register the logs route unguarded so the
 		// endpoint still works for no-auth deployments. (When auth is enabled
 		// it is registered with admin auth inside the block above, after the
-		// middleware — GHSA-m3qr-fvp4-78xj.)
-		server.RegisterLogsRoute(nil)
-	}
-
-	// Initialize Audit Logging (Enterprise feature - requires valid license)
-	// Must be registered before API routes so the middleware captures all requests
-	var auditLogger *audit.Logger
-	if cfg.AuditLog.Enabled {
-		if licenseClient == nil {
-			log.Warn().Msg("Audit logging requires enterprise license - feature disabled")
-		} else if !licenseClient.CanUseAuditLogging() {
-			log.Warn().Msg("License does not include audit_logging feature - feature disabled")
-		} else {
-			// Share the auth manager's SQLite handle when there is one. Audit
-			// and auth are enabled independently (this block is gated on the
-			// license, not on cfg.Auth.Enabled), so authManager may be nil —
-			// sharedSQLiteHandle falls back to a dedicated handle we own.
-			auditDB, auditOwnsDB, err := sharedSQLiteHandle(authManager, cfg.Auth.DBPath)
-			if err != nil {
-				log.Error().Err(err).Msg("Failed to open audit database - feature disabled")
-			} else {
-				auditLogger, err = audit.NewLogger(&audit.LoggerConfig{
-					DB:     auditDB,
-					Config: &cfg.AuditLog,
-					Logger: logger.Get("audit"),
-				})
-				if err != nil {
-					log.Error().Err(err).Msg("Failed to create audit logger - feature disabled")
-					if auditOwnsDB {
-						auditDB.Close()
-					}
-				} else {
-					auditLogger.Start()
-					shutdownCoordinator.RegisterHook("audit", func(ctx context.Context) error {
-						auditLogger.Stop()
-						// audit.Logger never closes its DB — it may be borrowed.
-						// Close it here only when this block opened it.
-						if auditOwnsDB {
-							return auditDB.Close()
-						}
-						return nil
-					}, shutdown.PriorityCompaction)
-
-					// Register audit middleware BEFORE API routes
-					server.GetApp().Use(audit.Middleware(auditLogger, cfg.AuditLog.IncludeReads))
-
-					log.Info().
-						Int("retention_days", cfg.AuditLog.RetentionDays).
-						Bool("include_reads", cfg.AuditLog.IncludeReads).
-						Msg("Audit logging enabled")
-				}
-			}
+		// middleware — GHSA-m3qr-fvp4-78xj.) Audit, when on, before it and
+		// every later route (#1630).
+		if auditMiddleware != nil {
+			server.GetApp().Use(auditMiddleware)
 		}
+		server.RegisterLogsRoute(nil)
+		server.RegisterMetricsRoutes(nil)
 	}
 
 	// Register MessagePack handler with Arrow buffer
@@ -3025,6 +3257,8 @@ func main() {
 	if authManager != nil && rbacManager != nil {
 		lineProtocolHandler.SetAuthAndRBAC(authManager, rbacManager)
 	}
+	// Bounds the Prometheus Remote Write body and its decoded size (#1383).
+	lineProtocolHandler.SetMaxPayloadSize(server.GetMaxPayloadSize())
 	lineProtocolHandler.RegisterRoutes(server.GetApp())
 
 	// Register the edge-sync hub receive endpoint (#569).
@@ -3047,11 +3281,42 @@ func main() {
 	// hubReceiptMarker marks sync_received receipts for hub-consumed spoke
 	// files (grouped by namespace). Built whenever the edge-sync receive or
 	// import side is enabled (both write receipts); shared by compaction's
-	// consumed-inputs observer (#619) and tiering's hot-file-removal hook
-	// (#687). Remains nil otherwise, which keeps tiering's spoke-migration
-	// gate closed.
+	// consumed-inputs observer (#619), tiering's hot-file-removal hook (#687)
+	// and a DELETE's partial rewrite (#1666), all of which preserve the
+	// content. Remains nil otherwise,
+	// which keeps tiering's spoke-migration gate closed.
 	var hubReceiptMarker func(paths []string) error
-	if cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Enabled {
+	// #1683: the three other receipt markers. hubInPlaceMarker for tiering
+	// (the holder is the same key in cold), hubNoHolderMarker for a row DELETE
+	// about to rewrite (no holder a spoke may be deleted against), and
+	// hubCompactedIntoMarker for compaction, with the job's output.
+	var (
+		hubInPlaceMarker       func(paths []string) error
+		hubNoHolderMarker      func(paths []string) error
+		hubCompactedIntoMarker func(inputs []string, output string) error
+	)
+	// spokeDeleteTiering and spokeDeleteInvalidate are filled in once the
+	// tiering manager and the query-cache invalidator exist, after the spoke
+	// block that wires delete_after_sync; the deleter reads them atomically.
+	var (
+		spokeDeleteTiering    atomic.Pointer[tiering.Manager]
+		spokeDeleteInvalidate atomic.Pointer[func()]
+		spokeDeleteReady      atomic.Bool
+	)
+	// hubNamespaceRemover and hubRemovalMarker mark receipts REMOVED for
+	// content the hub deletes on purpose (#1186): a confirmed database delete
+	// of a spoke namespace, and retention. Wired into the databases and
+	// retention handlers below; nil when this node is not an edge-sync hub.
+	var (
+		hubNamespaceRemover func(ctx context.Context, name string) error
+		hubRemovalMarker    func(ctx context.Context, paths []string) error
+		hubRowDeleteMarker  func(ctx context.Context, paths []string) error
+		// hubColdTier is the tiering manager once it is wired below, so the
+		// forget route's guard can see the cold tier (#1186). Atomic: the
+		// route can be called once the server is up, before or after that.
+		hubColdTier atomic.Pointer[tiering.Manager]
+	)
+	if cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Active() {
 		var registerFile func(context.Context, *edgesync.ReceivedFile) error
 		if clusterCoordinator != nil {
 			coord := clusterCoordinator
@@ -3105,6 +3370,17 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to create edge sync hub index; refusing to start")
 		}
+		// #1667: on a cluster hub, removals run on the writer and mark the
+		// writer's receipts, while this node's receipts belong to the spokes
+		// that sync here. The manifest tells a stale receipt removed
+		// cluster-wide from a local copy that is missing.
+		var hubManifest edgesync.ClusterManifest
+		// Only with Raft: a cluster run without it (cluster.raft_data_dir
+		// empty) has no manifest to ask, and every catch-up would fail and
+		// stall the spokes' sync for good.
+		if clusterCoordinator != nil && clusterCoordinator.HasRaft() {
+			hubManifest = coordinatorManifest{c: clusterCoordinator}
+		}
 
 		// Spoke secrets are encrypted at rest with the same key MQTT uses for
 		// broker passwords. Encrypted rather than hashed because HMAC
@@ -3146,28 +3422,53 @@ func main() {
 		// (deep-review B1), and tiering aborts the migration before any
 		// delete.
 		markLogger := logger.Get("edgesync")
-		hubReceiptMarker = func(inputs []string) error {
-			byNamespace := make(map[string][]string)
-			for _, in := range inputs {
-				first, rest, found := strings.Cut(in, "/")
-				if !found || first == "" || rest == "" {
-					continue
-				}
-				byNamespace[first] = append(byNamespace[first], rest)
+		// #1186: a database delete takes one path segment, so for a spoke
+		// namespace the name is the spoke and every receipt of it goes. For
+		// any other database the UPDATE matches no receipt.
+		hubNamespaceRemover = func(ctx context.Context, name string) error {
+			return hubIndex.MarkSpokeRemoved(ctx, name, edgesync.RemovedByOperatorDelete)
+		}
+		hubRemovalMarker = hubRemovalMarkerFor(hubIndex, edgesync.RemovedByRetention)
+		hubRowDeleteMarker = hubRemovalMarkerFor(hubIndex, edgesync.RemovedByRowDelete)
+		hubReceiptMarker = hubCompactedMarker(hubIndex.MarkCompacted, markLogger)
+		hubInPlaceMarker = hubCompactedMarker(hubIndex.MarkCompactedInPlace, markLogger)
+		hubNoHolderMarker = hubCompactedMarker(hubIndex.MarkCompactedNoHolder, markLogger)
+		hubCompactedIntoMarker = func(inputs []string, output string) error {
+			// #1683: one job, one output, one spoke namespace (compaction
+			// runs per {spoke}/{db} pseudo-database). An output outside a
+			// spoke namespace, or inputs from another, record nothing.
+			ns, _, ok := strings.Cut(output, "/")
+			if !ok || ns == "" {
+				return nil
 			}
 			markCtx, markCancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer markCancel()
-			var firstErr error
-			for ns, paths := range byNamespace {
-				if err := hubIndex.MarkCompacted(markCtx, ns, paths); err != nil {
-					markLogger.Warn().Err(err).Str("namespace", ns).Int("paths", len(paths)).
-						Msg("Could not mark consumed receipts; the caller retries or aborts")
-					if firstErr == nil {
-						firstErr = err
-					}
+			var rest, full []string
+			for _, in := range inputs {
+				first, r, found := strings.Cut(in, "/")
+				if !found || first != ns || r == "" {
+					continue
 				}
+				// An input whose file still exists was not consumed: a staged
+				// commit keeps inputs the manifest lists again, and a re-fire
+				// can follow a forget and re-send. Its receipt belongs to the
+				// file that is there now, not to this output.
+				present, err := storageBackend.Exists(markCtx, in)
+				if err != nil && !storage.IsStoreNotFound(err) {
+					return fmt.Errorf("check compacted input %q: %w", in, err)
+				}
+				if present {
+					continue
+				}
+				rest = append(rest, r)
+				full = append(full, in)
 			}
-			return firstErr
+			if err := hubIndex.MarkCompactedInto(markCtx, ns, rest, full, output); err != nil {
+				markLogger.Warn().Err(err).Str("namespace", ns).Str("output", output).
+					Msg("Could not record the compaction output on the receipts; the caller retries")
+				return err
+			}
+			return nil
 		}
 
 		// #619: hub compaction of received spoke namespaces. Wiring ORDER is
@@ -3177,6 +3478,7 @@ func main() {
 		// may be nil independently (CLAUDE.md nil rule).
 		if compactionManager != nil && cfg.EdgeSync.CompactReceivedNamespaces {
 			compactionManager.SetOnConsumedInputs(hubReceiptMarker)
+			compactionManager.SetOnConsumedInto(hubCompactedIntoMarker)
 			compactionManager.SetNamespaceExpander(receivedNamespaces(spokeRegistry))
 			log.Info().Msg("Hub compaction of received spoke namespaces enabled (edge_sync.compact_received_namespaces)")
 		}
@@ -3184,6 +3486,7 @@ func main() {
 		receiver, err := edgesync.NewReceiver(edgesync.ReceiverConfig{
 			Backend:      storageBackend,
 			Index:        hubIndex,
+			Manifest:     hubManifest,
 			Logger:       logger.Get("edgesync"),
 			RegisterFile: registerFile,
 			HoldPath:     edgeSyncHoldPath(clusterCoordinator),
@@ -3205,6 +3508,19 @@ func main() {
 			Index:      hubIndex,
 			Backend:    storageBackend,
 			MaxEntries: cfg.EdgeSync.MaxReconcileEntries,
+			Manifest:   hubManifest,
+			// #1683: a compacted receipt whose holder migrated to cold.
+			ColdExists: func(ctx context.Context, path string) (bool, error) {
+				tm := hubColdTier.Load()
+				if tm == nil {
+					return false, nil
+				}
+				cold := tm.ColdBackend()
+				if cold == nil {
+					return false, nil
+				}
+				return cold.Exists(ctx, path)
+			},
 		})
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to create edge sync reconciler; refusing to start")
@@ -3214,6 +3530,13 @@ func main() {
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to create the edge sync admin handler; refusing to start")
 		}
+		syncAdminHandler.SetReceiptRecovery(hubIndex, storageBackend)
+		syncAdminHandler.SetColdStorage(func() storage.Backend {
+			if tm := hubColdTier.Load(); tm != nil {
+				return tm.ColdBackend()
+			}
+			return nil
+		})
 		syncAdminHandler.RegisterRoutes(server.GetApp())
 
 		// The spoke-facing receive endpoints mount ONLY for a network hub. An
@@ -3283,17 +3606,11 @@ func main() {
 		}
 
 		// Air-gap import, independent of the network receive endpoints.
-		if cfg.EdgeSync.Import.Enabled {
+		// The importer serves both bundle sources: a drive (import.enabled,
+		// the HTTP route below) and a relay bucket (import.relay.enabled,
+		// #1685). Either may be on without the other.
+		if cfg.EdgeSync.Import.Active() {
 			importLogger := logger.Get("edgesync-import")
-
-			localRoot := ""
-			if cfg.Storage.Backend == "local" {
-				localRoot = cfg.Storage.LocalPath
-			}
-			importPolicy, err := edgesync.NewDestinationPolicy(cfg.EdgeSync.Import.AllowedDirs, localRoot)
-			if err != nil {
-				log.Fatal().Err(err).Msg("Failed to resolve the bundle import policy; refusing to start")
-			}
 
 			bundleIndex, err := edgesync.NewBundleIndex(syncDB, importLogger)
 			if err != nil {
@@ -3310,6 +3627,7 @@ func main() {
 			importReceiver, err := edgesync.NewReceiver(edgesync.ReceiverConfig{
 				Backend:      storageBackend,
 				Index:        hubIndex,
+				Manifest:     hubManifest,
 				Logger:       importLogger,
 				RegisterFile: collector.Register,
 				HoldPath:     edgeSyncHoldPath(clusterCoordinator),
@@ -3372,23 +3690,44 @@ func main() {
 				MaxFiles:      cfg.EdgeSync.Import.MaxFiles,
 				FlushManifest: flushManifest,
 				HoldPaths:     edgeSyncHoldPaths(clusterCoordinator),
-				Logger:        importLogger,
+				// #1684: sign the hub's verify answer into each ack, so an
+				// air-gapped spoke can delete what the hub provably holds.
+				Verify: func(ctx context.Context, spokeID string, entries []edgesync.ReconcileEntry) (*edgesync.VerifyResult, error) {
+					return reconciler.Verify(ctx, spokeID, entries, nil)
+				},
+				VerifyMaxEntries: reconciler.MaxEntries(),
+				Logger:           importLogger,
 			})
 			if err != nil {
 				log.Fatal().Err(err).Msg("Failed to create the bundle importer; refusing to start")
 			}
 
-			importHandler, err := api.NewEdgeSyncImportHandler(
-				importer, importPolicy, bundleIndex, authManager, importLogger)
-			if err != nil {
-				log.Fatal().Err(err).Msg("Failed to create the bundle import handler; refusing to start")
-			}
-			importHandler.RegisterRoutes(server.GetApp())
+			if cfg.EdgeSync.Import.Enabled {
+				localRoot := ""
+				if cfg.Storage.Backend == "local" {
+					localRoot = cfg.Storage.LocalPath
+				}
+				importPolicy, err := edgesync.NewDestinationPolicy(cfg.EdgeSync.Import.AllowedDirs, localRoot)
+				if err != nil {
+					log.Fatal().Err(err).Msg("Failed to resolve the bundle import policy; refusing to start")
+				}
+				importHandler, err := api.NewEdgeSyncImportHandler(
+					importer, importPolicy, bundleIndex, authManager, importLogger)
+				if err != nil {
+					log.Fatal().Err(err).Msg("Failed to create the bundle import handler; refusing to start")
+				}
+				importHandler.SetTimeout(cfg.EdgeSync.Import.Timeout)
+				importHandler.RegisterRoutes(server.GetApp())
 
-			importLogger.Info().
-				Str("hub_id", cfg.EdgeSync.HubID).
-				Bool("clustered", clusterCoordinator != nil).
-				Msg("Edge sync bundle import enabled; import a drive with POST /api/v1/bundle-import")
+				importLogger.Info().
+					Str("hub_id", cfg.EdgeSync.HubID).
+					Bool("clustered", clusterCoordinator != nil).
+					Msg("Edge sync bundle import enabled; import a drive with POST /api/v1/bundle-import")
+			}
+
+			if cfg.EdgeSync.Import.Relay.Enabled {
+				startHubRelay(cfg, importer, authManager, licenseClient, clusterCoordinator, server, shutdownCoordinator, importLogger)
+			}
 		}
 
 		// A hub with no registered spokes rejects everything, which is correct
@@ -3470,7 +3809,7 @@ func main() {
 	// Either role independently: a spoke with intermittent connectivity runs
 	// the agent, a fully air-gapped one only exports bundles, and a spoke that
 	// does both runs both. The shared ledger is why they live in one block.
-	if cfg.EdgeSync.Spoke.Enabled || cfg.EdgeSync.Spoke.Bundle.Enabled {
+	if cfg.EdgeSync.Spoke.Active() {
 		spokeLogger := logger.Get("edgesync-spoke")
 
 		// The ledger shares the auth database file, like the hub index. With
@@ -3575,11 +3914,24 @@ func main() {
 			if spokeRegistry != nil {
 				syncAgent.SetNamespaceExcluder(receivedNamespaces(spokeRegistry))
 			}
+			if cfg.EdgeSync.Spoke.DeleteAfterSync {
+				syncAgent.SetDeleteAfterSyncAcceptCompacted(cfg.EdgeSync.Spoke.DeleteAfterSyncAcceptCompacted)
+				syncAgent.SetDeleteAfterSync(cfg.EdgeSync.Spoke.DeleteAfterSyncDelay,
+					spokeLocalDeleter(storageBackend, &spokeDeleteTiering, &spokeDeleteReady),
+					func() {
+						if f := spokeDeleteInvalidate.Load(); f != nil {
+							(*f)()
+						}
+						flushSpokeDeleted()
+					})
+				spokeLogger.Warn().Dur("delay", cfg.EdgeSync.Spoke.DeleteAfterSyncDelay).
+					Msg("edge_sync.spoke.delete_after_sync is on: local copies of synced files are deleted once the hub verifies it holds them; local queries no longer see that data")
+			}
 		}
 
 		// Air-gap export, independent of the network agent above.
 		var bundleExporter *edgesync.Exporter
-		if cfg.EdgeSync.Spoke.Bundle.Enabled {
+		if cfg.EdgeSync.Spoke.ExportsBundles() {
 			// The storage root is passed so the policy can refuse it outright:
 			// exporting into it would make the next discovery pass find the
 			// exported copies and queue them for sync.
@@ -3589,8 +3941,13 @@ func main() {
 			if cfg.Storage.Backend == "local" {
 				localRoot = cfg.Storage.LocalPath
 			}
-			policy, err := edgesync.NewDestinationPolicy(
-				cfg.EdgeSync.Spoke.Bundle.AllowedDirs, localRoot)
+			// A relay-only spoke builds the exporter too, but /export and /ack
+			// stay closed unless drive export is on: no allowed directories.
+			var allowedDirs []string
+			if cfg.EdgeSync.Spoke.Bundle.Enabled {
+				allowedDirs = cfg.EdgeSync.Spoke.Bundle.AllowedDirs
+			}
+			policy, err := edgesync.NewDestinationPolicy(allowedDirs, localRoot)
 			if err != nil {
 				log.Fatal().Err(err).Msg("Failed to resolve the bundle destination policy; refusing to start")
 			}
@@ -3631,12 +3988,66 @@ func main() {
 			if err != nil {
 				log.Fatal().Err(err).Msg("Failed to create the bundle exporter; refusing to start")
 			}
+			if cfg.EdgeSync.Spoke.DeleteAfterSync {
+				// #1684: files a signed ack attests as held are deleted right
+				// after the ack is applied, and on a timer for the delay.
+				attested := &edgesync.AttestedDeleter{
+					Ledger: spokeLedger,
+					HubID:  cfg.EdgeSync.Spoke.HubID,
+					Delete: spokeLocalDeleter(storageBackend, &spokeDeleteTiering, &spokeDeleteReady),
+					AfterDeletes: func() {
+						if f := spokeDeleteInvalidate.Load(); f != nil {
+							(*f)()
+						}
+						flushSpokeDeleted()
+					},
+					Delay:           cfg.EdgeSync.Spoke.DeleteAfterSyncDelay,
+					MaxAge:          cfg.EdgeSync.Spoke.DeleteAfterSyncAckMaxAge,
+					AcceptCompacted: cfg.EdgeSync.Spoke.DeleteAfterSyncAcceptCompacted,
+					Logger:          spokeLogger,
+				}
+				bundleExporter.SetAttestedDeleter(attested)
+				attestedCtx, attestedCancel := context.WithCancel(context.Background())
+				var attestedWG sync.WaitGroup
+				shutdownCoordinator.RegisterHook("edgesync-attested-delete", func(context.Context) error {
+					attestedCancel()
+					attestedWG.Wait() // an in-flight run finishes before the ledger closes
+					return nil
+				}, shutdown.PriorityBuffer)
+				attestedWG.Add(1)
+				go func() {
+					defer attestedWG.Done()
+					ticker := time.NewTicker(15 * time.Minute)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-attestedCtx.Done():
+							return
+						case <-ticker.C:
+							if n, err := attested.Run(attestedCtx); err != nil && attestedCtx.Err() == nil {
+								spokeLogger.Warn().Err(err).Msg("delete_after_sync: deleting attested files stopped; the next run retries")
+							} else if n > 0 {
+								spokeLogger.Info().Int("deleted", n).Msg("delete_after_sync: deleted local copies an acknowledgment attested as held")
+							}
+						}
+					}
+				}()
+			}
+		}
+
+		// The relay (#1685) exports through the same exporter as a drive, so
+		// its acks run delete_after_sync through the same AttestedDeleter.
+		var spokeRelay *edgesync.RelaySpoke
+		if cfg.EdgeSync.Spoke.Relay.Enabled {
+			spokeRelay = startSpokeRelay(cfg, bundleExporter, licenseClient, clusterCoordinator, shutdownCoordinator, spokeLogger)
 		}
 
 		spokeHandler, err := api.NewEdgeSyncSpokeHandler(syncAgent, bundleExporter, authManager, spokeLogger)
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to create the edge sync spoke handler; refusing to start")
 		}
+		spokeHandler.SetRelay(spokeRelay)
+		spokeHandler.SetTimeouts(cfg.EdgeSync.Spoke.SyncTimeout, cfg.EdgeSync.Spoke.Bundle.Timeout)
 		spokeHandler.RegisterRoutes(server.GetApp())
 
 		// Automatic spoke sync is the paid scheduling phase of edge sync. The
@@ -3688,12 +4099,13 @@ func main() {
 		evt := spokeLogger.Info().
 			Str("spoke_id", cfg.EdgeSync.Spoke.SpokeID).
 			Bool("network_sync", syncAgent != nil).
-			Bool("bundle_export", bundleExporter != nil)
+			Bool("bundle_export", cfg.EdgeSync.Spoke.Bundle.Enabled).
+			Bool("relay", spokeRelay != nil)
 		if syncAgent != nil {
 			evt = evt.Str("hub_url", cfg.EdgeSync.Spoke.HubURL)
 		}
 		switch {
-		case syncAgent != nil && bundleExporter != nil:
+		case syncAgent != nil && cfg.EdgeSync.Spoke.Bundle.Enabled:
 			if automaticSync {
 				evt.Msg("Edge sync spoke enabled; scheduled and manual network sync are available, /export writes an air-gap bundle")
 			} else {
@@ -3705,8 +4117,11 @@ func main() {
 			} else {
 				evt.Msg("Edge sync spoke enabled; trigger a pass with POST /api/v1/spoke-sync/run")
 			}
-		default:
+		case cfg.EdgeSync.Spoke.Bundle.Enabled:
 			evt.Msg("Edge sync air-gap export enabled; write a bundle with POST /api/v1/spoke-sync/export")
+		default:
+			// Relay only: startSpokeRelay already named its route.
+			evt.Msg("Edge sync spoke enabled on the relay transport only")
 		}
 
 		// Periodic ledger maintenance: prune of terminal rows (synced,
@@ -3813,6 +4228,17 @@ func main() {
 
 	// Register Query handler with dedicated query timeout and slow query logging
 	queryHandler := api.NewQueryHandler(db, storageBackend, logger.Get("query"), cfg.Query.Timeout, cfg.Query.SlowQueryThresholdMs)
+	// Reads run on the server's query lifetime, which the HTTP drain cancels
+	// once its grace is over, so a long query cannot hold the shutdown (#1644).
+	queryHandler.SetLifetime(server.QueryLifetime())
+	// A file an ingest flush writes outside the current hour (late data, a
+	// future stamp) makes the query caches drop what they hold for its
+	// measurement; before, queries kept leaving that hour out until the
+	// cached lists expired (#1757). Set here, with flush workers already
+	// running: the setter is atomic, and a file flushed before this line has
+	// nothing cached to drop, because the caches belong to the handler
+	// created just above.
+	arrowBuffer.AddOnFilePublished(queryHandler.FilePublished)
 	queryHandler.SetCancelOnClientDisconnect(cfg.Query.CancelOnClientDisconnect)
 	if authManager != nil && rbacManager != nil {
 		queryHandler.SetAuthAndRBAC(authManager, rbacManager)
@@ -3871,8 +4297,34 @@ func main() {
 		}
 		retiredOpen = retiredReads
 	}
-	openCompactions := api.CombineOpenCompactions(compactionJobs, clusterOpen, retiredOpen)
+	// What every source other than a re-home job leaves out of reads: a job
+	// checks its file against it before it starts (#1825).
+	otherExclusions := api.CombineOpenCompactions(compactionJobs, clusterOpen, retiredOpen)
+	// Re-home on the cluster (#1825 slice 4b): the cluster record is the
+	// fourth source of exclusions, and of ownership from here on.
+	rehomeClusterOn := rehomeSharedCluster && clusterCoordinator != nil
+	rehomeLocalOn := rehomeLocalCluster && clusterCoordinator != nil
+	rehomeClusterInScope := rehomeCfgInScope && clusterCoordinator != nil &&
+		(!cfg.Iceberg.Enabled || clusterCoordinator.HasCompactorFailover())
+	var rehomeClusterOpen api.OpenCompactions
+	if rehomeClusterOn || rehomeLocalOn {
+		if rehomeLocalOn {
+			// Each node's own job records (rehomeRegistry) say what its
+			// reads leave out; the cluster's record answers ownership.
+			clusterCoordinator.SetRehomeLocalExclusions()
+		}
+		if src := clusterCoordinator.RehomeSource(); src != nil {
+			rehomeClusterSrc.Store(src)
+			rehomeClusterOpen = src
+		}
+	}
+	openCompactions := api.CombineOpenCompactions(compactionJobs, clusterOpen, retiredOpen, rehomeRegistry, rehomeClusterOpen)
 	queryHandler.SetOpenCompactions(openCompactions)
+	if clusterCoordinator != nil {
+		// Files this node gains from other nodes (pulled, or registered on a
+		// shared store) reach its query caches as its own flushes do (#1763).
+		clusterCoordinator.SetFilePublished(queryHandler.FilePublished)
+	}
 	queryHandler.RegisterRoutes(server.GetApp())
 	// Start the handler's background workers (currently the partition
 	// pruner cache janitor — sweeps expired globCache / partitionCache
@@ -3901,6 +4353,10 @@ func main() {
 			importHandler.SetRouter(router)
 			tleHandler.SetRouter(router)
 			queryHandler.SetRouter(router)
+			// Forwards run on the router's own context, not their request's
+			// (#1629); it ends where fasthttp ends request contexts: when the
+			// HTTP server starts shutting down.
+			server.OnShutdownStart(router.StopForwards)
 			log.Info().Msg("Cluster router wired to API handlers for request forwarding")
 		}
 
@@ -3923,7 +4379,9 @@ func main() {
 			gateEnabled = false
 		}
 		queryHandler.SetCluster(clusterCoordinator, gateEnabled)
-		if gateEnabled {
+		// Without replication (always the case on a shared object store,
+		// #1605) there is no catch-up batch and the gate never closes.
+		if gateEnabled && cfg.Cluster.ReplicationEnabled {
 			log.Info().Msg("Query catch-up gate enabled — read endpoints will return 503 until the startup catch-up batch settles")
 		}
 
@@ -3958,6 +4416,13 @@ func main() {
 	}
 
 	// Initialize Query Governance (Enterprise feature - requires valid license)
+	governanceInCluster := false
+	// The cluster's policies need its state: a coordinator without Raft
+	// (no cluster.raft_data_dir) keeps governance per node, as before.
+	governanceViewSource, governanceClustered := governance.ClusterViewSource(nil), false
+	if clusterCoordinator != nil {
+		governanceViewSource, governanceClustered = clusterCoordinator.GovernanceViewSource()
+	}
 	if cfg.Governance.Enabled {
 		if licenseClient == nil {
 			log.Warn().Msg("Query governance requires enterprise license - feature disabled")
@@ -3981,6 +4446,10 @@ func main() {
 					DB:     governanceDB,
 					Config: &cfg.Governance,
 					Logger: logger.Get("governance"),
+					// In a cluster the policies become cluster-wide once
+					// adopted (#1627); a table the cluster marked as its
+					// backup copy is never loaded again.
+					Cluster: governanceClustered,
 				})
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to create governance manager - feature disabled")
@@ -3988,6 +4457,12 @@ func main() {
 						governanceDB.Close()
 					}
 				} else {
+					if governanceClustered {
+						// Before the query handler gets it: from here on it
+						// reads the cluster's policies once they are adopted.
+						clusterCoordinator.UseGovernance(governanceManager)
+						governanceInCluster = true
+					}
 					governanceManager.Start()
 					shutdownCoordinator.RegisterHook("governance", func(ctx context.Context) error {
 						stopErr := governanceManager.Stop()
@@ -4019,6 +4494,21 @@ func main() {
 				}
 			}
 		}
+	}
+
+	if governanceClustered && !governanceInCluster {
+		// Governance does not run here (disabled, unlicensed or failed), but
+		// this node's database may hold the policies of when it did: they
+		// count in the cluster's adoption, and the node must answer it. Once
+		// adopted, its table is kept equal to the cluster's like every other
+		// node's, so turning governance on here later never enforces a
+		// policy the cluster dropped.
+		governanceDBPath := cfg.Auth.DBPath
+		if governanceDBPath == "" {
+			governanceDBPath = "./data/arc.db"
+		}
+		clusterCoordinator.SetLocalPolicyLister(clusterraft.PolicyKindGovernance, api.GovernanceTableLister(authManager, governanceDBPath))
+		clusterCoordinator.RunPolicyMirror(clusterraft.PolicyKindGovernance, api.GovernanceTableMirror(authManager, governanceDBPath, governanceViewSource, logger.Get("governance")))
 	}
 
 	// Initialize Query Management (Enterprise feature - requires valid license)
@@ -4121,6 +4611,17 @@ func main() {
 			}
 		}
 	}
+	spokeDeleteInvalidate.Store(&invalidateQueryCaches)
+
+	// Re-homing a misfiled file (#1825): the dry run. Its own routes, not
+	// compaction's: it reads storage and needs no compaction manager, so it
+	// works with compaction off. Admin only when auth is on.
+	// rehomeBackupRunning is set once the backup manager exists, further down.
+	var rehomeBackupRunning atomic.Pointer[func() bool]
+	rehomeHandler := api.NewRehomeHandler(storageBackend, authManager, dbConfig.UploadDir, logger.Get("rehome"))
+	rehomeHandler.RegisterRoutes(server.GetApp())
+	// Before storage closes: a running job reads from it.
+	shutdownCoordinator.RegisterHook("rehome-jobs", rehomeHandler.Shutdown, shutdown.PriorityCompaction)
 
 	// Register Compaction handler (if compaction is enabled)
 	if compactionManager != nil {
@@ -4143,6 +4644,12 @@ func main() {
 	// via os.CreateTemp.
 	deleteHandler := api.NewDeleteHandler(db, storageBackend, &cfg.Delete, authManager, dbConfig.UploadDir, logger.Get("delete"))
 	deleteHandler.SetOnFilesRemoved(invalidateQueryCaches)
+	deleteHandler.SetOnPathsChanged(notifyIcebergPaths)
+	if hubRowDeleteMarker != nil {
+		// #1666: a rewrite keeps the surviving rows (compacted); a file whose
+		// rows all match is removed. Both nil off a hub.
+		deleteHandler.SetReceiptMarkers(hubRowDeleteMarker, hubNoHolderMarker)
+	}
 	if registrationOutbox != nil {
 		// A rewrite of a file still pending registration is announced in its
 		// place (#1210).
@@ -4169,6 +4676,147 @@ func main() {
 		retiredCancel()
 		return nil
 	}, shutdown.PriorityHTTPServer)
+	// Re-home (#1825): DELETE leaves a job's files alone, and the swap is
+	// wired and the jobs a stopped process left are taken up, here: after
+	// the query and DELETE handlers exist, before the drainer below and
+	// before the readers start (continuous queries, retention, the Iceberg
+	// export, the HTTP and Flight SQL servers). The compaction schedulers
+	// are already started; they are kept off a job's files by the registry,
+	// seeded above, not by this order. A job found part way has its file
+	// removed without waiting for reads, because none from before the stop
+	// is alive.
+	deleteHandler.SetRehomeOwns(rehomeOwns)
+	rehomeHandler.SetSwap(&api.RehomeSwap{
+		LocalCluster: rehomeLocalOn,
+		Registry:     rehomeRegistry,
+		Reads:        queryHandler.Reads(),
+		// The export itself is bound once its scheduler exists (SetExport,
+		// below); from the configuration alone a job found at start knows
+		// to wait for it.
+		ExportExpected: cfg.Iceberg.Enabled,
+		// Tiered storage is built further down too (SetTiering), and may
+		// turn out not to run (no licence).
+		TieringExpected: cfg.TieredStorage.Enabled,
+		ColdConfigured:  cfg.TieredStorage.Enabled && cfg.TieredStorage.Cold.Enabled,
+		// The names the query engine reports for files in cold storage, read
+		// the way a query reads them: a job on a cold file leaves it out of
+		// reads by that name, and checks first that it is the name Arc
+		// builds. This connection has the cold store's credentials.
+		ColdFileNames: api.ColdFileNamesFromEngine(db.DB()),
+		Refusal: func() string {
+			switch {
+			case cfg.Cluster.Enabled && !rehomeClusterInScope:
+				return "moving a file's rows on a cluster needs a shared object store (S3, Azure or GCS) as primary storage or local storage with cluster.replication_enabled, and edge sync off; with the Iceberg export on, it also needs compactor failover (cluster.failover_enabled, with a licence that includes it), in this version"
+			case cfg.EdgeSync.Enabled || cfg.EdgeSync.Import.Active() || cfg.EdgeSync.Spoke.Active():
+				return "moving a file's rows is not available with edge sync in this version"
+			}
+			return ""
+		},
+		RewriteLock: deleteHandler.WithRewriteLock,
+		OtherExclusions: func(ctx context.Context, prefix string) ([]string, error) {
+			if otherExclusions == nil {
+				return nil, nil
+			}
+			if strict, ok := otherExclusions.(api.StrictExcluder); ok {
+				return strict.ExcludedForStrict(ctx, prefix)
+			}
+			return otherExclusions.ExcludedFor(ctx, prefix), nil
+		},
+		CompactionOpen: func(prefix string) bool {
+			return compactionManager != nil && compactionManager.OpenJobs.Open(prefix)
+		},
+		BackupRunning: func() bool {
+			running := rehomeBackupRunning.Load()
+			return running != nil && (*running)()
+		},
+		FilePublished:    queryHandler.FilePublished,
+		InvalidateCaches: invalidateQueryCaches,
+		InvalidateLocalCaches: func() {
+			db.ClearHTTPCache()
+			queryHandler.InvalidateCaches()
+		},
+		ClearMisfiled: func(path string) {
+			if compactionManager != nil {
+				compactionManager.ClearMisfiled("", path)
+			}
+		},
+	})
+	if rehomeLocalOn {
+		// Before Recover: on a cluster node, staged directories are this
+		// node's part of cluster jobs, settled by SweepLocal once synced, and
+		// a job journaled before it was one is undone. Every member, in
+		// scope or not: a node out of scope still does its part of a job
+		// in flight (#1859).
+		rehomeHandler.SetCluster(clusterCoordinator, clusterCoordinator.ReadReady)
+	}
+	if err := rehomeHandler.Recover(context.Background()); err != nil {
+		log.Fatal().Err(err).Msg("Could not take up the re-home jobs found at start")
+	}
+	if rehomeLocalOn {
+		// Every node's part of a job on its own disk (#1860); the puller
+		// records a job here before an output of it lands.
+		clusterCoordinator.SetRehomeParticipant(rehomeHandler.ParticipateLocal)
+		clusterCoordinator.SetRehomeLocalRecorder(rehomeHandler.RecordLocal)
+	}
+	if rehomeClusterOn {
+		// Every node's part of a job's states, and what the read lease does
+		// to reads and caches: losing it stops the reads in flight and those
+		// that have not bound yet; retaking it drops the caches first.
+		clusterCoordinator.SetRehomeParticipant(rehomeHandler.ParticipateCluster)
+		stopReads := func() { queryHandler.StopReads("this node lost its cluster read lease") }
+		resumeReads := func() {
+			db.ClearHTTPCache()
+			queryHandler.InvalidateCaches()
+			queryHandler.ResumeReads()
+		}
+		rehomeLeaseLost.Store(&stopReads)
+		rehomeLeaseSynced.Store(&resumeReads)
+		// Staged compaction's read fences (#1852): this node's part of a
+		// fence (drop the caches a phase needs, wait for the reads from
+		// before, drop again), and the pruner's caches bumped the first
+		// time a read here sees a job switched to its output.
+		dropFor := func(outputs []clusterraft.FileEntry) {
+			if len(outputs) == 0 {
+				return
+			}
+			measurements := map[[2]string]bool{}
+			for _, o := range outputs {
+				queryHandler.FilePublished(o.Database, o.Measurement, o.PartitionTime)
+				measurements[[2]string{o.Database, o.Measurement}] = true
+			}
+			for m := range measurements {
+				// An hour that is never the current one moves the
+				// measurement's stamp, as re-home does.
+				queryHandler.FilePublished(m[0], m[1], time.Unix(0, 0).UTC())
+			}
+			db.ClearHTTPCache()
+			queryHandler.InvalidateCaches()
+		}
+		clusterCoordinator.SetReadFenceFunc(func(ctx context.Context, outputs []clusterraft.FileEntry) error {
+			dropFor(outputs)
+			reads := queryHandler.Reads()
+			if err := reads.Wait(ctx, reads.Flip()); err != nil {
+				return err
+			}
+			if n := reads.Hung(); n > 0 {
+				log.Error().Int("hung_reads", n).
+					Msg("Queries on this node are still running more than 30 s after their deadline (stuck in the query engine, or streaming to a slow client); compaction no longer waits for them. They fail if a file they read was removed")
+			}
+			dropFor(outputs)
+			return nil
+		})
+		clusterCoordinator.SetOnCompactionSwitched(func(o clusterraft.FileEntry) {
+			queryHandler.FilePublished(o.Database, o.Measurement, o.PartitionTime)
+		})
+	}
+	if rehomeClusterInScope {
+		// The driver, on the primary writer.
+		rehomeHandler.SetCluster(clusterCoordinator, clusterCoordinator.ReadReady)
+		rehomeHandler.StartClusterTakeover()
+	}
+	if rehomeLocalOn {
+		rehomeHandler.StartLocalSweep()
+	}
 	deleteHandler.StartRetiredDrainer(retiredCtx)
 	if cfg.Delete.Enabled {
 		log.Info().
@@ -4182,14 +4830,28 @@ func main() {
 
 	// Register Databases handler
 	databasesHandler := api.NewDatabasesHandler(storageBackend, &cfg.Delete, authManager, logger.Get("databases"))
+	// A database delete and a re-home job on one of its files keep each
+	// other out (#1825).
+	databasesHandler.SetRehomeBlock(rehomeBlock)
+	if hubNamespaceRemover != nil {
+		databasesHandler.SetOnSpokeNamespaceRemoved(hubNamespaceRemover)
+	}
 	databasesHandler.SetFieldSchema(fieldSchemaRegistry)
 	databasesHandler.SetOnFilesRemoved(invalidateQueryCaches)
+	databasesHandler.SetOnPathsChanged(notifyIcebergPaths)
 	databasesHandler.SetFlusher(deleteFlusher(arrowBuffer, walWriter))
 	if registrationOutbox != nil {
 		databasesHandler.SetPendingRegistrations(registrationOutbox)
 	}
 	if clusterCoordinator != nil {
-		databasesHandler.SetCoordinator(clusterCoordinator, cfg.Cluster.SharedStorageMode || cfg.Cluster.ReplicationEnabled)
+		if localClusterWithoutReplication(true, cfg.Storage.Backend, cfg.Cluster.SharedStorageMode, cfg.Cluster.ReplicationEnabled) {
+			log.Warn().Str("role", clusterCoordinator.Role()).Msg(localClusterWithoutReplicationWarning())
+		}
+		// Gated to the primary writer in every cluster: even nodes that share
+		// no hot storage share the cold tier, and a database delete removes
+		// every cold object under the database and the database's manifest
+		// entries for every node (#1599).
+		databasesHandler.SetCoordinator(clusterCoordinator)
 		// The listings forward from a node that cannot serve queries, as the
 		// query routes do; a create, from a node that does not ingest, to
 		// the writer.
@@ -4218,6 +4880,13 @@ func main() {
 			log.Fatal().Err(err).Msg("Failed to initialize retention handler")
 		}
 		retentionHandler.SetOnFilesRemoved(invalidateQueryCaches)
+		// Retention claims a file before deleting it, against the re-home
+		// jobs in flight (#1825).
+		retentionHandler.SetRehomeClaim(rehomeClaim)
+		retentionHandler.SetOnPathsChanged(notifyIcebergPaths)
+		if hubRemovalMarker != nil {
+			retentionHandler.SetOnSpokeFilesRemoved(hubRemovalMarker)
+		}
 		retentionHandler.RegisterRoutes(server.GetApp())
 		if clusterCoordinator != nil {
 			retentionHandler.SetCoordinator(clusterCoordinator)
@@ -4272,15 +4941,29 @@ func main() {
 				log.Fatal().Err(err).Str("path", icebergDBPath).Msg("Failed to open Iceberg catalog DB")
 			}
 		}
-		// Default the warehouse to the storage root when unset, so table metadata lands
-		// alongside the data (file:// for local; s3://bucket/prefix for object storage).
-		warehouse := cfg.Iceberg.Warehouse
-		if warehouse == "" {
-			warehouse = iceberg.DefaultWarehouse(storageBackend)
-		}
+		warehouse := icebergWarehouseURI(cfg.Iceberg.Warehouse, storageBackend)
 		exporter, err := iceberg.NewExporter(icebergDB, storageBackend, warehouse, cfg.Iceberg.NamespacePrefix, cfg.Iceberg.RetainSnapshots, logger.Get("iceberg"))
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize Iceberg exporter")
+		}
+		// How long a published table version outlives the next one, and how
+		// often ingest publishes one (#1751). Set on every node: it only ever
+		// keeps more.
+		exporter.SetVersionRetention(time.Duration(cfg.Iceberg.MinVersionAge)*time.Second,
+			icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil)+
+				icebergArrivalInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil))
+		// #1676: where new tables are created. Colocated needs the warehouse
+		// to be the storage root, which only the resolved values can tell.
+		if err := exporter.SetLayout(cfg.Iceberg.Layout); err != nil {
+			log.Fatal().Err(err).Msg("Invalid Iceberg export layout")
+		}
+		if cfg.Iceberg.Layout == config.IcebergLayoutColocated {
+			log.Info().Msg("Iceberg export creates new tables in each measurement's directory (iceberg.layout=colocated); existing tables keep their location")
+			if clusterCoordinator != nil && !cluster.IsSharedObjectStore(storageBackend) {
+				log.Warn().Msg("Iceberg export with iceberg.layout=colocated on a cluster with node-local storage: table metadata " +
+					"is written only on the exporting node; another node's database DELETE removes it there once every node runs a build " +
+					"that applies the database-drop notice (#1731), and the emptied directories stay")
+			}
 		}
 		exporter.ConfigureNamespaceMigrationDryRun(cfg.Iceberg.NamespaceMigrationDryRun)
 		if cfg.Iceberg.NamespaceMigrationDryRun {
@@ -4295,13 +4978,38 @@ func main() {
 		if !cfg.Iceberg.OrphanSweepEnabled {
 			log.Warn().Msg("Iceberg orphan metadata sweep is disabled (iceberg.orphan_sweep_enabled=false): the manifest files of expired snapshots are retained indefinitely and are copied into every backup")
 		}
-		// Shared storage: every node sees the same tables and the export moves with the
-		// compactor lease, so the published version, not this node's catalog row, is current
-		// (#939). Elsewhere it is consulted only for a table with no catalog row.
-		exporter.SetWarehouseAuthoritative(cfg.Cluster.SharedStorageMode)
+		// A shared bucket, with or without shared_storage_mode (#1609): every node sees the
+		// same tables and the export moves with the compactor lease, so the published
+		// version, not this node's catalog row, is current (#939). Every other node too: its
+		// catalog can be restored behind its warehouse, on S3 (#1609) and local storage (#1613).
+		icebergTopo := icebergTopologyFor(cfg.Cluster.SharedStorageMode, cluster.IsSharedObjectStore(storageBackend),
+			clusterCoordinator != nil, clusterCoordinator != nil && clusterCoordinator.HasCompactorFailover(), compactionGate != nil)
+		exporter.SetWarehouseAuthoritative(icebergTopo.authoritative)
+		// A catalog row whose metadata another node's database DROP removed is forgotten,
+		// not refused, on a shared bucket with a coordinator (#1611); a standalone node keeps
+		// the #637 error. Same condition as the manifest barrier.
+		exporter.SetForgetDroppedRows(icebergTopo.barrier)
 		// #639 item 3: database deletion clears the Iceberg catalog too.
 		databasesHandler.SetIcebergDropper(exporter)
+		// #1626: the warehouse's directories in the storage root are not
+		// databases: not listed, not deletable, not written to. One layout for
+		// the listings, the writers and the export walk.
+		warehouseLayout := exporter.WarehouseLayout()
+		databasesHandler.SetWarehouseLayout(warehouseLayout)
+		queryHandler.SetWarehouseLayout(warehouseLayout)
+		// The writers' name was set right after the storage backend, from
+		// the same URI; this is the same value.
+		storage.SetWarehouseRootName(warehouseLayout.RootName())
+		if name := warehouseLayout.RootName(); name != "" {
+			log.Info().Str("warehouse_dir", name).Msg("Iceberg warehouse is a subdirectory of the storage root: it is not listed as a database, and writes to a database of that name are refused")
+		}
+		{
+			wctx, wcancel := context.WithTimeout(context.Background(), 10*time.Second)
+			iceberg.WarnWarehouseShadowing(wctx, storageBackend, warehouseLayout, logger.Get("iceberg"))
+			wcancel()
+		}
 		icebergSource := iceberg.NewStorageWalkSource(storageBackend, cfg.Iceberg.NamespacePrefix, logger.Get("iceberg"))
+		icebergSource.SetWarehouseLayout(warehouseLayout)
 		// A compacted file is exported only once its compaction has replaced
 		// the sources; until then the crash-recovery manifest names it (#638).
 		// Read through a manager of its own rather than the compaction
@@ -4320,9 +5028,9 @@ func main() {
 			}
 			icebergSource.SetExclusions(strict)
 		}
-		// Shared storage: the exclusions above come from this node's manifest, so a listed file
-		// it does not know yet waits for it to catch up before export (#939).
-		if cfg.Cluster.SharedStorageMode && clusterCoordinator != nil {
+		// Shared bucket: the exclusions above come from this node's manifest, so a listed file
+		// it does not know yet waits for it to catch up before export (#939, #1609).
+		if icebergTopo.barrier {
 			icebergSource.SetManifestBarrier(func(p string) bool {
 				node := clusterCoordinator.GetRaftNode()
 				if node == nil || node.FSM() == nil {
@@ -4334,7 +5042,13 @@ func main() {
 		// On a local-storage cluster a delete reaches this disk after the
 		// manifest; files the cluster deleted stay out of the table meanwhile.
 		if clusterCoordinator != nil && storageBackend.Type() == "local" {
-			icebergSource.SetDeletedHere(clusterCoordinator.LocalCopyDeleted)
+			// Not the source of a re-home job this node records (#1870): from
+			// the latch until its own step records the job latched, its
+			// record still leaves the outputs out, and reading the source as
+			// deleted would publish neither.
+			icebergSource.SetDeletedHere(func(p string) bool {
+				return clusterCoordinator.LocalCopyDeleted(p) && !rehomeRegistry.ClusterSource(p)
+			})
 			if !clusterCoordinator.TracksLocalCopies() {
 				log.Warn().Msg("Iceberg export on a local-storage cluster without local copy tracking (cluster.replication_enabled, cluster.replication_catchup_enabled and cluster.raft_data_dir): a pass that runs between a compaction, DELETE or retention removing a file from the manifest and this node unlinking it publishes the deleted file next to the one holding its rows, so external readers can see those rows twice")
 			}
@@ -4360,12 +5074,31 @@ func main() {
 		// sees, so the gate is the compactor lease itself, with no static-role fallback: before
 		// the first lease is assigned no node exports. Config refuses shared-storage Iceberg
 		// without cluster.failover_enabled, which is what assigns the lease.
+		//
+		// A shared bucket without shared_storage_mode (#1609) takes the lease gate too when
+		// compactor failover exists; without it, the compaction gate and a warning.
 		var icebergGate iceberg.WriterGate
-		switch {
-		case cfg.Cluster.SharedStorageMode && clusterCoordinator != nil:
+		switch icebergTopo.gate {
+		case icebergGateLease:
 			icebergGate = icebergLeaseGate{clusterCoordinator}
-		case compactionGate != nil:
+		case icebergGateCompaction:
 			icebergGate = icebergWriterGate{compactionGate}
+		case icebergGateNone:
+		default:
+			// A nil gate always runs: an unknown kind must not fail open.
+			log.Fatal().Int("gate", int(icebergTopo.gate)).Msg("Iceberg export: unknown gate kind")
+		}
+		if icebergTopo.warnNoElection && compactionGate.CanCompact() {
+			log.Warn().Msg(icebergNoElectionWarning)
+		}
+		icebergPassesAtOnce := icebergReconcileConcurrency(cfg.Iceberg.ReconcileConcurrency, clusterCoordinator != nil, icebergTopo.warnNoElection, storageBackend.Type() != "local")
+		if n := cfg.Iceberg.ReconcileConcurrency; n > 1 && icebergPassesAtOnce == 1 {
+			log.Info().Int("iceberg.reconcile_concurrency", n).
+				Msg("Iceberg export reconciles one table at a time on this node: reconcile passes of several tables at once are for standalone nodes")
+		} else {
+			// The value in effect: unset, it depends on the storage.
+			log.Info().Int("reconcile_passes_at_once", icebergPassesAtOnce).Int("iceberg.reconcile_concurrency", n).
+				Msg("Iceberg export: reconcile passes of different tables that run at once")
 		}
 		icebergScheduler := iceberg.NewScheduler(iceberg.SchedulerConfig{
 			Exporter: exporter,
@@ -4373,10 +5106,167 @@ func main() {
 			Interval: time.Duration(cfg.Iceberg.ReconcileInterval) * time.Second,
 			Gate:     icebergGate,
 			Logger:   logger.Get("iceberg"),
+			// 0 leaves RequestIngestReconcile and its bookkeeping off (#1750).
+			// On a cluster node the reports are files reaching it from other
+			// nodes (#1756).
+			IngestInterval: icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil) +
+				icebergArrivalInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil),
+			// An ingest request adds only the files ingest reported, without
+			// listing the measurement (#1751).
+			IngestAppend: cfg.Iceberg.IngestAppendEnabled,
+			// How many tables' ingest appends run at once (#1778). Without the
+			// ingest trigger (a cluster node, interval 0) nothing reads it.
+			IngestConcurrency: cfg.Iceberg.IngestExportConcurrency,
+			// How many tables' reconcile passes run at once (#1786): one on a
+			// cluster node.
+			ReconcileConcurrency: icebergPassesAtOnce,
 		})
+		// #1825: a re-home job keeps the file it replaces until the published
+		// table does not name it, and the export commits that file's removal
+		// with the files that replace it.
+		exporter.SetReplaced(func(database, measurement string) map[string][]string {
+			prefix := database + "/" + measurement + "/"
+			out := rehomeRegistry.Replaced(prefix)
+			// Cluster jobs past their latch (#1870): on a shared store this
+			// node keeps no record of them.
+			if src := rehomeClusterSrc.Load(); src != nil {
+				for k, v := range src.Replaced(prefix) {
+					if out == nil {
+						out = map[string][]string{}
+					}
+					if _, ok := out[k]; !ok {
+						out[k] = v
+					}
+				}
+			}
+			return out
+		})
+		rehomeHandler.SetExport(func(ctx context.Context, database, measurement, fileKey string) (api.RehomeExportAnswer, error) {
+			a, err := icebergScheduler.ReconcileAndConfirm(ctx, database, measurement, fileKey)
+			if err != nil {
+				return api.RehomeExportAnswer{}, err
+			}
+			clear, why := a.Verdict(fileKey != "")
+			return api.RehomeExportAnswer{Clear: clear, Why: why, NotExporter: a.Blocked == iceberg.NotExportingReason}, nil
+		})
+		// The published table read without a pass, whichever node exports
+		// (#1870): on a shared warehouse every node waits for the same table.
+		rehomeHandler.SetExportCheck(func(ctx context.Context, database, measurement, fileKey string) (bool, bool, error) {
+			a, err := icebergScheduler.CheckPublished(ctx, database, measurement, fileKey)
+			if err != nil {
+				return false, false, err
+			}
+			if a.Blocked != "" {
+				return false, false, errors.New(a.Blocked)
+			}
+			return a.Published, a.Named, a.Err
+		})
+		// #1731: with node-local warehouses (not icebergTopo.barrier, which is a shared bucket or
+		// shared_storage_mode), a database DELETE on the writer drops only the writer's tables.
+		// Every node drops its own on the writer's replicated notice, once its delete workers
+		// unlinked the database's files; skipped while the manifest has files under the database
+		// again (a replayed notice, a database recreated at once). Wired here, not at start: a
+		// notice applied meanwhile waits in the scheduler for its loop.
+		if clusterCoordinator != nil && !icebergTopo.barrier {
+			icebergScheduler.SetDropGuard(clusterCoordinator.IcebergDatabaseHasFiles)
+			clusterCoordinator.SetIcebergDatabaseDropper(icebergScheduler.RequestDropDatabase)
+			log.Info().Msg("Iceberg export on node-local storage: this node drops its own Iceberg tables of a database deleted on the cluster")
+		}
+		// Per-table export lag series on /metrics (#1772), opt-in: they carry
+		// database and measurement names.
+		if n := cfg.Iceberg.ExportLagTableSeries; n > 0 {
+			icebergScheduler.EnableExportLagTables()
+			metrics.Get().SetIcebergTableLagSource(icebergScheduler, n)
+			ev := log.Info().Int("tables", n)
+			if authManager == nil || cfg.Auth.MetricsPublic {
+				ev.Msg("Iceberg export lag per table on /metrics: these series name databases and measurements, and /metrics is served without a token")
+			} else {
+				ev.Msg("Iceberg export lag per table on /metrics: these series name databases and measurements, readable by any valid token")
+			}
+		}
 		// Started after tiering is set up (below), so the first pass already sees the cold tier.
 		icebergStart = icebergScheduler.Start
 		icebergExporter, icebergWalk = exporter, icebergSource
+		// A finished compaction asks for its measurement now: the table drops
+		// the deleted inputs within a pass instead of up to
+		// iceberg.reconcile_interval later (#1722). Requests before the loop
+		// starts wait for its first pass; on a node the gate keeps off they
+		// are dropped.
+		if compactionManager != nil {
+			compactionManager.SetOnMeasurementCompacted(icebergScheduler.RequestReconcile)
+		}
+		// Row DELETE, retention, tiering moves, delete_after_sync and a partial
+		// database delete report the storage paths they changed (#1727). They
+		// are served only on the node that exports: on a cluster's primary
+		// writer, where those mostly run, the gate drops them and the timed
+		// passes cover them.
+		// Stored when the export starts (icebergStart below): a scheduler that
+		// never starts (no cold tier) would collect requested paths forever.
+		requestPaths := icebergScheduler.RequestReconcilePaths
+		startScheduler := icebergStart
+		icebergStart = func() {
+			startScheduler()
+			icebergPathsChanged.Store(&requestPaths)
+			// An ingest flush asks for its measurement's table, so a new file
+			// is exported after at most iceberg.ingest_export_interval and not
+			// at the next timed pass (#1750). Installed when the export
+			// starts, like the path requests above: a scheduler that never
+			// starts would only collect them.
+			//
+			// On a cluster node the files that reach it from other nodes
+			// report (#1756, SetIcebergFileArrived below), and its own
+			// flushes only on local storage (#1902): the node that flushes is
+			// usually not the one that exports, and the gate drops its
+			// request, but on the exporter its own files are otherwise left
+			// to the timed pass. Not on a shared bucket: there every node's
+			// registration already reports as an arrival, the exporter's own
+			// included, and a request served before that registration lands
+			// would cost a Raft barrier.
+			if clusterCoordinator != nil && icebergArrivalInterval(cfg.Iceberg.IngestExportInterval, true) > 0 {
+				// #1756: a file that reaches this node from another (pulled
+				// onto local storage, or registered in a shared bucket) asks
+				// for an export of its table; the scheduler's gate drops the
+				// request unless this node exports.
+				// The append path needs a per-file check this storage has only
+				// when local; on a shared bucket every arrival would fall back
+				// to a full pass, so ask for one directly.
+				appendOn := cfg.Iceberg.IngestAppendEnabled && storageBackend.Type() == "local"
+				clusterCoordinator.SetIcebergFileArrived(func(database, measurement, storagePath string, sizeBytes int64) {
+					if appendOn {
+						icebergScheduler.RequestIngestAppend(database, measurement, storagePath, sizeBytes)
+						return
+					}
+					icebergScheduler.RequestIngestReconcile(database, measurement)
+				})
+			}
+			if icebergOwnFlushReports(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil, storageBackend.Type()) {
+				if cfg.Iceberg.IngestAppendEnabled {
+					// The append path (#1751): each file the flush registers
+					// is named to the export, which adds just those. Reported
+					// at registration and not at the write: a request served
+					// between the two would find no file and list the whole
+					// measurement.
+					arrowBuffer.SetOnFileRegistered(func(database, measurement, storagePath string, sizeBytes int64) {
+						icebergScheduler.RequestIngestAppend(database, measurement, storagePath, sizeBytes)
+					})
+				} else {
+					arrowBuffer.AddOnFilePublished(func(database, measurement string, _ time.Time) {
+						icebergScheduler.RequestIngestReconcile(database, measurement)
+					})
+				}
+				// A file ingest deletes after storing it (the late-landed copy
+				// of a failed flush) may be in the table already: take it out
+				// now, not at the next timed pass.
+				arrowBuffer.SetOnFileRemoved(icebergScheduler.RequestReconcile)
+			}
+			// In a cluster the writer's own requests are dropped here at the
+			// gate: the exporter node's coordinator tells it what its listing
+			// lost (local unlinks, shared-bucket manifest deletes by reason,
+			// rewrites landing), #1728.
+			if clusterCoordinator != nil {
+				clusterCoordinator.SetIcebergPathCallbacks(icebergScheduler.RequestReconcilePathsHot, icebergScheduler.RequestReconcilePathsLater, icebergScheduler.RequestReconcilePaths)
+			}
+		}
 		shutdownCoordinator.RegisterHook("iceberg", func(ctx context.Context) error {
 			icebergScheduler.Stop()
 			// Close only a handle this block opened. A borrowed one belongs to
@@ -4387,6 +5277,14 @@ func main() {
 			return nil
 		}, shutdown.PriorityDatabase)
 		log.Info().Str("warehouse", warehouse).Int("interval_s", cfg.Iceberg.ReconcileInterval).Msg("Iceberg export enabled")
+		if cfg.Iceberg.RESTCatalogEnabled {
+			registerIcebergRESTCatalog(server.GetApp(), exporter, authManager, rbacManager, spokeRegistry, storageBackend,
+				icebergCatalogServable(cfg.Cluster.SharedStorageMode || cluster.IsSharedObjectStore(storageBackend), icebergGate))
+		}
+		// #1690 option B: Glue sync starts and stops with the export.
+		if cfg.Iceberg.Glue.Enabled {
+			icebergStart = wireIcebergGlue(exporter, storageBackend, icebergGate, cfg.Iceberg.Glue, cfg.Iceberg.Layout, shutdownCoordinator, icebergStart)
+		}
 	}
 
 	// Register Continuous Query handler
@@ -4397,6 +5295,8 @@ func main() {
 		if err == nil {
 			cqHandler.SetFieldSchema(fieldSchemaRegistry)
 			cqHandler.SetOpenCompactions(openCompactions)
+			// The same count of reads in flight as queries (#1825).
+			cqHandler.SetReads(queryHandler.Reads())
 		}
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to initialize continuous query handler")
@@ -4436,6 +5336,15 @@ func main() {
 	if cfg.Cluster.SharedStorageMode && clusterCoordinator == nil {
 		log.Fatal().
 			Msg("cluster.shared_storage_mode=true but the cluster coordinator is not running (see the errors above); without it retention, CQ and tiering migration would run on this node unconditionally against the shared bucket")
+	}
+	if !cfg.Cluster.SharedStorageMode && objectStoreCluster(cfg.Cluster.Enabled, cfg.Storage.Backend) && clusterCoordinator == nil {
+		// Licensed for clustering, so the coordinator failed to start (Raft,
+		// TLS): refused, as shared-storage mode refuses it above. Without
+		// the licence the node is plainly standalone and only warned (#1606).
+		if licenseHasClustering(licenseClient) {
+			log.Fatal().Str("backend", cfg.Storage.Backend).Msg(objectStoreClusterCoordinatorFailedError)
+		}
+		log.Warn().Str("backend", cfg.Storage.Backend).Msg(objectStoreClusterNoCoordinatorWarning)
 	}
 
 	// Initialize CQ Scheduler (Enterprise feature - requires valid license)
@@ -4563,10 +5472,19 @@ func main() {
 			reconciler.SetPendingFilter(registrationOutbox.HoldsRegistration)
 		}
 		if err == nil {
+			// The export may have published an orphan the sweep deletes (#1728).
+			reconciler.SetOnPathsDeleted(notifyIcebergPaths)
+		}
+		if err == nil {
 			// A committed compaction output moving into place here is not an
 			// orphan entry (#1207 d2a2a).
-			reconciler.SetHeldFilter(clusterCoordinator.CompactionOutputHeld)
-			reconciler.SetCompactionOwnedFilter(clusterCoordinator.CompactionOwns)
+			reconciler.SetHeldFilter(func(p string) bool {
+				return clusterCoordinator.CompactionOutputHeld(p) || clusterCoordinator.RehomeOwnsPath(p)
+			})
+			// And the files a re-home job owns (#1825).
+			reconciler.SetCompactionOwnedFilter(func(p string) bool {
+				return clusterCoordinator.CompactionOwns(p) || clusterCoordinator.RehomeOwnsPath(p)
+			})
 			// On a shared object store the sweep runs on the active
 			// compactor, which has no outbox: what the writers have pending,
 			// asked of each and read from their published lists, is not an
@@ -4627,6 +5545,7 @@ func main() {
 	// (accept whenever ready) is already right and nothing is wired.
 	if clusterCoordinator != nil {
 		server.SetWriteReadiness(clusterCoordinator.MayAcceptIngest)
+		server.SetReadReadiness(clusterCoordinator.ReadReady)
 	}
 
 	// MQTT API handlers are registered unconditionally. Both MQTTHandler
@@ -4779,18 +5698,30 @@ func main() {
 				// the backend's transport open until process teardown.
 				registerTieringColdBackendShutdown(shutdownCoordinator, coldBackend)
 
-				// Where nodes share data — one hot bucket (shared-storage
-				// mode), or per-node disks kept in step by file replication
-				// — only the primary writer among them moves and deletes
-				// files (the gate retention and CQ use); every node still
-				// syncs its tier metadata each cycle because queries route
-				// from it; and every hot copy tiering removes leaves the
-				// cluster manifest first, so peer replication does not pull
-				// it back. A local-storage cluster without replication
-				// shares nothing and stays ungated: each node's metadata is
-				// authoritative for its own disk. The manifest seam is wired
-				// whenever a coordinator exists, since files are registered
-				// in the manifest either way.
+				// Where nodes share data — one hot bucket, or per-node disks
+				// kept in step by file replication — only the primary writer
+				// among them moves and deletes files (the gate retention and
+				// CQ use); every node still syncs its tier metadata each cycle
+				// because queries route from it; and every hot copy tiering
+				// removes leaves the cluster manifest first, so peer
+				// replication does not pull it back. A hot bucket is shared
+				// whether or not cluster.shared_storage_mode is set: without
+				// the flag it is the single-writer form of Pattern 2, whose
+				// primary the writer-failover manager elects (#1603). So the
+				// bucket is recognised from the backend that was built, as
+				// reconciliation (IsSharedObjectStore) and the manifest delete
+				// callbacks (the storage type) already decide it.
+				//
+				// A local-storage cluster without replication is neither
+				// shipped pattern (cluster_topology.go, #1599). Its writers
+				// stay ungated, each migrating the hot files on its own
+				// disk. Its readers and compactors, which hold none, are
+				// gated: they only sync, as in the shipped patterns, and so
+				// retire the cold rows a writer removed rather than report
+				// them as lost. The cold store is shared either way: the
+				// cold mark requires one store on every node (#1552). The
+				// manifest seam is wired whenever a coordinator exists, since
+				// files are registered in the manifest either way.
 				var tieringGate tiering.ClusterGate
 				var tieringManifest tiering.ManifestCoordinator
 				if clusterCoordinator != nil {
@@ -4798,7 +5729,8 @@ func main() {
 						coordinator: clusterCoordinator,
 						logger:      logger.Get("tiering-manifest"),
 					}
-					if cfg.Cluster.SharedStorageMode || cfg.Cluster.ReplicationEnabled {
+					if tieringGateWired(cfg.Cluster.SharedStorageMode, cfg.Cluster.ReplicationEnabled,
+						cluster.IsSharedObjectStore(storageBackend), cfg.Storage.Backend, clusterCoordinator.Role()) {
 						tieringGate = newWriterClusterGate(clusterCoordinator)
 					}
 				}
@@ -4826,6 +5758,10 @@ func main() {
 						tieringDB.Close()
 					}
 				} else {
+					// #1825: a re-home job's files stay on the hot tier while
+					// it runs. Before Start, so the startup scan and the first
+					// cycle already see a job found at start.
+					tieringManager.SetOwnedFilter(rehomeOwns)
 					// /health "tiering": cold rows whose object is gone (#1551).
 					// ColdMissingObjects is nil until a cold sync has checked.
 					server.SetColdMissingObjects(tieringManager.ColdMissingObjects)
@@ -5036,10 +5972,14 @@ func main() {
 		if retentionHandler != nil {
 			retentionHandler.SetTieringManager(tieringManager)
 		}
+		spokeDeleteTiering.Store(tieringManager)
 		tieringHandler := api.NewTieringHandler(tieringManager, authManager, licenseClient, logger.Get("tiering-api"))
 		tieringHandler.RegisterRoutes(server.GetApp())
 
 		tieringPoliciesHandler := api.NewTieringPoliciesHandler(tieringManager, authManager, licenseClient, logger.Get("tiering-policies-api"))
+		// A policy PUT for a database that does not exist answers 404, by the
+		// rule GET /api/v1/databases/:name answers with (#1626).
+		tieringPoliciesHandler.SetDatabaseCheck(databasesHandler.CheckDatabase)
 		tieringPoliciesHandler.RegisterRoutes(server.GetApp())
 
 		// Wire tiering manager to query handler for multi-tier query routing
@@ -5051,6 +5991,14 @@ func main() {
 		// partition paths (pruner + SQL transform caches) go stale and must
 		// be dropped — same reason compaction invalidates them (#662).
 		tieringManager.SetOnMigrationComplete(queryHandler.InvalidateCaches)
+		tieringManager.SetOnPathsChanged(notifyIcebergPaths)
+		// In a cluster, cold removals on this node reach the Iceberg exporter
+		// (another node) as a Raft notice (#1728), gathered into one per
+		// burst and proposed off the caller's path. A failed notice costs
+		// the export iceberg.cold_rescan_interval, as before.
+		if clusterCoordinator != nil {
+			tieringManager.SetOnColdRemoved(clusterCoordinator.NoteIcebergColdRemoved)
+		}
 		// Around every chunk of hot copies a migration releases, and when a
 		// replica records a pulled file's move to cold: a cold listing cached
 		// before the copy, or a hot glob cached before the release, would
@@ -5065,7 +6013,8 @@ func main() {
 		// mark their sync receipts first, or the spoke re-uploads duplicates.
 		// Wiring this also lifts the migrator's spoke-namespace gate.
 		if hubReceiptMarker != nil {
-			tieringManager.SetOnHotFilesRemoved(hubReceiptMarker)
+			tieringManager.SetOnHotFilesRemoved(hubInPlaceMarker)
+			hubColdTier.Store(tieringManager)
 			log.Info().Msg("Tiering hot-file removals wired to edge-sync receipt marking; spoke cold migration enabled")
 		}
 		log.Info().Msg("Tiering manager wired to query handler for multi-tier queries")
@@ -5148,6 +6097,9 @@ func main() {
 			}
 		}
 	}
+	// delete_after_sync may run from here: the cache invalidator exists and
+	// tiering, if on, is wired (its move claim and tier rows are in place).
+	spokeDeleteReady.Store(true)
 
 	// Iceberg export, once tiering is set up: with a cold tier, files migrated to it stay in the
 	// tables (#939), so the export must see the cold tier from its first pass. Exporting without
@@ -5179,7 +6131,25 @@ func main() {
 		}
 		if startExport {
 			icebergStart()
+		} else {
+			rehomeHandler.SetExportNotStarted("the Iceberg export is not started on this node: tiered_storage.cold is enabled and the export cannot track the cold tier (the server log has the reason)")
 		}
+	}
+	// #1825: everything a re-home job may need is bound now, or known absent:
+	// the Iceberg export above, tiering here. Jobs found at start past their
+	// commit are taken up from this point, and new ones accepted.
+	if tieringManager != nil {
+		rehomeHandler.SetTiering(tieringManager)
+	}
+	rehomeHandler.Wired()
+	// A node whose cold tier is configured and not running (no licence, or
+	// cold storage unreachable at start) would refuse every job's published
+	// step, holding each for 15 minutes before it reverts (#1869): it does not
+	// take part, so the cluster refuses jobs up front.
+	if clusterCoordinator != nil && rehomeCfgInScope && cfg.TieredStorage.Enabled && cfg.TieredStorage.Cold.Enabled &&
+		(tieringManager == nil || tieringManager.ColdTierMissing()) {
+		clusterCoordinator.SetRehomeInScope(false)
+		log.Warn().Msg("Re-home: this node's cold tier is configured but not running (no licence, or cold storage unreachable at start), so it does not take part in moving a file's rows, and no such job starts on the cluster until it does (restart once the cold tier is reachable)")
 	}
 
 	// Initialize Backup/Restore (OSS feature — no license required)
@@ -5308,6 +6278,17 @@ func main() {
 			log.Error().Err(err).Str("target", cfg.Backup.DefaultTarget).Msg("Failed to initialize backup manager")
 		} else {
 			backupHandler := api.NewBackupHandler(backupManager, authManager, cfg.Backup.OperationTimeout, logger.Get("backup-api"))
+			// Files a restore wrote are read at once, not after the query
+			// caches' TTL (#1764).
+			backupManager.SetOnDataRestored(queryHandler.InvalidateCaches)
+			// A backup or restore and a re-home job keep each other out
+			// (#1825).
+			backupHandler.SetRehomeBlock(rehomeBlock)
+			backupRunning := func() bool {
+				p := backupManager.GetProgress()
+				return p != nil && p.Status == "running"
+			}
+			rehomeBackupRunning.Store(&backupRunning)
 			// Cluster safety (#1083). Only when the coordinator exists: an
 			// interface holding a typed nil *Coordinator is not == nil (#713),
 			// and both setters would then keep a pointer whose methods panic.
@@ -5326,6 +6307,11 @@ func main() {
 				} else {
 					log.Warn().Msg("Cluster coordinator has no Raft file manifest: backups run without the manifest cross-check and restores register nothing")
 				}
+			}
+			if icebergExporter != nil {
+				// A restore that stages a catalog pauses the export until the
+				// restart that applies it (#1813).
+				backupManager.SetIcebergExportPauser(icebergExporter)
 			}
 			if tieringManager != nil {
 				backupManager.SetTierRecorder(tieringManager)
@@ -5421,8 +6407,9 @@ func main() {
 	// accordingly; a future PR may expose this as an env var
 	// (ARC_SHUTDOWN_READY_DRAIN_SECONDS) if customers ask.
 	//
-	// In-flight requests that arrived BEFORE MarkNotReady drain via Fiber's
-	// normal shutdown handling — they complete; only NEW requests get
+	// In-flight requests that arrived BEFORE MarkNotReady drain in the
+	// http-server hook: they get its grace to complete, after which the
+	// queries still running are cancelled (#1644); only NEW requests get
 	// rejected by the LB once it observes the 503.
 	// Drain grace: 10s in clustered mode gives the LB one poll cycle to
 	// observe /ready=503 and stop routing before the listener closes.
@@ -5435,14 +6422,19 @@ func main() {
 	}
 	shutdownCoordinator.RegisterHook("ready-flag-off", func(ctx context.Context) error {
 		server.MarkNotReady()
-		if readyDrainGrace == 0 {
+		// At most half of the hooks' remaining share: the HTTP drain after
+		// this needs a grace too (#1644). The hooks get 40% of
+		// server.shutdown_timeout, so the full 10 s needs 50 s or more; at
+		// the default 30 s the LB gets 6 s, less than one 10 s poll cycle.
+		grace := readyDrainGraceWithin(ctx, readyDrainGrace)
+		if grace == 0 {
 			return nil
 		}
 		// time.NewTimer + defer Stop instead of time.After: if ctx.Done
 		// wins the select, time.After would leak the underlying timer
 		// until the deadline expires. Bounded leak in a shutdown hook,
 		// but using the standard idiom anyway.
-		timer := time.NewTimer(readyDrainGrace)
+		timer := time.NewTimer(grace)
 		defer timer.Stop()
 		select {
 		case <-timer.C:
@@ -5454,18 +6446,43 @@ func main() {
 		return nil
 	}, 5)
 
+	var flightSQLServer *api.FlightSQLServer
+	if cfg.FlightSQL.Enabled {
+		flightSQLServer, err = api.NewFlightSQLServer(queryHandler, api.FlightSQLServerConfig{
+			Host:        cfg.Server.Host,
+			Port:        cfg.FlightSQL.Port,
+			TLSEnabled:  cfg.Server.TLSEnabled,
+			TLSCertFile: cfg.Server.TLSCertFile,
+			TLSKeyFile:  cfg.Server.TLSKeyFile,
+			Version:     Version,
+			Middleware:  flightSQLMiddleware,
+		}, logger.Get("flight-sql"))
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to initialize Flight SQL server")
+		}
+		// Bound now, served once the HTTP server is up: a port conflict
+		// exits before the node reports ready. Like an HTTP start failure,
+		// the exit skips the shutdown hooks.
+		if err := flightSQLServer.Listen(); err != nil {
+			log.Fatal().Err(err).Msg("Failed to start Flight SQL server")
+		}
+		shutdownCoordinator.RegisterHook("flight-sql-server", func(ctx context.Context) error {
+			return flightSQLServer.Shutdown(ctx)
+		}, shutdown.PriorityHTTPServer-1)
+	}
+
 	// Register HTTP server shutdown hook (first to stop accepting new
-	// requests). The arg is the HTTP server's INTERNAL drain timeout —
-	// independent of shutdownCoordinator's own budget, though both now derive
-	// from server.shutdown_timeout (#805), so raising that key gives the drain
-	// and the overall shutdown the same extra room. If the coordinator ctx
-	// expires before this hook completes, the coordinator skips remaining
-	// hooks; the internal timeout is a best-effort upper bound on this hook's
-	// slice of that budget. The debug-pprof hook (registered earlier in main,
-	// same priority) uses srv.Close() instead of Shutdown(ctx) to avoid
-	// letting a long /debug/pprof/profile?seconds=N capture starve this hook.
+	// requests). It drains within ctx's deadline, which is the hooks' share
+	// of server.shutdown_timeout (SetComponentReserve above): a grace for
+	// in-flight requests, then the queries still running are cancelled and
+	// the connections still open are closed (api.Server.ShutdownContext).
+	// It used to drain for the whole budget, so one long query left no time
+	// for the buffer flush or the WAL close (#1644). The debug-pprof hook
+	// (registered earlier in main, same priority) uses srv.Close() instead
+	// of Shutdown(ctx) to avoid letting a long /debug/pprof/profile?seconds=N
+	// capture starve this hook.
 	shutdownCoordinator.RegisterHook("http-server", func(ctx context.Context) error {
-		return server.Shutdown(shutdownTimeout)
+		return server.ShutdownContext(ctx, shutdownTimeout)
 	}, shutdown.PriorityHTTPServer)
 
 	// Clear credential material that earlier versions could leave in stored
@@ -5482,11 +6499,22 @@ func main() {
 	// cluster coordinator is up, and all background schedulers are running.
 	// In single-writer deployments this is also the signal to Kubernetes
 	// readiness probes / any LB doing httpchk that the node is healthy.
+	// Every route is registered by now: check that none sits ahead of the
+	// audit middleware (#1630). Logged, never fatal.
+	if auditMiddleware != nil {
+		checkAuditCoverage(server.GetApp(), auditMiddleware, authPublicRoutes, authPublicPrefixes, log.Logger)
+	}
+
 	server.MarkReady()
 
 	// Start server
 	if err := server.Start(); err != nil {
 		log.Fatal().Err(err).Msg("Failed to start HTTP server")
+	}
+	if flightSQLServer != nil {
+		if err := flightSQLServer.Serve(); err != nil {
+			log.Fatal().Err(err).Msg("Failed to start Flight SQL server")
+		}
 	}
 
 	protocol := "HTTP"
@@ -5660,6 +6688,166 @@ func sharedSQLiteHandle(authManager *auth.AuthManager, dbPath string) (db *sql.D
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(time.Hour)
 	return db, true, nil
+}
+
+// icebergPathsChanged is the Iceberg scheduler's RequestReconcilePaths once
+// Iceberg export is set up (#1727). The paths that remove, move or rewrite
+// data files are wired before the scheduler exists, so they report through
+// notifyIcebergPaths, which does nothing while it is unset (Iceberg off).
+var icebergPathsChanged atomic.Pointer[func(keys []string)]
+
+// notifyIcebergPaths tells the Iceberg export which storage keys or prefixes
+// just changed, so the tables naming them are reconciled now rather than at
+// the next timed pass.
+func notifyIcebergPaths(keys []string) {
+	if fn := icebergPathsChanged.Load(); fn != nil {
+		(*fn)(keys)
+	}
+}
+
+// spokeLocalDeleter deletes a spoke's own copy of a synced file the hub proved
+// it holds (edge sync phase 3a, delete_after_sync). A file already gone is
+// success; a file whose size differs from the ledger's is kept; spoke tiering's
+// move claim keeps it off a file being migrated; the hot tier row goes with
+// the file. The agent drops the query caches once per batch afterwards. Not
+// ready until startup has wired tiering and the cache invalidator.
+func spokeLocalDeleter(backend storage.Backend, tm *atomic.Pointer[tiering.Manager], ready *atomic.Bool) edgesync.LocalDeleter {
+	return func(ctx context.Context, path string, wantSize int64) error {
+		if !ready.Load() {
+			return edgesync.ErrDeleterNotReady
+		}
+		size, err := backend.StatFile(ctx, path)
+		if err != nil {
+			return fmt.Errorf("stat: %w", err)
+		}
+		if size < 0 {
+			return nil
+		}
+		if size != wantSize {
+			return fmt.Errorf("%w: local size %d, synced size %d", edgesync.ErrLocalChanged, size, wantSize)
+		}
+		mgr := tm.Load()
+		if mgr != nil {
+			release, err := mgr.ClaimForDelete(ctx, path)
+			if err != nil {
+				return err
+			}
+			defer release()
+		}
+		if err := backend.Delete(ctx, path); err != nil {
+			if after, serr := backend.StatFile(ctx, path); serr != nil || after >= 0 {
+				return fmt.Errorf("delete: %w", err)
+			}
+		}
+		if mgr != nil {
+			if err := mgr.DeleteFile(ctx, path); err != nil {
+				log.Warn().Err(err).Str("path", path).Msg("delete_after_sync: deleted the local file but not its tier row")
+			}
+		}
+		spokeDeleted.add(path)
+		return nil
+	}
+}
+
+// spokeDeleted collects the paths delete_after_sync removed until its batch
+// ends (flushSpokeDeleted, from the AfterDeletes hooks): one Iceberg request
+// per batch, not per file, which would commit the table once per file.
+var spokeDeleted pathBatch
+
+type pathBatch struct {
+	mu    sync.Mutex
+	paths []string
+}
+
+func (b *pathBatch) add(p string) {
+	b.mu.Lock()
+	b.paths = append(b.paths, p)
+	b.mu.Unlock()
+}
+
+func (b *pathBatch) take() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := b.paths
+	b.paths = nil
+	return out
+}
+
+// flushSpokeDeleted reports a finished delete_after_sync batch to the
+// Iceberg export (#1727).
+func flushSpokeDeleted() {
+	if paths := spokeDeleted.take(); len(paths) > 0 {
+		notifyIcebergPaths(paths)
+	}
+}
+
+// coordinatorManifest adapts the cluster coordinator to edgesync.ClusterManifest
+// (#1667). The catch-up is bounded short: it runs inside a spoke's reconcile
+// or upload request, and a failure only makes the spoke retry.
+type coordinatorManifest struct{ c *cluster.Coordinator }
+
+const hubManifestSyncTimeout = 5 * time.Second
+
+func (m coordinatorManifest) Sync(ctx context.Context) error {
+	return m.c.SyncManifestWithin(ctx, hubManifestSyncTimeout)
+}
+
+func (m coordinatorManifest) Lists(path string) bool {
+	_, ok := m.c.GetFileEntry(path)
+	return ok
+}
+
+// hubCompactedMarker groups storage paths ("{spoke}/{source path}") by spoke
+// namespace and applies one HubIndex compacted-mark to each, under a bounded
+// context. Any failure is returned, so the caller (compaction keeps its
+// manifest, tiering aborts, DELETE reports the file failed) can retry.
+func hubCompactedMarker(mark func(ctx context.Context, spokeID string, sourcePaths []string) error, logger zerolog.Logger) func(paths []string) error {
+	return func(inputs []string) error {
+		byNamespace := make(map[string][]string)
+		for _, in := range inputs {
+			first, rest, found := strings.Cut(in, "/")
+			if !found || first == "" || rest == "" {
+				continue
+			}
+			byNamespace[first] = append(byNamespace[first], rest)
+		}
+		markCtx, markCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer markCancel()
+		var firstErr error
+		for ns, paths := range byNamespace {
+			if err := mark(markCtx, ns, paths); err != nil {
+				logger.Warn().Err(err).Str("namespace", ns).Int("paths", len(paths)).
+					Msg("Could not mark receipts compacted; the caller retries, aborts or reports the file failed")
+				if firstErr == nil {
+					firstErr = err
+				}
+			}
+		}
+		return firstErr
+	}
+}
+
+// hubRemovalMarkerFor returns a marker that records hub-side removal of
+// spoke files with the given reason (#1186, #1666): paths are storage paths,
+// "{spoke}/{source path}", grouped by namespace. A path outside any spoke
+// namespace costs one indexed probe and matches nothing.
+func hubRemovalMarkerFor(idx *edgesync.HubIndex, reason string) func(ctx context.Context, paths []string) error {
+	return func(ctx context.Context, paths []string) error {
+		byNamespace := make(map[string][]string)
+		for _, p := range paths {
+			first, rest, found := strings.Cut(p, "/")
+			if !found || first == "" || rest == "" {
+				continue
+			}
+			byNamespace[first] = append(byNamespace[first], rest)
+		}
+		for ns, rest := range byNamespace {
+			if err := idx.MarkRemoved(ctx, ns, rest, reason); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 }
 
 // receivedNamespaces returns a Discoverer namespace excluder backed by the
@@ -6044,6 +7232,12 @@ func (a *tieringManifestAdapter) DeleteFilesFromManifest(ctx context.Context, pa
 	}, func(err error) bool {
 		return errors.Is(err, cluster.ErrNoLeaderKnown) || errors.Is(err, cluster.ErrLeaderUnreachable)
 	})
+	if err != nil && clusterraft.IsManifestChanged(err) {
+		// A file of the batch was taken by a compaction or a re-home job
+		// between the migrator's check and this proposal (#1869): the
+		// migrator drops it and proposes the rest again.
+		return fmt.Errorf("%w: %v", tiering.ErrManifestChanged, err)
+	}
 	if err != nil {
 		a.logger.Error().Err(err).
 			Int("count", len(ops)).
@@ -6088,6 +7282,14 @@ func (a *tieringManifestAdapter) SeedColdMarks(ctx context.Context, marks map[st
 }
 
 var _ tiering.ColdMarker = (*tieringManifestAdapter)(nil)
+
+// ColdMarkBackend: the cold store the cluster's cold mark was seeded from,
+// which a reader compares with its own before retiring cold rows (#1563).
+func (a *tieringManifestAdapter) ColdMarkBackend() (backend string, seeded, conflict bool) {
+	return a.coordinator.ColdMarkBackend()
+}
+
+var _ tiering.ColdStoreIdentity = (*tieringManifestAdapter)(nil)
 
 func (a *tieringManifestAdapter) CompactionOwns(path string) bool {
 	return a.coordinator.CompactionOwns(path)
@@ -6196,6 +7398,20 @@ func (g *compactionClusterGate) CompactionPauseReason() string {
 // Role returns the node's role string for log messages.
 func (g *compactionClusterGate) Role() string {
 	return string(g.role)
+}
+
+// icebergWarehouseURI is the warehouse the exporter is given: the storage root
+// when unset, so table metadata lands alongside the data (file:// for local;
+// s3://bucket/prefix for object storage), and a bare path as the file:// URI
+// of its absolute directory, so new tables get file:// locations (#1616).
+// Tables created before keep the bare locations in their catalog rows, which
+// the exporter resolves too.
+func icebergWarehouseURI(configured string, backend storage.Backend) string {
+	warehouse := configured
+	if warehouse == "" {
+		warehouse = iceberg.DefaultWarehouse(backend)
+	}
+	return iceberg.NormalizeLocalWarehouse(warehouse)
 }
 
 // icebergWriterGate adapts the compaction cluster gate to iceberg.WriterGate: the Iceberg

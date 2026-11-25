@@ -103,7 +103,7 @@ func TestColdMissingObjects_ObjectWrittenAfterTheListing(t *testing.T) {
 	}
 }
 
-// A cluster reader keeps rows the primary deleted (#1563): nothing is
+// A cluster reader cannot tell a primary delete from a loss (#1563): nothing is
 // reported there, and a node that becomes a reader drops its last result.
 func TestColdMissingObjects_ReaderReportsNothing(t *testing.T) {
 	m, _, cold := missingRig(t)
@@ -289,5 +289,21 @@ func TestColdMissingObjects_DropTakenOverIsBracketed(t *testing.T) {
 	}
 	if len(during) != 1 || during[0] != 1 || m.coldRemovals.Load() != 0 {
 		t.Fatalf("removals during the delete %v, after %d: want [1] and 0", during, m.coldRemovals.Load())
+	}
+}
+
+// A chunk's cold-copy drops are reported once, not per file (#1728: each
+// report is a Raft notice in a cluster).
+func TestDropTakenOverReportsTheChunkOnce(t *testing.T) {
+	m, hot, cold, cleanup := setupIntegrationTest(t, true)
+	t.Cleanup(cleanup)
+	m.manifest = &ownedManifest{fakeManifest: &fakeManifest{hot: hot, entries: map[string]int64{}}, ownedFrom: 1}
+	cold.seedRaw(missA, []byte("x"))
+	cold.seedRaw(missB, []byte("x"))
+	var calls [][]string
+	m.SetOnColdRemoved(func(k []string) { calls = append(calls, k) })
+	m.migrator.dropTakenOver(context.Background(), []MigrationCandidate{candidateFor(missA), candidateFor(missB)})
+	if len(calls) != 1 || len(calls[0]) != 2 {
+		t.Fatalf("reports %v, want one naming both", calls)
 	}
 }

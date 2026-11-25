@@ -52,10 +52,19 @@ type clusterFilesCoordinator interface {
 	DeleteFileFromManifest(ctx context.Context, path, reason string) error
 }
 
+// clusterNodeRemover is the part of the coordinator a node removal uses; a
+// seam so the handler's status mapping is testable without a licensed
+// coordinator.
+type clusterNodeRemover interface {
+	GetLocalNode() *cluster.Node
+	RemoveNodeViaRaft(nodeID string) error
+}
+
 // ClusterHandler handles cluster management API endpoints.
 type ClusterHandler struct {
 	coordinator      *cluster.Coordinator
 	filesCoordinator clusterFilesCoordinator
+	nodeRemover      clusterNodeRemover
 	authManager      *auth.AuthManager
 	licenseClient    *license.Client
 	logger           zerolog.Logger
@@ -69,13 +78,18 @@ func NewClusterHandler(
 	licenseClient *license.Client,
 	logger zerolog.Logger,
 ) *ClusterHandler {
+	// Assigned only when non-nil, so a nil coordinator leaves nil
+	// interfaces rather than typed nils.
 	var fc clusterFilesCoordinator
+	var nr clusterNodeRemover
 	if coordinator != nil {
 		fc = coordinator
+		nr = coordinator
 	}
 	return &ClusterHandler{
 		coordinator:      coordinator,
 		filesCoordinator: fc,
+		nodeRemover:      nr,
 		authManager:      authManager,
 		licenseClient:    licenseClient,
 		logger:           logger.With().Str("component", "cluster-handler").Logger(),
@@ -83,9 +97,11 @@ func NewClusterHandler(
 }
 
 // captureDeleteFileAuditTarget captures and bounds target file metadata from DELETE
-// query parameters before authentication or confirmation rejections, ensuring that
-// refused attempts (401/403 auth failure, 400 missing confirmation, 409 disabled)
-// still record the target path and reason in the audit trail.
+// query parameters before authorization or confirmation rejections, ensuring that
+// refused attempts (403 from the admin check, 400 missing confirmation, 409
+// disabled) still record the target path and reason in the audit trail. A 401
+// is answered by the auth middleware, which runs before the audit middleware,
+// and is not recorded (#1630).
 func captureDeleteFileAuditTarget(c *fiber.Ctx) error {
 	if c.Method() != fiber.MethodDelete {
 		return c.Next()
@@ -828,8 +844,15 @@ func (h *ClusterHandler) nodeToMapWithLease(node *cluster.Node, activeCompactorI
 // handleRemoveNode removes a dead or unresponsive node from the cluster.
 // This is an admin-only destructive operation — it removes the node from
 // Raft voting, the cluster FSM state, and the local registry.
+//
+// An ID that is not a member answers 404 and proposes nothing (#1619). A
+// member here is anything a removal would act on (see
+// cluster.Coordinator.isRemovableMember): a stale Raft voter missing from the
+// registry and a writer that left gracefully are both still removable. On a
+// non-leader the answer stays the 500 "not the leader", checked before
+// membership.
 func (h *ClusterHandler) handleRemoveNode(c *fiber.Ctx) error {
-	if h.coordinator == nil {
+	if h.nodeRemover == nil {
 		return h.respondNotEnabled(c)
 	}
 
@@ -842,7 +865,7 @@ func (h *ClusterHandler) handleRemoveNode(c *fiber.Ctx) error {
 	}
 
 	// Prevent self-removal
-	localNode := h.coordinator.GetLocalNode()
+	localNode := h.nodeRemover.GetLocalNode()
 	if localNode != nil && localNode.ID == nodeID {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"success": false,
@@ -850,7 +873,16 @@ func (h *ClusterHandler) handleRemoveNode(c *fiber.Ctx) error {
 		})
 	}
 
-	if err := h.coordinator.RemoveNodeViaRaft(nodeID); err != nil {
+	if err := h.nodeRemover.RemoveNodeViaRaft(nodeID); err != nil {
+		if errors.Is(err, cluster.ErrNodeNotFound) {
+			// Not "not the leader": arcli matches that text to retry on the
+			// leader, and this answer must not send it there.
+			h.logger.Warn().Str("node_id", nodeID).Msg("Refused to remove a node that is not a member of the cluster")
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"success": false,
+				"error":   "node " + nodeID + " is not a member of the cluster",
+			})
+		}
 		h.logger.Error().Err(err).Str("node_id", nodeID).Msg("Failed to remove node from cluster")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,

@@ -126,3 +126,26 @@ func TestSharedStorePullerStartFailure_FallsBackToSharedCallbacks(t *testing.T) 
 		t.Fatalf("tier reports = %+v, want the migration reported", reports)
 	}
 }
+
+// #1605: replication on, with everything the puller needs, but the storage is
+// a shared object store. The puller is not started (every node already reads
+// the bucket); the shared callbacks are registered instead.
+func TestSharedObjectStoreWithReplication_StartsNoPuller(t *testing.T) {
+	local, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewLocalBackend: %v", err)
+	}
+	t.Cleanup(func() { _ = local.Close() })
+	store := &fakeObjectStore{LocalBackend: local, meta: map[string]string{}}
+	if !IsSharedObjectStore(store) {
+		t.Fatal("fakeObjectStore is not a shared object store; the test would prove nothing")
+	}
+	c, recorder := newSharedRig(t, store, &config.ClusterConfig{ClusterName: "shared", ReplicationEnabled: true, SharedSecret: "test-secret"})
+	if c.puller != nil {
+		t.Fatal("puller started on a shared object store")
+	}
+	registerAndDelete(t, c, "testdb/cpu/2026/10/08/m_daily.parquet", "tiering:migrated")
+	if reports := recorder.unlinkReports(); len(reports) != 1 {
+		t.Fatalf("tier reports = %+v, want the migration reported by the shared callbacks", reports)
+	}
+}

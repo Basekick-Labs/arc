@@ -59,7 +59,14 @@ type Exporter struct {
 	maxFiles int
 	maxBytes int64
 	logger   zerolog.Logger
+
+	// attested deletes the local copies a signed ack attested as held, right
+	// after the ack is applied (delete_after_sync, #1684). Nil when off.
+	attested *AttestedDeleter
 }
+
+// SetAttestedDeleter wires delete_after_sync into ack application (#1684).
+func (e *Exporter) SetAttestedDeleter(d *AttestedDeleter) { e.attested = d }
 
 // NewExporter validates configuration and returns a ready exporter.
 func NewExporter(cfg ExporterConfig) (*Exporter, error) {
@@ -115,7 +122,21 @@ func (e *Exporter) Export(ctx context.Context, dest string, limit int) (*ExportR
 	if err != nil {
 		return nil, err
 	}
+	return e.exportWith(ctx, limit, func(selected []*LedgerEntry) (*ExportResult, error) {
+		return e.writer.Export(ctx, resolved, selected, time.Now())
+	})
+}
 
+// ExportToRelay is Export into a relay bucket (#1685): the same discovery,
+// selection, caps and ledger marking, with the bundle streamed to the relay
+// backend instead of written to a directory.
+func (e *Exporter) ExportToRelay(ctx context.Context, relay storage.Backend, limit int) (*ExportResult, error) {
+	return e.exportWith(ctx, limit, func(selected []*LedgerEntry) (*ExportResult, error) {
+		return e.writer.ExportToRelay(ctx, relay, selected, time.Now())
+	})
+}
+
+func (e *Exporter) exportWith(ctx context.Context, limit int, write func([]*LedgerEntry) (*ExportResult, error)) (*ExportResult, error) {
 	if limit <= 0 || limit > e.maxFiles {
 		limit = e.maxFiles
 	}
@@ -240,7 +261,7 @@ func (e *Exporter) Export(ctx context.Context, dest string, limit int) (*ExportR
 			Msg("Bundle truncated at the byte cap; the remainder goes in the next one")
 	}
 
-	res, err := e.writer.Export(ctx, resolved, selected, time.Now())
+	res, err := write(selected)
 	if err != nil {
 		return nil, err
 	}
@@ -349,10 +370,25 @@ func (e *Exporter) ApplyAck(ctx context.Context, dir string) (*AckResult, error)
 	if err != nil {
 		return nil, err
 	}
+	return e.applyVerifiedAck(ctx, ack)
+}
 
+// applyVerifiedAck advances the ledger on an ack that ReadAck or DecodeAck
+// verified, and runs delete_after_sync on what it attests. Shared by the
+// drive path above and the relay (#1685).
+func (e *Exporter) applyVerifiedAck(ctx context.Context, ack *Ack) (*AckResult, error) {
 	res, err := ApplyAck(ctx, e.ledger, ack, e.logger)
 	if err != nil {
 		return nil, err
+	}
+	if e.attested != nil && res.Attested > 0 {
+		// Never turns an applied ack into a failure: the ledger advanced
+		// either way, and the timer retries what was not deleted.
+		n, derr := e.attested.Run(ctx)
+		res.LocalDeleted = n
+		if derr != nil {
+			e.logger.Warn().Err(derr).Str("bundle_id", res.BundleID).Msg("delete_after_sync: deleting attested files stopped; the next run retries")
+		}
 	}
 
 	e.logger.Info().
@@ -362,6 +398,8 @@ func (e *Exporter) ApplyAck(ctx context.Context, dir string) (*AckResult, error)
 		Int("untracked", res.Untracked).
 		Int("discrepancies", res.Discrepancies).
 		Int("conflicts", len(res.Conflicts)).
+		Int("attested", res.Attested).
+		Int("local_deleted", res.LocalDeleted).
 		Msg("Acknowledgment applied")
 
 	return res, nil

@@ -150,6 +150,8 @@ func (h *CompactionHandler) RegisterRoutes(app *fiber.App) {
 	// the next cycle tries again (after giving jobs more memory).
 	group.Get("/too-wide", adminOnly, h.listTooWide)
 	group.Delete("/too-wide", adminOnly, h.clearTooWide)
+	group.Get("/misfiled", adminOnly, h.listMisfiled)
+	group.Delete("/misfiled", adminOnly, h.clearMisfiled)
 
 	// Admin route — trigger compaction requires admin permission
 	if h.authManager != nil {
@@ -199,6 +201,44 @@ func (h *CompactionHandler) clearTooWide(c *fiber.Ctx) error {
 		})
 	}
 	n := h.manager.ClearTooWide(c.Query("tier"), c.Query("partition"))
+	return c.JSON(fiber.Map{"cleared": n})
+}
+
+// listMisfiled handles GET /api/v1/compaction/misfiled: the files compaction
+// leaves alone because a job found rows in them outside the hour or day of
+// the directory they sit in (#1825).
+func (h *CompactionHandler) listMisfiled(c *fiber.Ctx) error {
+	if h.manager == nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "Compaction not initialized",
+		})
+	}
+	entries := h.manager.MisfiledFiles()
+	out := make([]fiber.Map, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, fiber.Map{
+			"tier":      e.Tier,
+			"path":      e.Path,
+			"partition": e.Partition,
+			"min_time":  e.MinTime,
+			"max_time":  e.MaxTime,
+			"found_at":  e.FoundAt,
+		})
+	}
+	// The memo is this node's: on a cluster, the compactor node's list is the
+	// one cycles use. A file refused by both tiers has two entries.
+	return c.JSON(fiber.Map{"files": out, "count": len(out), "scope": "this node"})
+}
+
+// clearMisfiled handles DELETE /api/v1/compaction/misfiled: every remembered
+// file, or only ?tier= and/or ?path=. The next cycle reads them again.
+func (h *CompactionHandler) clearMisfiled(c *fiber.Ctx) error {
+	if h.manager == nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "Compaction not initialized",
+		})
+	}
+	n := h.manager.ClearMisfiled(c.Query("tier"), c.Query("path"))
 	return c.JSON(fiber.Map{"cleared": n})
 }
 
@@ -284,6 +324,10 @@ func (h *CompactionHandler) getCandidates(c *fiber.Ctx) error {
 			"file_count":     cand.FileCount,
 			"tier":           cand.Tier,
 			"too_wide":       tooWide[cand.Tier+"/"+cand.PartitionPath],
+			// A settled day (#1774, #1775): file_count is its hour-level
+			// files, never a daily file it already has, and a cycle runs at
+			// most 500 of these per tier.
+			"settled": cand.Settled,
 		}
 	}
 

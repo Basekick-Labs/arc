@@ -134,6 +134,12 @@ type RouterConfig struct {
 	// RouteDatabaseCreate forwards only to such a writer; nil, or a writer
 	// without it, creates the database locally.
 	PeerDatabaseCreate func(nodeID string) bool
+
+	// WriteDialContext, when set, opens the connections of forwarded writes
+	// and imports instead of a net.Dialer; still bounded by
+	// writeForwardDialTimeout. Nil in production (a test seam: writeTransport
+	// replaces Transport's own DialContext).
+	WriteDialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // Router routes requests to appropriate nodes in the cluster.
@@ -159,6 +165,12 @@ type Router struct {
 	// Active connection counts per node (for least_connections strategy)
 	activeConns   map[string]*atomic.Int64
 	activeConnsMu sync.RWMutex
+
+	// lifetime is the root of every forward's context (Lifetime): it carries
+	// no values and ends at StopForwards (server shutdown), so a forward
+	// never holds the pooled fasthttp request context (#1629).
+	lifetime     context.Context
+	stopForwards context.CancelFunc
 }
 
 // NewRouter creates a new request router.
@@ -204,26 +216,47 @@ func NewRouter(cfg *RouterConfig) *Router {
 		},
 		writeClient: &http.Client{
 			Timeout:   cfg.WriteTimeout,
-			Transport: writeTransport(transport),
+			Transport: writeTransport(transport, cfg.WriteDialContext),
 		},
 		// Not the write timeout: a local import has no server-side bound,
 		// and a 500 MB import can outlast any write timeout. A 504 while the
 		// writer is still importing would invite a re-run that duplicates
 		// rows (#1070). ImportTimeout is only a backstop: a forward is not
-		// cancelled when its client gives up (fasthttp ends a request's
-		// context only at shutdown), so without it a writer that never
+		// cancelled when its client gives up (its context, rooted on
+		// Lifetime, ends only at shutdown), so without it a writer that never
 		// answers would hold this node's goroutine, connection and upload.
 		// Dial and TLS handshake stay bounded; TCP keepalive ends a
 		// connection to a writer that vanished, but only after minutes.
 		importClient: &http.Client{
 			Timeout:   cfg.ImportTimeout,
-			Transport: writeTransport(transport),
+			Transport: writeTransport(transport, cfg.WriteDialContext),
 		},
 		logger:      cfg.Logger.With().Str("component", "cluster-router").Logger(),
 		activeConns: make(map[string]*atomic.Int64),
 	}
+	r.lifetime, r.stopForwards = context.WithCancel(context.Background())
 
 	return r
+}
+
+// Lifetime is the context every forward from this router is rooted on
+// (api.forwardContext): it carries no request state and ends at
+// StopForwards. Nil-safe.
+func (r *Router) Lifetime() context.Context {
+	if r == nil || r.lifetime == nil {
+		return context.Background()
+	}
+	return r.lifetime
+}
+
+// StopForwards cancels every forward in flight and every later one: called
+// when the HTTP server starts shutting down (api.Server.OnShutdownStart), as
+// the request context of a forward used to end then. Nil-safe, idempotent.
+func (r *Router) StopForwards() {
+	if r == nil || r.stopForwards == nil {
+		return
+	}
+	r.stopForwards()
 }
 
 // RouteWrite routes a write request to an appropriate writer node.
@@ -411,10 +444,19 @@ const IngestFencedResponseHeader = "X-Arc-Ingest-Fenced"
 // nothing written" quickly, not after the whole write timeout.
 const writeForwardDialTimeout = 5 * time.Second
 
-// writeTransport is base with dial and TLS handshake timeouts.
-func writeTransport(base *http.Transport) *http.Transport {
+// writeTransport is base with dial and TLS handshake timeouts. dial, when
+// set, replaces the net.Dialer (RouterConfig.WriteDialContext) under the same
+// dial timeout.
+func writeTransport(base *http.Transport, dial func(ctx context.Context, network, addr string) (net.Conn, error)) *http.Transport {
 	t := base.Clone()
 	t.DialContext = (&net.Dialer{Timeout: writeForwardDialTimeout, KeepAlive: 30 * time.Second}).DialContext
+	if dial != nil {
+		t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			ctx, cancel := context.WithTimeout(ctx, writeForwardDialTimeout)
+			defer cancel()
+			return dial(ctx, network, addr)
+		}
+	}
 	t.TLSHandshakeTimeout = writeForwardDialTimeout
 	return t
 }

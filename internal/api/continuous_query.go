@@ -18,6 +18,7 @@ import (
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/fieldschema"
 	"github.com/basekick-labs/arc/internal/ingest"
+	"github.com/basekick-labs/arc/internal/readgate"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/pkg/models"
@@ -34,6 +35,10 @@ type CQSchedulerReloader interface {
 	// StartJobDirect schedules a job using data already in hand, avoiding a
 	// redundant SQLite read that could race with the just-committed INSERT.
 	StartJobDirect(cqID int64, name, interval string, isActive bool) error
+	// StopJob stops the job of a CQ that was deleted, and keeps any later
+	// start for that ID from scheduling it again. A no-op when the CQ has no
+	// job or the scheduler is not running.
+	StopJob(cqID int64)
 }
 
 // CQCoordinator is the minimal cluster interface the CQ handler needs to gate
@@ -50,12 +55,17 @@ type ContinuousQueryHandler struct {
 	arrowBuffer *ingest.ArrowBuffer
 	// lastSkipLogNano samples logSkippedRun (#676).
 	lastSkipLogNano atomic.Int64
-	fieldSchema     *fieldschema.Registry // optional, #914
+	// lastReadSkipLogNano samples logSkippedRead.
+	lastReadSkipLogNano atomic.Int64
+	fieldSchema         *fieldschema.Registry // optional, #914
 	// openCompactions: compaction jobs whose output and inputs can both be in
 	// storage (optional; see wrapOpenCompactions).
 	openCompactions OpenCompactions
-	config          *config.ContinuousQueryConfig
-	sqliteDB        *sql.DB
+	// reads is the query handler's count of reads in flight (SetReads); nil
+	// counts nothing.
+	reads    *readgate.Gate
+	config   *config.ContinuousQueryConfig
+	sqliteDB *sql.DB
 	// ownsDB records whether this handler opened sqliteDB itself. When CQ
 	// shares the auth database (the default), the handle is borrowed and Close
 	// must leave it to its owner.
@@ -75,6 +85,15 @@ type ContinuousQueryHandler struct {
 
 // aggregate runs a CQ's aggregation (executeAggregation, or the test hook).
 func (h *ContinuousQueryHandler) aggregate(ctx context.Context, cq *ContinuousQuery, query string, start, end time.Time) (int64, error) {
+	// On a cluster whose nodes share one object store, not while this
+	// node's cluster state may be behind the leader's: it would leave the
+	// wrong files out, and the run writes what it read back for good
+	// (cluster/read_lease.go). The run is skipped and its window kept.
+	if rr, ok := h.coordinator.(readLeaseReadiness); ok {
+		if ready, why := rr.ReadReady(); !ready {
+			return 0, fmt.Errorf("%w: %s", ErrNoReadLease, why)
+		}
+	}
 	if h.aggregateHook != nil {
 		return h.aggregateHook(ctx, cq, query, start)
 	}
@@ -180,6 +199,9 @@ type ExecuteCQResponse struct {
 	// primary moved it meanwhile; theirs is kept) or "pending" (the cluster
 	// has not taken it yet; the next run settles it).
 	WatermarkStatus string `json:"watermark_status,omitempty"`
+	// Skipped: the run had no new window (see quietEmptyWindow) and did
+	// nothing. Not serialized; the scheduler reads it to log at Debug.
+	Skipped bool `json:"-"`
 }
 
 // CQExecution represents an execution history record
@@ -219,6 +241,10 @@ func (h *ContinuousQueryHandler) sourceRead(ctx context.Context, cq *ContinuousQ
 
 // SetOpenCompactions wires the compaction jobs a source read must account for.
 func (h *ContinuousQueryHandler) SetOpenCompactions(oc OpenCompactions) { h.openCompactions = oc }
+
+// SetReads shares the query handler's count of reads in flight, so a job that
+// swaps files waits for a running continuous query too.
+func (h *ContinuousQueryHandler) SetReads(g *readgate.Gate) { h.reads = g }
 
 func NewContinuousQueryHandler(db *database.DuckDB, storage storage.Backend, arrowBuffer *ingest.ArrowBuffer, cfg *config.ContinuousQueryConfig, authManager *auth.AuthManager, logger zerolog.Logger) (*ContinuousQueryHandler, error) {
 	// continuous_query.db_path defaults to the auth database. When it resolves
@@ -425,6 +451,8 @@ func validateCQDefinition(req *ContinuousQueryRequest, create bool) error {
 		return err
 	} else if ok && !isValidDatabaseName(req.Database.Value) {
 		return errors.New("invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)")
+	} else if ok && storage.IsWarehouseRootName(req.Database.Value) {
+		return errors.New(warehouseDatabaseError(req.Database.Value))
 	}
 	if ok, err := required("source_measurement", req.SourceMeasurement); err != nil {
 		return err
@@ -759,9 +787,61 @@ func (h *ContinuousQueryHandler) handleDelete(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Continuous query not found"})
 	}
 
+	// Stop its job. Left running, it would fire at the CQ's interval until a
+	// restart or reload, every run failing on the missing row and logged at
+	// Error. In a cluster, SyncJobs stops it when the delete is mirrored.
+	if h.scheduler != nil {
+		h.scheduler.StopJob(int64(queryID))
+	}
+
 	h.logger.Info().Int("query_id", queryID).Msg("Deleted continuous query")
 
 	return c.JSON(fiber.Map{"message": "Continuous query deleted successfully"})
+}
+
+// cqNow is the clock a run derives its window from (a test seam).
+var cqNow = time.Now
+
+// quietEmptyWindow reports whether a run's empty window is simply nothing new
+// to process, answered with 0 records rather than an error (#1628): both
+// bounds were derived (the start from the watermark, the end from now), and
+// the watermark is at most cqEndTimeSkew ahead of now. That is a second run
+// within the same second, or a watermark an earlier manual end_time set up to
+// the minute ahead it may. A watermark further ahead (clock skew, a failover)
+// stays an error, so a CQ stuck behind it is not silent; so does an empty
+// window the caller asked for.
+func quietEmptyWindow(start, end, now time.Time, startFromWatermark, endGiven bool) bool {
+	return startFromWatermark && !endGiven &&
+		!start.Before(end) &&
+		!start.After(now.Add(cqEndTimeSkew))
+}
+
+// emptyCQWindowResponse is the answer to a run quietEmptyWindow skipped: the
+// window it reports is empty (start and end at the watermark) and nothing was
+// written. No run happened, so there is no execution to name: execution_id is
+// "" (present, as clients require the key) and no history row has it. Every
+// other field the clients require is set.
+func emptyCQWindowResponse(queryID int64, cq *ContinuousQuery, watermark time.Time, began time.Time, dryRun bool, executedQuery string) ExecuteCQResponse {
+	status := "completed"
+	if dryRun {
+		status = "dry_run"
+	}
+	return ExecuteCQResponse{
+		QueryID:                queryID,
+		QueryName:              cq.Name,
+		ExecutionID:            "",
+		Status:                 status,
+		StartTime:              watermark.Format(time.RFC3339),
+		EndTime:                watermark.Format(time.RFC3339),
+		RecordsRead:            nil,
+		RecordsWritten:         0,
+		ExecutionTimeSeconds:   time.Since(began).Seconds(),
+		DestinationMeasurement: cq.DestinationMeasurement,
+		DryRun:                 dryRun,
+		ExecutedAt:             time.Now().UTC().Format(time.RFC3339),
+		ExecutedQuery:          executedQuery,
+		Skipped:                true,
+	}
 }
 
 // ExecuteCQ executes a continuous query by ID programmatically (used by scheduler)
@@ -803,13 +883,21 @@ func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (
 		startTime, _ = time.Parse(time.RFC3339, *cq.LastProcessedTime)
 		startTime = startTime.UTC()
 	} else {
-		startTime = time.Now().UTC().Add(-1 * time.Hour)
+		startTime = cqNow().UTC().Add(-1 * time.Hour)
 	}
 	// Whole seconds: the window bounds go into the query as RFC3339, and the
 	// watermark is stored at that precision.
-	endTime = time.Now().UTC().Truncate(time.Second)
+	now := cqNow()
+	endTime = now.UTC().Truncate(time.Second)
 
 	if !startTime.Before(endTime) {
+		if quietEmptyWindow(startTime, endTime, now, cq.LastProcessedTime != nil, false) {
+			// Nothing new since the last run (#1628): no aggregation, no
+			// execution row, the watermark left as it is. The scheduler logs
+			// it (Debug), from Skipped.
+			resp := emptyCQWindowResponse(queryID, cq, startTime, start, false, "")
+			return &resp, nil
+		}
 		return nil, fmt.Errorf("start_time must be before end_time")
 	}
 
@@ -828,6 +916,14 @@ func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (
 
 	// Execute the aggregation query using DuckDB
 	recordsWritten, err := h.aggregate(ctx, cq, executedQuery, startTime, endTime)
+	if err != nil && errors.Is(err, ErrNoReadLease) {
+		// This node may not read now (read_lease.go): skipped, not failed,
+		// as for refused writes. No execution row, the window stays, and
+		// the log line is sampled: it holds for every run of every query
+		// until the node has synced again.
+		h.logSkippedRead(cq.Name, err)
+		return nil, fmt.Errorf("execution skipped: %w", err)
+	}
 	if err != nil && ingest.IsWriteRefusal(err) {
 		// Writes are refused (fenced, or WAL volume disk pressure, #676): the
 		// run is skipped, not failed. No execution row, which would be one
@@ -959,6 +1055,7 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 
 	// Determine time range
 	var startTime, endTime time.Time
+	startFromWatermark := false
 
 	if req.StartTime != nil && *req.StartTime != "" {
 		startTime, err = time.Parse(time.RFC3339, *req.StartTime)
@@ -969,11 +1066,14 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 	} else if cq.LastProcessedTime != nil {
 		startTime, _ = time.Parse(time.RFC3339, *cq.LastProcessedTime)
 		startTime = startTime.UTC()
+		startFromWatermark = true
 	} else {
-		startTime = time.Now().UTC().Add(-1 * time.Hour)
+		startTime = cqNow().UTC().Add(-1 * time.Hour)
 	}
 
-	if req.EndTime != nil && *req.EndTime != "" {
+	endGiven := req.EndTime != nil && *req.EndTime != ""
+	now := cqNow()
+	if endGiven {
 		endTime, err = time.Parse(time.RFC3339, *req.EndTime)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid end_time format"})
@@ -981,16 +1081,28 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 		endTime = endTime.UTC()
 		// The run's end becomes the watermark: one in the future would make
 		// every later run fail until the clock caught up (#1324).
-		if !req.DryRun && endTime.After(time.Now().Add(cqEndTimeSkew)) {
+		if !req.DryRun && endTime.After(now.Add(cqEndTimeSkew)) {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "end_time may not be more than a minute in the future"})
 		}
 	} else {
-		endTime = time.Now().UTC()
+		endTime = now.UTC()
 	}
 	endTime = endTime.Truncate(time.Second)
 
 	if !startTime.Before(endTime) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "start_time must be before end_time"})
+		if !quietEmptyWindow(startTime, endTime, now, startFromWatermark, endGiven) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "start_time must be before end_time"})
+		}
+		// Nothing new since the last run (#1628): 200 with 0 records, no
+		// aggregation, no execution row, the watermark left as it is.
+		executedQuery := ""
+		if req.DryRun {
+			executedQuery = strings.ReplaceAll(cq.Query, "{start_time}", fmt.Sprintf("'%s'", startTime.Format(time.RFC3339)))
+			executedQuery = strings.ReplaceAll(executedQuery, "{end_time}", fmt.Sprintf("'%s'", startTime.Format(time.RFC3339)))
+		}
+		h.logger.Debug().Str("query_name", cq.Name).Time("watermark", startTime).Bool("dry_run", req.DryRun).
+			Msg("No new window for continuous query")
+		return c.JSON(emptyCQWindowResponse(int64(queryID), cq, startTime, start, req.DryRun, executedQuery))
 	}
 
 	// Replace placeholders in query
@@ -1035,6 +1147,16 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(c.Context(), 10*time.Minute)
 	defer cancel()
 	recordsWritten, err := h.aggregate(ctx, cq, executedQuery, startTime, endTime)
+	if err != nil && errors.Is(err, ErrNoReadLease) {
+		// Nothing was read or written: refused, 503 and retryable.
+		h.logSkippedRead(cq.Name, err)
+		c.Set("Retry-After", "1")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "cluster_state_not_synced",
+			"message": "This node cannot run a query now: " + strings.TrimPrefix(err.Error(), ErrNoReadLease.Error()+": ") +
+				". Retry shortly.",
+		})
+	}
 	if err != nil {
 		executionDuration := time.Since(start).Seconds()
 
@@ -1389,6 +1511,9 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	if !isValidDatabaseName(cq.Database) {
 		return 0, fmt.Errorf("stored continuous-query definition %q has an invalid database name: %q", cq.Name, cq.Database)
 	}
+	if storage.IsWarehouseRootName(cq.Database) {
+		return 0, fmt.Errorf("stored continuous-query definition %q targets database %q, which is reserved for the Iceberg warehouse", cq.Name, cq.Database)
+	}
 
 	// SECURITY: and the stored measurement names, for the same reason and in
 	// the same place. Both are storage path segments of the run — the source
@@ -1445,12 +1570,26 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	// MaskStringLiterals, which ends a comment at its first `*/`, so it reads a
 	// nested comment as DuckDB does only because the validator never lets one
 	// through.
+	// A read in flight, from before its exclusions are read until its rows
+	// are in memory (internal/readgate). A job that swaps files waits for
+	// it: a run that bound after the swap with the exclusions from before it
+	// would aggregate without the swapped rows and write that back for good.
+	entered, leaveRead := h.reads.EnterAt()
+	defer leaveRead()
+	// Stopped if this node loses its cluster read lease (readgate.Bind).
+	ctx, cancelRead := context.WithCancel(ctx)
+	defer h.reads.Bind(entered, ctx, cancelRead)()
 	wrappedQuery := wrapSourceMeasurement(query, cq.Database, cq.SourceMeasurement, h.sourceRead(ctx, cq, measurementPath))
 
 	h.logger.Debug().Str("query", sqlutil.ForLog(wrappedQuery)).Msg("Executing wrapped query")
 
 	// Execute query using DuckDB
-	rows, err := h.db.Query(wrappedQuery)
+	// With the run's context: without it the statement waited for a pooled
+	// connection, and ran, with no bound at all, past the run's own timeout.
+	// The same context ends when the scheduler stops this query's job (the
+	// query was updated or deleted, or the scheduler reloaded): the run then
+	// fails, its window is not marked done, and the next run covers it.
+	rows, err := h.db.QueryContext(ctx, wrappedQuery)
 	if err != nil {
 		return 0, fmt.Errorf("query execution failed: %w", err)
 	}
@@ -1460,6 +1599,7 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	if err != nil {
 		return 0, err
 	}
+	leaveRead() // the rows are read; what follows writes them
 
 	h.logger.Info().Int("record_count", len(records)).Msg("Aggregation query returned records")
 
@@ -1587,6 +1727,23 @@ const cqSkipLogEvery = time.Minute
 
 // logSkippedRun logs a run skipped because writes are refused, at most once
 // every cqSkipLogEvery across all continuous queries.
+// ErrNoReadLease is a run refused because this node may not read now: on a
+// cluster whose nodes share one object store, its cluster state may be behind
+// the leader's (cluster/read_lease.go). Retryable; the window is kept.
+var ErrNoReadLease = errors.New("this node cannot read now")
+
+// logSkippedRead logs runs skipped for want of a read lease, at most once a
+// minute.
+func (h *ContinuousQueryHandler) logSkippedRead(name string, err error) {
+	now := time.Now().UnixNano()
+	last := h.lastReadSkipLogNano.Load()
+	if now-last < int64(cqSkipLogEvery) || !h.lastReadSkipLogNano.CompareAndSwap(last, now) {
+		return
+	}
+	h.logger.Warn().Err(err).Str("query_name", name).
+		Msg("Continuous query runs skipped: this node's cluster state may be behind the leader's (retryable); the next run covers the window (sampled: at most one line a minute)")
+}
+
 func (h *ContinuousQueryHandler) logSkippedRun(name string, err error) {
 	now := time.Now().UnixNano()
 	last := h.lastSkipLogNano.Load()
@@ -1602,6 +1759,14 @@ func (h *ContinuousQueryHandler) handleGetExecutions(c *fiber.Ctx) error {
 	queryID, err := c.ParamsInt("id")
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid query ID"})
+	}
+
+	// An ID with no continuous query has no history to list: 404, as GET
+	// /:id answers, rather than a 200 with an empty one.
+	if _, err := h.getQuery(int64(queryID)); isCQWait(err) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	} else if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Continuous query not found"})
 	}
 
 	limit := c.QueryInt("limit", 50)
@@ -1620,7 +1785,8 @@ func (h *ContinuousQueryHandler) handleGetExecutions(c *fiber.Ctx) error {
 	}
 	defer rows.Close()
 
-	var executions []CQExecution
+	// Non-nil, so a continuous query that has not run yet lists [], not null.
+	executions := []CQExecution{}
 	for rows.Next() {
 		var ex CQExecution
 		if err := rows.Scan(&ex.ID, &ex.QueryID, &ex.ExecutionID, &ex.ExecutionTime, &ex.Status, &ex.StartTime, &ex.EndTime, &ex.RecordsRead, &ex.RecordsWritten, &ex.ExecutionDurationSeconds, &ex.ErrorMessage); err != nil {

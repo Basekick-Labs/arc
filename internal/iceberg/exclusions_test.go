@@ -180,8 +180,8 @@ func TestFilesAndLocal_ChurnFailsTheMeasurement(t *testing.T) {
 		n++
 		return nil, nil
 	})
-	if _, _, err := src.FilesAndLocal(ctx, cpu); err == nil || !strings.Contains(err.Error(), "kept changing") {
-		t.Fatalf("err = %v, want the churn error", err)
+	if _, _, err := src.FilesAndLocal(ctx, cpu); err == nil || !strings.Contains(err.Error(), "kept changing") || !errors.Is(err, errSourcesMoving) {
+		t.Fatalf("err = %v, want the churn error, marked as sources moving (reported busy)", err)
 	}
 	if n != vanishRetries {
 		t.Fatalf("listed %d times, want %d", n, vanishRetries)
@@ -336,14 +336,33 @@ func TestFilesAndLocal_ManifestBarrierOnlyForUnknownFiles(t *testing.T) {
 	if _, _, err := src.FilesAndLocal(ctx, cpu); err != nil || syncs != 1 {
 		t.Fatalf("every file known: %d syncs (err %v), want no further one", syncs, err)
 	}
-	// A file the manifest never learns of costs one barrier per call, not one per retry.
+	// A file the manifest never learns of costs one barrier, not one per retry,
+	// and not one per pass (#1609): after a barrier it is remembered as
+	// unmanaged.
 	delete(known, newKey)
 	src.SetManifestBarrier(func(p string) bool { return known[p] }, func(context.Context) error { syncs++; return nil })
 	if _, _, err := src.FilesAndLocal(ctx, cpu); err != nil || syncs != 2 {
 		t.Fatalf("an unknown file: %d syncs (err %v), want exactly one more", syncs, err)
 	}
-	src.SetManifestBarrier(func(string) bool { return false }, func(context.Context) error { return errors.New("no leader") })
-	if _, _, err := src.FilesAndLocal(ctx, cpu); err == nil {
+	for pass := 0; pass < 3; pass++ {
+		if _, _, err := src.FilesAndLocal(ctx, cpu); err != nil || syncs != 2 {
+			t.Fatalf("pass %d over the same unmanaged file: %d syncs (err %v), want no further one", pass, syncs, err)
+		}
+	}
+	// Once the manifest learns of it, it is forgotten: a later unknown state
+	// waits again.
+	known[newKey] = true
+	if _, _, err := src.FilesAndLocal(ctx, cpu); err != nil || syncs != 2 {
+		t.Fatalf("known file: %d syncs (err %v)", syncs, err)
+	}
+	delete(known, newKey)
+	if _, _, err := src.FilesAndLocal(ctx, cpu); err != nil || syncs != 3 {
+		t.Fatalf("unknown again after being known: %d syncs (err %v), want one more", syncs, err)
+	}
+
+	fresh := NewStorageWalkSource(b, "arc", zerolog.Nop())
+	fresh.SetManifestBarrier(func(string) bool { return false }, func(context.Context) error { return errors.New("no leader") })
+	if _, _, err := fresh.FilesAndLocal(ctx, cpu); err == nil {
 		t.Fatal("a failed barrier must fail the measurement")
 	}
 }

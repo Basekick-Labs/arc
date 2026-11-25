@@ -67,6 +67,18 @@ jobs:
       - name: Vet
         run: go vet -tags=duckdb_arrow ./...
 
+      # The FIPS variant, checked on every PR rather than first at release
+      # time (#1587: the GCS backend pulled x/crypto/hkdf into the FIPS build
+      # and nothing saw it until the release dry run). fips-check is the
+      # release workflow's import-graph guard (go list, which resolves imports
+      # but does not type-check); vet type-checks the fips build and its
+      # tests; the tests run the packages whose fips-only paths have tests.
+      - name: FIPS build checks
+        run: |
+          make fips-check
+          go vet -tags=duckdb_arrow,fips ./...
+          go test -tags=duckdb_arrow,fips ./internal/config/ ./internal/storage/ ./internal/auth/ ./internal/fips/
+
       # -timeout is per package binary; Go's default is 10 minutes, and
       # internal/cluster alone takes about 520 s under -race on these
       # runners (650 s on a laptop). A package that hits the default panics
@@ -292,7 +304,13 @@ jobs:
           bash scripts/test_cluster_raft_env.sh helm/arc-enterprise writer,reader,compactor \
             -f helm/arc-enterprise/values-local-storage.yaml
 
+      - name: Enterprise chart shared storage, multi-writer and single-writer
+        run: bash scripts/test_enterprise_shared_mode.sh helm/arc-enterprise
+
       - name: Every clustered role can join Raft (shared storage preset)
         run: |
           bash scripts/test_cluster_raft_env.sh helm/arc-enterprise writer,reader,compactor \
             -f helm/arc-enterprise/values-shared-storage.yaml
+
+      - name: Flight SQL listener in both charts (off by default, ports when on)
+        run: bash scripts/test_helm_flight_sql.sh

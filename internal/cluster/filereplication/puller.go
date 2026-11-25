@@ -229,7 +229,8 @@ type Config struct {
 	ManifestEntry func(path string) (raft.FileEntry, bool)
 
 	// RecordPulledFile, when set, is called once for every file this node
-	// pulled and kept, so the node's tier metadata describes the file the way
+	// pulled and kept, or moved into place from its staged copy, so the
+	// node's tier metadata describes the file the way
 	// it would a file this node flushed itself. Without it a replicated file
 	// has no tier row until the next tier scan, and the query layer routes
 	// reads from those rows: a measurement with no row loses partition
@@ -282,6 +283,12 @@ type Config struct {
 	// when the output is now at its path. Tried before any fetch of an entry
 	// with a CompactionJob.
 	AdoptStaged func(ctx context.Context, entry *raft.FileEntry) (bool, error)
+
+	// BeforePull, when set, runs before a file is fetched from a peer. An
+	// error defers the pull: it is retried after the attempt's backoff, as
+	// when no peer is available. Re-home on local storage (#1860) uses it to
+	// record a job on this node before its outputs land here.
+	BeforePull func(ctx context.Context, entry *raft.FileEntry) error
 
 	// Logger receives structured log output.
 	Logger zerolog.Logger
@@ -372,7 +379,7 @@ type Puller struct {
 	// Every candidate peer disagreed with the manifest's SHA256 for one entry.
 	// Distinct from totalChecksumMismatch, which counts per-peer rejections.
 	totalChecksumMismatchExhausted atomic.Int64
-	totalTierRegistered            atomic.Int64 // pulled files reported to tier metadata
+	totalTierRegistered            atomic.Int64 // pulled or puller-adopted files reported to tier metadata
 	totalPeerLookupFailure         atomic.Int64 // no candidate peers available
 	totalBadOffsetServer           atomic.Int64 // server rejected resume offset (AckCodeBadOffset)
 	// Kept because staging and append support are independent interfaces by
@@ -1752,6 +1759,14 @@ func (p *Puller) processEntryOnce(log zerolog.Logger, request *pullRequest) (nex
 			return
 		}
 
+		if p.cfg.BeforePull != nil {
+			if err := p.cfg.BeforePull(p.ctx, entry); err != nil {
+				log.Debug().Err(err).Str("path", entry.Path).Int("attempt", attempt).Msg("Pull deferred")
+				p.sleepBackoff(attempt)
+				continue
+			}
+		}
+
 		// Resolve candidate peers fresh on each attempt so topology changes
 		// (node failover, rescheduling) are picked up automatically.
 		peers := p.cfg.PeerResolver.ResolvePeers(entry.OriginNodeID, entry.Path)
@@ -2387,9 +2402,9 @@ func (p *Puller) adoptStaged(log zerolog.Logger, entry *raft.FileEntry) bool {
 		return false
 	}
 	p.totalAdopted.Add(1)
-	if p.cfg.RecordPulledFile != nil {
-		p.cfg.RecordPulledFile(entry.Path, entry.SizeBytes)
-	}
+	// Through the counting wrapper, as a pull is: an adoption is a file
+	// kept here as much as a fetched one.
+	p.recordPulledFile(entry.Path, entry.SizeBytes)
 	return true
 }
 

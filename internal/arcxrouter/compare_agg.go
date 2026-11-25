@@ -283,6 +283,12 @@ func compareAgg(rec arrow.Record, oracle []aggCell, items []string) string {
 				continue
 			}
 			msg := fmt.Sprintf("agg col %d differs (NaN-ness: arcx_nan=%t duckdb_nan=%t)", c, math.IsNaN(a.f), math.IsNaN(d.f))
+			if math.IsNaN(a.f) && math.IsInf(d.f, 0) && c < len(items) && isPinnedNaNItem(items[c]) {
+				if oracleDiff == "" {
+					oracleDiff = msg
+				}
+				continue
+			}
 			if deferArg(c, msg) {
 				continue
 			}

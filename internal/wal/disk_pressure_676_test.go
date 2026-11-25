@@ -653,3 +653,27 @@ func TestDiskCapClearingCountsReservations(t *testing.T) {
 		t.Fatal("did not clear at the band")
 	}
 }
+
+// MaxReservable is the most one Reserve can ever admit: the directory cap
+// less the active file's header, which no purge removes; with no cap, no
+// bound (free space can be freed, so it is pressure, not a bound) (#1383).
+func TestDiskMonitorMaxReservable(t *testing.T) {
+	f := &fakeDisk{avail: 50 << 30}
+	if got := newFakeMonitor(t, f, DiskMonitorConfig{}).MaxReservable(); got != 0 {
+		t.Fatalf("no cap: %d, want 0", got)
+	}
+	m := newFakeMonitor(t, f, DiskMonitorConfig{MaxDirectoryBytes: 1000 * mib})
+	most := m.MaxReservable()
+	if most != 1000*mib-WALFileHeaderSize {
+		t.Fatalf("MaxReservable = %d", most)
+	}
+	f.set(func(f *fakeDisk) { f.dir = WALFileHeaderSize })
+	m.sample()
+	if !m.Reserve(most) {
+		t.Fatal("a reservation of MaxReservable on an empty directory was refused")
+	}
+	m.Release(most)
+	if m.Reserve(most + 1) {
+		t.Fatal("a reservation over MaxReservable was admitted")
+	}
+}

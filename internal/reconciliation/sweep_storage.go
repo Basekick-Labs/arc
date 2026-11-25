@@ -256,10 +256,12 @@ func (r *Reconciler) applyStorageDeletes(
 				Int("count", len(paths)).
 				Msg("Reconciliation: BatchDeleter.DeleteBatch failed; falling back to per-file Delete")
 		} else {
+			r.pathsDeleted(paths)
 			return len(paths)
 		}
 	}
 	applied := 0
+	var deleted []string
 	deleteErrCount := 0
 	invalidPathCount := 0
 	var deleteLastErr error
@@ -288,7 +290,9 @@ func (r *Reconciler) applyStorageDeletes(
 			continue
 		}
 		applied++
+		deleted = append(deleted, p)
 	}
+	r.pathsDeleted(deleted)
 	if deleteErrCount > 0 {
 		r.logger.Warn().
 			Err(deleteLastErr).

@@ -3,6 +3,7 @@ package tiering
 import (
 	"context"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 )
@@ -106,10 +107,16 @@ func TestRetentionColdRowMaintenance(t *testing.T) {
 	}
 
 	calls := 0
+	var reported []string
 	m.SetOnMigrationComplete(func() { calls++ })
-	m.NotifyColdFilesRemoved(2)
-	m.NotifyColdFilesRemoved(0)
+	m.SetOnColdRemoved(func(keys []string) { reported = append(reported, keys...) })
+	m.NotifyColdFilesRemoved([]string{"db1/cpu/a.parquet", "db1/cpu/b.parquet"})
+	m.NotifyColdFilesRemoved(nil)
 	if calls != 1 {
 		t.Fatalf("query-cache callback ran %d times, want 1", calls)
+	}
+	// The keys reach the cluster's cold-removal notice (#1728).
+	if strings.Join(reported, ",") != "db1/cpu/a.parquet,db1/cpu/b.parquet" {
+		t.Fatalf("reported %v", reported)
 	}
 }

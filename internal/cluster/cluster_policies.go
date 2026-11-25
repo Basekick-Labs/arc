@@ -43,20 +43,13 @@ func (c *Coordinator) clusterPoliciesJoinGate(req interface {
 	g := &c.clusterPolicies
 	g.mu.Lock()
 	if hasCapability(req.GetCapabilities(), raft.CapabilityClusterPolicies) {
-		// Retention's own flag gates the join too.
-		rWhy, rRelease := c.retentionPoliciesJoinGate(req)
-		if rWhy != "" {
+		// Each kind's own flag gates the join too (policy_kinds.go).
+		kWhy, kRelease := c.policyKindsJoinGate(req)
+		if kWhy != "" {
 			g.mu.Unlock()
-			return rWhy, nil
+			return kWhy, nil
 		}
-		// And the continuous query flag.
-		qWhy, qRelease := c.cqPoliciesJoinGate(req)
-		if qWhy != "" {
-			rRelease()
-			g.mu.Unlock()
-			return qWhy, nil
-		}
-		return "", func() { qRelease(); rRelease(); g.mu.Unlock() }
+		return "", func() { kRelease(); g.mu.Unlock() }
 	}
 	enabled := fsm != nil && fsm.ClusterPoliciesEnabled()
 	if !enabled && g.inFlight {
@@ -86,8 +79,7 @@ func (c *Coordinator) clusterPoliciesEnableLoop(ctx context.Context) {
 			return
 		case <-t.C:
 			c.maybeEnableClusterPolicies()
-			c.maybeEnableRetentionPolicies()
-			c.maybeEnableCQPolicies()
+			c.maybeEnablePolicyKinds()
 			c.maybeSeedPolicies(ctx)
 		}
 	}
@@ -145,6 +137,10 @@ type ClusterPoliciesStatus struct {
 	// CQEnabled / CQBlocking: the continuous query flag, likewise.
 	CQEnabled  bool     `json:"cq_enabled"`
 	CQBlocking []string `json:"cq_blocking_nodes,omitempty"`
+	// GovernanceEnabled / GovernanceBlocking: the governance flag (#1627),
+	// likewise.
+	GovernanceEnabled  bool     `json:"governance_enabled"`
+	GovernanceBlocking []string `json:"governance_blocking_nodes,omitempty"`
 }
 
 // PolicyKindStatus is one kind's adoption: seeded (the cluster holds it),
@@ -180,6 +176,10 @@ func (c *Coordinator) ClusterPoliciesStatus() ClusterPoliciesStatus {
 		st.CQEnabled = fsm.CQPoliciesEnabled()
 		if b := c.cqPolicies.blockers.Load(); b != nil && !st.CQEnabled && c.raftNode.IsLeader() {
 			st.CQBlocking = *b
+		}
+		st.GovernanceEnabled = fsm.GovernancePoliciesEnabled()
+		if b := c.governancePolicies.blockers.Load(); b != nil && !st.GovernanceEnabled && c.raftNode.IsLeader() {
+			st.GovernanceBlocking = *b
 		}
 		st.Kinds = map[string]PolicyKindStatus{}
 		for _, kind := range policyKinds {

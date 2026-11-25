@@ -41,12 +41,8 @@ func (p *readPeer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // readRouter routes from a compactor; withPeer false leaves the cluster with
 // no node to serve a read.
-func readRouter(t *testing.T, peerURL string, capable, withPeer bool, timeout ...time.Duration) *cluster.Router {
+func readRouter(t *testing.T, peerURL string, capable, withPeer bool) *cluster.Router {
 	t.Helper()
-	requestTimeout := time.Second
-	if len(timeout) > 0 {
-		requestTimeout = timeout[0]
-	}
 	local := cluster.NewNode("local", "Local", cluster.RoleCompactor, "test-cluster")
 	registry := cluster.NewRegistry(&cluster.RegistryConfig{LocalNode: local, Logger: zerolog.Nop()})
 	if withPeer {
@@ -56,7 +52,7 @@ func readRouter(t *testing.T, peerURL string, capable, withPeer bool, timeout ..
 		require.NoError(t, registry.Register(reader))
 	}
 	return cluster.NewRouter(&cluster.RouterConfig{
-		Timeout:         requestTimeout,
+		Timeout:         time.Second,
 		Registry:        registry,
 		LocalNode:       local,
 		Logger:          zerolog.Nop(),
@@ -129,7 +125,7 @@ func TestOnlyTheIntendedRoutesAreForwardable(t *testing.T) {
 		"GET /api/v1/measurements": true, "GET /api/v1/databases/:database/measurements/:measurement/schema": true,
 		"GET /api/v1/databases": true, "GET /api/v1/databases/:name": true, "GET /api/v1/databases/:name/measurements": true,
 		"POST /write": true, "POST /api/v2/write": true, "POST /api/v1/write/line-protocol": true,
-		"POST /api/v1/write/msgpack": true, "POST /api/v1/write/tle": true,
+		"POST /api/v1/write/msgpack": true, "POST /api/v1/write/tle": true, "POST /api/v1/write/prometheus": true,
 		// Creation only; DELETE /api/v1/databases/:name stays refused.
 		"POST /api/v1/databases": true,
 	}
@@ -163,38 +159,54 @@ func TestOnlyTheIntendedRoutesAreForwardable(t *testing.T) {
 // A forward is registered in the compactor's query registry, so
 // /api/v1/queries lists it (with its target) and can cancel it; cancelling
 // closes the connection to the peer.
+//
+// Cancelled only once the peer has the request (#1629): the target is
+// recorded before the router dials, so "listed with its target" does not mean
+// the peer has it, and a cancel before then never reaches the peer. The
+// router's timeout is far above the test's waits, so a slow run never sees a
+// timeout and a retry; the peer's signals close once either way.
 func TestForwardedQueryIsListedAndCancellable(t *testing.T) {
 	r := newDoorRig(t)
-	// Authenticate before starting the registry/cancellation deadline: a cold
-	// PBKDF2 verification can exceed it under race instrumentation and CPU load.
-	// The request still passes through the real auth middleware and its cache.
-	require.NotNil(t, r.am.VerifyToken(r.tokens["coarse-no-team"]))
 	reg := queryregistry.NewRegistry(nil, zerolog.Nop())
 	r.qh.queryRegistry = reg
+	peerReceived := make(chan struct{})
 	peerCancelled := make(chan struct{})
-	peerStarted := make(chan struct{})
-	releasePeer := make(chan struct{})
+	var receivedOnce, cancelledOnce sync.Once
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		// Read the body first, as a real peer does before running the query:
 		// net/http notices a dropped connection only after that.
 		_, _ = io.ReadAll(req.Body)
-		close(peerStarted)
-		select {
-		case <-req.Context().Done(): // a long query; ends when the forward is cut
-			close(peerCancelled)
-		case <-releasePeer: // release the handler if an assertion fails
-		}
+		receivedOnce.Do(func() { close(peerReceived) })
+		<-req.Context().Done() // a long query; ends when the forward is cut
+		cancelledOnce.Do(func() { close(peerCancelled) })
 	}))
 	defer srv.Close()
-	defer close(releasePeer) // runs before Close, including on test failure
-	r.qh.SetRouter(readRouter(t, srv.URL, true, true, 30*time.Second))
+	local := cluster.NewNode("local", "Local", cluster.RoleCompactor, "test-cluster")
+	registry := cluster.NewRegistry(&cluster.RegistryConfig{LocalNode: local, Logger: zerolog.Nop()})
+	reader := cluster.NewNode("reader-1", "Reader", cluster.RoleReader, "test-cluster")
+	reader.UpdateState(cluster.StateHealthy)
+	reader.APIAddress = strings.TrimPrefix(srv.URL, "http://")
+	require.NoError(t, registry.Register(reader))
+	router := cluster.NewRouter(&cluster.RouterConfig{
+		Timeout:         5 * time.Minute,
+		Registry:        registry,
+		LocalNode:       local,
+		Logger:          zerolog.Nop(),
+		PeerReadQueries: func(string) bool { return true },
+	})
+	r.qh.SetRouter(router)
 
-	done := make(chan int, 1)
+	done := make(chan int)
 	go func() {
 		status, _ := r.read(t, "POST", "/api/v1/query", `{"sql":"SELECT 42"}`)
 		done <- status
 	}()
 
+	select {
+	case <-peerReceived:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the forward never reached the peer")
+	}
 	var entry *queryregistry.TrackedQuery
 	require.Eventually(t, func() bool {
 		for _, q := range reg.GetActive() {
@@ -207,13 +219,6 @@ func TestForwardedQueryIsListedAndCancellable(t *testing.T) {
 	}, 5*time.Second, 10*time.Millisecond, "the forward is not listed with its target")
 	require.Equal(t, "reader-1", entry.ForwardedTo)
 
-	// The registry target is set before dialing. Wait for an established
-	// peer request before asserting that cancelling closes that connection.
-	select {
-	case <-peerStarted:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the forwarded request did not reach the peer")
-	}
 	require.True(t, reg.Cancel(entry.ID))
 	select {
 	case <-peerCancelled:

@@ -53,6 +53,12 @@ type Metrics struct {
 	lineprotocolRecordsTotal  atomic.Int64
 	lineprotocolBytesTotal    atomic.Int64
 
+	// Prometheus Remote Write specific
+	promRemoteWriteRequestsTotal atomic.Int64
+	promRemoteWriteRecordsTotal  atomic.Int64
+	promRemoteWriteBytesTotal    atomic.Int64
+	promRemoteWriteErrorsTotal   atomic.Int64
+
 	// Query metrics
 	queryRequestsTotal atomic.Int64
 	querySuccessTotal  atomic.Int64
@@ -64,6 +70,10 @@ type Metrics struct {
 	// the cold tier could not list, because this node's tier metadata holds
 	// no cold rows for the range (#1550).
 	queryColdUnlistedSkipped atomic.Int64
+	// queryDaysReadUnlisted counts days a query read through one recursive
+	// glob because the day's listing failed (#1810): its partitions could
+	// not be told apart, so the whole day was read.
+	queryDaysReadUnlisted atomic.Int64
 	// queryColdMarkSkipped counts cluster reads that left out cold
 	// partitions the cold tier could not list because the cluster's cold
 	// mark says the range holds no cold data (#1552).
@@ -95,6 +105,10 @@ type Metrics struct {
 	bufferFlushesTotal    atomic.Int64
 	bufferErrorsTotal     atomic.Int64
 	bufferFlushFailures   atomic.Int64
+	ingestPublishDelay    ingestPublishDelay                    // arc_ingest_publish_delay_seconds (ingest_publish_delay.go)
+	icebergExport         icebergExport                         // arc_iceberg_export_* (iceberg_export.go)
+	icebergTableLag       atomic.Pointer[icebergTableLagSource] // per-table lag series (iceberg_export_tables.go)
+	flightSQLPrepare      flightSQLPrepare                      // arc_flight_sql_prepare_* (flight_sql_prepare.go)
 	bufferQueueDepth      atomic.Int64
 	bufferRecordsQueued   atomic.Int64
 	bufferRecordsInflight atomic.Int64
@@ -118,10 +132,15 @@ type Metrics struct {
 	// many partitions are remembered now.
 	compactionPartitionsSkippedTooWide atomic.Int64
 	compactionPartitionsTooWide        atomic.Int64
-	compactionFilesCompacted           atomic.Int64
-	compactionBytesRead                atomic.Int64
-	compactionBytesWritten             atomic.Int64
-	compactionManifestsRecovered       atomic.Int64
+	// compactionInputsMisfiled: inputs a job refused because they hold rows
+	// outside the partition they sit in (#1825); the gauge is how many files
+	// compaction leaves alone for that now.
+	compactionInputsMisfiled     atomic.Int64
+	compactionFilesMisfiled      atomic.Int64
+	compactionFilesCompacted     atomic.Int64
+	compactionBytesRead          atomic.Int64
+	compactionBytesWritten       atomic.Int64
+	compactionManifestsRecovered atomic.Int64
 	// compactionScheduledSkips: scheduled ticks that never ran because a cycle
 	// held the claim until the scheduler's next tick, by tier (#220).
 	compactionScheduledSkips [len(CompactionScheduledSkipTiers)]atomic.Int64
@@ -151,17 +170,23 @@ type Metrics struct {
 	dbConnectionsIdle  atomic.Int64
 	dbWaitCount        atomic.Int64 // Cumulative connections waited for
 	dbWaitMicros       atomic.Int64 // Cumulative time blocked waiting, microseconds
-	// dbQueriesTotal and dbQueryErrorsTotal are NOT wired, deliberately.
+	// There is deliberately no DuckDB-level query counter. db_queries_total
+	// and db_query_errors_total existed and were never incremented.
+	// arc_db_queries_total left /metrics in #802 (the error counter was never
+	// on it); both left the JSON snapshot, the `api` timeseries and
+	// /api/v1/metrics/query-pool in #1747, where they had still been served
+	// as a permanent 0.
 	//
-	// Counting them at the DuckDB wrapper (DuckDB.Query/QueryContext/Exec)
-	// misses the hot path: shipped builds answer queries through
+	// Counting at the DuckDB wrapper (DuckDB.Query/QueryContext/Exec) would
+	// miss the hot path: shipped builds answer queries through
 	// DuckDB.ArrowQueryContext (and the arcx engine, when built), which never
 	// pass through those wrappers. A counter named "total" that silently
-	// omits most queries is the failure mode #801 was filed for, so it is
-	// better absent than partial. Use arc_query_requests_total / arc_query_errors_total,
-	// which are counted at every API entry point (#809).
-	dbQueriesTotal     atomic.Int64
-	dbQueryErrorsTotal atomic.Int64
+	// omits most queries is the failure mode #801 was filed for, and one that
+	// is never incremented reads as "this node served no queries". Better
+	// absent than partial. Use arc_query_requests_total / arc_query_errors_total
+	// (query_requests_total / query_errors_total in the snapshot), which are
+	// counted at every API entry point (#809). Do not re-add a DuckDB-level
+	// counter without counting on every query path.
 
 	// MQTT metrics
 	mqttMessagesReceived atomic.Int64
@@ -234,8 +259,13 @@ type Metrics struct {
 	// dropped (the WAL writer refused or timed out; those rows replay).
 	walRowCheckpointsWritten atomic.Int64
 	walRowCheckpointsDropped atomic.Int64
-	bufferFullRejections     atomic.Int64 // Write requests refused at ingest.max_buffered_bytes (#1468)
-	walDiskStatErrors        atomic.Int64 // Failed reads of the WAL volume's free space (the gate fails open)
+
+	// #1635: keys of failed flush writes that may land after all.
+	ingestAmbiguousWritesRecorded  atomic.Int64
+	ingestAmbiguousWritesRemoved   atomic.Int64
+	ingestAmbiguousWritesAbandoned atomic.Int64
+	bufferFullRejections           atomic.Int64 // Write requests refused at ingest.max_buffered_bytes (#1468)
+	walDiskStatErrors              atomic.Int64 // Failed reads of the WAL volume's free space (the gate fails open)
 
 	// Cluster file registration outbox (#1209)
 	fileRegistrationsPending      atomic.Int64 // files flushed and not yet confirmed in the cluster manifest
@@ -248,11 +278,16 @@ type Metrics struct {
 	reconciliationStorageSweepHeld atomic.Int64
 
 	// Ingest fencing (#1207)
-	ingestFenced          atomic.Int64                           // 1 while this writer refuses writes
-	ingestFencedWrites    [len(IngestFencedReasons)]atomic.Int64 // live writes refused, by reason (#1268)
-	writesForwarded       [len(WriteForwardResults)]atomic.Int64 // writes forwarded to a writer, by result (#1270)
-	walQuarantinedFiles   atomic.Int64                           // WAL files isolated after repeated recovery failures
-	walQuarantineReleased atomic.Int64                           // pending WAL entries released because their file was quarantined (#1225)
+	ingestFenced           atomic.Int64                           // 1 while this writer refuses writes
+	ingestFencedWrites     [len(IngestFencedReasons)]atomic.Int64 // live writes refused, by reason (#1268)
+	writesForwarded        [len(WriteForwardResults)]atomic.Int64 // writes forwarded to a writer, by result (#1270)
+	walQuarantinedFiles    atomic.Int64                           // WAL files isolated after repeated recovery failures
+	walFlushIntentsWritten atomic.Int64                           // #1646
+	walFlushIntentsDropped atomic.Int64                           // #1646
+	walFlushIntentsAdopted atomic.Int64                           // #1646
+	walDamagedEntries      atomic.Int64                           // damaged WAL frames in files quarantined for damage (#1634)
+	walRepairedLengths     atomic.Int64                           // WAL entries read past a damaged length field (#1641)
+	walQuarantineReleased  atomic.Int64                           // pending WAL entries released because their file was quarantined (#1225)
 	// 1 while the last recovery pass left a file on disk for which at least one
 	// row range of a parent entry was handed off — the state an older binary
 	// would replay in full.
@@ -382,6 +417,9 @@ type Metrics struct {
 	// objects or retiring the rows clears them on the next sync.
 	tieringColdRowsMissingObjects        atomic.Int64
 	tieringColdRowsMissingObjectsHotCopy atomic.Int64
+	// tieringColdRowsRetiredByReader counts cold rows a cluster reader
+	// retired because the cold object and the hot copy were both gone (#1563).
+	tieringColdRowsRetiredByReader atomic.Int64
 
 	// Cluster auth metrics (Enterprise only — mutated on every FSM apply
 	// of a token command). clusterAuthApplyTotal increments per applied
@@ -599,6 +637,13 @@ func (m *Metrics) IncLineProtocolRequests()           { m.lineprotocolRequestsTo
 func (m *Metrics) IncLineProtocolRecords(count int64) { m.lineprotocolRecordsTotal.Add(count) }
 func (m *Metrics) IncLineProtocolBytes(bytes int64)   { m.lineprotocolBytesTotal.Add(bytes) }
 
+// Prometheus Remote Write Metrics. Bytes are decoded (protobuf) bytes; an
+// error is a request answered 400 or above, a partial write included.
+func (m *Metrics) IncPromRemoteWriteRequests()           { m.promRemoteWriteRequestsTotal.Add(1) }
+func (m *Metrics) IncPromRemoteWriteRecords(count int64) { m.promRemoteWriteRecordsTotal.Add(count) }
+func (m *Metrics) IncPromRemoteWriteBytes(bytes int64)   { m.promRemoteWriteBytesTotal.Add(bytes) }
+func (m *Metrics) IncPromRemoteWriteErrors()             { m.promRemoteWriteErrorsTotal.Add(1) }
+
 // Query Metrics
 func (m *Metrics) IncQueryRequests() { m.queryRequestsTotal.Add(1) }
 func (m *Metrics) IncQuerySuccess()  { m.querySuccessTotal.Add(1) }
@@ -610,6 +655,10 @@ func (m *Metrics) IncSlowQueries()   { m.querySlowTotal.Add(1) }
 // cold tier could not list, on tier metadata's word that the range has no
 // cold rows (#1550).
 func (m *Metrics) IncQueryColdUnlistedSkipped() { m.queryColdUnlistedSkipped.Add(1) }
+
+// IncQueryDaysReadUnlisted counts one day a returned query plan reads whole
+// because the day's storage listing failed (#1810).
+func (m *Metrics) IncQueryDaysReadUnlisted() { m.queryDaysReadUnlisted.Add(1) }
 
 // IncQueryColdMarkSkipped counts one cluster read answered without the cold
 // partitions it could not list, on the cold mark's word (#1552).
@@ -733,6 +782,8 @@ func (m *Metrics) compactionScheduledSkipsTotal() int64 {
 }
 
 func (m *Metrics) SetCompactionPartitionsTooWide(n int64)  { m.compactionPartitionsTooWide.Store(n) }
+func (m *Metrics) AddCompactionInputsMisfiled(n int64)     { m.compactionInputsMisfiled.Add(n) }
+func (m *Metrics) SetCompactionFilesMisfiled(n int64)      { m.compactionFilesMisfiled.Store(n) }
 func (m *Metrics) IncCompactionFilesCompacted(count int64) { m.compactionFilesCompacted.Add(count) }
 func (m *Metrics) IncCompactionBytesRead(bytes int64)      { m.compactionBytesRead.Add(bytes) }
 func (m *Metrics) IncCompactionBytesWritten(bytes int64)   { m.compactionBytesWritten.Add(bytes) }
@@ -785,9 +836,6 @@ func (m *Metrics) SetDBPoolStats(st sql.DBStats) {
 	m.dbWaitCount.Store(st.WaitCount)
 	m.dbWaitMicros.Store(st.WaitDuration.Microseconds())
 }
-
-func (m *Metrics) IncDBQueries()     { m.dbQueriesTotal.Add(1) }
-func (m *Metrics) IncDBQueryErrors() { m.dbQueryErrorsTotal.Add(1) }
 
 // Audit Metrics
 //
@@ -940,8 +988,12 @@ func (m *Metrics) IncWALNotDurableRejections()     { m.walNotDurableRejections.A
 func (m *Metrics) IncWALDurableAckTimeouts()       { m.walDurableAckTimeouts.Add(1) }
 func (m *Metrics) IncWALRowCheckpointsWritten()    { m.walRowCheckpointsWritten.Add(1) }
 func (m *Metrics) IncWALRowCheckpointsDropped()    { m.walRowCheckpointsDropped.Add(1) }
-func (m *Metrics) IncBufferFullRejections()        { m.bufferFullRejections.Add(1) }
-func (m *Metrics) IncWALDiskStatErrors()           { m.walDiskStatErrors.Add(1) }
+
+func (m *Metrics) IncIngestAmbiguousWritesRecorded()  { m.ingestAmbiguousWritesRecorded.Add(1) }
+func (m *Metrics) IncIngestAmbiguousWritesRemoved()   { m.ingestAmbiguousWritesRemoved.Add(1) }
+func (m *Metrics) IncIngestAmbiguousWritesAbandoned() { m.ingestAmbiguousWritesAbandoned.Add(1) }
+func (m *Metrics) IncBufferFullRejections()           { m.bufferFullRejections.Add(1) }
+func (m *Metrics) IncWALDiskStatErrors()              { m.walDiskStatErrors.Add(1) }
 
 // SetReconciliationStorageSweepHeld records whether the last reconciliation
 // run held its orphan-storage sweep (#1214).
@@ -1046,6 +1098,29 @@ func (m *Metrics) fileRegistrationOldestPendingSeconds() float64 {
 	return time.Since(time.Unix(0, ns)).Seconds()
 }
 func (m *Metrics) IncWALQuarantinedFiles() { m.walQuarantinedFiles.Add(1) }
+
+// Flush intents (#1646).
+func (m *Metrics) IncWALFlushIntentsWritten() { m.walFlushIntentsWritten.Add(1) }
+func (m *Metrics) IncWALFlushIntentsDropped() { m.walFlushIntentsDropped.Add(1) }
+func (m *Metrics) IncWALFlushIntentsAdopted() { m.walFlushIntentsAdopted.Add(1) }
+
+// GetWALFlushIntentsAdopted reads arc_wal_flush_intents_adopted_total.
+func (m *Metrics) GetWALFlushIntentsAdopted() int64 { return m.walFlushIntentsAdopted.Load() }
+
+// AddWALDamagedEntries counts the damaged frames (checksum mismatches) of a
+// WAL file quarantined on the first pass (#1634): entries recovery cannot
+// replay. Files quarantined after three strikes are not counted here.
+func (m *Metrics) AddWALDamagedEntries(n int64) { m.walDamagedEntries.Add(n) }
+
+// GetWALDamagedEntries reads arc_wal_damaged_entries_total.
+func (m *Metrics) GetWALDamagedEntries() int64 { return m.walDamagedEntries.Load() }
+
+// AddWALRepairedLengths counts WAL entries recovery read past a damaged
+// length field, by their checksum (#1641).
+func (m *Metrics) AddWALRepairedLengths(n int64) { m.walRepairedLengths.Add(n) }
+
+// GetWALRepairedLengths reads arc_wal_repaired_length_entries_total.
+func (m *Metrics) GetWALRepairedLengths() int64 { return m.walRepairedLengths.Load() }
 
 // AddWALQuarantineReleased counts pending WAL entries the writer stopped
 // waiting for because recovery quarantined their file (#1225).
@@ -1228,6 +1303,12 @@ func (m *Metrics) SetBackupSkippedFiles(n int64) {
 	m.backupSkippedFiles.Store(n)
 }
 
+// AddTieringColdRowsRetiredByReader counts cold rows a cluster reader retired
+// after their object and hot copy were confirmed gone (#1563).
+func (m *Metrics) AddTieringColdRowsRetiredByReader(n int64) {
+	m.tieringColdRowsRetiredByReader.Add(n)
+}
+
 // SetTieringColdRowsMissingObjects records the last cold-tier metadata sync's
 // cold rows whose object is gone from cold storage: lost (no hot copy either)
 // and hotCopy (still read from hot storage) (#1551).
@@ -1358,6 +1439,12 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"lineprotocol_records_total":  m.lineprotocolRecordsTotal.Load(),
 		"lineprotocol_bytes_total":    m.lineprotocolBytesTotal.Load(),
 
+		// Prometheus Remote Write
+		"prometheus_remote_write_requests_total": m.promRemoteWriteRequestsTotal.Load(),
+		"prometheus_remote_write_records_total":  m.promRemoteWriteRecordsTotal.Load(),
+		"prometheus_remote_write_bytes_total":    m.promRemoteWriteBytesTotal.Load(),
+		"prometheus_remote_write_errors_total":   m.promRemoteWriteErrorsTotal.Load(),
+
 		// Query
 		"query_requests_total":              m.queryRequestsTotal.Load(),
 		"query_success_total":               m.querySuccessTotal.Load(),
@@ -1365,6 +1452,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"query_timeouts_total":              m.queryTimeoutsTotal.Load(),
 		"query_slow_total":                  m.querySlowTotal.Load(),
 		"query_cold_unlisted_skipped_total": m.queryColdUnlistedSkipped.Load(),
+		"query_days_read_unlisted_total":    m.queryDaysReadUnlisted.Load(),
 		"query_cold_mark_skipped_total":     m.queryColdMarkSkipped.Load(),
 		"query_rows_total":                  m.queryRowsTotal.Load(),
 		"query_latency_sum_us":              m.queryLatencySum.Load(),
@@ -1379,19 +1467,30 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"query_client_disconnects_sql_json_total":   m.queryDisconnectsSQLJSON.Load(),
 
 		// Buffer
-		"buffer_records_buffered":         m.bufferRecordsBuffered.Load(),
-		"buffer_bytes_buffered":           m.bufferBytesBuffered.Load(),
-		"buffer_oldest_unflushed_seconds": float64(m.bufferOldestAgeNS.Load()) / float64(time.Second),
-		"buffer_memory_limit_bytes":       m.bufferMemoryLimit.Load(),
-		"buffer_memory_pressure":          m.bufferMemoryPressure.Load(),
-		"buffer_records_written":          m.bufferRecordsWritten.Load(),
-		"buffer_records_dropped_total":    m.bufferRecordsDropped.Load(),
-		"buffer_flushes_total":            m.bufferFlushesTotal.Load(),
-		"buffer_errors_total":             m.bufferErrorsTotal.Load(),
-		"buffer_flush_failures_total":     m.bufferFlushFailures.Load(),
-		"buffer_queue_depth":              m.bufferQueueDepth.Load(),
-		"buffer_records_queued":           m.bufferRecordsQueued.Load(),
-		"buffer_records_inflight":         m.bufferRecordsInflight.Load(),
+		"buffer_records_buffered":          m.bufferRecordsBuffered.Load(),
+		"buffer_bytes_buffered":            m.bufferBytesBuffered.Load(),
+		"buffer_oldest_unflushed_seconds":  float64(m.bufferOldestAgeNS.Load()) / float64(time.Second),
+		"buffer_memory_limit_bytes":        m.bufferMemoryLimit.Load(),
+		"buffer_memory_pressure":           m.bufferMemoryPressure.Load(),
+		"buffer_records_written":           m.bufferRecordsWritten.Load(),
+		"buffer_records_dropped_total":     m.bufferRecordsDropped.Load(),
+		"buffer_flushes_total":             m.bufferFlushesTotal.Load(),
+		"buffer_errors_total":              m.bufferErrorsTotal.Load(),
+		"buffer_flush_failures_total":      m.bufferFlushFailures.Load(),
+		"ingest_publish_delay_count":       m.ingestPublishDelayCount(),
+		"ingest_publish_delay_sum_seconds": time.Duration(m.ingestPublishDelay.sumNS.Load()).Seconds(),
+		"ingest_publish_delay_max_seconds": time.Duration(m.ingestPublishDelay.maxNS.Load()).Seconds(),
+		"iceberg_export_lag_count":         m.icebergExportLagCount(),
+		"iceberg_export_lag_sum_seconds":   time.Duration(m.icebergExport.sumNS.Load()).Seconds(),
+		"iceberg_export_pending_seconds":   m.icebergExportPending(time.Now()).Seconds(),
+		"iceberg_export_backlog_files":     m.icebergExport.backlog.Load(),
+		"iceberg_ingest_appends":           m.icebergExport.appends.Load(),
+		"iceberg_ingest_append_files":      m.icebergExport.appendFiles.Load(),
+		"iceberg_ingest_append_fallbacks":  m.icebergExport.appendFallbacks.Load(),
+		"iceberg_files_left_out":           m.icebergExport.leftOut.Load(),
+		"buffer_queue_depth":               m.bufferQueueDepth.Load(),
+		"buffer_records_queued":            m.bufferRecordsQueued.Load(),
+		"buffer_records_inflight":          m.bufferRecordsInflight.Load(),
 
 		// Storage
 		"storage_writes_total":      m.storageWritesTotal.Load(),
@@ -1408,6 +1507,8 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"compaction_scheduled_skips":             m.compactionScheduledSkipsTotal(),
 		"compaction_partitions_skipped_too_wide": m.compactionPartitionsSkippedTooWide.Load(),
 		"compaction_partitions_too_wide":         m.compactionPartitionsTooWide.Load(),
+		"compaction_inputs_misfiled":             m.compactionInputsMisfiled.Load(),
+		"compaction_files_misfiled":              m.compactionFilesMisfiled.Load(),
 		"compaction_files_compacted":             m.compactionFilesCompacted.Load(),
 		"compaction_bytes_read":                  m.compactionBytesRead.Load(),
 		"compaction_bytes_written":               m.compactionBytesWritten.Load(),
@@ -1426,8 +1527,6 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"db_wait_micros":        m.dbWaitMicros.Load(),
 		"db_connections_in_use": m.dbConnectionsInUse.Load(),
 		"db_connections_idle":   m.dbConnectionsIdle.Load(),
-		"db_queries_total":      m.dbQueriesTotal.Load(),
-		"db_query_errors_total": m.dbQueryErrorsTotal.Load(),
 
 		// Audit
 		"audit_events_total":   m.auditEventsTotal.Load(),
@@ -1492,6 +1591,9 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"wal_durable_ack_timeouts":          m.walDurableAckTimeouts.Load(),
 		"wal_row_checkpoints_written":       m.walRowCheckpointsWritten.Load(),
 		"wal_row_checkpoints_dropped":       m.walRowCheckpointsDropped.Load(),
+		"ingest_ambiguous_writes_recorded":  m.ingestAmbiguousWritesRecorded.Load(),
+		"ingest_ambiguous_writes_removed":   m.ingestAmbiguousWritesRemoved.Load(),
+		"ingest_ambiguous_writes_abandoned": m.ingestAmbiguousWritesAbandoned.Load(),
 		"ingest_buffer_full_rejections":     m.bufferFullRejections.Load(),
 		"wal_disk_stat_errors":              m.walDiskStatErrors.Load(),
 		"file_registrations_pending":        m.fileRegistrationsPending.Load(),
@@ -1501,6 +1603,11 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"ingest_fenced":                     m.ingestFenced.Load(),
 		"ingest_fenced_writes":              m.ingestFencedWritesTotal(),
 		"wal_quarantined_files":             m.walQuarantinedFiles.Load(),
+		"wal_flush_intents_written":         m.walFlushIntentsWritten.Load(),
+		"wal_flush_intents_dropped":         m.walFlushIntentsDropped.Load(),
+		"wal_flush_intents_adopted":         m.walFlushIntentsAdopted.Load(),
+		"wal_damaged_entries":               m.walDamagedEntries.Load(),
+		"wal_repaired_length_entries":       m.walRepairedLengths.Load(),
 		"wal_quarantine_released_entries":   m.walQuarantineReleased.Load(),
 		"wal_partial_row_recovery_pending":  m.walPartialRowRecovery.Load(),
 
@@ -1547,6 +1654,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"backup_skipped_files":                          m.backupSkippedFiles.Load(),
 		"tiering_cold_rows_missing_objects":             m.tieringColdRowsMissingObjects.Load(),
 		"tiering_cold_rows_missing_objects_hot_copy":    m.tieringColdRowsMissingObjectsHotCopy.Load(),
+		"tiering_cold_rows_retired_by_reader_total":     m.tieringColdRowsRetiredByReader.Load(),
 
 		// Cluster Auth (Enterprise, Phase A)
 		"cluster_heartbeats_unknown_node_total": m.clusterHeartbeatsUnknownNodeTotal.Load(),
@@ -1688,6 +1796,23 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_lineprotocol_records_total counter\n"...)
 	b = appendMetric(b, "arc_lineprotocol_records_total", float64(m.lineprotocolRecordsTotal.Load()))
 
+	// Prometheus Remote Write metrics
+	b = append(b, "# HELP arc_prometheus_remote_write_requests_total Total Prometheus Remote Write requests\n"...)
+	b = append(b, "# TYPE arc_prometheus_remote_write_requests_total counter\n"...)
+	b = appendMetric(b, "arc_prometheus_remote_write_requests_total", float64(m.promRemoteWriteRequestsTotal.Load()))
+
+	b = append(b, "# HELP arc_prometheus_remote_write_records_total Total samples written via Prometheus Remote Write\n"...)
+	b = append(b, "# TYPE arc_prometheus_remote_write_records_total counter\n"...)
+	b = appendMetric(b, "arc_prometheus_remote_write_records_total", float64(m.promRemoteWriteRecordsTotal.Load()))
+
+	b = append(b, "# HELP arc_prometheus_remote_write_bytes_total Total decoded bytes received via Prometheus Remote Write\n"...)
+	b = append(b, "# TYPE arc_prometheus_remote_write_bytes_total counter\n"...)
+	b = appendMetric(b, "arc_prometheus_remote_write_bytes_total", float64(m.promRemoteWriteBytesTotal.Load()))
+
+	b = append(b, "# HELP arc_prometheus_remote_write_errors_total Prometheus Remote Write requests answered with an error (400 or above, partial writes included)\n"...)
+	b = append(b, "# TYPE arc_prometheus_remote_write_errors_total counter\n"...)
+	b = appendMetric(b, "arc_prometheus_remote_write_errors_total", float64(m.promRemoteWriteErrorsTotal.Load()))
+
 	// Query metrics
 	b = append(b, "# HELP arc_query_requests_total Total query requests\n"...)
 	b = append(b, "# TYPE arc_query_requests_total counter\n"...)
@@ -1744,6 +1869,10 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_query_cold_unlisted_skipped_total counter\n"...)
 	b = appendMetric(b, "arc_query_cold_unlisted_skipped_total", float64(m.queryColdUnlistedSkipped.Load()))
 
+	b = append(b, "# HELP arc_query_days_read_unlisted_total Days a query read whole because the day's storage listing failed\n"...)
+	b = append(b, "# TYPE arc_query_days_read_unlisted_total counter\n"...)
+	b = appendMetric(b, "arc_query_days_read_unlisted_total", float64(m.queryDaysReadUnlisted.Load()))
+
 	b = append(b, "# HELP arc_query_cold_mark_skipped_total Cluster reads answered without cold partitions the cold tier could not list, because the cluster's cold mark says the read's range holds no cold data.\n"...)
 	b = append(b, "# TYPE arc_query_cold_mark_skipped_total counter\n"...)
 	b = appendMetric(b, "arc_query_cold_mark_skipped_total", float64(m.queryColdMarkSkipped.Load()))
@@ -1763,6 +1892,7 @@ func (m *Metrics) PrometheusFormat() string {
 	b = appendMetricWithLabel(b, "arc_query_client_disconnects_total", "path", DisconnectPathArrowIPC, float64(m.queryDisconnectsArrowIPC.Load()))
 	b = appendMetricWithLabel(b, "arc_query_client_disconnects_total", "path", DisconnectPathArrowJSON, float64(m.queryDisconnectsArrowJSON.Load()))
 	b = appendMetricWithLabel(b, "arc_query_client_disconnects_total", "path", DisconnectPathSQLJSON, float64(m.queryDisconnectsSQLJSON.Load()))
+	b = m.appendFlightSQLPrepare(b)
 
 	// Buffer metrics
 	b = append(b, "# HELP arc_buffer_records_buffered Records currently buffered\n"...)
@@ -1800,6 +1930,9 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_buffer_flush_failures_total Total buffer flush failures\n"...)
 	b = append(b, "# TYPE arc_buffer_flush_failures_total counter\n"...)
 	b = appendMetric(b, "arc_buffer_flush_failures_total", float64(m.bufferFlushFailures.Load()))
+
+	b = m.appendIngestPublishDelay(b)
+	b = m.appendIcebergExport(b)
 
 	b = append(b, "# HELP arc_buffer_queue_depth Current flush queue depth\n"...)
 	b = append(b, "# TYPE arc_buffer_queue_depth gauge\n"...)
@@ -1866,6 +1999,14 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_compaction_partitions_too_wide Partitions remembered as too wide to compact in a job's memory\n"...)
 	b = append(b, "# TYPE arc_compaction_partitions_too_wide gauge\n"...)
 	b = appendMetric(b, "arc_compaction_partitions_too_wide", float64(m.compactionPartitionsTooWide.Load()))
+
+	b = append(b, "# HELP arc_compaction_inputs_misfiled_total Input files a compaction job refused because they hold rows outside the hour or day of the directory they sit in; the job then compacted nothing\n"...)
+	b = append(b, "# TYPE arc_compaction_inputs_misfiled_total counter\n"...)
+	b = appendMetric(b, "arc_compaction_inputs_misfiled_total", float64(m.compactionInputsMisfiled.Load()))
+
+	b = append(b, "# HELP arc_compaction_files_misfiled Files compaction leaves alone on this node because they hold rows outside the hour or day of the directory they sit in (GET /api/v1/compaction/misfiled lists them)\n"...)
+	b = append(b, "# TYPE arc_compaction_files_misfiled gauge\n"...)
+	b = appendMetric(b, "arc_compaction_files_misfiled", float64(m.compactionFilesMisfiled.Load()))
 
 	b = append(b, "# HELP arc_compaction_files_compacted_total Input files compacted by successful compaction attempts (a staged job: before the cluster commits it)\n"...)
 	b = append(b, "# TYPE arc_compaction_files_compacted_total counter\n"...)
@@ -2153,6 +2294,15 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_wal_row_checkpoints_dropped_total Row-range checkpoints the WAL writer refused or timed out on; those rows replay after a crash\n"...)
 	b = append(b, "# TYPE arc_wal_row_checkpoints_dropped_total counter\n"...)
 	b = appendMetric(b, "arc_wal_row_checkpoints_dropped_total", float64(m.walRowCheckpointsDropped.Load()))
+	b = append(b, "# HELP arc_ingest_ambiguous_writes_recorded_total Flush writes that failed but may still land in storage, tracked so a late copy is removed once WAL replay stores the rows (#1635)\n"...)
+	b = append(b, "# TYPE arc_ingest_ambiguous_writes_recorded_total counter\n"...)
+	b = appendMetric(b, "arc_ingest_ambiguous_writes_recorded_total", float64(m.ingestAmbiguousWritesRecorded.Load()))
+	b = append(b, "# HELP arc_ingest_ambiguous_writes_removed_total Late-landed copies of failed flush writes removed after their rows were replayed into another file\n"...)
+	b = append(b, "# TYPE arc_ingest_ambiguous_writes_removed_total counter\n"...)
+	b = appendMetric(b, "arc_ingest_ambiguous_writes_removed_total", float64(m.ingestAmbiguousWritesRemoved.Load()))
+	b = append(b, "# HELP arc_ingest_ambiguous_writes_abandoned_total Failed flush writes no longer tracked without a removal (rows never seen stored again, or a foreign object at the key); a late copy there duplicates rows\n"...)
+	b = append(b, "# TYPE arc_ingest_ambiguous_writes_abandoned_total counter\n"...)
+	b = appendMetric(b, "arc_ingest_ambiguous_writes_abandoned_total", float64(m.ingestAmbiguousWritesAbandoned.Load()))
 	b = append(b, "# HELP arc_ingest_buffer_full_rejections_total Write requests refused because rows waiting to be flushed reached ingest.max_buffered_bytes (bulk imports: 90 percent of it); nothing was written, clients retry\n"...)
 	b = append(b, "# TYPE arc_ingest_buffer_full_rejections_total counter\n"...)
 	b = appendMetric(b, "arc_ingest_buffer_full_rejections_total", float64(m.bufferFullRejections.Load()))
@@ -2196,9 +2346,24 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# TYPE arc_cluster_file_registration_journal_errors_total counter\n"...)
 	b = appendMetric(b, "arc_cluster_file_registration_journal_errors_total", float64(m.fileRegistrationJournalErrs.Load()))
 
-	b = append(b, "# HELP arc_wal_quarantined_files_total WAL files isolated after repeated recovery failures\n"...)
+	b = append(b, "# HELP arc_wal_quarantined_files_total WAL files isolated after repeated recovery failures, or at once when their only failure is damaged entries\n"...)
 	b = append(b, "# TYPE arc_wal_quarantined_files_total counter\n"...)
 	b = appendMetric(b, "arc_wal_quarantined_files_total", float64(m.walQuarantinedFiles.Load()))
+	b = append(b, "# HELP arc_wal_flush_intents_written_total Flush intents appended to the WAL before a file was stored\n"...)
+	b = append(b, "# TYPE arc_wal_flush_intents_written_total counter\n"...)
+	b = appendMetric(b, "arc_wal_flush_intents_written_total", float64(m.walFlushIntentsWritten.Load()))
+	b = append(b, "# HELP arc_wal_flush_intents_dropped_total Flush intents not written (WAL queue full, or too large); a crash before those flushes' checkpoints replays their rows\n"...)
+	b = append(b, "# TYPE arc_wal_flush_intents_dropped_total counter\n"...)
+	b = appendMetric(b, "arc_wal_flush_intents_dropped_total", float64(m.walFlushIntentsDropped.Load()))
+	b = append(b, "# HELP arc_wal_flush_intents_adopted_total Files a flush stored before a crash took its checkpoint, checkpointed at recovery instead of replayed\n"...)
+	b = append(b, "# TYPE arc_wal_flush_intents_adopted_total counter\n"...)
+	b = appendMetric(b, "arc_wal_flush_intents_adopted_total", float64(m.walFlushIntentsAdopted.Load()))
+	b = append(b, "# HELP arc_wal_damaged_entries_total Damaged WAL entries (checksum mismatch) in files recovery quarantined on the first pass; their rows cannot be replayed\n"...)
+	b = append(b, "# TYPE arc_wal_damaged_entries_total counter\n"...)
+	b = appendMetric(b, "arc_wal_damaged_entries_total", float64(m.walDamagedEntries.Load()))
+	b = append(b, "# HELP arc_wal_repaired_length_entries_total WAL entries recovery read past a damaged length field, found by their checksum and confirmed by the next entry\n"...)
+	b = append(b, "# TYPE arc_wal_repaired_length_entries_total counter\n"...)
+	b = appendMetric(b, "arc_wal_repaired_length_entries_total", float64(m.walRepairedLengths.Load()))
 
 	b = append(b, "# HELP arc_wal_quarantine_released_entries_total Pending WAL entries the writer stopped waiting for because their file was quarantined\n"...)
 	b = append(b, "# TYPE arc_wal_quarantine_released_entries_total counter\n"...)
@@ -2318,6 +2483,9 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_tiering_cold_rows_missing_objects_hot_copy Cold tier rows whose cold object is gone but whose hot copy still exists and is read, as of the last cold-tier metadata sync. No data is missing.\n"...)
 	b = append(b, "# TYPE arc_tiering_cold_rows_missing_objects_hot_copy gauge\n"...)
 	b = appendMetric(b, "arc_tiering_cold_rows_missing_objects_hot_copy", float64(m.tieringColdRowsMissingObjectsHotCopy.Load()))
+	b = append(b, "# HELP arc_tiering_cold_rows_retired_by_reader_total Cold tier rows a cluster reader retired because their cold object and hot copy were both gone, normally after the primary's DELETE, retention run or database delete. A reader cannot tell that from an object removed outside Arc.\n"...)
+	b = append(b, "# TYPE arc_tiering_cold_rows_retired_by_reader_total counter\n"...)
+	b = appendMetric(b, "arc_tiering_cold_rows_retired_by_reader_total", float64(m.tieringColdRowsRetiredByReader.Load()))
 
 	// Cluster Auth metrics (Enterprise, Phase A — Cluster Auth Convergence).
 	// apply_* counters increment per applied token command, per node — so

@@ -76,6 +76,17 @@ func (h *MQTTSubscriptionHandler) requireEnabled(c *fiber.Ctx) error {
 	return c.Next()
 }
 
+// notFound answers 404 for a request naming a subscription ID that is not
+// stored. Every route that takes an ID uses it, so a wrong or stale ID reads
+// the same everywhere and is not reported as a server fault.
+func (h *MQTTSubscriptionHandler) notFound(c *fiber.Ctx, id string, err error) error {
+	h.logger.Debug().Err(err).Str("id", id).Msg("Subscription not found")
+	return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+		"success": false,
+		"error":   "Subscription not found",
+	})
+}
+
 // handleCreate creates a new subscription
 func (h *MQTTSubscriptionHandler) handleCreate(c *fiber.Ctx) error {
 	var req mqtt.CreateSubscriptionRequest
@@ -153,10 +164,13 @@ func (h *MQTTSubscriptionHandler) handleGet(c *fiber.Ctx) error {
 
 	sub, err := h.manager.Get(c.Context(), id)
 	if err != nil {
-		h.logger.Debug().Err(err).Str("id", id).Msg("Subscription not found")
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+		if errors.Is(err, mqtt.ErrSubscriptionNotFound) {
+			return h.notFound(c, id, err)
+		}
+		h.logger.Error().Err(err).Str("id", id).Msg("Failed to get subscription")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
-			"error":   "Subscription not found",
+			"error":   "Failed to get subscription",
 		})
 	}
 
@@ -184,6 +198,9 @@ func (h *MQTTSubscriptionHandler) handleUpdate(c *fiber.Ctx) error {
 
 	sub, err := h.manager.Update(c.Context(), id, &req)
 	if err != nil {
+		if errors.Is(err, mqtt.ErrSubscriptionNotFound) {
+			return h.notFound(c, id, err)
+		}
 		h.logger.Error().Err(err).Str("id", id).Msg("Failed to update subscription")
 
 		// Check for specific errors
@@ -229,6 +246,9 @@ func (h *MQTTSubscriptionHandler) handleDelete(c *fiber.Ctx) error {
 	id := c.Params("id")
 
 	if err := h.manager.Delete(c.Context(), id); err != nil {
+		if errors.Is(err, mqtt.ErrSubscriptionNotFound) {
+			return h.notFound(c, id, err)
+		}
 		h.logger.Error().Err(err).Str("id", id).Msg("Failed to delete subscription")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
@@ -249,6 +269,12 @@ func (h *MQTTSubscriptionHandler) handleStart(c *fiber.Ctx) error {
 	id := c.Params("id")
 
 	if err := h.manager.StartSubscription(c.Context(), id); err != nil {
+		if errors.Is(err, mqtt.ErrSubscriptionNotFound) {
+			return h.notFound(c, id, err)
+		}
+		if msg, ok := mqtt.BrokerConnectMessage(err); ok {
+			return h.brokerConnectFailed(c, id, "start", msg)
+		}
 		h.logger.Error().Err(err).Str("id", id).Msg("Failed to start subscription")
 
 		if errors.Is(err, mqtt.ErrSubscriptionAlreadyRunning) {
@@ -272,11 +298,29 @@ func (h *MQTTSubscriptionHandler) handleStart(c *fiber.Ctx) error {
 	})
 }
 
+// brokerConnectFailed answers a start or restart whose connect to the broker
+// failed: 502, an upstream failure, not a fault of this server (#1619). The
+// error is the message stored as the subscription's error_message, so the
+// response and a later GET agree; it never carries the broker URL. Not 503,
+// which clients read as the MQTT subsystem being disabled. The subscription is
+// left with status error and is not running, also after a restart, which
+// stopped the old subscriber first.
+func (h *MQTTSubscriptionHandler) brokerConnectFailed(c *fiber.Ctx, id, action, msg string) error {
+	h.logger.Warn().Str("id", id).Str("error", msg).Msg("Failed to " + action + " subscription: could not connect to the broker")
+	return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
+		"success": false,
+		"error":   msg,
+	})
+}
+
 // handleStop stops a subscription
 func (h *MQTTSubscriptionHandler) handleStop(c *fiber.Ctx) error {
 	id := c.Params("id")
 
 	if err := h.manager.StopSubscription(c.Context(), id); err != nil {
+		if errors.Is(err, mqtt.ErrSubscriptionNotFound) {
+			return h.notFound(c, id, err)
+		}
 		h.logger.Error().Err(err).Str("id", id).Msg("Failed to stop subscription")
 
 		if errors.Is(err, mqtt.ErrSubscriptionNotRunning) {
@@ -305,6 +349,9 @@ func (h *MQTTSubscriptionHandler) handlePause(c *fiber.Ctx) error {
 	id := c.Params("id")
 
 	if err := h.manager.PauseSubscription(c.Context(), id); err != nil {
+		if errors.Is(err, mqtt.ErrSubscriptionNotFound) {
+			return h.notFound(c, id, err)
+		}
 		h.logger.Error().Err(err).Str("id", id).Msg("Failed to pause subscription")
 
 		if errors.Is(err, mqtt.ErrSubscriptionNotRunning) {
@@ -333,6 +380,12 @@ func (h *MQTTSubscriptionHandler) handleRestart(c *fiber.Ctx) error {
 	id := c.Params("id")
 
 	if err := h.manager.RestartSubscription(c.Context(), id); err != nil {
+		if errors.Is(err, mqtt.ErrSubscriptionNotFound) {
+			return h.notFound(c, id, err)
+		}
+		if msg, ok := mqtt.BrokerConnectMessage(err); ok {
+			return h.brokerConnectFailed(c, id, "restart", msg)
+		}
 		h.logger.Error().Err(err).Str("id", id).Msg("Failed to restart subscription")
 
 		if errors.Is(err, mqtt.ErrSubscriptionAlreadyRunning) {
@@ -362,6 +415,9 @@ func (h *MQTTSubscriptionHandler) handleStats(c *fiber.Ctx) error {
 
 	stats, err := h.manager.GetStats(c.Context(), id)
 	if err != nil {
+		if errors.Is(err, mqtt.ErrSubscriptionNotFound) {
+			return h.notFound(c, id, err)
+		}
 		h.logger.Error().Err(err).Str("id", id).Msg("Failed to get subscription stats")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,

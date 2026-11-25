@@ -8,7 +8,8 @@ import (
 )
 
 // The real engine remains maintainer-only. This source contract verifies that
-// its SQL builder uses the same file-selection helper the public tests exercise.
+// its planner (planEngine, behind buildEngineSQL and the serve paths) uses the
+// same file-selection helper the public tests exercise.
 func TestBuildEngineSQL_UsesTestedFileSelection(t *testing.T) {
 	file, err := parser.ParseFile(gotoken.NewFileSet(), "router.go", nil, parser.AllErrors)
 	if err != nil {
@@ -17,7 +18,7 @@ func TestBuildEngineSQL_UsesTestedFileSelection(t *testing.T) {
 	var call *ast.CallExpr
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Name.Name != "buildEngineSQL" {
+		if !ok || fn.Name.Name != "planEngine" {
 			continue
 		}
 		ast.Inspect(fn.Body, func(node ast.Node) bool {
@@ -33,7 +34,7 @@ func TestBuildEngineSQL_UsesTestedFileSelection(t *testing.T) {
 		})
 	}
 	if call == nil || len(call.Args) != 9 {
-		t.Fatal("buildEngineSQL does not call the tested selector with pruning and exclusions")
+		t.Fatal("planEngine does not call the tested selector with pruning and exclusions")
 	}
 	for index, name := range map[int]string{7: "Pruner", 8: "Exclude"} {
 		arg, ok := call.Args[index].(*ast.SelectorExpr)

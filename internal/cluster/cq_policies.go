@@ -21,62 +21,6 @@ import (
 // ErrCQPoliciesNotEnabled: cluster-wide continuous queries are not on yet.
 var ErrCQPoliciesNotEnabled = errors.New("cluster-wide continuous queries are not enabled yet: every node must run a release that supports them")
 
-// cqPoliciesJoinGate is retentionPoliciesJoinGate for the CQ flag.
-func (c *Coordinator) cqPoliciesJoinGate(req interface {
-	GetNodeID() string
-	GetCapabilities() []string
-}) (why string, release func()) {
-	fsm := c.raftNode.FSM()
-	g := &c.cqPolicies
-	g.mu.Lock()
-	if hasCapability(req.GetCapabilities(), raft.CapabilityClusterCQ) {
-		return "", g.mu.Unlock
-	}
-	enabled := fsm != nil && fsm.CQPoliciesEnabled()
-	if !enabled && g.inFlight {
-		if err := c.barrierWithin(streamClaimsJoinBarrier); err != nil {
-			g.mu.Unlock()
-			return "the cluster could not confirm its continuous query policies state; retry the join", nil
-		}
-		enabled = fsm != nil && fsm.CQPoliciesEnabled()
-	}
-	if !enabled {
-		return "", g.mu.Unlock
-	}
-	g.mu.Unlock()
-	return "cluster-wide continuous queries are enabled in this cluster: the node must run a release that supports them", nil
-}
-
-// maybeEnableCQPolicies proposes the CQ flag from the leader once every node
-// supports it.
-func (c *Coordinator) maybeEnableCQPolicies() {
-	if c.raftNode == nil {
-		return
-	}
-	fsm := c.raftNode.FSM()
-	if fsm == nil || !fsm.ClusterPoliciesEnabled() || fsm.CQPoliciesEnabled() || !c.raftNode.IsLeader() {
-		return
-	}
-	g := &c.cqPolicies
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	nodes, blockers := capabilityCandidates(fsm.GetAllNodes(), c.raftNode.ConfigurationServerIDs, raft.CapabilityClusterCQ)
-	g.blockers.Store(&blockers)
-	if len(blockers) > 0 {
-		return
-	}
-	raw, err := json.Marshal(raft.EnableCQPoliciesPayload{Nodes: nodes, Now: time.Now().UTC()})
-	if err != nil {
-		return
-	}
-	g.inFlight = true
-	if err := c.raftNode.Apply(&raft.Command{Type: raft.CommandEnableCQPolicies, Payload: raw}, 5*time.Second); err != nil {
-		c.logger.Warn().Err(err).Msg("Proposing cluster-wide continuous queries failed; retrying")
-		return
-	}
-	c.logger.Info().Int("nodes", len(nodes)).Msg("Cluster-wide continuous queries enabled: every node supports them")
-}
-
 // CQPoliciesSeeded reports whether continuous queries live in the cluster
 // state. Until then they stay in each node's SQLite, as before.
 func (c *Coordinator) CQPoliciesSeeded() bool {

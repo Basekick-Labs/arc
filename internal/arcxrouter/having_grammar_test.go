@@ -69,11 +69,6 @@ func TestHavingGrammarDecline(t *testing.T) {
 		// No aggregate anywhere (bare DISTINCT).
 		"SELECT host FROM cpu GROUP BY host",
 		"SELECT host FROM cpu GROUP BY host HAVING host = 'a'",
-		// A hidden bucket-gated aggregate on a tag key (the agg-6a gate).
-		"SELECT host, count(*) FROM cpu GROUP BY host HAVING stddev(x) > 1",
-		"SELECT host FROM cpu GROUP BY host HAVING median(x) > 1",
-		"SELECT host FROM cpu GROUP BY host HAVING corr(y, x) > 0",
-		"SELECT host FROM cpu GROUP BY host HAVING count_if(x > 1) > 0",
 		// Grouped mode is never routed, hidden or not.
 		b + "count(*) FROM cpu GROUP BY 1 HAVING mode(code) > 1",
 		// ORDER BY a hidden aggregate: the shadow cannot see its values.

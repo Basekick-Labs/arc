@@ -13,6 +13,11 @@ tls_enabled = false
 # tls_cert_file = "/etc/letsencrypt/live/example.com/fullchain.pem"
 # tls_key_file = "/etc/letsencrypt/live/example.com/privkey.pem"
 
+# Optional Arrow Flight SQL listener (disabled by default)
+[flight_sql]
+enabled = false
+port = 50051
+
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
@@ -128,6 +133,10 @@ max_buffer_age_ms = 100   # Sample override; built-in default is 5000
 
 # Sort keys for compression/query performance: "measurement:col1,col2"
 # Time column is always appended automatically
+# Environment override: entries separated by WHITESPACE, since each entry
+# contains commas; no space inside an entry:
+# ARC_INGEST_SORT_KEYS="cpu:host,region mem:host"
+# (ingest.decimal_columns takes its env override the same way.)
 sort_keys = []
 default_sort_keys = ""
 
@@ -281,12 +290,37 @@ daily_enabled = true
 daily_schedule = "0 3 * * *"
 daily_min_age_hours = 24
 daily_min_files = 12
+# A day older than this many days whose newest file is older than
+# daily_min_age_hours is settled: it gets a daily file even with fewer than
+# daily_min_files hour-level files, so tiering can move it to cold (#1774).
+# Late files in a settled day that already has a daily file go into another
+# daily file instead of a rewrite of the existing one (#1775); a younger day
+# is rewritten, which also merges duplicate rows across the two.
+# 0 means the default, 7.
+# daily_skip_file_age_check_days = 7
+
+# A compaction job reads each input file's time range before it merges
+# anything. If a file holds rows outside the hour (hourly tier) or UTC day
+# (daily tier) of the directory it sits in, the job compacts nothing, the file
+# is remembered ({temp_directory}/misfiled.json) and later jobs of that
+# partition run without it. Arc's own writers never produce such a file; it
+# comes from data written by old versions, restored or synced from such a
+# store, or placed by hand. GET /api/v1/compaction/misfiled lists them.
+# false merges such a file with its neighbours, as before 27.01.1: the output
+# then holds rows of two days and the Iceberg export leaves it out of its table.
+# The list is then neither read nor used, so files remembered earlier are
+# compacted too; it is kept on disk for a later start with the check on.
+# Environment override: ARC_COMPACTION_REFUSE_MISFILED_INPUTS=false
+# refuse_misfiled_inputs = true
 
 # -----------------------------------------------------------------------------
 # Authentication
 # -----------------------------------------------------------------------------
 [auth]
 enabled = true
+# metrics_public = false             # true: /metrics and /api/v1/metrics without a
+#                                    # token. false (default): any valid token, a
+#                                    # read-only one included; give scrapers their own.
 
 # -----------------------------------------------------------------------------
 # Delete
@@ -377,9 +411,48 @@ s3_cache_ttl_seconds = 3600
 # namespace_prefix = "arc"
 # namespace_migration_dry_run = true
 # reconcile_interval = 300
+# ingest_export_interval = 60        # seconds: a flushed file is exported after at
+#                                    # most this long, not at the next timed pass.
+#                                    # 0 = timed passes only; otherwise >= 5.
+# reconcile_concurrency = 0          # tables whose reconcile passes run at once (1-16);
+#                                    # 0 = 4 on object storage, 1 on local storage.
+#                                    # Standalone nodes only, a cluster node runs one
+# ingest_export_concurrency = 8      # tables whose ingest appends run at once (1-32);
+#                                    # 1 exports one table at a time
+# export_lag_table_series = 0        # tables with their own export lag series on
+#                                    # /metrics (0-1000): the ones waiting longest and
+#                                    # the ones whose last export took longest. 0 = none.
+#                                    # The series carry database and measurement names,
+#                                    # visible to any valid token (and to anyone, with
+#                                    # auth.metrics_public = true).
+# ingest_append_enabled = true       # those exports add only the new files, without
+#                                    # listing the measurement. false = a full pass
+#                                    # of the measurement each time.
+# min_version_age = 300              # seconds a published table version stays on
+#                                    # disk after the next one is published, so a
+#                                    # reader that resolved it can still open it.
+#                                    # >= 120, and >= glue.sync_interval + 60 with Glue.
 # catalog_db_path = "./data/arc.db"   # the shared auth database
 # retain_snapshots = 10
 # orphan_sweep_enabled = true
+# layout = "warehouse"               # or "colocated": new tables' metadata in each
+#                                    # measurement's directory, for readers that
+#                                    # reach data only through the table folder
+#                                    # (OneLake shortcuts). Local or S3 storage,
+#                                    # warehouse at the storage root, the same
+#                                    # value on every node.
+# rest_catalog_enabled = false       # serve a read-only Iceberg REST catalog at
+#                                    # /iceberg (uri=http(s)://<arc>/iceberg,
+#                                    # Arc token as bearer) for Snowflake, Trino,
+#                                    # Spark, PyIceberg, DuckDB. Needs enabled.
+#
+# [iceberg.glue]                     # register the tables in AWS Glue (S3 only)
+# enabled = false                    # Athena, EMR, Redshift Spectrum, Snowflake
+#                                    # (CATALOG_SOURCE = GLUE), Glue federation
+# region = ""                        # default: storage.s3_region
+# catalog_id = ""                    # default: the credentials' account
+# sync_interval = 60                 # seconds between retries of failed syncs;
+#                                    # each publish is synced at once
 
 # -----------------------------------------------------------------------------
 # Query Governance (Enterprise)
@@ -412,9 +485,76 @@ enabled = false
 # sync_interval = "5m"         # Delay after a completed pass; at least 1s
 # sync_retry_interval = "30s"  # Initial retry; doubles up to sync_interval
 #                             # At least 1s and shorter than sync_interval
+# sync_timeout = "2h"          # Bound on one manual pass (POST /api/v1/spoke-sync/run)
+# delete_after_sync = false    # Delete the local copy once the hub VERIFIES it holds it
+#                             # (a later pass than the one that synced it, or a signed
+#                             # bundle acknowledgement). Deletes edge data: with the
+#                             # network path on, needs an https hub_url (or loopback);
+#                             # refused on a cluster node. Local queries stop seeing it.
+# delete_after_sync_delay = "0s"  # Minimum time from synced to the verify that may delete
+# delete_after_sync_ack_max_age = "168h"  # Air-gapped: how long after export a signed
+#                             # bundle acknowledgement may still delete files
+# delete_after_sync_accept_compacted = false  # Also delete files the hub holds only compacted
+#                             # or in cold. Hub compaction drops exact duplicate rows,
+#                             # widens mixed int/float columns, nulls unparseable times:
+#                             # with this on the spoke's exact copy goes.
+#
+# [edge_sync.spoke.bundle]
+# timeout = "2h"               # Bound on one air-gap export (POST /api/v1/spoke-sync/export)
+#
+# [edge_sync.import]
+# timeout = "4h"               # Hub side: bound on one air-gap import (POST /api/v1/bundle-import)
+#
+# Relay transport: spoke and hub exchange bundles and acks through a bucket both
+# can reach (spokes behind NAT, intermittent links, no inbound to the hub).
+# Scheduled passes need the paid license; the manual routes are free:
+# POST /api/v1/spoke-sync/relay/run (spoke), POST /api/v1/bundle-import/relay/run (hub).
+# The target keys are a backup target's: type = "local", "s3", "minio", "azure",
+# "azblob" or "gcs" with local_path / s3_* / azure_* / gcs_*. The target's own prefix is the
+# relay root; it must not overlap primary storage, the cold tier or a backup target.
+# Relay bundles use [edge_sync.spoke.bundle] max_files / max_bytes (10000 / 64 GiB)
+# and its timeout for a manual pass; the hub's staging_dir must hold one bundle.
+#
+# [edge_sync.spoke.relay]
+# enabled = false
+# interval = "5m"              # Between scheduled passes (export, apply acks)
+# ack_timeout = "72h"          # A bundle with no ack this long after export is taken
+#                             # back and its files re-sent; longer than interval
+# type = "s3"
+# s3_bucket = "arc-relay"
+# s3_prefix = "fleet-a/"
+#
+# [edge_sync.import.relay]
+# enabled = false
+# interval = "1m"              # Between scheduled polls of the bucket
+# staging_dir = "./data/edge_sync_relay_staging"  # One bundle at a time, verified
+#                             # before import; not inside storage.local_path
+# type = "s3"
+# s3_bucket = "arc-relay"
+# s3_prefix = "fleet-a/"
+#
+# allowed_dirs (in both [edge_sync.import] and [edge_sync.spoke.bundle]) is a
+# TOML array, or a comma-separated string; a path may contain spaces, and a
+# path containing a comma needs the array. Entries must be absolute paths:
+# allowed_dirs = ["/Volumes/Air Gap", "/mnt/bundles"]
+# ARC_EDGE_SYNC_IMPORT_ALLOWED_DIRS="/Volumes/Air Gap,/mnt/bundles"
+#
+# Closing the HTTP connection does not cancel a manual pass, export or import;
+# only these bounds or a server shutdown do. Go durations; must be positive.
 # Environment overrides:
 # ARC_EDGE_SYNC_SPOKE_SYNC_INTERVAL
 # ARC_EDGE_SYNC_SPOKE_SYNC_RETRY_INTERVAL
+# ARC_EDGE_SYNC_SPOKE_SYNC_TIMEOUT
+# ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC
+# ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC_DELAY
+# ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC_ACCEPT_COMPACTED
+# ARC_EDGE_SYNC_SPOKE_DELETE_AFTER_SYNC_ACK_MAX_AGE
+# ARC_EDGE_SYNC_SPOKE_BUNDLE_TIMEOUT
+# ARC_EDGE_SYNC_IMPORT_TIMEOUT
+# ARC_EDGE_SYNC_SPOKE_RELAY_ENABLED, ARC_EDGE_SYNC_SPOKE_RELAY_INTERVAL,
+# ARC_EDGE_SYNC_SPOKE_RELAY_ACK_TIMEOUT, ARC_EDGE_SYNC_SPOKE_RELAY_TYPE, ...
+# ARC_EDGE_SYNC_IMPORT_RELAY_ENABLED, ARC_EDGE_SYNC_IMPORT_RELAY_INTERVAL,
+# ARC_EDGE_SYNC_IMPORT_RELAY_STAGING_DIR, ARC_EDGE_SYNC_IMPORT_RELAY_TYPE, ...
 #
 # -----------------------------------------------------------------------------
 # Telemetry
@@ -439,10 +579,11 @@ migration_history_retention_days = 90
 # Environment override: ARC_TIERED_STORAGE_SCAN_TIMEOUT=4h
 #
 # The scan is what puts a file in the tier metadata the query path routes reads
-# from. It runs on four paths and this one number now bounds all of them: the
-# startup scan, POST /api/v1/tiering/scan, and the pre-migration scan inside a
-# scheduled cycle or POST /api/v1/tiering/migrate. Before 27.01.1 the first two
-# were capped at 30 minutes with no way to change it (#1154).
+# from. It runs on four paths and this one number bounds all of them: the
+# startup scan, POST /api/v1/tiering/scan, the pre-migration scan inside a
+# scheduled cycle, and the scan POST /api/v1/tiering/reconcile runs first.
+# POST /api/v1/tiering/migrate does not scan. Before 27.01.1 the first two were
+# capped at 30 minutes with no way to change it (#1154).
 #
 # Inside a migration cycle the scan runs on a budget derived from the cycle's,
 # so it gets whichever is shorter. At this default the two are equal (the cycle
@@ -465,6 +606,14 @@ migration_history_retention_days = 90
 # nothing else writes a tier row for a compacted file on the node that produced
 # it.
 # scan_timeout = "2h"
+#
+# How long one migration run may take: a scheduled cycle,
+# POST /api/v1/tiering/migrate or POST /api/v1/tiering/reconcile. Go duration;
+# must be positive. The scan at the start of a cycle or a reconcile runs inside
+# this bound, so keep it no shorter than scan_timeout (Arc warns at startup if
+# it is shorter). Files a run already moved to cold are still released for up
+# to 2 minutes after it (#1830).
+# migration_timeout = "2h"
 
 [tiered_storage.cold]
 enabled = false
@@ -704,8 +853,15 @@ local_path = "./data/backups"           # Directory for local backups; see the r
 # enabled = false
 # history_size = 100              # Number of completed queries to keep in memory
 
-# Peer file replication (Enterprise, cluster mode).
+# Cluster (Enterprise).
 # [cluster]
+# Static seed nodes (host:port of each peer's coordinator) used to join the
+# cluster. Either spelling works (uncomment ONE; a key may appear only once);
+# ARC_CLUSTER_SEEDS takes the comma form and overrides the file.
+# seeds = ["10.0.0.1:9100", "10.0.0.2:9100"]
+# seeds = "10.0.0.1:9100,10.0.0.2:9100"
+#
+# Peer file replication (cluster mode).
 # Aggregate inbound bandwidth of this node's pull workers, in bytes per second
 # or a size such as "10MB" (1 MB = 1024 KB). 0 = unlimited. Staged compaction
 # fetches are not capped. A file whose transfer outlasts one fetch resumes from

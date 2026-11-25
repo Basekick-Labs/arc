@@ -364,7 +364,11 @@ jobs:
           # Apple stopped shipping Intel Macs years ago, and GitHub's macos-13
           # runners are a scarce, sunsetting tier that stalled the release waiting
           # on capacity. Homebrew on macOS is Apple-Silicon-only.
-          - runner: macos-14
+          # macos-15: GitHub retired the macos-14 image ("The configuration
+          # 'macos-14-arm64-us-default' is not supported"). The binary keeps
+          # macOS 14 as its minimum through MACOSX_DEPLOYMENT_TARGET in the
+          # build step, checked after it.
+          - runner: macos-15
             suffix: darwin-arm64
             variant: standard
             artifact: arc-darwin-arm64
@@ -405,6 +409,9 @@ jobs:
       - name: Build binary
         env:
           CGO_ENABLED: 1
+          # Oldest macOS the darwin binary runs on, whatever the runner's
+          # SDK; 26.09.3 was built for 14.0. Ignored on Linux.
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
           GOFIPS140: ${{ matrix.gofips }}
         run: |
           VERSION=${{ needs.prepare.outputs.version }}
@@ -419,6 +426,17 @@ jobs:
           # Show binary info
           file ${{ matrix.artifact }}
           ls -lh ${{ matrix.artifact }}
+
+      - name: Check macOS floor
+        if: runner.os == 'macOS'
+        run: |
+          MINOS=$(otool -l ${{ matrix.artifact }} | awk '/LC_BUILD_VERSION/ {f=1} f && /minos/ {print $2; exit}')
+          echo "minos=${MINOS}"
+          if [ "$(printf '%s\n%s\n' "${MINOS}" "14.0" | sort -V | tail -1)" != "14.0" ]; then
+            echo "::error::${{ matrix.artifact }} requires macOS ${MINOS}, above the supported 14.0"
+            exit 1
+          fi
+          echo "✅ ${{ matrix.artifact }} requires macOS ${MINOS}" >> $GITHUB_STEP_SUMMARY
 
       - name: Check glibc floor
         if: runner.os == 'Linux'

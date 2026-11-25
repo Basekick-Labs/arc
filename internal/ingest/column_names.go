@@ -8,6 +8,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/basekick-labs/arc/internal/colname"
 	"github.com/basekick-labs/arc/internal/storage"
 )
 
@@ -72,33 +73,15 @@ func ColumnNameProblem(name string) string {
 
 // QuoteColumnName is name for a message or log line: as is when it is valid
 // UTF-8, otherwise Go-quoted, so an invalid byte is shown escaped and never
-// written raw.
-func QuoteColumnName(name string) string {
-	name = TruncateColumnName(name)
-	if utf8.ValidString(name) {
-		return name
-	}
-	return strconv.Quote(name)
-}
+// written raw. See colname.Quote.
+func QuoteColumnName(name string) string { return colname.Quote(name) }
 
 // maxShownNameBytes bounds a client-sent name echoed in an answer or a log.
-const maxShownNameBytes = 256
+const maxShownNameBytes = colname.MaxShownBytes
 
 // TruncateColumnName is name cut to maxShownNameBytes (whole runes when it
-// is valid UTF-8), with "…" when cut: no length limit applies to names, and
-// an answer or log line must not echo an arbitrarily long one.
-func TruncateColumnName(name string) string {
-	if len(name) <= maxShownNameBytes {
-		return name
-	}
-	cut := maxShownNameBytes
-	if utf8.ValidString(name) {
-		for cut > 0 && !utf8.RuneStart(name[cut]) {
-			cut--
-		}
-	}
-	return name[:cut] + "…"
-}
+// is valid UTF-8), with "…" when cut. See colname.Truncate.
+func TruncateColumnName(name string) string { return colname.Truncate(name) }
 
 // KnownColumns returns, for a measurement, the spelling each column name the
 // measurement already has is stored under, keyed by its FoldColumnName: the

@@ -45,7 +45,7 @@ func TestWALRowSpansOfNamesOnlyExactlyKnownRows(t *testing.T) {
 		{lo: 3, hi: 5},
 		{lo: 5, hi: 9, parent: tokB, base: 10, copied: true},
 		{lo: 9, hi: 11},
-		{lo: 11, hi: 13, copied: true},
+		{lo: 11, hi: 13, copied: true, tokens: []string{tokA, tokB}}, // unnamed, but replay re-stores both entries whole (#1697)
 		{lo: 13, hi: 14, copied: true},
 		{lo: 14, hi: 16, copied: true},
 		{lo: 16, hi: 17, copied: true},

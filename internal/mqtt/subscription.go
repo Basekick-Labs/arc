@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/basekick-labs/arc/internal/storage"
 )
 
 // Validation limits
@@ -36,10 +38,20 @@ var (
 	ErrSubscriptionNotRunning        = errors.New("subscription not running")
 	ErrSubscriptionRunningCantUpdate = errors.New("cannot update running subscription - stop it first")
 	ErrSubscriptionUniqueConstraint  = errors.New("subscription name already exists")
+	// ErrSubscriptionNotFound is wrapped for a request naming a subscription
+	// ID that is not stored. Handlers map it to 404 Not Found, so a wrong or
+	// stale ID is told apart from a server fault.
+	ErrSubscriptionNotFound = errors.New("subscription not found")
 	// ErrValidation wraps a request that failed validation (bad QoS, broker URL,
 	// missing field, …). Handlers map it to 400 Bad Request rather than 500 —
 	// it's a client error, not a server fault.
 	ErrValidation = errors.New("validation error")
+	// ErrBrokerConnect matches a start that could not connect to the broker:
+	// unreachable, timed out, or the broker refused the connection (#1619).
+	// Handlers map it to 502 Bad Gateway with the error's own text, which is
+	// also the status error_message. It is matched only by the connect itself,
+	// never by a failure before it (topic mapping, password, TLS files).
+	ErrBrokerConnect = errors.New("could not connect to the broker")
 )
 
 // Subscription represents an MQTT subscription configuration
@@ -293,7 +305,10 @@ func validateBrokerURL(brokerURL string) error {
 	// Parse as URL to validate structure
 	parsed, err := url.Parse(brokerURL)
 	if err != nil {
-		return err
+		// url.Parse's error quotes the whole URL, and its detail can quote
+		// pieces of it ("invalid URL escape \"%zz\""), password included; this
+		// text reaches the 400 body and the log (#1619).
+		return errors.New("not a valid URL")
 	}
 
 	if parsed.Host == "" {
@@ -346,6 +361,9 @@ func ValidateCreateRequest(req *CreateSubscriptionRequest) error {
 func validateSubscriptionTargets(s *Subscription, strictFilters bool) error {
 	if !isValidStorageSegment(s.Database) {
 		return fmt.Errorf("database %q must start with a letter and contain only alphanumeric characters, underscores, or hyphens", s.Database)
+	}
+	if storage.IsWarehouseRootName(s.Database) {
+		return fmt.Errorf("database name %q is reserved for the Iceberg warehouse", s.Database)
 	}
 	if err := validateTopicMapping(s.TopicMapping, strictFilters); err != nil {
 		return err

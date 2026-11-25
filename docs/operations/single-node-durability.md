@@ -142,3 +142,11 @@ kernel remains running during `SIGKILL`; its file cache is not discarded.
 Power-loss testing requires a controlled VM or host reset that discards
 unflushed writes. Crashing during sustained ingest is a separate, still
 unmeasured part of #1387.
+
+Until [#1618](https://github.com/Basekick-Labs/arc/issues/1618) the local
+storage backend did not fsync the Parquet files a flush wrote, so a power loss
+after the flush's WAL checkpoint could lose rows acknowledged as `durable`,
+which a `SIGKILL` probe cannot show. Local writes now fsync the file before it
+is renamed into place and the directory after, and the flush checkpoints only
+once that has returned. That closes the gap by construction; it has not been
+measured with a power-loss test.

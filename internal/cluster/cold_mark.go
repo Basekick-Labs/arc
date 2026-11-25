@@ -188,6 +188,18 @@ func (c *Coordinator) ColdMarkTrusted(now time.Time, maxAge time.Duration, local
 	return fsm.ColdMarkTrustedFor(now, maxAge, servers, localIdentity)
 }
 
+// ColdMarkBackend is ClusterFSM.ColdMarkBackend; all zero without a cluster.
+func (c *Coordinator) ColdMarkBackend() (backend string, seeded, conflict bool) {
+	if c == nil || c.raftNode == nil {
+		return "", false, false
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return "", false, false
+	}
+	return fsm.ColdMarkBackend()
+}
+
 // ColdMarkDay returns scope's mark ("database/measurement") as days since the
 // epoch and the proposer time of its last raise; has is false when no cold
 // object of the scope was ever marked.

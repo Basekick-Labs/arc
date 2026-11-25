@@ -29,9 +29,11 @@ type coldExport struct {
 	cfg   *aws.Config
 	props iceberg.Properties
 
-	once sync.Once
-	io   iceio.IO
-	err  error
+	// io is the FileIO of the pass whose context is builtFor (fileIOFor).
+	mu       sync.Mutex
+	builtFor context.Context
+	io       iceio.IO
+	err      error
 }
 
 // SetColdTier tells the exporter where the cold tier's files live, so their DataFiles can be
@@ -42,6 +44,11 @@ func (e *Exporter) SetColdTier(cold storage.Backend) error {
 		return fmt.Errorf("the Iceberg export tracks an S3 cold tier only (got %s)", cold.Type())
 	}
 	e.cold = &coldExport{root: strings.TrimSuffix(DefaultWarehouse(cold), "/"), cfg: cfg, props: props}
+	if e.colocatedLayout() {
+		e.logger.Warn().Msg("Iceberg export with iceberg.layout=\"colocated\" and a cold tier: files that move to the cold tier " +
+			"are outside the table's folder, so readers that reach data only through it (OneLake shortcuts) cannot read them; " +
+			"catalog-based readers can")
+	}
 	return nil
 }
 
@@ -49,9 +56,19 @@ func (e *Exporter) SetColdTier(cold storage.Backend) error {
 // table's.
 func (e *Exporter) fileIOFor(ctx context.Context, tbl *icetable.Table, uri string) (iceio.IO, error) {
 	if c := e.cold; c != nil && strings.HasPrefix(uri, c.root+"/") {
-		c.once.Do(func() {
+		// One FileIO per pass, built with that pass's context: iceberg-go's
+		// S3 FileIO issues every request under the context it was built
+		// with. Kept across passes, it answered "context canceled" to every
+		// read after the pass that built it had ended (#1825): a cold file
+		// read on every pass, such as one left out of the table, wedged its
+		// table from the second pass on. Built per pass, a read is still
+		// bounded by the pass's deadline and ends with it at shutdown.
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.io == nil || c.builtFor != ctx {
 			c.io, c.err = iceio.LoadFS(utils.WithAwsConfig(ctx, c.cfg), c.props, c.root)
-		})
+			c.builtFor = ctx
+		}
 		if c.err != nil {
 			return nil, fmt.Errorf("open the cold tier's filesystem: %w", c.err)
 		}
@@ -62,7 +79,7 @@ func (e *Exporter) fileIOFor(ctx context.Context, tbl *icetable.Table, uri strin
 
 // cloneFromTable builds, for each added path, the DataFile of a live entry holding the same file
 // under another URI — the same storage key and the same size: a hot file now registered under its
-// cold URI, or the reverse. Those adds never open their file. keyOf maps an added URI to its
+// cold URI, or the reverse. Those adds never open their file. An entry with no day is not cloned. keyOf maps an added URI to its
 // storage key. Returns the clones and the paths still to build.
 func cloneFromTable(tbl *icetable.Table, live map[string]iceberg.DataFile, toAdd []string, keyOf map[string]string, want map[string]int64) (cloned []iceberg.DataFile, rest []string, err error) {
 	byBase := make(map[string][]iceberg.DataFile, len(live))
@@ -78,6 +95,11 @@ func cloneFromTable(tbl *icetable.Table, live map[string]iceberg.DataFile, toAdd
 					src = df
 					break
 				}
+			}
+			if src != nil && missingPartitionValue(tbl.Spec(), src) {
+				// An entry with no day (#1754) is not carried to the new URI: the file is
+				// built there, which reads its day from its rows.
+				src = nil
 			}
 		}
 		if src == nil {

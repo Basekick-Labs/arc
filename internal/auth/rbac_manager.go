@@ -1416,13 +1416,60 @@ func (rm *RBACManager) RemoveTokenFromTeam(ctx context.Context, tokenID, teamID 
 	return nil
 }
 
-// GetTokenTeams returns all teams a token belongs to
+// RemoveTokenFromTeamLocal removes a membership of a token the cluster does
+// not manage, from this node's SQLite only (#1630): the cluster state has no
+// such membership, so a proposal would be dropped and the route answered 200
+// with nothing removed. Only an unmarked membership is removed. When the only
+// row for the pair is marked, it is the cluster token's that holds the same
+// ID on this cluster (an ID collision), and the removal is refused.
+func (rm *RBACManager) RemoveTokenFromTeamLocal(ctx context.Context, tokenID, teamID int64) error {
+	result, err := rm.db.ExecContext(ctx, `
+		DELETE FROM rbac_token_memberships WHERE token_id = ? AND team_id = ? AND raft_materialised = 0
+	`, tokenID, teamID)
+	if err != nil {
+		return fmt.Errorf("failed to remove token from team: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to remove token from team: %w", err)
+	}
+	if n == 0 {
+		var exists int
+		err := rm.db.QueryRowContext(ctx,
+			`SELECT 1 FROM rbac_token_memberships WHERE token_id = ? AND team_id = ?`, tokenID, teamID).Scan(&exists)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return tagError(ErrNotFound, errors.New("token membership not found"))
+		case err != nil:
+			return fmt.Errorf("failed to look up token membership: %w", err)
+		}
+		return &TokenScopeError{Code: TokenCodeClusterMembership, TokenID: tokenID,
+			Message: fmt.Sprintf("This membership belongs to the cluster token with ID %d, not to the token this node keeps at that ID (an ID collision). Nothing was changed. To remove it from the cluster token, send the request without ?node to a node where token %d is the cluster token.", tokenID, tokenID)}
+	}
+	rm.InvalidateTokenCache(tokenID)
+	rm.logger.Info().Int64("token_id", tokenID).Int64("team_id", teamID).
+		Msg("Removed a membership of a token the cluster does not manage, on this node only")
+	return nil
+}
+
+// GetTokenTeams returns all teams a token belongs to.
+//
+// A membership the cluster wrote (raft_materialised = 1) counts only for a
+// token row the cluster wrote too. On a cluster node, the token this node
+// keeps at ID X from before v26.06.1 (unmarked) and the cluster's token with
+// the same ID are different tokens, but memberships are keyed by token_id
+// alone, so without this the node's token would inherit every team of the
+// cluster's token (#1630). An unmarked membership counts for any token: it
+// is a grant made on this node to the row this node holds at that ID.
+// Standalone nodes that never joined a cluster have no marked rows, so the
+// condition is always true there.
 func (rm *RBACManager) GetTokenTeams(tokenID int64) ([]Team, error) {
 	rows, err := rm.db.Query(`
 		SELECT t.id, t.organization_id, t.name, t.description, t.created_at, t.updated_at, t.enabled
 		FROM rbac_teams t
 		INNER JOIN rbac_token_memberships m ON t.id = m.team_id
-		WHERE m.token_id = ?
+		INNER JOIN api_tokens tok ON tok.id = m.token_id
+		WHERE m.token_id = ? AND (m.raft_materialised = 0 OR tok.raft_materialised = 1)
 		ORDER BY t.name
 	`, tokenID)
 	if err != nil {
@@ -1437,6 +1484,9 @@ func (rm *RBACManager) GetTokenTeams(tokenID int64) ([]Team, error) {
 			return nil, fmt.Errorf("failed to scan team: %w", err)
 		}
 		teams = append(teams, team)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read token teams: %w", err)
 	}
 	return teams, nil
 }
@@ -1882,6 +1932,17 @@ func (rm *RBACManager) CanAccessAnythingIn(tokenInfo *TokenInfo, database, permi
 		return false
 	}
 	return ok
+}
+
+// CanAccessAnythingInErr is CanAccessAnythingIn with the store error returned
+// rather than read as a denial. A caller whose answer an outside system
+// caches (the Iceberg REST catalog, #1690: a remote catalog can drop a table
+// that disappears from a listing) must tell "not permitted" from "the grants
+// could not be read", and answer the second with a 503.
+func (rm *RBACManager) CanAccessAnythingInErr(tokenInfo *TokenInfo, database, permission string) (bool, error) {
+	return rm.holdsGrant(tokenInfo, permission, func(pattern string) bool {
+		return matchPattern(pattern, database)
+	})
 }
 
 // HasPermissionAnywhere reports whether the token holds any grant permitting
@@ -2375,12 +2436,13 @@ func (rm *RBACManager) countTeamCascadeDescendants(ctx context.Context, teamID i
 // map it to 409 Conflict. Phase A.2 Item 2.
 var ErrCascadeCapExceeded = errors.New("cascade exceeds configured limit")
 
-// ErrNameConflict is the sentinel tagging every organization/team
-// name-collision error, on both the OSS direct-SQLite path (UNIQUE
-// constraint violation) and the cluster Raft path ("already exists"
-// from the FSM apply). HTTP handlers detect it via errors.Is and map it
-// to 409 Conflict — a duplicate name is a client error, not a server
-// fault. Issue #549.
+// ErrNameConflict is the sentinel tagging every organization/team and
+// API token name-collision error, on both the OSS direct-SQLite path
+// (UNIQUE constraint violation; for tokens, a write that changed no row
+// because of the name) and the cluster Raft path ("already exists" from
+// the FSM apply; for tokens, tagged by the cluster proposer). HTTP
+// handlers detect it via errors.Is and map it to 409 Conflict — a
+// duplicate name is a client error, not a server fault. Issue #549, #1625.
 var ErrNameConflict = errors.New("name already exists")
 
 // ErrInvalidName is the sentinel tagging validateName failures on the
@@ -2398,7 +2460,8 @@ var ErrInvalidRoleInput = errors.New("invalid role input")
 
 // ErrNotFound is the sentinel tagging every "entity does not exist" error
 // returned by RBACManager — organizations, teams, roles, and measurement
-// permissions, on both the OSS direct-SQLite and cluster Raft paths.
+// permissions, on both the OSS direct-SQLite and cluster Raft paths — and
+// by the AuthManager token writes (update, revoke, rotate, delete).
 //
 // Handlers must NOT map this to a status code centrally. The same error
 // means different things depending on where the missing ID sits in the

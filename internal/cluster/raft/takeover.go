@@ -2012,6 +2012,9 @@ func (f *ClusterFSM) applyInstanceSettled(payload []byte) interface{} {
 // takeoverNodeRemovedLocked: a claimant removed from the cluster releases
 // its unfinished claims; a removed origin's instances become orphaned (it
 // will never register them), and keep their claims. Caller holds f.mu.
+//
+// Anything cleared here for id must also be counted by
+// ClusterFSM.ReferencesNode (#1619).
 func (f *ClusterFSM) takeoverNodeRemovedLocked(id string) {
 	t := f.takeover
 	t.gen++

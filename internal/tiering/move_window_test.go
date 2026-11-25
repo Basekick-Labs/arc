@@ -493,7 +493,7 @@ func TestStreamRelease_KeptFilesACompactionTookOverLoseTheirColdCopy(t *testing.
 	ch := make(chan MigrationCandidate, 2)
 	var stop atomic.Bool
 	errc := make(chan error, 1)
-	go func() { errc <- m.migrator.streamRelease(ctx, ch, &stop) }()
+	go func() { _, err := m.migrator.streamRelease(ctx, ch, &stop); errc <- err }()
 	ch <- candidateFor(gateDailyA)
 	select {
 	case <-stopped:

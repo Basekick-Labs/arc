@@ -61,7 +61,7 @@ func awaitBufferRecordMetrics(t *testing.T, queued, inflight int64) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("queued/inflight records = %d/%d, want %d/%d", snapshotInt(t, "buffer_records_queued"), snapshotInt(t, "buffer_records_inflight"), queued, inflight)
+	t.Fatalf("queued/inflight records = %d/%d, want %d/%d (%s)", snapshotInt(t, "buffer_records_queued"), snapshotInt(t, "buffer_records_inflight"), queued, inflight, describeLiveBuffers())
 }
 
 func TestBufferMetricsIncludeQueuedAndInFlightRecords(t *testing.T) {
@@ -80,6 +80,7 @@ func TestBufferMetricsIncludeQueuedAndInFlightRecords(t *testing.T) {
 		completed:             make(chan struct{}, 2),
 	}
 	buf := NewArrowBuffer(bufferMetricsConfig(), backend, zerolog.New(io.Discard))
+	requireSoleBuffer(t)
 	t.Cleanup(func() {
 		releaseFlushes()
 		_ = buf.Close()
@@ -146,6 +147,7 @@ func snapshotFloat(t *testing.T, key string) float64 {
 // buffer, so a sampler refreshes it independently.
 func TestBufferMetrics_RecordsBufferedTracksUnflushedData(t *testing.T) {
 	buf := NewArrowBuffer(bufferMetricsConfig(), &mockStorageBackend{}, zerolog.New(io.Discard))
+	requireSoleBuffer(t)
 	t.Cleanup(func() { _ = buf.Close() })
 
 	// Stay below MaxBufferSize so nothing flushes.
@@ -193,6 +195,7 @@ func TestBufferMetricsIncludeInFlightFlush(t *testing.T) {
 	cfg := bufferMetricsConfig()
 	cfg.MaxBufferSize = 1
 	buf := NewArrowBuffer(cfg, backend, zerolog.New(io.Discard))
+	requireSoleBuffer(t)
 	var releaseOnce sync.Once
 	t.Cleanup(func() {
 		releaseOnce.Do(func() { close(release) })
@@ -295,6 +298,7 @@ func TestBufferMetricsWarnAtMemoryThreshold(t *testing.T) {
 // before/after delta on the global would be testing test-execution order.
 func TestBufferMetrics_FlushCountersMove(t *testing.T) {
 	buf := NewArrowBuffer(bufferMetricsConfig(), &mockStorageBackend{}, zerolog.New(io.Discard))
+	requireSoleBuffer(t)
 
 	// Cross MaxBufferSize so a flush fires.
 	for i := 0; i < 12; i++ {
@@ -344,6 +348,7 @@ func newGatedMetricsBuffer(t *testing.T) (*ArrowBuffer, *gatedStorageBackend, fu
 		completed:             make(chan struct{}, 16),
 	}
 	buf := NewArrowBuffer(bufferMetricsConfig(), backend, zerolog.New(io.Discard))
+	requireSoleBuffer(t)
 	t.Cleanup(func() {
 		releaseFlushes()
 		_ = buf.Close()
@@ -441,6 +446,7 @@ func metricsTypedBatch() *TypedColumnBatch {
 // flush releases both bytes and age.
 func TestBufferBytesCountTypedAndRawWrites(t *testing.T) {
 	buf := NewArrowBuffer(bufferMetricsConfig(), &mockStorageBackend{}, zerolog.New(io.Discard))
+	requireSoleBuffer(t)
 	t.Cleanup(func() { _ = buf.Close() })
 	ctx := context.Background()
 
@@ -474,6 +480,7 @@ func TestBufferBytesCountTypedAndRawWrites(t *testing.T) {
 // Records still in a shard buffer age from the buffer's first write.
 func TestBufferOldestAgeCoversShardBuffers(t *testing.T) {
 	buf := NewArrowBuffer(bufferMetricsConfig(), &mockStorageBackend{}, zerolog.New(io.Discard))
+	requireSoleBuffer(t)
 	t.Cleanup(func() { _ = buf.Close() })
 	writeMetricsRecords(t, buf, 1) // below MaxBufferSize: stays in the shard
 	time.Sleep(150 * time.Millisecond)

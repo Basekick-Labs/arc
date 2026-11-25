@@ -646,9 +646,30 @@ func (b *S3Backend) StatFile(ctx context.Context, path string) (int64, error) {
 		return -1, fmt.Errorf("HeadObject %s: %w", path, err)
 	}
 	if result.ContentLength == nil {
-		return 0, nil
+		return b.listedSize(ctx, path, key)
 	}
 	return *result.ContentLength, nil
+}
+
+// listedSize is the size of the object at key as a listing reports it, for a
+// store whose HEAD response carried no length (#1812). A listing's schema
+// requires a size, so this is what the store itself records. The exact key
+// sorts before any key it is a prefix of, so the first listed key is it if it
+// exists. No size there either is ErrNoContentLength, never 0: an empty
+// object and an unknown size are different answers.
+func (b *S3Backend) listedSize(ctx context.Context, path, key string) (int64, error) {
+	out, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(b.bucket),
+		Prefix:  aws.String(key),
+		MaxKeys: aws.Int32(1),
+	})
+	if err != nil {
+		return -1, fmt.Errorf("HeadObject %s: %w (and the listing for its size failed: %w)", path, ErrNoContentLength, err)
+	}
+	if len(out.Contents) == 1 && aws.ToString(out.Contents[0].Key) == key && out.Contents[0].Size != nil {
+		return *out.Contents[0].Size, nil
+	}
+	return -1, fmt.Errorf("HeadObject %s: %w", path, ErrNoContentLength)
 }
 
 // List lists objects with the given prefix
@@ -786,7 +807,11 @@ func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 			}
 			key := "unknown"
 			if e.Key != nil {
-				key = *e.Key
+				// The service answers with the PREFIXED object name (exactly
+				// what prefixObjectKey sent: plain concatenation). Report the
+				// caller's key, the one every manifest, listing and log line
+				// names (#1111), as Azure and GCS do.
+				key = strings.TrimPrefix(*e.Key, b.prefix)
 			}
 			code := ""
 			if e.Code != nil {
@@ -1026,6 +1051,22 @@ func (b *S3Backend) ConfigJSON() string {
 // Implements the DirectoryLister interface.
 // Uses S3's delimiter feature to efficiently list only "directories" (common prefixes).
 func (b *S3Backend) ListDirectories(ctx context.Context, prefix string) ([]string, error) {
+	dirs, _, err := b.listLevel(ctx, prefix, false)
+	return dirs, err
+}
+
+// ListLevel implements LevelLister: one delimiter listing, returning the
+// level's directories and the objects directly in it.
+func (b *S3Backend) ListLevel(ctx context.Context, prefix string) ([]string, []string, error) {
+	return b.listLevel(ctx, prefix, true)
+}
+
+var _ LevelLister = (*S3Backend)(nil)
+
+// listLevel is the delimiter listing behind ListDirectories and ListLevel.
+// The level's own objects are collected only when wantFiles is set, so
+// ListDirectories does no per-object work for names it would discard.
+func (b *S3Backend) listLevel(ctx context.Context, prefix string, wantFiles bool) ([]string, []string, error) {
 	// Ensure prefix ends with / for proper directory listing (unless empty)
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix = prefix + "/"
@@ -1033,15 +1074,15 @@ func (b *S3Backend) ListDirectories(ctx context.Context, prefix string) ([]strin
 
 	fullPrefix, err := b.prefixedListPrefix(prefix)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	var dirs []string
+	var dirs, files []string
 	var continuationToken *string
 
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
@@ -1051,7 +1092,7 @@ func (b *S3Backend) ListDirectories(ctx context.Context, prefix string) ([]strin
 			ContinuationToken: continuationToken,
 		})
 		if err != nil {
-			return nil, listError("failed to list S3 directories", err)
+			return nil, nil, listError("failed to list S3 directories", err)
 		}
 
 		// CommonPrefixes contains the "directories"
@@ -1067,13 +1108,30 @@ func (b *S3Backend) ListDirectories(ctx context.Context, prefix string) ([]strin
 			}
 		}
 
+		// Contents holds the objects directly at this level. Same rule as
+		// List: a key this backend would refuse (a directory marker) is not
+		// data and is left out.
+		for _, obj := range result.Contents {
+			if !wantFiles || obj.Key == nil {
+				continue
+			}
+			if _, err := b.prefixedKey(strings.TrimPrefix(*obj.Key, b.prefix)); err != nil {
+				continue
+			}
+			// A bare name only: a store that ignored the delimiter and
+			// returned a deeper key must not make that key look direct.
+			if name := strings.TrimPrefix(*obj.Key, fullPrefix); name != "" && !strings.Contains(name, "/") {
+				files = append(files, name)
+			}
+		}
+
 		if result.IsTruncated == nil || !*result.IsTruncated {
 			break
 		}
 		continuationToken = result.NextContinuationToken
 	}
 
-	return dirs, nil
+	return dirs, files, nil
 }
 
 // ListObjects lists objects with their metadata at a prefix.

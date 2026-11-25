@@ -47,6 +47,14 @@ const (
 // only: the live hour that feature targets exists only on the hot tier, and
 // the feature is documented for the local backend.
 //
+// allowFileTime is also how this function knows the tier is the one ingest
+// writes to: only then are its listings cached under the measurement's
+// publish generation, and dropped when ingest publishes a file outside the
+// current hour (publish.go, #1757). A caller MUST pass true for that tier:
+// with false, a late row's hour stays out of queries until the cached
+// listing expires. Pass false for any other tier, whose files ingest never
+// writes.
+//
 // Results are NOT cached at this layer (unlike OptimizeTablePath's
 // partitionCache): the SQL transform cache already dedupes repeated queries,
 // and the remote directory/file listings below are individually cached in
@@ -110,6 +118,14 @@ func (p *PartitionPruner) pruneTierPaths(ctx context.Context, tierGlob, database
 	if !p.enabled || timeRange == nil {
 		return nil, TierPruneFallback, nil
 	}
+	// Before anything is listed: every listing below is stored under the
+	// measurement's generation as it is now (publish.go). Only for the tier
+	// ingest writes to, which is the one allowFileTime is set for: a file
+	// ingest publishes cannot change what another tier holds, and a tier
+	// migration invalidates every cache when it finishes.
+	if allowFileTime {
+		ctx = withListScope(ctx, p.scopeFor(database, measurement))
+	}
 	suffix := database + "/" + measurement + "/**/*.parquet"
 	if !strings.HasSuffix(tierGlob, suffix) {
 		p.logger.Debug().Str("glob", tierGlob).Msg("Tier glob shape not recognized; not pruning")
@@ -152,7 +168,7 @@ func (p *PartitionPruner) pruneTierPaths(ctx context.Context, tierGlob, database
 	if storage.IsObjectURL(tierGlob) {
 		paths, unverified, verified = p.filterTierRemotePaths(ctx, paths, backend, rootURL, listing)
 	} else {
-		paths = p.filterExistingLocalPaths(paths)
+		paths, _, _ = p.filterExistingLocalPathsOpts(ctx, paths, 0)
 	}
 	// A live partition left out because it has no files yet: the SQL
 	// transform cache must not keep a result made without it.
@@ -208,6 +224,7 @@ func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []str
 
 	verified = true
 	live := p.liveWindow()
+	scope := scopeFrom(ctx)
 	// hourDirs groups hour-level paths by their backend-relative parent (day)
 	// directory, listed once each.
 	hourDirs := make(map[string][]hourEntry)
@@ -251,7 +268,18 @@ func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []str
 			err := errTierListingFailed
 			if !listing.skip() {
 				listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				subdirs, err = lister.ListDirectories(listCtx, parent+"/")
+				if level, ok := lister.(storage.LevelLister); ok {
+					// The day's level listing also says whether the day
+					// holds daily files: kept for the day-level check
+					// below, which then makes no request of its own.
+					var files []string
+					subdirs, files, err = level.ListLevel(listCtx, parent+"/")
+					if err == nil {
+						p.globCache.setScoped("tier:dayfiles:"+rootURL+parent+"/", parquetNames(files), scope)
+					}
+				} else {
+					subdirs, err = lister.ListDirectories(listCtx, parent+"/")
+				}
 				cancel()
 			}
 			if err != nil {
@@ -272,7 +300,7 @@ func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []str
 				}
 				children = append(children, subdir)
 			}
-			p.globCache.set(cacheKey, children)
+			p.globCache.setScoped(cacheKey, children, scope)
 		}
 		childSet := make(map[string]bool, len(children))
 		for _, c := range children {
@@ -298,9 +326,7 @@ func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []str
 			var files []string
 			err := errTierListingFailed
 			if !listing.skip() {
-				listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				files, err = backend.List(listCtx, prefix)
-				cancel()
+				files, err = listDirectParquet(ctx, backend, prefix)
 			}
 			if err != nil {
 				listing.failed = true
@@ -310,15 +336,8 @@ func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []str
 				verified = false
 				continue
 			}
-			var directFiles []string
-			for _, f := range files {
-				remaining := strings.TrimPrefix(f, prefix)
-				if remaining != "" && !strings.Contains(remaining, "/") && strings.HasSuffix(remaining, ".parquet") {
-					directFiles = append(directFiles, remaining)
-				}
-			}
-			p.globCache.set(cacheKey, directFiles)
-			hasFiles = len(directFiles) > 0
+			p.globCache.setScoped(cacheKey, files, scope)
+			hasFiles = len(files) > 0
 		}
 		if hasFiles {
 			existing = append(existing, path)

@@ -8,7 +8,7 @@ import (
 
 func TestFlushAllAndWaitWaitsForAdmittedAsyncTasks(t *testing.T) {
 	buffer := &ArrowBuffer{}
-	taskID := buffer.beginAsyncFlushTask()
+	taskID := buffer.beginAsyncFlushTask("")
 
 	finished := make(chan error, 1)
 	go func() {
@@ -34,7 +34,7 @@ func TestFlushAllAndWaitWaitsForAdmittedAsyncTasks(t *testing.T) {
 
 func TestFlushAllAndWaitHonorsContextWhileWaiting(t *testing.T) {
 	buffer := &ArrowBuffer{shards: []*bufferShard{{}}}
-	taskID := buffer.beginAsyncFlushTask()
+	taskID := buffer.beginAsyncFlushTask("")
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 

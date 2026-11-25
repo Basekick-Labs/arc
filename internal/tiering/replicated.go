@@ -769,10 +769,15 @@ func (m *Manager) applyTierEventBatch(batch []tierEvent) []tierEvent {
 	// after-read too.
 	mayChange := make(map[tierEventKey]bool, 4)
 	var retries []tierEvent
+	// Paths an unlink or missing event wrote for: files that left this
+	// node's hot tier (a migration, a removal), for the Iceberg export
+	// (#1728). Never a pulled file: in steady state that is every ingest
+	// batch, and the export has nothing to drop for it.
+	var moved []string
 
 	for start := 0; start < len(batch); start += tierEventChunk {
 		end := min(start+tierEventChunk, len(batch))
-		if unapplied := m.applyTierEventChunk(batch[start:end], touched, before, mayChange, &retries); unapplied > 0 {
+		if unapplied := m.applyTierEventChunk(batch[start:end], touched, before, mayChange, &retries, &moved); unapplied > 0 {
 			// The chunk ran out of its deadline: the SQLite handle is stalled,
 			// the cold tier is, or the shutdown drain budget is spent. Each
 			// remaining chunk would burn a full deadline against the same
@@ -803,18 +808,23 @@ func (m *Manager) applyTierEventBatch(batch []tierEvent) []tierEvent {
 	for k := range touched {
 		m.metadata.invalidateTierCache(k.database, k.measurement)
 	}
+	// After the tier cache: the export reads which tier a file is on.
+	m.notifyPathsChanged(moved)
 
 	// The query layer's pruned-path and SQL-transform caches hold WHICH tiers
 	// a measurement reads from — the thing a completed migration changes,
 	// which is why that drops them (main.go wires notifyMigrationComplete to
 	// QueryHandler.InvalidateCaches). A pulled file for a measurement that
-	// already has hot rows, or a compaction unlink that leaves others, changes
-	// nothing those caches hold — and on a replicating node that is every
-	// batch in steady state, since every pulled file is a new path. Dropping
-	// them per batch would disable both caches on every node for as long as
-	// any peer is ingesting, and log two Info lines per batch doing it. So the
-	// sets are compared, and a set that could not be read, before or after,
-	// counts as changed. Without any notification on a genuine change, a node
+	// already has hot rows, or a compaction unlink that leaves others, does
+	// not change which tiers it reads — and on a replicating node that is
+	// every batch in steady state, since every pulled file is a new path.
+	// What such a file does change, a partition that was empty, is reported
+	// per file and per measurement where it lands (the coordinator's
+	// FilePublished report, #1763), not here. Dropping both caches wholesale
+	// per batch would disable them on every node for as long as any peer is
+	// ingesting, and log two Info lines per batch doing it. So the sets are
+	// compared, and a set that could not be read, before or after, counts as
+	// changed. Without any notification on a genuine change, a node
 	// that has just acquired its first hot row for a measurement it only
 	// receives would keep serving a cached cold-only read for the cache TTL.
 	changed := 0
@@ -872,7 +882,7 @@ func sameTierSet(a, b map[Tier]bool) bool {
 // and then writes sequentially, so the single SQLite connection never waits on
 // the network. Returns how many of the chunk's events went unapplied because
 // the deadline ran out; zero means the chunk completed.
-func (m *Manager) applyTierEventChunk(chunk []tierEvent, touched map[tierEventKey]struct{}, before map[tierEventKey]tierSetSnapshot, mayChange map[tierEventKey]bool, retries *[]tierEvent) int {
+func (m *Manager) applyTierEventChunk(chunk []tierEvent, touched map[tierEventKey]struct{}, before map[tierEventKey]tierSetSnapshot, mayChange map[tierEventKey]bool, retries *[]tierEvent, moved *[]string) int {
 	budget := tierEventDrainTimeout
 	if m.draining.Load() {
 		// What is left of the whole drain's budget, not a fresh one per
@@ -950,6 +960,12 @@ func (m *Manager) applyTierEventChunk(chunk []tierEvent, touched map[tierEventKe
 			// path-derived pair with the row's own.
 			k := tierEventKey{info.Database, info.Measurement}
 			touched[k] = struct{}{}
+			// Not a pulled file, and not a database delete (that drop
+			// removes the database's tables itself; a reconcile racing it
+			// could recreate one).
+			if ev.kind != tierEventPulled && ev.reason != "database:delete" {
+				*moved = append(*moved, ev.path)
+			}
 			if prev, ok := before[k]; ev.kind != tierEventPulled || !ok || !prev.ok || !prev.tiers[TierHot] {
 				mayChange[k] = true
 			}
@@ -1160,10 +1176,11 @@ func (m *Manager) logRefusedHotRegistration(ctx context.Context, path string) {
 // The reason is a hint only, and must be: the operator manifest-delete
 // endpoint passes whatever ?reason= it is given, so a reason that looks like a
 // migration is not proof of one. Treating it as proof would insert a cold row
-// for a path with no cold object — and nothing retires such a row, because
-// orphan reconciliation only examines cold rows whose hot copy still exists
-// and the cold sync reports a missing object rather than reverting the row.
-// The measurement would then lose its hot glob: the very bug this file fixes.
+// for a path with no cold object. Orphan reconciliation only examines cold
+// rows whose hot copy still exists, and on a primary or standalone node the
+// cold sync reports a missing object rather than reverting the row; a reader
+// retires it only at its next cold sync (#1563). Until then the measurement
+// would lose its hot glob: the very bug this file fixes.
 //
 // So a migration-shaped reason buys one existence check against the cold
 // backend, and the check decides:

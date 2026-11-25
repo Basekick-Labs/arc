@@ -418,6 +418,11 @@ func (h *DeleteHandler) removeLeftovers(ctx context.Context, database, measureme
 // pass: removed and unjournaled mid-copy, its copy would reach cold holding
 // the rows a DELETE took out, with nothing left to say so.
 func (h *DeleteHandler) claimForRemoval(ctx context.Context, path string) (func(), bool) {
+	// A file a re-home job in flight owns is not removed under it (#1825).
+	if h.rehomeOwns != nil && h.rehomeOwns(path) {
+		h.logger.Debug().Str("file", path).Msg("Left for a later pass: a re-home job in flight owns it")
+		return nil, false
+	}
 	if h.moveClaims == nil {
 		return func() {}, true
 	}
@@ -716,6 +721,7 @@ func (h *DeleteHandler) DrainRetired(ctx context.Context) int {
 		}
 	}
 	removed := 0
+	var changed []string // removed or reverted paths, for the export (#1727)
 	for _, r := range recs {
 		if ctx.Err() != nil {
 			break
@@ -741,6 +747,7 @@ func (h *DeleteHandler) DrainRetired(ctx context.Context) int {
 				h.reads.remove(r.Path)
 				h.forgetSeen(r)
 				removed++
+				changed = append(changed, r.Path)
 			}
 			release()
 		case retiredRevert:
@@ -751,6 +758,9 @@ func (h *DeleteHandler) DrainRetired(ctx context.Context) int {
 			if derr = deleteReplaced(ctx, h.storage, r.ReplacedBy); derr == nil {
 				h.clearRetired(ctx, r.Path)
 				h.forgetSeen(r)
+				// The export may have published the rewrite (a revert is a
+				// cluster's; served where this node is the exporter).
+				changed = append(changed, r.ReplacedBy)
 			}
 			release()
 		case retiredClear:
@@ -773,8 +783,11 @@ func (h *DeleteHandler) DrainRetired(ctx context.Context) int {
 			h.logger.Info().Str("file", r.Path).Msg("Cleared a retired-file record with nothing left to do")
 		}
 	}
-	if removed > 0 {
-		h.filesRemoved()
+	if removed > 0 && h.onFilesRemoved != nil {
+		h.onFilesRemoved()
+	}
+	if len(changed) > 0 && h.onPathsChanged != nil {
+		h.onPathsChanged(changed)
 	}
 	return removed
 }

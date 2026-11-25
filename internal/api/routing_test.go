@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -41,7 +42,7 @@ func TestBuildHTTPRequest(t *testing.T) {
 
 	app.Post("/api/v1/write/msgpack", func(c *fiber.Ctx) error {
 		// Build HTTP request from Fiber context
-		req, err := BuildHTTPRequest(c)
+		req, _, err := BuildHTTPRequest(c, context.Background())
 		require.NoError(t, err)
 
 		// Verify method
@@ -90,7 +91,7 @@ func TestBuildHTTPRequest_PreservesMultiValueHeaders(t *testing.T) {
 	var capturedXFF, capturedVia []string
 
 	app.Get("/test", func(c *fiber.Ctx) error {
-		req, err := BuildHTTPRequest(c)
+		req, _, err := BuildHTTPRequest(c, context.Background())
 		require.NoError(t, err)
 		capturedXFF = req.Header.Values("X-Forwarded-For")
 		capturedVia = req.Header.Values("Via")
@@ -155,7 +156,7 @@ func TestBuildHTTPRequest_FiltersHopByHopAndContentLength(t *testing.T) {
 	var captured http.Header
 
 	app.Post("/test", func(c *fiber.Ctx) error {
-		req, err := BuildHTTPRequest(c)
+		req, _, err := BuildHTTPRequest(c, context.Background())
 		require.NoError(t, err)
 		captured = req.Header
 		return c.SendStatus(fiber.StatusOK)
@@ -438,7 +439,7 @@ func TestBuildHTTPRequest_StripsClientForwardingHeaders(t *testing.T) {
 	var built *http.Request
 	app.Get("/test", func(c *fiber.Ctx) error {
 		var err error
-		built, err = BuildHTTPRequest(c)
+		built, _, err = BuildHTTPRequest(c, context.Background())
 		require.NoError(t, err)
 		return c.SendStatus(fiber.StatusOK)
 	})

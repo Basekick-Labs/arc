@@ -135,6 +135,13 @@ func sharedManifest(coord any) bool {
 // apostrophe because the log masker truncates a line at the first quote.
 var errSourceRetired = errors.New("source file was retired by a concurrent delete, retry the request")
 
+// errFileBeingRehomed reports a file a re-home job in flight owns (#1825):
+// the file being moved, or one its rows are moved into. A rewrite here would
+// publish a replacement the job knows nothing of, beside the files the job
+// writes. The file is left as it is and the response says so; the DELETE can
+// be sent again once the job has ended.
+var errFileBeingRehomed = errors.New("the file is being re-homed or compacted; retry once that job has ended")
+
 // parquetRowGroupSize is the row group size used for Parquet rewrites during delete operations.
 // Matches compaction's row group size to limit DuckDB's internal write buffer per group.
 const parquetRowGroupSize = 122880
@@ -170,11 +177,19 @@ type DeleteHandler struct {
 	// onFilesRemoved invalidates the query caches (and the cluster's) after
 	// files were removed or rewritten: see SetOnFilesRemoved.
 	onFilesRemoved func()
-	db             *database.DuckDB
-	storage        storage.Backend
-	config         *config.DeleteConfig
-	authManager    *auth.AuthManager
-	coordinator    DeleteCoordinator // nil in standalone mode
+	// onPathsChanged, when set, is told the storage prefixes a DELETE changed
+	// (SetOnPathsChanged).
+	onPathsChanged func(keys []string)
+	// receiptRemoved and receiptRewritten mark edge-sync receipts before a
+	// DELETE changes a spoke file (#1666); nil unless this node is a hub.
+	// See SetReceiptMarkers.
+	receiptRemoved   func(ctx context.Context, paths []string) error
+	receiptRewritten func(paths []string) error
+	db               *database.DuckDB
+	storage          storage.Backend
+	config           *config.DeleteConfig
+	authManager      *auth.AuthManager
+	coordinator      DeleteCoordinator // nil in standalone mode
 	// pending is this node's file registration outbox (#1209): a file it
 	// flushed may not be in the manifest yet. nil off ingest nodes.
 	pending        PendingRegistrations
@@ -185,6 +200,8 @@ type DeleteHandler struct {
 	// moveClaims keeps the tiering migrator off a file this DELETE rewrites
 	// (the tiering manager, when tiering is on).
 	moveClaims moveClaimer
+	// rehomeOwns reports a file a re-home job in flight owns (SetRehomeOwns).
+	rehomeOwns func(path string) bool
 	// tempDir is the absolute, sandbox-allowlisted directory used by
 	// rewriteS3File to stage the COPY-rewritten parquet locally before
 	// uploading. MUST match one of the prefixes added to DuckDB's
@@ -307,6 +324,45 @@ func NewDeleteHandler(db *database.DuckDB, storage storage.Backend, cfg *config.
 // SetRetiredReads wires the standalone read source for replaced files.
 func (h *DeleteHandler) SetRetiredReads(r *RetiredReads) { h.reads = r }
 
+// SetReceiptMarkers wires the edge-sync hub's receipt marking into DELETE
+// (#1666). removed marks the receipt of a file whose rows all match (nothing
+// of it survives; reason row_delete); rewritten marks the receipt of a file
+// rewritten without the matching rows COMPACTED, because its surviving rows
+// live on in the new file. Either way the spoke does not re-send the
+// original, which would bring the deleted rows back and duplicate the rest.
+// Paths outside a spoke namespace match no receipt.
+func (h *DeleteHandler) SetReceiptMarkers(removed func(ctx context.Context, paths []string) error, rewritten func(paths []string) error) {
+	h.receiptRemoved, h.receiptRewritten = removed, rewritten
+}
+
+// markReceipt marks relativePath's edge-sync receipt for a DELETE about to
+// remove it (whole) or rewrite it. Called before anything changes: a failed
+// mark then leaves the file as it was, and a failure after the mark leaves a
+// vouched receipt over a file that still exists, which reconcile and receive
+// treat as present either way. Marking after the rewrite instead left a window
+// in which the leftover sweep removes the old file unmarked.
+// receiptMarkTimeout bounds one receipt mark, as cmd/arc's compacted marker
+// bounds its own.
+const receiptMarkTimeout = 60 * time.Second
+
+func (h *DeleteHandler) markReceipt(ctx context.Context, relativePath string, whole bool) error {
+	var err error
+	switch {
+	case whole && h.receiptRemoved != nil:
+		// Not cut short by a client disconnect, but bounded: it runs under
+		// rewriteMu. A mark cut off part way is harmless (see above).
+		mctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), receiptMarkTimeout)
+		err = h.receiptRemoved(mctx, []string{relativePath})
+		cancel()
+	case !whole && h.receiptRewritten != nil:
+		err = h.receiptRewritten([]string{relativePath})
+	}
+	if err != nil {
+		return fmt.Errorf("mark edge-sync receipt of %s: %w", filepath.Base(relativePath), err)
+	}
+	return nil
+}
+
 // SetCoordinator wires the cluster coordinator for manifest updates and role
 // gating. Called after construction when cluster mode is enabled.
 func (h *DeleteHandler) SetCoordinator(c DeleteCoordinator) {
@@ -327,6 +383,20 @@ func (h *DeleteHandler) SetPendingRegistrations(p PendingRegistrations) {
 }
 
 // SetTieringManager wires rewrite/delete metadata updates into tiering.
+// SetRehomeOwns gives the handler the test for a file a re-home job in
+// flight owns (#1825). nil: no such jobs.
+func (h *DeleteHandler) SetRehomeOwns(fn func(path string) bool) { h.rehomeOwns = fn }
+
+// WithRewriteLock runs fn while no DELETE rewrites a file: under the mutex
+// the whole rewrite phase of a DELETE, the removal of leftovers and the
+// drainer hold. A re-home job, having registered its ownership, checks its
+// file inside it: a DELETE that was rewriting the file has finished.
+func (h *DeleteHandler) WithRewriteLock(fn func()) {
+	h.rewriteMu.Lock()
+	defer h.rewriteMu.Unlock()
+	fn()
+}
+
 func (h *DeleteHandler) SetTieringManager(tm *tiering.Manager) {
 	h.tieringManager = tm
 	h.coldTier = nil
@@ -558,7 +628,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 			// hold the only rows that matched) is still removed.
 			h.rewriteMu.Lock()
 			if h.removeLeftovers(ctx, req.Database, req.Measurement) > 0 {
-				h.filesRemoved()
+				h.filesRemovedIn(req.Database, req.Measurement)
 			}
 			h.rewriteMu.Unlock()
 		}
@@ -710,6 +780,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	// retryable, so the answer is 503 rather than 207.
 	var notRegistered []string
 	var moving []string
+	rehoming := 0 // files a re-home job in flight owns, left as they are
 	var coldUnchecked []string
 
 	for round := 0; ; round++ {
@@ -735,6 +806,8 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 				if errors.Is(err, tiering.ErrFileMoving) || errors.Is(err, tiering.ErrColdCheckFailed) {
 					// Expected while a migration runs; the response says so.
 					h.logger.Warn().Err(err).Str("file", f.path).Msg("File left as it is: it is being moved to cold storage")
+				} else if errors.Is(err, errFileBeingRehomed) {
+					h.logger.Warn().Str("file", f.path).Msg("File left as it is: a re-home job in flight owns it")
 				} else {
 					h.logger.Error().Err(err).Str("file", f.path).Msg("Failed to rewrite file")
 				}
@@ -743,7 +816,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 				// corresponding manifest record.
 				if errors.Is(err, errManifestFailure) {
 					h.db.ClearHTTPCache()
-					h.filesRemoved()
+					h.filesRemovedIn(req.Database, req.Measurement)
 					freeOSMemoryThrottled()
 					return c.Status(fiber.StatusInternalServerError).JSON(DeleteResponse{
 						Success:         false,
@@ -763,6 +836,9 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 				}
 				if errors.Is(err, tiering.ErrFileMoving) {
 					moving = append(moving, f.relativePath)
+				}
+				if errors.Is(err, errFileBeingRehomed) {
+					rehoming++
 				}
 				if errors.Is(err, tiering.ErrColdCheckFailed) {
 					coldUnchecked = append(coldUnchecked, f.relativePath)
@@ -784,7 +860,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		}
 		incomplete := func(why string) error {
 			h.db.ClearHTTPCache()
-			h.filesRemoved()
+			h.filesRemovedIn(req.Database, req.Measurement)
 			freeOSMemoryThrottled()
 			return respondDeleteUnavailable(c, DeleteResponse{
 				Error:            "Delete incomplete: " + why + "; the rows of the other files are deleted; retry to finish",
@@ -817,7 +893,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 				failedPath = bindErr.path
 			}
 			h.db.ClearHTTPCache()
-			h.filesRemoved()
+			h.filesRemovedIn(req.Database, req.Measurement)
 			freeOSMemoryThrottled()
 			return c.Status(fiber.StatusMultiStatus).JSON(DeleteResponse{
 				Success:          false,
@@ -844,7 +920,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	// Clear cache_httpfs and release memory back to the OS. DuckDB's Parquet metadata
 	// cache cannot be emptied (#1372); entries for removed files leave under memory_limit.
 	h.db.ClearHTTPCache()
-	h.filesRemoved()
+	h.filesRemovedIn(req.Database, req.Measurement)
 	freeOSMemoryThrottled()
 
 	executionTime := float64(time.Since(start).Milliseconds())
@@ -882,6 +958,9 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		}
 		if len(moving) > 0 {
 			resp.Error += fmt.Sprintf(" (%d of them %s)", len(moving), movingWhy)
+		}
+		if rehoming > 0 {
+			resp.Error += fmt.Sprintf(" (%d of them are being re-homed and were left as they are; retry for those once the job has ended, GET /api/v1/rehome)", rehoming)
 		}
 		if len(coldUnchecked) > 0 {
 			resp.Error += fmt.Sprintf(" (%d of them %s; retry for those)", len(coldUnchecked), coldUncheckedWhy)
@@ -1274,6 +1353,13 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 	if size, statErr := h.storage.StatFile(ctx, relativePath); statErr == nil && size < 0 {
 		return 0, fmt.Errorf("%w: %s", errSourceRetired, filepath.Base(relativePath))
 	}
+	// A re-home job registers its ownership and then takes the rewrite
+	// mutex once, to check its file: a rewrite that began before that has
+	// finished by the time the job looks, and one that begins after sees
+	// the ownership here.
+	if h.rehomeOwns != nil && h.rehomeOwns(relativePath) {
+		return 0, fmt.Errorf("%w: %s", errFileBeingRehomed, filepath.Base(relativePath))
+	}
 	// Kept off a file the tiering migrator is copying, or one with a cold
 	// copy already: a rewrite here would leave that copy holding the rows
 	// this DELETE removes, and the cold sync would serve them again for
@@ -1316,6 +1402,9 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 		// Nothing matches now (a clause on now() that matched at the scan):
 		// a rewrite would be the same rows under another name.
 		return 0, nil
+	}
+	if err := h.markReceipt(ctx, relativePath, rowsAfter == 0); err != nil {
+		return 0, err
 	}
 
 	// If all rows would be deleted, remove the file entirely.
@@ -1481,6 +1570,20 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, relative
 
 	// Try to clean up temp directory if empty
 	os.Remove(tempDir) // Ignore error, directory might not be empty
+
+	// DuckDB does not fsync what it COPYs, and the caller removes the old file
+	// next: make the rewrite durable first, or a power loss could leave
+	// neither (#1618). Fails closed on a backend that cannot: only the local
+	// backend reaches here, and it can.
+	mover, ok := h.storage.(storage.ObjectMover)
+	if !ok {
+		os.Remove(newFilePath)
+		return 0, "", fmt.Errorf("cannot make the rewritten file durable: %T does not support sync", h.storage)
+	}
+	if err := mover.Sync(ctx, newRelativePath); err != nil {
+		os.Remove(newFilePath)
+		return 0, "", fmt.Errorf("failed to make rewritten file durable: %w", err)
+	}
 
 	h.logger.Info().
 		Str("file", filepath.Base(filePath)).
@@ -1938,8 +2041,22 @@ func (h *DeleteHandler) SetOnFilesRemoved(fn func()) {
 	h.onFilesRemoved = fn
 }
 
-func (h *DeleteHandler) filesRemoved() {
+// SetOnPathsChanged sets the function told which storage prefixes a DELETE
+// changed (main.go: the Iceberg scheduler's RequestReconcilePaths, #1727).
+func (h *DeleteHandler) SetOnPathsChanged(fn func(keys []string)) {
+	h.onPathsChanged = fn
+}
+
+// filesRemovedIn reports a DELETE on database/measurement that removed or
+// rewrote files: the caches are cleared, and the measurement's directory is
+// reported as a storage prefix, not as names. On a hub a spoke's data lives
+// under "{spoke}/{db}/", which the export names differently from the
+// request; the scheduler maps the prefix onto the tables it knows.
+func (h *DeleteHandler) filesRemovedIn(database, measurement string) {
 	if h.onFilesRemoved != nil {
 		h.onFilesRemoved()
+	}
+	if h.onPathsChanged != nil && database != "" && measurement != "" {
+		h.onPathsChanged([]string{database + "/" + measurement + "/"})
 	}
 }

@@ -43,12 +43,14 @@ func DefaultMiddlewareConfig() MiddlewareConfig {
 			// The write-pool health check, for the same reason as /ready: a
 			// load balancer cannot authenticate.
 			"/ready/write",
+			// The read-pool health check (#1852), for the same reason.
+			"/ready/read",
 			"/api/v1/auth/verify",
 		},
-		PublicPrefixes: []string{
-			"/metrics",
-		},
-		Skip: false,
+		// /metrics is public only with auth.metrics_public (authPublicPaths,
+		// cmd/arc/audit_coverage.go).
+		PublicPrefixes: []string{},
+		Skip:           false,
 	}
 }
 
@@ -84,43 +86,9 @@ func NewMiddleware(config MiddlewareConfig) fiber.Handler {
 		// so an attacker who can pollute lookup with weird paths can also
 		// pollute the audit trail.
 		reqPath := path.Clean(c.Path())
-		for _, route := range config.PublicRoutes {
-			if reqPath == route {
-				return c.Next()
-			}
+		if IsPublicPath(reqPath, config.PublicRoutes, config.PublicPrefixes) {
+			return c.Next()
 		}
-		for _, prefix := range config.PublicPrefixes {
-			// Normalise prefix: strip exactly one trailing slash. An
-			// operator who reads "this is a directory prefix" and writes
-			// `/metrics/` in their config would otherwise silently break
-			// the anchored match: prefix+"/" becomes "/metrics//" which
-			// matches no real path. Symmetric with the request-path
-			// normalisation above; both sides should be in canonical form
-			// before the equality and HasPrefix checks. We deliberately
-			// don't `path.Clean` the prefix because (a) it's
-			// operator-supplied static config, not attacker-controlled,
-			// and (b) Clean would also collapse a configured `//foo` to
-			// `/foo`, hiding the misconfiguration instead of treating it
-			// as the same prefix the operator wrote.
-			prefix = strings.TrimSuffix(prefix, "/")
-			// Guard against empty-prefix entries (including a configured
-			// `/` that the TrimSuffix above just emptied). `HasPrefix(p, "/")`
-			// is true for every real HTTP path, so an empty prefix would
-			// disable auth wholesale.
-			if prefix == "" {
-				continue
-			}
-			// Anchor the match: require exact path or true subdirectory
-			// (`prefix + "/"`). Without this, a configured prefix `/metrics`
-			// also matches `/metricsX`, `/metrics-secret`, etc. — any route
-			// happening to share the same byte prefix would silently bypass
-			// auth. Matches the same shape gemini-code-assist flagged on
-			// PR #442's deniedRoots check.
-			if reqPath == prefix || strings.HasPrefix(reqPath, prefix+"/") {
-				return c.Next()
-			}
-		}
-
 		// No auth manager configured
 		if config.AuthManager == nil {
 			return c.Next()
@@ -513,4 +481,48 @@ func RequireResourceWrite(am *AuthManager, rm ResourcePermissionChecker) fiber.H
 // RequireResourceDelete creates middleware requiring delete permission with resource context
 func RequireResourceDelete(am *AuthManager, rm ResourcePermissionChecker) fiber.Handler {
 	return RequireResourcePermission(am, rm, "delete")
+}
+
+// IsPublicPath reports whether reqPath (already path.Clean-ed) is one the auth
+// middleware lets through without a token: an exact public route, or a public
+// prefix matched at a segment boundary. Exported so the audit coverage check
+// (cmd/arc) applies the same rule (#1630).
+func IsPublicPath(reqPath string, routes, prefixes []string) bool {
+	for _, route := range routes {
+		if reqPath == route {
+			return true
+		}
+	}
+	for _, prefix := range prefixes {
+		// Normalise prefix: strip exactly one trailing slash. An
+		// operator who reads "this is a directory prefix" and writes
+		// `/metrics/` in their config would otherwise silently break
+		// the anchored match: prefix+"/" becomes "/metrics//" which
+		// matches no real path. Symmetric with the request-path
+		// normalisation the caller applies; both sides should be in canonical form
+		// before the equality and HasPrefix checks. We deliberately
+		// don't `path.Clean` the prefix because (a) it's
+		// operator-supplied static config, not attacker-controlled,
+		// and (b) Clean would also collapse a configured `//foo` to
+		// `/foo`, hiding the misconfiguration instead of treating it
+		// as the same prefix the operator wrote.
+		prefix = strings.TrimSuffix(prefix, "/")
+		// Guard against empty-prefix entries (including a configured
+		// `/` that the TrimSuffix above just emptied). `HasPrefix(p, "/")`
+		// is true for every real HTTP path, so an empty prefix would
+		// disable auth wholesale.
+		if prefix == "" {
+			continue
+		}
+		// Anchor the match: require exact path or true subdirectory
+		// (`prefix + "/"`). Without this, a configured prefix `/metrics`
+		// also matches `/metricsX`, `/metrics-secret`, etc. — any route
+		// happening to share the same byte prefix would silently bypass
+		// auth. Matches the same shape gemini-code-assist flagged on
+		// PR #442's deniedRoots check.
+		if reqPath == prefix || strings.HasPrefix(reqPath, prefix+"/") {
+			return true
+		}
+	}
+	return false
 }

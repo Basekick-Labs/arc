@@ -675,6 +675,46 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		cmd.Type == clusterraft.CommandCleanupCompaction ||
 		cmd.Type == clusterraft.CommandClaimFinisher
 	isCompactionHeld := cmd.Type == clusterraft.CommandCompactionHeld
+	// Re-home (#1825): the primary writer stages a job and its finisher
+	// drives it (ingest roles, like the compaction rule above); every node,
+	// readers included, acks the job's states, like the pause ack. Each must
+	// name the requesting node. Enable is leader-only and never accepted
+	// from a peer.
+	// Compaction read fences (#1852): a node raises its own fence (any role,
+	// readers included); the finisher advances a job (compaction roles). A
+	// waived fence is the leader's own and never forwarded; enable is
+	// leader-only.
+	// A backup mark (#1857): the node running a backup or restore, any role;
+	// it must name the requesting node.
+	isBackupMark := cmd.Type == clusterraft.CommandBackupMark
+	if isBackupMark {
+		var p clusterraft.BackupMarkPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil || p.Node != req.NodeID {
+			c.logger.Warn().Str("requesting_node", req.NodeID).Msg("ForwardApply rejected: backup mark names another node")
+			c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "backup mark must name the requesting node")
+			return
+		}
+	}
+	isFence := cmd.Type == clusterraft.CommandReadFence
+	isAdvanceCompaction := cmd.Type == clusterraft.CommandAdvanceCompaction
+	if isFence || isAdvanceCompaction {
+		if err := fenceCommandSpeaksFor(&cmd, req.NodeID); err != nil {
+			c.logger.Warn().Err(err).Str("requesting_node", req.NodeID).Int("cmd_type", int(cmd.Type)).
+				Msg("ForwardApply rejected: read fence command names another node, or is a waiver")
+			c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "read fence command must name the requesting node")
+			return
+		}
+	}
+	isRehome := isRehomeDriveCommand(cmd.Type)
+	isRehomeAck := cmd.Type == clusterraft.CommandAckRehome
+	if isRehome || isRehomeAck {
+		if err := rehomeCommandSpeaksFor(&cmd, req.NodeID); err != nil {
+			c.logger.Warn().Err(err).Str("requesting_node", req.NodeID).Int("cmd_type", int(cmd.Type)).
+				Msg("ForwardApply rejected: re-home command names another node")
+			c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "re-home command must name the requesting node")
+			return
+		}
+	}
 	// Policy definitions (#1324): same rule as the auth commands, any known
 	// authenticated peer (the admin check happened on the node that took
 	// the HTTP call). CommandSeedPolicies is leader-only and never accepted
@@ -688,7 +728,9 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		cmd.Type == clusterraft.CommandDeleteRetentionPolicy ||
 		cmd.Type == clusterraft.CommandCreateCQ ||
 		cmd.Type == clusterraft.CommandUpdateCQ ||
-		cmd.Type == clusterraft.CommandDeleteCQ
+		cmd.Type == clusterraft.CommandDeleteCQ ||
+		cmd.Type == clusterraft.CommandSetGovernancePolicy ||
+		cmd.Type == clusterraft.CommandDeleteGovernancePolicy
 	// A continuous query's watermark is set by the primary writer, which in
 	// local-storage mode need not be the Raft leader. The FSM decides who
 	// may set it (applySetCQWatermark); refused here early are a watermark
@@ -714,6 +756,32 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		cmd.Type == clusterraft.CommandColdMarkSeed ||
 		cmd.Type == clusterraft.CommandColdMarkReset
 	isColdMarkAck := cmd.Type == clusterraft.CommandColdMarkAck || cmd.Type == clusterraft.CommandColdMarkAlive
+	// An Iceberg cold-removal notice (#1728): proposed by a writer after it
+	// removed cold objects (any writer running tiering; it need not be the
+	// leader). No state; the worst a forged one does is ask an export to
+	// reconcile measurements it knows. Ingest roles only, and validated here
+	// so an invalid one never reaches the log.
+	isIcebergNotice := cmd.Type == clusterraft.CommandIcebergPathsChanged || cmd.Type == clusterraft.CommandIcebergDatabaseDropped
+	if cmd.Type == clusterraft.CommandIcebergPathsChanged {
+		var p clusterraft.IcebergPathsChangedPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil || clusterraft.ValidateIcebergPathsChanged(p) != nil {
+			c.logger.Warn().Str("requesting_node", req.NodeID).Msg("ForwardApply rejected: invalid Iceberg notice")
+			c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeInvalidCommand, "invalid iceberg notice")
+			return
+		}
+	}
+	// A database-drop notice (#1731): from the primary writer after a DELETE.
+	// No state; the worst a forged one does is make nodes drop the Iceberg
+	// tables of a database whose manifest is empty (the export skips a drop
+	// while files remain), which the next pass recreates.
+	if cmd.Type == clusterraft.CommandIcebergDatabaseDropped {
+		var p clusterraft.IcebergDatabaseDroppedPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil || clusterraft.ValidateIcebergDatabaseDropped(p) != nil {
+			c.logger.Warn().Str("requesting_node", req.NodeID).Msg("ForwardApply rejected: invalid Iceberg database-drop notice")
+			c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeInvalidCommand, "invalid iceberg database-drop notice")
+			return
+		}
+	}
 	if isColdMarkAck {
 		// Ack and Alive have the same node_id field.
 		var p clusterraft.ColdMarkAckPayload
@@ -730,7 +798,7 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 			return
 		}
 	}
-	if !isManifest && !isAuth && !isRBAC && !isBarrier && !isPauseSet && !isPauseAck && !isTakeOver && !isCompaction && !isCompactionHeld && !isPolicy && !isWatermark && !isColdMark && !isColdMarkAck {
+	if !isManifest && !isAuth && !isRBAC && !isBarrier && !isPauseSet && !isPauseAck && !isTakeOver && !isCompaction && !isCompactionHeld && !isPolicy && !isWatermark && !isColdMark && !isColdMarkAck && !isIcebergNotice && !isRehome && !isRehomeAck && !isFence && !isAdvanceCompaction && !isBackupMark {
 		c.logger.Warn().
 			Str("requesting_node", req.NodeID).
 			Int("cmd_type", int(cmd.Type)).
@@ -738,12 +806,12 @@ func (c *Coordinator) handleForwardApply(conn net.Conn, req *protocol.ForwardApp
 		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeInvalidCommand, "command type not allowed via forwarding")
 		return
 	}
-	if ((isManifest || isPauseSet) && !caps.CanIngest && !caps.CanCompact) || (isTakeOver && !caps.CanIngest) || (isCompaction && !caps.CanIngest && !caps.CanCompact) {
+	if ((isManifest || isPauseSet) && !caps.CanIngest && !caps.CanCompact) || (isTakeOver && !caps.CanIngest) || (isCompaction && !caps.CanIngest && !caps.CanCompact) || (isIcebergNotice && !caps.CanIngest) || (isRehome && !caps.CanIngest) || (isAdvanceCompaction && !caps.CanIngest && !caps.CanCompact) {
 		c.logger.Warn().
 			Str("peer", remoteAddr).
 			Str("requesting_node", req.NodeID).
 			Str("role", string(peerNode.Role)).
-			Msg("ForwardApply rejected: node role not authorized for manifest mutations")
+			Msg("ForwardApply rejected: node role not authorized for this command")
 		c.sendForwardApplyError(conn, req.Nonce, protocol.ForwardCodeAuth, "unauthorized role")
 		return
 	}

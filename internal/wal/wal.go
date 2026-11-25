@@ -405,6 +405,9 @@ type walEntry struct {
 	// flushed. Checkpoint entries also have seq 0 but must NOT set this, or
 	// every file would hold one and none would ever be reclaimable.
 	untrackedData bool
+	// flushIntent marks a flush intent (#1646, intent.go): written without a
+	// sync of its own, and only for the failure log's wording.
+	flushIntent bool
 	// foreignProof marks a CHECKPOINT entry that covers at least one identity
 	// this process did not mint: a row-range identity, or a whole-entry token
 	// from an earlier writer instance. Either can describe entries in a file
@@ -1217,6 +1220,9 @@ func (w *Writer) logWriteFailure(entry walEntry, err error) {
 	msg := "WAL data entry could not be written and is lost from the WAL: its rows reach storage only if the flush of the ingest buffer holding them succeeds; a crash or a failed flush before that loses them"
 	if entry.durable && entry.seq == 0 {
 		msg = "WAL flush checkpoint could not be written: its data is already in storage, but recovery may replay those entries again (a duplicate, not a loss)"
+	}
+	if entry.flushIntent {
+		msg = "WAL flush intent could not be written: a crash before that flush's checkpoint replays its rows (a duplicate, not a loss)"
 	}
 	w.logger.Error().Err(err).
 		Bool("disk_full", isDiskFull(err)).
@@ -2355,9 +2361,13 @@ func (w *Writer) Close() error {
 	return nil
 }
 
-// purgeWALFiles deletes WAL files matching the given filter function.
-// Returns the count of deleted files.
-func (w *Writer) purgeWALFiles(shouldDelete func(path string) bool) (int, error) {
+// PurgeAll deletes all WAL files in the directory.
+// Call this after a clean shutdown where all data has been flushed to storage,
+// so that recovery on next startup doesn't replay already-persisted data.
+//
+// It does not look at what a file holds or whether its entries were flushed;
+// the caller vouches for that. During operation, use PurgeFlushed.
+func (w *Writer) PurgeAll() (int, error) {
 	pattern := filepath.Join(w.config.WALDir, "*.wal")
 	files, err := filepath.Glob(pattern)
 	if err != nil {
@@ -2366,50 +2376,23 @@ func (w *Writer) purgeWALFiles(shouldDelete func(path string) bool) (int, error)
 
 	deleted := 0
 	for _, f := range files {
-		if shouldDelete(f) {
-			if err := os.Remove(f); err != nil {
-				w.logger.Error().Err(err).Str("file", f).Msg("Failed to purge WAL file")
-			} else {
-				deleted++
-				// Keep the sequence bookkeeping in step. A stale entry would
-				// leave PurgeFlushed walking to a path that no longer exists,
-				// where the delete fails and — because it stops rather than
-				// skips — nothing after it is ever reclaimed.
-				w.mu.Lock()
-				w.forgetFileLocked(f)
-				w.mu.Unlock()
-			}
+		if err := os.Remove(f); err != nil {
+			w.logger.Error().Err(err).Str("file", f).Msg("Failed to purge WAL file")
+			continue
 		}
+		deleted++
+		// Keep the sequence bookkeeping in step. A stale entry would
+		// leave PurgeFlushed walking to a path that no longer exists,
+		// where the delete fails and — because it stops rather than
+		// skips — nothing after it is ever reclaimed.
+		w.mu.Lock()
+		w.forgetFileLocked(f)
+		w.mu.Unlock()
 	}
-	return deleted, nil
-}
-
-// PurgeAll deletes all WAL files in the directory.
-// Call this after a clean shutdown where all data has been flushed to storage,
-// so that recovery on next startup doesn't replay already-persisted data.
-func (w *Writer) PurgeAll() (int, error) {
-	deleted, err := w.purgeWALFiles(func(_ string) bool { return true })
 	if deleted > 0 {
 		w.logger.Info().Int("deleted", deleted).Msg("Purged WAL files after clean shutdown")
 	}
-	return deleted, err
-}
-
-// PurgeInactive deletes all WAL files except the currently active one.
-// Use this during normal operation (unlike PurgeAll which is for shutdown)
-// to clean up rotated WAL files after their data has been flushed to storage.
-func (w *Writer) PurgeInactive() (int, error) {
-	w.mu.Lock()
-	activePath := w.currentPath
-	w.mu.Unlock()
-
-	deleted, err := w.purgeWALFiles(func(path string) bool {
-		return path != activePath
-	})
-	if deleted > 0 {
-		w.logger.Info().Int("deleted", deleted).Msg("Purged inactive WAL files")
-	}
-	return deleted, err
+	return deleted, nil
 }
 
 // noteWrittenLocked records an entry against w.currentPath. Caller holds w.mu.
@@ -2504,7 +2487,9 @@ func (w *Writer) forgetFileLocked(path string) {
 }
 
 // Quarantined tells the writer that recovery moved path to quarantinedAs
-// after repeated replay failures (#1225). If this process wrote it, entries in
+// after repeated replay failures (#1225), or on the first pass when its only
+// failure is checksum-damaged entries, once the recovery barrier has stored
+// its intact ones (#1634). If this process wrote it, entries in
 // it may still be waiting for a flush: recovery can no longer replay them
 // from it, so keeping them pending would hold the purge floor at this file for
 // the life of the process, and no WAL file would be reclaimed again (#676).

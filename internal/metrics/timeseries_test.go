@@ -217,7 +217,6 @@ func TestTimeSeriesCollector_CollectedMetrics(t *testing.T) {
 			"query_latency_avg_us",
 			"db_connections_open",
 			"db_connections_in_use",
-			"db_queries_total",
 			"auth_requests_total",
 			"auth_cache_hits",
 			"auth_failures_total",

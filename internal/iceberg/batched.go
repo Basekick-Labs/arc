@@ -1,0 +1,1185 @@
+package iceberg
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"path"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	iceberg "github.com/apache/iceberg-go"
+	icetable "github.com/apache/iceberg-go/table"
+)
+
+// A first registration used to be one all-or-nothing step: read every new file's footer for
+// the schema, read every footer again to build its DataFile, then commit once — all inside the
+// scheduler's per-measurement deadline. A measurement whose footers took longer than that to read
+// never committed anything, and every pass started again from zero (#1686).
+//
+// reconcile commits new files in chunks instead. Each chunk reads the schemas of its own files,
+// evolves the table, builds the DataFiles and commits, so what a pass gets through is durable in
+// the table and the next pass starts after it. Progress therefore survives a timeout and a
+// restart: a cold scheduler seeds itself from the table (tableSeed) and only the unregistered
+// files are read again.
+//
+// What is NOT chunked is anything a reader must see change atomically. Every removal, every tier
+// move (the table's own entry cloned under its new URI), every rewrite (a path whose bytes
+// changed) and every new file in a UTC day that also loses a file land in the first commit,
+// together. That is what keeps a compaction (N inputs out, one output in, same day) a single
+// snapshot, as it was before: split across two, a reader between them would see that day's rows
+// missing. Only new files with no removal in their day are chunked, and they are the ones a
+// reader has never seen, so registering them a chunk at a time only ever adds rows.
+
+const (
+	// dataFileChunkMax is the most new files one chunk registers. A chunk reads up to two
+	// footers per file (schema, then DataFile) at unionSchemaConcurrency, so at ~200 ms per
+	// object-store round trip 256 files take about 30 s including the commit — several chunks per
+	// measurement deadline, and few enough snapshots per pass that retain_snapshots and the
+	// manifest collapse are not stressed.
+	dataFileChunkMax = 256
+	// dataFileChunkMin is the floor the adaptive chunk size shrinks to on a store so slow that a
+	// whole chunk does not fit in the time left (see shrinkChunk).
+	dataFileChunkMin = 8
+	// chunkGrowBelow: a chunk that completes faster than this lets the next one double, back
+	// towards dataFileChunkMax.
+	chunkGrowBelow = 15 * time.Second
+	// defaultCommitReserve is the part of the measurement deadline a chunk's footer reads may
+	// not use: it is left for the commit, the discovery files and the end-of-pass expiry, prune
+	// and sweep, which are a handful of object-store round trips each.
+	defaultCommitReserve = 20 * time.Second
+)
+
+// stopWriterLost is the reason a pass stops when canCommit turns false.
+const stopWriterLost = "writer role lost"
+
+// reconcileRequest is one measurement's reconcile input.
+type reconcileRequest struct {
+	database, measurement string
+	// dropChecked: the caller ran settleDroppedTable on this Exporter for
+	// this pass (shared_drop.go); otherwise reconcile does.
+	dropChecked bool
+	// schema covers every file in current except those in unread.
+	schema ArcSchema
+	// current is the measurement's full listing. It is always the whole listing, never the
+	// part of it this pass will register: a table path missing from current is REMOVED.
+	current []FileRef
+	// unread are listed files whose footer schema is not folded into schema yet. They are read
+	// a chunk at a time through readSchemas, only when the chunk registers them.
+	unread      []FileRef
+	readSchemas func(ctx context.Context, files []FileRef) (ArcSchema, error)
+	// canCommit is checked immediately before every commit (#939: the writer lease can move
+	// during a long pass). nil means always.
+	canCommit func() bool
+	// exists reports whether a listed file is still in storage, asked through the file's own
+	// backend (vanished.go). nil turns vanished-file handling off: a read error is the pass's.
+	exists func(ctx context.Context, f FileRef) (bool, error)
+}
+
+// reconcileResult reports what one reconcile did.
+type reconcileResult struct {
+	// settled: the table equals the listing, the discovery files are published, any history
+	// floor owed has landed and no heal commit failed (#1098). Only then may the scheduler cache
+	// the fingerprint.
+	settled bool
+	// pruneAgainAt: the pass's prune left published versions on disk that
+	// only time or a retry removes: the version after each was published too
+	// recently (iceberg.min_version_age), or the prune could not finish. It
+	// is when a pass of the table next has something to prune even if the
+	// table has gone quiet (Exporter.pruneAgainAt); zero when the prune left
+	// nothing it could remove later.
+	pruneAgainAt time.Time
+	// partial: new files remain unregistered because the pass ran out of time or lost the
+	// writer role. Not an error: what was committed stays, and the next pass continues.
+	partial bool
+	// registered and remaining count new files (rewrites and tier moves excluded).
+	registered, remaining int
+	// schema is the table's schema when the pass ended.
+	schema ArcSchema
+	// moved: source files disappeared during the pass, and new files or whole days were left for
+	// the next pass (vanished.go). Never settled.
+	moved bool
+	// commits is how many data commits the pass made.
+	commits int
+	// droppedCold: a file left behind was on the cold tier, whose listing is cached.
+	droppedCold bool
+	// writerLost: the converged branch stopped because this node is no longer the writer.
+	writerLost bool
+	// leftOut is how many files the pass found that could not be given a day and left out of
+	// the table (file_day.go). It is every such file of the measurement only when the pass
+	// went through all its new files: not partial, not moved, the writer role kept.
+	leftOut int
+}
+
+// withoutPaths is paths less those in drop.
+func withoutPaths(paths []string, drop map[string]struct{}) []string {
+	if len(drop) == 0 {
+		return paths
+	}
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if _, ok := drop[p]; !ok {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// maxRedatedPerPass bounds the entries with no day that one pass re-registers. Each costs a
+// read of the file's time column, inside the pass's first commit, which has no chunking and
+// runs under the pass's deadline.
+const maxRedatedPerPass = 256
+
+// ReconcileMeasurementWithHint is ReconcileMeasurement plus whether the pass fully
+// SETTLED: the reader discovery files (version-hint.text, v<N>.metadata.json) were
+// published, the snapshot expiry (by retention, or the history floor this pass owed) did not
+// fail, AND no heal commit (name mapping, retention properties) failed (#1098).
+//
+// The scheduler needs this separately from the error. None of these steps undoes the
+// committed snapshot, but if one fails the caller must NOT cache the
+// measurement's fingerprint, or a file set that then goes quiet is never revisited: the
+// hint would stay stale forever, and metadata that names deleted data files would stay
+// published (#1092).
+//
+// The return is true when there was nothing to do for either step, which is the ordinary
+// converged case. sc must cover every file in current; a pass that runs out of time (ctx has a
+// deadline) commits what it got through and returns false.
+func (e *Exporter) ReconcileMeasurementWithHint(ctx context.Context, database, measurement string, sc ArcSchema, current []FileRef) (settled bool, err error) {
+	res, err := e.reconcile(ctx, reconcileRequest{database: database, measurement: measurement, schema: sc, current: current})
+	return res.settled, err
+}
+
+func (e *Exporter) reconcile(ctx context.Context, req reconcileRequest) (res reconcileResult, err error) {
+	ctx = e.withAWS(ctx)
+	e.passLag = 0 // the largest export lag this pass publishes (export_lag.go)
+	database, measurement := req.database, req.measurement
+	tkey := database + "\x00" + measurement
+	// On a shared bucket: give way to a drop of the database running on
+	// another node, and remove a table that drop meant to remove
+	// (shared_drop.go, #1792). The scheduler does this before it reads the
+	// table; a caller that has not is covered here.
+	if !req.dropChecked {
+		if err := e.settleDroppedTable(ctx, database, measurement, req.canCommit); err != nil {
+			return reconcileResult{}, err
+		}
+	}
+	// And at the end of the pass, however it ends (a pass can commit and
+	// then fail, and one that creates the table need not commit): if the
+	// database was dropped on another node meanwhile, what the pass wrote
+	// goes.
+	defer func() {
+		if e.droppedUnderPass(ctx, database, measurement, req.canCommit) {
+			res.settled = false
+			if err == nil {
+				err = fmt.Errorf("%s.%s: %w", database, measurement, errDroppedUnderPass)
+			}
+		}
+	}()
+	// A pass can rewrite the table's manifests: the append path counts them again (append.go).
+	e.forgetSmallManifests(tkey)
+	canCommit := req.canCommit
+	if canCommit == nil {
+		canCommit = func() bool { return true }
+	}
+	e.setPassGate(canCommit)
+	defer e.setPassGate(nil)
+	// A pass that ends fenced, or on a node that is no longer the writer,
+	// leaves its commits for another node to publish: their write times must
+	// not wait here for a publish this exporter will never make
+	// (export_lag.go). Deferred after the gate's reset is registered, so it
+	// runs first, while the gate still answers.
+	defer e.forgetExportLagIfNotPublisher(database, measurement)
+	// EnsureTable publishes the discovery files itself when it creates or evolves
+	// the table, so start from whether those writes succeeded. Otherwise a
+	// creation-time failure would be invisible here and the fingerprint would be
+	// cached over an unpublished hint.
+	e.resetHintFailure()
+
+	sc := req.schema
+	unread := make(map[string]FileRef, len(req.unread))
+	for _, f := range req.unread {
+		unread[f.PhysicalPath] = f
+	}
+	if len(unread) > 0 && req.readSchemas == nil {
+		return reconcileResult{}, fmt.Errorf("reconcile %s.%s: %d files have no schema and no reader", database, measurement, len(unread))
+	}
+
+	// Files that disappeared during the pass, and every new file left for the next pass with them
+	// (vanished.go).
+	probe := newProbe(req.exists, req.current)
+	refOf := make(map[string]FileRef, len(req.current))
+	for _, f := range req.current {
+		refOf[f.PhysicalPath] = f
+	}
+	var (
+		moved       bool
+		droppedCold bool
+		deferredNew int
+		leftBehind  = make(map[string]struct{})
+	)
+	leave := func(paths []string) {
+		for _, p := range paths {
+			leftBehind[p] = struct{}{}
+			if refOf[p].Cold {
+				droppedCold = true
+			}
+		}
+	}
+
+	// A table that does not exist yet is created from sc, and its day(time) partition spec is
+	// taken from sc's time column (EnsureTable). Never create it from a schema that has read no
+	// footer at all: a table created without its spec cannot get one later, and cloneDataFile
+	// refuses entries across specs. So read the first chunk's schemas here, synchronously, and
+	// fail the pass (creating nothing) if that does not finish.
+	if len(unread) > 0 && !schemaHasField(sc, "time") {
+		exists, err := e.tableExists(ctx, database, measurement)
+		if err != nil {
+			return reconcileResult{}, err
+		}
+		if !exists {
+			candidates := append([]FileRef(nil), req.unread...)
+			sortNewestFirst(candidates, func(f FileRef) string { return chunkSortKey(f.Key, f.PhysicalPath) })
+			for round := 1; ; round++ {
+				first := candidates[:min(e.chunkSizeFor(tkey), len(candidates))]
+				if len(first) == 0 {
+					// Every new file vanished before its footer was read: there is nothing to
+					// create the table from, and nothing is created. The next listing has the
+					// files that replaced them.
+					return reconcileResult{moved: true, droppedCold: droppedCold}, nil
+				}
+				// Under the chunk budget like any other chunk, and shrunk the same way when it
+				// does not fit: a new table on a store too slow for a full first chunk must
+				// converge too.
+				cctx, cancel := e.chunkContext(ctx)
+				add, err := req.readSchemas(cctx, first)
+				expired := errors.Is(cctx.Err(), context.DeadlineExceeded)
+				cancel()
+				if err != nil {
+					if ctx.Err() == nil && expired && errors.Is(err, context.DeadlineExceeded) {
+						e.shrinkChunk(tkey)
+						return reconcileResult{}, err
+					}
+					err = explainRead(ctx, err, refPaths(first), probe)
+					var ve *vanishedErr
+					if !errors.As(err, &ve) {
+						return reconcileResult{}, err
+					}
+					// No table yet, so nothing is removed and every file is a free add: leaving
+					// the vanished files' days for the next pass, but for fresh ingest files
+					// (#1755), loses no reader anything.
+					moved = true
+					kept, dropped := dropVanished(refPaths(candidates), ve.paths, database, measurement)
+					leave(dropped)
+					if round >= maxVanishRounds {
+						return reconcileResult{moved: true, droppedCold: droppedCold}, nil
+					}
+					candidates = keepRefs(candidates, kept)
+					continue
+				}
+				if sc, err = MergeSchemas(sc, add); err != nil {
+					return reconcileResult{}, markConflict(err, conflictWithFiles) // no table yet: files on both sides
+				}
+				for _, f := range first {
+					delete(unread, f.PhysicalPath)
+				}
+				break
+			}
+		}
+	}
+
+	tbl, err := e.EnsureTable(ctx, database, measurement, sc)
+	if err != nil {
+		return reconcileResult{}, err
+	}
+	if err := e.fencedErr(); err != nil {
+		return reconcileResult{}, err // EnsureTable's create or evolve lost a publish race (adopt.go)
+	}
+	hintOK := !e.hintFailed()
+
+	want := make(map[string]int64, len(req.current))
+	keyOf := make(map[string]string, len(req.current))
+	for _, f := range req.current {
+		want[f.PhysicalPath] = f.SizeBytes
+		keyOf[f.PhysicalPath] = f.Key
+	}
+	live, dups, err := e.tableLiveEntries(ctx, tbl)
+	if err != nil {
+		return reconcileResult{}, fmt.Errorf("read current iceberg data files: %w", err)
+	}
+	// Paths the table holds more than once (#1795, duplicates.go) are repaired first, as this
+	// pass's first commit: the diff below could not remove such a path. A later commit of the
+	// pass claims the version the repair and its floor leave, as after the removal commit and
+	// its floor (commit, below). A repair refused cleanly leaves the table as it was and the
+	// pass goes on; one whose outcome is unknown ends the pass, as any other commit does.
+	repairCommits, repairStart := 0, -1
+	if len(dups) > 0 {
+		if !canCommit() {
+			e.logger.Info().Str("database", database).Str("measurement", measurement).
+				Msg("Iceberg reconcile: this node stopped being the writer during the pass; published and pruned nothing, the new writer settles the table")
+			return reconcileResult{schema: arcSchemaOf(tbl), writerLost: true}, nil
+		}
+		repaired, ok, err := e.repairDuplicates(ctx, tbl, live, dups, want, database, measurement)
+		if err != nil {
+			return reconcileResult{}, fmt.Errorf("repair data files held more than once: %w", err)
+		}
+		if ok {
+			tbl = repaired
+			repairCommits, repairStart = 1, e.metadataVersion(tbl)
+			// Every older snapshot holds those paths more than once, and the repair leaves an
+			// empty one behind it: floored, as after a removal. finishPass retries a failed floor.
+			var floorOK bool
+			tbl, floorOK = e.expireSnapshots(ctx, tbl, database, measurement, floorRepaired)
+			e.setFloorOwed(tkey, !floorOK)
+			if live, err = e.tableLiveFiles(ctx, tbl); err != nil {
+				return reconcileResult{commits: repairCommits}, fmt.Errorf("read current iceberg data files: %w", err)
+			}
+		}
+	}
+
+	// The diff key is (path, size). A path on both sides with a different size is a file
+	// whose bytes changed without changing its path — for example, a backup restore replacing
+	// an existing object. The manifest entry still describes the old content (record_count,
+	// file_size_in_bytes, column bounds), so external engines keep counting deleted rows and
+	// can mis-plan reads against the shorter file. Such a path is dropped and re-registered
+	// in the same commit.
+	//
+	// An entry with no day is re-registered the same way (#1754): an earlier version
+	// registered a file whose footer has no min/max for the time column under a null day, which
+	// readers prune for any time filter. Rebuilding it reads its day from its rows
+	// (buildDataFiles). They go in the pass's first commit, which is not chunked, so a pass
+	// takes maxRedatedPerPass of them and reports itself partial while more remain. An entry
+	// whose file turns out to have no single day is removed and not added again.
+	var toAdd, toRemove, rewritten []string
+	redatedPaths := map[string]struct{}{}
+	redated, redatedLeft := 0, 0
+	spec := tbl.Spec()
+	for p, size := range want {
+		df, ok := live[p]
+		switch {
+		case !ok:
+			toAdd = append(toAdd, p)
+		case df.FileSizeBytes() != size:
+			rewritten = append(rewritten, p)
+			toRemove = append(toRemove, p)
+			toAdd = append(toAdd, p)
+		case missingPartitionValue(spec, df):
+			if redated == maxRedatedPerPass {
+				redatedLeft++
+				continue
+			}
+			redated++
+			redatedPaths[p] = struct{}{}
+			rewritten = append(rewritten, p)
+			toRemove = append(toRemove, p)
+			toAdd = append(toAdd, p)
+		}
+	}
+	for p := range live {
+		if _, ok := want[p]; !ok {
+			toRemove = append(toRemove, p)
+		}
+	}
+	// Deterministic order (stable snapshots, easier debugging).
+	sort.Strings(toAdd)
+	sort.Strings(toRemove)
+
+	if len(toAdd) == 0 && len(toRemove) == 0 {
+		// Already converged — no new snapshot. Still publish the discovery
+		// files unless they are in place (alreadyPublished): a previous pass
+		// may have committed the snapshot but failed to write them, and this
+		// is the path that pass's retry lands on.
+		//
+		// Sweep here too. A measurement whose file set has stopped changing is
+		// skipped by the scheduler's fingerprint gate before it ever reaches this
+		// function, so for such a table THIS is the pass that reclaims: the first
+		// one after a restart, whose fingerprint cache is cold.
+		//
+		// Only while this node is still the writer: the lease can move while EnsureTable and
+		// the manifest read run, and a node that lost it must not publish or prune — the new
+		// writer's mid-pass versions are protected only by that writer's own prune (#1097). The
+		// commit path stops the same way (stopWriterLost).
+		if !canCommit() {
+			e.logger.Info().Str("database", database).Str("measurement", measurement).
+				Msg("Iceberg reconcile: this node stopped being the writer during the pass; published and pruned nothing, the new writer settles the table")
+			return reconcileResult{schema: arcSchemaOf(tbl), writerLost: true}, nil
+		}
+		tbl, ok, err := e.finishPass(ctx, tbl, tkey, database, measurement, repairCommits, repairStart)
+		if err != nil {
+			return reconcileResult{commits: repairCommits}, err
+		}
+		settled := ok && hintOK && !e.healFailed()
+		if settled {
+			e.noteLeftAt(tkey, tbl.MetadataLocation()) // where an append may go on from (appendFiles)
+		}
+		return reconcileResult{settled: settled, schema: arcSchemaOf(tbl), pruneAgainAt: e.pruneAgainAt(), commits: repairCommits}, nil
+	}
+
+	// Metadata-only: files are dropped and added as DataFiles. (Transaction.Delete is a
+	// ROW-level predicate that rewrites partially-matching files — wrong here; we drop whole
+	// files that Arc already removed from storage.) The removes are the table's own entries;
+	// the adds are built from their footers first, which is also where a file whose rows
+	// straddle a UTC day is found. A rewritten path appears in both lists and is removed before
+	// it is added, inside the same commit.
+	removes := make([]iceberg.DataFile, 0, len(toRemove))
+	for _, p := range toRemove {
+		removes = append(removes, live[p])
+	}
+	// A file that moved tiers is the same file under another URI: its DataFile is the table's
+	// own entry with the new path, and the moved object is never read (cold_export.go).
+	cloned, toBuild, err := cloneFromTable(tbl, live, toAdd, keyOf, want)
+	if err != nil {
+		return reconcileResult{}, err
+	}
+	// An entry given its day is replaced by itself: it commits with its own removal, and
+	// brings no other file of its day into the first commit, which a real removal does.
+	anchored, free := splitAnchored(toBuild, withoutPaths(toRemove, redatedPaths), database, measurement)
+	// A re-home job's old file is among the removals (#1825): its rows are in
+	// new files in other directories, often other days. Those files go in the
+	// first commit with the removal, so no published version has the removal
+	// without them, and that commit is all or nothing below. Only those: the
+	// first commit is not chunked or time-budgeted, and a backlog of other
+	// new files folded into it could keep it from ever fitting in a pass.
+	swapOutputs, swap := e.replacedOutputs(database, measurement, toRemove)
+	if swap {
+		kept := free[:0]
+		for _, p := range free {
+			if isOneOf(p, keyOf[p], swapOutputs) {
+				anchored = append(anchored, p)
+				continue
+			}
+			kept = append(kept, p)
+		}
+		free = kept
+	}
+	if len(redatedPaths) > 0 {
+		kept := free[:0]
+		for _, p := range free {
+			if _, ok := redatedPaths[p]; ok {
+				anchored = append(anchored, p)
+				continue
+			}
+			kept = append(kept, p)
+		}
+		free = kept
+	}
+	if len(leftBehind) > 0 {
+		// Left behind by the first read of a new table (above): only free adds exist then.
+		kept := free[:0]
+		for _, p := range free {
+			if _, left := leftBehind[p]; left {
+				deferredNew++
+				continue
+			}
+			kept = append(kept, p)
+		}
+		free = kept
+	}
+	sortNewestFirst(free, func(p string) string { return chunkSortKey(keyOf[p], p) })
+	newFiles := len(toAdd) - len(rewritten) - len(cloned)
+
+	var (
+		commits    int
+		registered int
+		skippedAll []leftOutFile
+		loopErr    error
+		stopReason string
+	)
+	liveNow := len(live)
+	// The first version this pass committed; finishPass's prune keeps it and later ones. A repair
+	// above is the pass's first commit.
+	passStart := repairStart
+	commits = repairCommits
+	commit := func(rm, adds []iceberg.DataFile) error {
+		if commits > 0 {
+			// Claim the previous commit's version before making another (adopt.go): a pass of
+			// several commits otherwise publishes only its last version, and a stale writer is
+			// fenced only by colliding with a published one. A single-commit pass claims nothing
+			// here, exactly as before #1686.
+			if err := e.claimVersion(ctx, tbl); err != nil {
+				return err
+			}
+		}
+		// The manifest collapse (#1106) is decided per commit, before it stages anything (it
+		// reads the CURRENT snapshot and the transaction cannot be re-driven once the diff has
+		// staged), against the live count THIS commit drives the table to — not the pass's
+		// final one. A commit that empties the table must not collapse; see shouldCollapse.
+		after := liveNow - len(rm) + len(adds)
+		collapse := e.shouldCollapse(ctx, tbl, after, database, measurement)
+		committed, err := e.commitDiff(ctx, tbl, rm, adds, database, measurement, collapse)
+		if err != nil {
+			return err
+		}
+		tbl, liveNow = committed, after
+		if commits == 0 {
+			passStart = e.metadataVersion(tbl)
+		}
+		commits++
+		// version-hint.text moves once per pass, in finishPass, whether the pass ended complete,
+		// partial or on a chunk error. The v<N> copy of this commit is claimed by the next
+		// commit (above), or published with the hint if this was the last.
+		return nil
+	}
+
+	// First commit: removals, tier moves, rewrites and new files sharing a day with a removal,
+	// all together (see the comment at the top of this file). Not chunked and not time-budgeted:
+	// splitting it is exactly what must not happen, and it is the commit the pass was making
+	// before #1686, for the part of the diff it covers.
+	if len(removes) > 0 || len(cloned) > 0 || len(anchored) > 0 {
+		var built []iceberg.DataFile
+		var skipped []leftOutFile
+		for round := 1; ; round++ {
+			tbl, sc, built, skipped, err = e.prepareChunk(ctx, ctx, tbl, sc, anchored, unread, req.readSchemas, want, canCommit, probe)
+			var ve *vanishedErr
+			if !errors.As(err, &ve) {
+				break
+			}
+			if fe := e.fencedErr(); fe != nil {
+				return reconcileResult{}, fe
+			}
+			// A file of this commit vanished: defer its whole day — removals, tier moves, new
+			// files — exactly as the table has it, and commit the other days (vanished.go). A day
+			// that cannot be read from a key, or a third round, defers every day of the commit.
+			moved = true
+			days, byDay := daysOfPaths(ve.paths, database, measurement)
+			if !byDay || round >= maxVanishRounds || anyUnknownDay(toRemove, database, measurement) ||
+				anyUnknownDay(anchored, database, measurement) || anyUnknownDay(dataFilePaths(cloned), database, measurement) || swap {
+				// swap: a re-home job's files span days, and deferring one
+				// of them would commit the old file's removal without it.
+				days = nil
+			}
+			leave(ve.paths) // only for the cold-listing flag: commit 0 is already split from the free set
+			// A round whose schemas were read before a DataFile build failed has already evolved
+			// the table with the deferred day's columns. Harmless: columns are only ever added,
+			// all optional, and the deferred files are registered against them next pass.
+			var n int
+			n, toRemove, removes, rewritten, cloned, anchored = deferDays(days, live, toRemove, rewritten, cloned, anchored, database, measurement)
+			deferredNew += n
+			if len(removes)+len(cloned)+len(anchored) == 0 {
+				err, built, skipped = nil, nil, nil
+				break
+			}
+		}
+		if errors.Is(err, errWriterLost) {
+			stopReason = stopWriterLost
+			err = nil
+		} else if err != nil {
+			if fe := e.fencedErr(); fe != nil {
+				return reconcileResult{}, fe
+			}
+			return reconcileResult{}, err
+		}
+		for _, f := range skipped {
+			if isOneOf(f.path, keyOf[f.path], swapOutputs) {
+				return reconcileResult{}, fmt.Errorf("a re-home job's new file %s cannot be registered (%s); the file it replaces stays in the table until it can", f.path, f.reason)
+			}
+		}
+		skippedAll = append(skippedAll, skipped...)
+		adds := append(cloned, built...)
+		// An anchored add or a clone exists only beside a removal: in its day, or, for the new
+		// files of a re-home job whose old file this pass removes (swap), that old file's.
+		// deferDays takes a day whole, and everything when any path's day is unreadable or the
+		// pass is such a swap, so a non-empty commit always has a removal.
+		if len(adds)+len(removes) == 0 {
+			// Every day of this commit was deferred: nothing to commit.
+		} else if !canCommit() {
+			stopReason = stopWriterLost
+		} else {
+			if err := commit(removes, adds); err != nil {
+				return reconcileResult{}, err
+			}
+			// Floor history now, straight after the commit that removed the paths, as before
+			// #1686 — not at the end of the pass, which a node that loses the writer role
+			// mid-pass never reaches, and the next writer, seeing nothing to remove, would never
+			// floor at all. finishPass retries a failed floor.
+			var floorOK bool
+			// An entry given its day is the same file, still in storage: older snapshots that
+			// name it stay readable, so it does not count as a removal for the history floor.
+			gone := 0
+			for _, df := range removes {
+				if _, ok := redatedPaths[df.FilePath()]; !ok {
+					gone++
+				}
+			}
+			tbl, floorOK = e.expireSnapshots(ctx, tbl, database, measurement, expireModeFor(gone))
+			if gone > 0 {
+				e.setFloorOwed(tkey, !floorOK)
+			}
+			rewrote := make(map[string]struct{}, len(rewritten))
+			for _, p := range rewritten {
+				rewrote[p] = struct{}{}
+			}
+			for _, df := range built {
+				if _, ok := rewrote[df.FilePath()]; !ok {
+					registered++
+				}
+			}
+			// built, not adds: a tier move's clone is a file the table already had.
+			e.noteExported(tbl.Identifier(), built, rewrote)
+		}
+	}
+
+	// Then the new files no removal touches, newest first, a chunk at a time, while there is
+	// time left. A chunk that runs out of time commits nothing and ends the pass; the next one
+	// continues with a smaller chunk.
+	var lastDur time.Duration
+	vanishRounds := 0
+	for len(free) > 0 && stopReason == "" {
+		if !e.timeForChunk(ctx, lastDur) {
+			stopReason = "measurement deadline"
+			break
+		}
+		batch := free[:min(e.chunkSizeFor(tkey), len(free))]
+		cctx, cancel := e.chunkContext(ctx)
+		start := time.Now()
+		var built []iceberg.DataFile
+		var skipped []leftOutFile
+		tbl, sc, built, skipped, err = e.prepareChunk(cctx, ctx, tbl, sc, batch, unread, req.readSchemas, want, canCommit, probe)
+		// Read before cancel(), which would set it on every path.
+		chunkExpired := errors.Is(cctx.Err(), context.DeadlineExceeded)
+		cancel()
+		if errors.Is(err, errWriterLost) {
+			stopReason = stopWriterLost
+			break
+		}
+		var ve *vanishedErr
+		if errors.As(err, &ve) {
+			if fe := e.fencedErr(); fe != nil {
+				return reconcileResult{}, fe
+			}
+			// New files only, none in the table: leave the vanished files' days for the next pass,
+			// but for their fresh ingest files (#1755), and go on with the rest (vanished.go).
+			moved = true
+			var dropped []string
+			free, dropped = dropVanished(free, ve.paths, database, measurement)
+			leave(dropped)
+			deferredNew += len(dropped)
+			vanishRounds++
+			if vanishRounds >= maxVanishRounds {
+				stopReason = stopSourcesMoving
+				break
+			}
+			continue
+		}
+		if err != nil {
+			if fe := e.fencedErr(); fe != nil {
+				return reconcileResult{}, fe
+			}
+			// Only a deadline error is "did not fit"; a type conflict that happens to surface
+			// after the chunk's deadline is still an error.
+			if ctx.Err() == nil && chunkExpired && errors.Is(err, context.DeadlineExceeded) {
+				// The chunk's own budget ran out, not the pass's: commit nothing for it, shrink
+				// the next one and stop. Not an error — earlier chunks stand.
+				e.shrinkChunk(tkey)
+				stopReason = "chunk did not fit in the time left"
+				break
+			}
+			loopErr = err
+			break
+		}
+		skippedAll = append(skippedAll, skipped...)
+		if len(built) > 0 {
+			if !canCommit() {
+				stopReason = stopWriterLost
+				break
+			}
+			if err := commit(nil, built); err != nil {
+				if fe := e.fencedErr(); fe != nil {
+					return reconcileResult{}, fe // forked: no hint, no prune, no sweep (adopt.go)
+				}
+				loopErr = err
+				break
+			}
+			registered += len(built)
+			e.noteExported(tbl.Identifier(), built, nil)
+		}
+		free = free[len(batch):]
+		lastDur = time.Since(start)
+		e.growChunk(tkey, lastDur)
+	}
+
+	if len(skippedAll) > 0 {
+		// Files that could not be given a day (file_day.go). They are left out of the table
+		// and reported here and in arc_iceberg_files_left_out; the rest of the measurement
+		// still exports. Nothing registers them later: a pass finds them again and leaves
+		// them out again, until the file is rewritten or removed.
+		e.logger.Error().
+			Str("database", database).Str("measurement", measurement).
+			Int("skipped", len(skippedAll)).Strs("files", leftOutLines(skippedAll)).
+			Msg("Iceberg: files left out of the table because no single UTC day could be given to them; their rows are readable through Arc and missing from the Iceberg table")
+	}
+
+	// A node that lost the writer role mid-pass writes nothing more: no expiry commit, no
+	// discovery files, no prune or sweep. The new writer's pass reconciles from the table.
+	finishedOK := false
+	writerGone := stopReason == stopWriterLost
+	if !writerGone && commits == 0 && !canCommit() {
+		// Nothing committed and the writer role is gone (a pass whose files all vanished, whose
+		// days were all deferred, or that ran out of time before a commit): publish and prune
+		// nothing, as on the converged branch (#1097). stopReason keeps the reason the loop
+		// stopped for the logs; writerGone is what skips finishPass.
+		writerGone = true
+	}
+	if !writerGone {
+		tbl, finishedOK, err = e.finishPass(ctx, tbl, tkey, database, measurement, commits, passStart)
+		if err != nil {
+			return reconcileResult{}, err
+		}
+	}
+	partial := (len(free) > 0 || redatedLeft > 0) && loopErr == nil
+	remaining := len(free) + deferredNew + redatedLeft
+	if partial && commits == 0 && !writerGone && !moved {
+		// Nothing landed: no time was left for even one chunk (the listing and the table seed
+		// took the deadline), or the smallest chunk still did not fit. That is not progress, and
+		// reporting it as in_progress would also bring every later pass forward to the short
+		// retry interval. A failure, on the normal interval, with the chunk already shrunk. (A
+		// pass whose files vanished is busy instead, whatever is left: vanished.go.)
+		loopErr = fmt.Errorf("no time left in this pass to register any of %d new files (%s); the next pass retries with chunks of %d", remaining, stopReason, e.chunkSizeFor(tkey))
+		partial = false
+	}
+	if stopReason == stopWriterLost && commits == 0 && len(removes)+len(cloned)+len(anchored) > 0 {
+		// The first commit itself was refused (writer role): nothing of this pass landed.
+		partial, remaining = true, newFiles+redatedLeft
+	}
+	if commits > 0 {
+		e.logger.Info().
+			Str("database", database).Str("measurement", measurement).
+			Int("added", registered).Int("removed", len(toRemove)-len(rewritten)).
+			Int("reregistered", len(rewritten)).Int("given_a_day", redated).Int("moved", len(cloned)).
+			Int("commits", commits).Int("remaining", remaining).
+			Bool("hint_published", hintOK).
+			Bool("history_settled", finishedOK).
+			Bool("heal_ok", !e.healFailed()).
+			// How long the oldest ingest file this pass published had waited
+			// since it was written; 0 when it published none (#1750).
+			Dur("oldest_ingest_file_lag", e.passLag).
+			Msg("Reconciled Iceberg table")
+	}
+	if partial {
+		e.logger.Info().
+			Str("database", database).Str("measurement", measurement).
+			Int("registered", registered).Int("new_files", newFiles).Int("remaining", remaining).
+			Str("stopped", stopReason).
+			Msg("Iceberg: registered part of this measurement's new files; the next pass continues from the table")
+	}
+	if moved {
+		e.logger.Info().
+			Str("database", database).Str("measurement", measurement).
+			Int("registered", registered).Int("left_for_next_pass", deferredNew).
+			Msg("Iceberg: source files disappeared during this pass (a compaction, delete or retention is rewriting this measurement); what they touched is left for the next pass")
+	}
+	res = reconcileResult{
+		partial:      partial,
+		registered:   registered,
+		remaining:    remaining,
+		schema:       arcSchemaOf(tbl),
+		moved:        moved,
+		commits:      commits,
+		droppedCold:  droppedCold,
+		writerLost:   writerGone && !partial && !moved,
+		pruneAgainAt: e.pruneAgainAt(),
+		leftOut:      len(skippedAll),
+	}
+	if loopErr != nil {
+		return res, loopErr
+	}
+	// A failed expiry, floor or retention, must not be cached as settled. The scheduler keys its
+	// skip gate on this value; reporting not-settled keeps the fingerprint uncached so the next
+	// tick re-drives the measurement, and finishPass retries there even if that pass removes and
+	// commits nothing.
+	res.settled = !partial && !moved && hintOK && finishedOK && !e.healFailed()
+	if res.settled {
+		e.noteLeftAt(tkey, tbl.MetadataLocation()) // where an append may go on from (appendFiles)
+	}
+	return res, nil
+}
+
+// finishPass runs the once-per-pass steps after the pass's commits: snapshot expiry, the
+// discovery files, version-file pruning and the orphan sweep. Once per pass, not per commit:
+// expiring and pruning after every chunk would add a commit per chunk and walk readers' version
+// cushion (pruneOldVersionFiles keeps retain+1) forward several times within one pass.
+//
+// Expire old snapshots so snapshot history and metadata don't grow unbounded, and floor
+// history to the current snapshot when this pass removed any path. A removed path is one
+// Arc already deleted from the primary backend, or a compaction's input that is about to be:
+// once the output holding its rows is in place, the input is left out of the table (#1722)
+// and deleted right after, or by compaction's recovery if that delete failed. Either way every older snapshot names a file that is gone or
+// going, and time travel to it fails on the read (#1092). Flooring does not lose lasting
+// history: it drops snapshots that are unreadable now or will be within the compaction. A
+// rewritten path is in
+// the removal list too: it is still present in storage, but with different bytes, so the
+// older snapshots' record_count and bounds describe content that no longer exists there — the
+// original #1092 symptom.
+//
+// A failed expiry doesn't undo the successful reconcile, but it leaves the pass unsettled, so
+// the scheduler runs the table's next pass. For the retention case that pass retries by itself:
+// every pass that gets here as the writer tries to expire down to retain_snapshots, committed
+// or not (#1791; before, a pass that committed nothing did not, and a failed expiry was lost
+// once the table went quiet). The floor
+// needs a memory: only a pass that removes something asks to floor, so the next pass may well
+// remove nothing. A failed floor is remembered (floorOwed) and retried by every later pass until
+// it lands, including a pass with nothing to commit; before #1686 the retry pass took the
+// converged branch, which never expired, and the floor was lost. The memory is per process: a
+// restart in between forgets it. The floor itself is taken straight after the commit that
+// removed the paths (reconcile), so here it is only the retry.
+//
+// passStart is the first version this pass committed (-1: none). Pruning keeps it and every
+// later v<N> copy, so the versions a multi-commit pass claimed (claimVersion) stay on disk for
+// the fence until the next pass.
+//
+// ok reports that the discovery files were published and the expiry, floor or retention, did
+// not fail. (A failed heal also leaves the pass unsettled; the callers read that from
+// healFailed, #1098.)
+func (e *Exporter) finishPass(ctx context.Context, tbl *icetable.Table, tkey, database, measurement string, commits, passStart int) (*icetable.Table, bool, error) {
+	// The writer role can be lost after the pass's last commit check. Then the pass still
+	// publishes what it committed (its own commits are the table's head), but makes no expiry
+	// commit and does not prune or sweep: its view is stale, and the new writer's pass does those.
+	mayCommit := e.passMayCommit()
+	floor := e.floorOwed(tkey)
+	expireOK := true
+	switch {
+	case !mayCommit:
+		expireOK = !floor // an owed floor stays owed
+	case floor:
+		tbl, expireOK = e.expireSnapshots(ctx, tbl, database, measurement, floorHistory)
+		e.setFloorOwed(tkey, !expireOK)
+	default:
+		// Every pass, whether or not it committed (#1791). What can leave a
+		// table over retain_snapshots is not only this pass's commits:
+		// appends add snapshots and expire none (append.go), an earlier
+		// pass's expiry can have failed, and another process or node can
+		// have committed and stopped before expiring. The table says how
+		// many snapshots it has, so nothing has to remember that an expiry
+		// is owed. Within retain_snapshots this reads the loaded metadata
+		// and commits nothing (expireSnapshots).
+		tbl, expireOK = e.expireSnapshots(ctx, tbl, database, measurement, retainConfigured)
+	}
+	// Not when the discovery files already name this metadata (#1787): a pass
+	// that committed nothing would refuse its own v<N> copy, read it back to
+	// compare and write the hint it just read. What a publish does besides
+	// the two files and still applies is done here.
+	wrote := e.alreadyPublished(tbl)
+	if wrote {
+		e.hardenLocalMetadataPerms(tbl.MetadataLocation())
+		e.drainExportLag(tbl.Identifier())
+	} else {
+		wrote = e.writeVersionHint(ctx, tbl)
+	}
+	published := wrote && !e.hintFailed()
+	if err := e.fencedErr(); err != nil {
+		return tbl, false, err
+	}
+	// Every pass whose final publish landed, including one with no data commit: a heal or a schema
+	// evolution in EnsureTable publishes its own v<N> copy, and a converged pass used to leave it
+	// over the retain+1 bound until some later pass committed data (#1097). Not when that publish
+	// failed: the hint may still name a version this prune would delete (an earlier failed hint
+	// write in the pass does not matter once this one landed). Not when the pass-start hint could
+	// not be read, nor on a node that is no longer the writer: its view is stale, and the new
+	// writer's claimed versions are protected only by that writer's own prune. Every version this
+	// pass wrote to the hint is kept too. A zero-commit pass pays one LIST of the metadata
+	// directory for it (the orphan sweep, when on, lists it too).
+	protect, hintKnown := e.protectedVersions()
+	if wrote && hintKnown && mayCommit {
+		e.pruneOldVersionFilesFrom(ctx, tbl, passStart, protect...)
+	}
+	// After pruneOldVersionFiles, so the on-disk metadata set the sweep reads for
+	// reachability is the one this pass settled on, not one version stale.
+	if mayCommit {
+		e.sweepOrphanMetadata(ctx, tbl)
+	}
+	// Not settled when the pass-start hint could not be read: the prune was skipped, and a settled
+	// pass would be cached and not revisited while the table sits over its copy bound.
+	return tbl, published && expireOK && hintKnown && mayCommit, nil
+}
+
+// errWriterLost is prepareChunk's report that canCommit turned false before a schema commit.
+var errWriterLost = errors.New("iceberg: this node is no longer the writer")
+
+// prepareChunk reads the schemas of the chunk's unread files (readCtx), evolves the table to
+// cover them (commitCtx: a schema commit is not abandoned halfway because the read budget
+// ended), and builds the chunk's DataFiles (readCtx). Files whose schema is read are removed
+// from unread. On error the returned table and schema are still the current ones.
+//
+// A schema evolution is a commit, and it publishes the discovery files (evolveSchema), so it is
+// gated like the data commits: errWriterLost when canCommit is false, and the fence is checked
+// straight after it.
+func (e *Exporter) prepareChunk(readCtx, commitCtx context.Context, tbl *icetable.Table, sc ArcSchema, paths []string, unread map[string]FileRef, readSchemas func(context.Context, []FileRef) (ArcSchema, error), want map[string]int64, canCommit func() bool, probe probeFunc) (*icetable.Table, ArcSchema, []iceberg.DataFile, []leftOutFile, error) {
+	if len(paths) == 0 {
+		return tbl, sc, nil, nil, nil
+	}
+	var toRead []FileRef
+	for _, p := range paths {
+		if f, ok := unread[p]; ok {
+			toRead = append(toRead, f)
+		}
+	}
+	if len(toRead) > 0 {
+		add, err := readSchemas(readCtx, toRead)
+		if err != nil {
+			// Only the two footer reads are explained as vanished files (vanished.go); a schema
+			// conflict, a schema commit or the fence below keep their own errors.
+			return tbl, sc, nil, nil, explainRead(commitCtx, err, refPaths(toRead), probe)
+		}
+		merged, err := MergeSchemas(sc, add)
+		if err != nil {
+			return tbl, sc, nil, nil, markConflict(err, conflictWithTable) // sc is the table's schema
+		}
+		if !schemaCovers(tbl, merged) && !canCommit() {
+			return tbl, sc, nil, nil, errWriterLost
+		}
+		evolved, err := e.evolveSchema(commitCtx, tbl, merged)
+		if err != nil {
+			return tbl, sc, nil, nil, err
+		}
+		if err := e.fencedErr(); err != nil {
+			return evolved, sc, nil, nil, err
+		}
+		tbl, sc = evolved, merged
+		for _, f := range toRead {
+			delete(unread, f.PhysicalPath)
+		}
+	}
+	built, skipped, err := e.buildDataFiles(readCtx, tbl, paths, want)
+	if err != nil {
+		return tbl, sc, nil, nil, explainRead(commitCtx, err, paths, probe)
+	}
+	return tbl, sc, built, skipped, nil
+}
+
+// splitAnchored separates the paths to build into those that must commit with this pass's
+// removals (anchored) and those that may be registered a chunk at a time (free). A path is
+// anchored when its UTC day directory also loses a file this pass — a compaction output, a
+// rewrite, a tier move whose clone did not resolve. A path or removal whose day cannot be read
+// from its key is treated as touching every day: with any removal at all, everything is
+// anchored, which is the single commit Arc made before #1686.
+func splitAnchored(toBuild, toRemove []string, database, measurement string) (anchored, free []string) {
+	if len(toRemove) == 0 {
+		return nil, append([]string(nil), toBuild...)
+	}
+	days := make(map[string]struct{}, len(toRemove))
+	for _, p := range toRemove {
+		d := dayOf(p, database, measurement)
+		if d == "" {
+			return append([]string(nil), toBuild...), nil
+		}
+		days[d] = struct{}{}
+	}
+	for _, p := range toBuild {
+		d := dayOf(p, database, measurement)
+		if _, hit := days[d]; hit || d == "" {
+			anchored = append(anchored, p)
+		} else {
+			free = append(free, p)
+		}
+	}
+	return anchored, free
+}
+
+// dayOf returns "YYYY/MM/DD" from a data file's path or URI, by the storage layout
+// {database}/{measurement}/{year}/{month}/{day}/[{hour}/]{file}. Daily-compacted files have
+// no hour directory, which is why the day — not the hour — is the unit: it is also the
+// table's day() partition. "" when the path does not have that shape.
+func dayOf(p, database, measurement string) string {
+	p = filepath.ToSlash(p)
+	marker := database + "/" + measurement + "/"
+	var rest string
+	if i := strings.LastIndex(p, "/"+marker); i >= 0 {
+		rest = p[i+1+len(marker):]
+	} else if strings.HasPrefix(p, marker) {
+		rest = p[len(marker):]
+	} else {
+		return ""
+	}
+	segs := strings.SplitN(rest, "/", 4)
+	if len(segs) < 4 || segs[0] == "" || segs[1] == "" || segs[2] == "" {
+		return ""
+	}
+	return segs[0] + "/" + segs[1] + "/" + segs[2]
+}
+
+// chunkSortKey orders files by storage key, which sorts by time across tiers (a URI does not:
+// a cold s3:// URI and a hot local path sort by scheme). Falls back to the path.
+func chunkSortKey(key, p string) string {
+	if key != "" {
+		return key
+	}
+	return p
+}
+
+// sortNewestFirst sorts descending by key: a dashboard reads recent data, so a measurement that
+// is still being registered answers recent queries first.
+func sortNewestFirst[T any](s []T, key func(T) string) {
+	sort.SliceStable(s, func(i, j int) bool { return key(s[i]) > key(s[j]) })
+}
+
+// schemaCovers reports whether the table already has every column of sc (evolveSchema would be
+// a no-op).
+func schemaCovers(tbl *icetable.Table, sc ArcSchema) bool {
+	for _, f := range sc.Fields {
+		if _, ok := tbl.Schema().FindFieldByName(f.Name); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// metadataVersion is the number N of the table's current metadata file (the v<N> it is
+// published as), -1 when the location cannot be parsed.
+func (e *Exporter) metadataVersion(tbl *icetable.Table) int {
+	v, _, ok := e.parseVersionAndMetaDir(tbl.MetadataLocation())
+	if !ok {
+		return -1
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+// claimVersion publishes the v<N>.metadata.json copy of a commit in the middle of a pass,
+// without moving version-hint.text (finishPass does that once). It is the stale-writer fence
+// (adopt.go) for the versions a multi-commit pass would otherwise never publish: errFenced when
+// another writer already holds this version. Any other failure is logged and ignored; the
+// copy is a claim, not the publish readers use.
+func (e *Exporter) claimVersion(ctx context.Context, tbl *icetable.Table) error {
+	if e.backend == nil {
+		return nil
+	}
+	metaLoc := tbl.MetadataLocation()
+	version, dirKey, ok := e.parseVersionAndMetaDir(metaLoc)
+	if !ok {
+		return nil
+	}
+	metaKey, ok := e.warehouseRelKey(metaLoc)
+	if !ok {
+		return nil
+	}
+	body, err := e.backend.Read(ctx, metaKey)
+	if err != nil {
+		e.logger.Debug().Err(err).Str("key", metaKey).Msg("Iceberg: could not read a mid-pass version to claim it (non-fatal)")
+		return nil
+	}
+	vKey := path.Join(dirKey, "v"+version+".metadata.json")
+	if err := e.publishMetadataCopy(ctx, vKey, body); err != nil {
+		if errors.Is(err, errFenced) {
+			e.logger.Error().Err(err).Str("key", vKey).Bool("adopts_next_pass", e.warehouseAuthoritative).
+				Msg("Iceberg: another writer published this table version first; this pass stops (the next one adopts the published version where the warehouse is authoritative)")
+			e.hintFailMu.Lock()
+			e.fenced = err
+			e.hintFailMu.Unlock()
+			return err
+		}
+		e.logger.Debug().Err(err).Str("key", vKey).Msg("Iceberg: could not claim a mid-pass version (non-fatal)")
+	}
+	return nil
+}
+
+func schemaHasField(sc ArcSchema, name string) bool {
+	for _, f := range sc.Fields {
+		if f.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// arcSchemaOf is the table's current schema as an ArcSchema.
+func arcSchemaOf(tbl *icetable.Table) ArcSchema {
+	var sc ArcSchema
+	for _, f := range tbl.Schema().Fields() {
+		sc.Fields = append(sc.Fields, ArcField{Name: f.Name, Type: f.Type})
+	}
+	return sc
+}
+
+// timeForChunk reports whether another chunk should start: the deadline leaves the commit
+// reserve plus about as long as the last chunk took. No deadline, always.
+func (e *Exporter) timeForChunk(ctx context.Context, last time.Duration) bool {
+	dl, ok := ctx.Deadline()
+	if !ok {
+		return true
+	}
+	return time.Until(dl) > e.commitReserve+last
+}
+
+// chunkContext is the context a chunk's footer reads run under: the pass's, ending the commit
+// reserve before its deadline, so a chunk that does not fit stops with time left to finish the
+// pass cleanly instead of failing it at the hard deadline.
+func (e *Exporter) chunkContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if dl, ok := ctx.Deadline(); ok {
+		return context.WithDeadline(ctx, dl.Add(-e.commitReserve))
+	}
+	return context.WithCancel(ctx)
+}
+
+// chunkSizeFor is the measurement's current chunk size: dataFileChunkMax (e.chunkMax) unless a
+// chunk timed out, in which case it halves down to dataFileChunkMin and doubles back after
+// chunks that finish quickly. Remembered per process; a restart starts at the maximum again.
+func (e *Exporter) chunkSizeFor(tkey string) int {
+	e.chunkMu.Lock()
+	defer e.chunkMu.Unlock()
+	if n, ok := e.chunkSize[tkey]; ok {
+		return n
+	}
+	return e.maxChunk()
+}
+
+// maxChunk is e.chunkMax, or dataFileChunkMax for an Exporter not built by NewExporter: a zero
+// chunk size would never advance the chunk loop. Called with chunkMu held or from it.
+func (e *Exporter) maxChunk() int {
+	if e.chunkMax <= 0 {
+		return dataFileChunkMax
+	}
+	return e.chunkMax
+}
+
+func (e *Exporter) shrinkChunk(tkey string) {
+	e.chunkMu.Lock()
+	defer e.chunkMu.Unlock()
+	n, ok := e.chunkSize[tkey]
+	if !ok {
+		n = e.maxChunk()
+	}
+	n = max(n/2, min(dataFileChunkMin, e.maxChunk()))
+	if e.chunkSize == nil {
+		e.chunkSize = make(map[string]int)
+	}
+	e.chunkSize[tkey] = n
+}
+
+func (e *Exporter) growChunk(tkey string, took time.Duration) {
+	e.chunkMu.Lock()
+	defer e.chunkMu.Unlock()
+	n, ok := e.chunkSize[tkey]
+	if !ok || took >= chunkGrowBelow {
+		return
+	}
+	if n *= 2; n >= e.maxChunk() {
+		delete(e.chunkSize, tkey) // back at the default; keep the map to shrunk tables only
+		return
+	}
+	e.chunkSize[tkey] = n
+}
+
+func (e *Exporter) floorOwed(tkey string) bool {
+	e.chunkMu.Lock()
+	defer e.chunkMu.Unlock()
+	_, owed := e.floorDue[tkey]
+	return owed
+}
+
+func (e *Exporter) setFloorOwed(tkey string, owed bool) {
+	e.chunkMu.Lock()
+	defer e.chunkMu.Unlock()
+	if owed {
+		if e.floorDue == nil {
+			e.floorDue = make(map[string]struct{})
+		}
+		e.floorDue[tkey] = struct{}{}
+	} else {
+		delete(e.floorDue, tkey)
+	}
+}

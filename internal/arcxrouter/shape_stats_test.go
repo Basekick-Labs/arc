@@ -1,5 +1,5 @@
 // agg-8 companion: skewness / kurtosis / kurtosis_pop route ungrouped and under a
-// time bucket; tag-keyed grouping stays gated. Pure tokenizer tests.
+// time bucket, and tag-keyed since C2. Pure tokenizer tests.
 
 package arcxrouter
 
@@ -28,7 +28,6 @@ func TestShapeStatsRoute(t *testing.T) {
 		}
 	}
 	for _, sql := range []string{
-		"SELECT host, kurtosis(v) FROM cpu GROUP BY host",
 		"SELECT skewness(DISTINCT v) FROM cpu",
 		"SELECT skewness(v * 2) FROM cpu",
 		"SELECT skewness(v, w) FROM cpu",

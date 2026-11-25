@@ -9,6 +9,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/rs/zerolog"
 
@@ -38,7 +39,10 @@ type FileSetSource interface {
 type StorageWalkSource struct {
 	backend  storage.Backend
 	resolver *PathResolver
-	nsPrefix string // Iceberg namespace prefix; warehouse dirs "<nsPrefix>_*.db" are excluded
+	// layout names the warehouse's directories in the storage root, which the walk skips. Never
+	// nil: NewStorageWalkSource starts with the namespace-directory rule alone, and
+	// SetWarehouseLayout adds a subdirectory or nested warehouse (#1626).
+	layout *WarehouseLayout
 	// pendingOutputs, when set, names compaction outputs whose sources still
 	// exist; they are excluded from the file set (#638).
 	pendingOutputs func(ctx context.Context, prefix string) (map[string]struct{}, error)
@@ -52,6 +56,14 @@ type StorageWalkSource struct {
 	// manifest's view of a listed file and its read barrier (see SetManifestBarrier).
 	manifestKnows func(path string) bool
 	manifestSync  func(ctx context.Context) error
+	// unmanagedMu guards unmanaged: per measurement, the listed files still
+	// unknown to the manifest after a barrier. They are objects the manifest
+	// never learns of (written before the cluster existed, say), and a
+	// barrier per pass for them would be a replicated log entry per pass
+	// (#1609). Replaced on every barrier, so it holds only what is still
+	// listed; a file the manifest later learns of is dropped from it.
+	unmanagedMu sync.Mutex
+	unmanaged   map[string]map[string]struct{}
 	// cold, when set, is the cold tier the source lists next to the primary (cold.go).
 	cold   *coldTier
 	logger zerolog.Logger
@@ -101,6 +113,19 @@ type Exclusions interface {
 	ExcludedForStrict(ctx context.Context, prefix string) ([]string, error)
 }
 
+// replacementExclusions is an Exclusions that names, in the same answer, the
+// compaction outputs whose inputs it leaves out (api.ReplacementExcluder over
+// compaction.OpenJobs). Such an output holds every row of the inputs left
+// out, so the export keeps it even while its crash-recovery manifest still
+// lists inputs on disk (#1722). Without it, a pass between a compaction's
+// upload and its deletes left out the output (pendingOutputs, #638) and the
+// inputs (exclusions, #939 A0) alike, and committed the table without the
+// job's rows; with a failed delete or a crash, every pass did until
+// compaction's recovery ran.
+type replacementExclusions interface {
+	ExcludedWithOutputsStrict(ctx context.Context, prefix string) (excluded, outputs []string, err error)
+}
+
 // SetExclusions installs the files Arc's reads leave out (#939 A0). Without
 // it the exporter publishes, during a DELETE rewrite or a compaction, a file
 // next to the one that replaced it, and external readers count its rows twice
@@ -138,29 +163,44 @@ func NewStorageWalkSource(backend storage.Backend, nsPrefix string, logger zerol
 	return &StorageWalkSource{
 		backend:  backend,
 		resolver: NewPathResolver(backend),
-		nsPrefix: nsPrefix,
+		layout:   NewWarehouseLayout("", "", nsPrefix),
 		logger:   logger,
 	}
 }
 
-// isWarehouseDir reports whether a top-level directory is an Iceberg warehouse namespace
-// directory ("<nsPrefix>_<db>.db") written by the exporter, which must be excluded from the
-// data-file walk. Iceberg's SQL catalog names namespace dirs "<namespace>.db".
-func (s *StorageWalkSource) isWarehouseDir(name string) bool {
-	if strings.HasPrefix(name, s.nsPrefix+"_") && strings.HasSuffix(name, ".db") {
-		return true
+// SetWarehouseLayout makes the walk skip the directories the exporter's warehouse occupies in
+// the storage root, by the rule the database listings apply (#1626): a subdirectory warehouse
+// ("<root>/lv_wh") is not walked as a database, nor a nested one as a measurement. The
+// namespace-directory rule holds either way. Call during wiring, before the scheduler starts.
+func (s *StorageWalkSource) SetWarehouseLayout(l *WarehouseLayout) {
+	if l != nil {
+		s.layout = l
 	}
-	// iceberg-go v0.7.0 JSON-encodes a namespace whose component contains a dot, and an edge-sync
-	// spoke ID may contain one (#1129), so that directory does not start with "<prefix>_" at all.
-	// Decoding through catalogNamespaceKey's own inverse is deliberate: a second, local copy of
-	// the encoding rule is how the exporter would come to disagree with the catalog about which
-	// directories are its own, and a directory it fails to recognise here is walked back in as a
-	// user database -- the harm the whole namespace scheme exists to prevent (#634).
-	if !strings.HasSuffix(name, ".db") {
+}
+
+// isWarehouseDir reports whether a top-level directory belongs to the Iceberg warehouse the
+// exporter writes ("<nsPrefix>_<db>.db" namespace directories, and a subdirectory warehouse once
+// SetWarehouseLayout names it), which must be excluded from the data-file walk.
+func (s *StorageWalkSource) isWarehouseDir(name string) bool {
+	return s.layout.IsWarehouseRootDir(name)
+}
+
+// Exportable reports whether (database, measurement) is one Measurements
+// would yield: not the exporter's own warehouse directories, not Arc's
+// reserved state directories, not a nested warehouse. A request that names a
+// measurement directly (an ingest flush's) skips Measurements, so it asks
+// here: a database that happens to be named like one of those directories
+// must not get a table.
+func (s *StorageWalkSource) Exportable(m Measurement) bool {
+	db := strings.Trim(m.Database, "/")
+	name := strings.Trim(m.Measurement, "/")
+	if db == "" || name == "" {
 		return false
 	}
-	namespace, ok := decodeCatalogNamespace(strings.TrimSuffix(name, ".db"))
-	return ok && namespaceBelongsToPrefix(namespace, s.nsPrefix)
+	if s.isWarehouseDir(db) || db == compactionStateDir || storage.IsReservedRootDir(db) {
+		return false
+	}
+	return !s.layout.IsWarehouseMeasurement(db, name)
 }
 
 // dirLister is the subset of storage backends that can enumerate immediate subdirectories.
@@ -221,8 +261,8 @@ func (s *StorageWalkSource) measurementsOn(ctx context.Context, dl dirLister) ([
 		}
 		for _, m := range measurements {
 			m = strings.Trim(m, "/")
-			if m == "" {
-				continue
+			if m == "" || s.layout.IsWarehouseMeasurement(db, m) {
+				continue // a nested warehouse ("<root>/db/m/…") is not a measurement
 			}
 			out = append(out, Measurement{Database: db, Measurement: m})
 		}
@@ -315,7 +355,10 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 		if moved {
 			err = nil
 		}
-		if err == nil && len(vanished) == 0 && !moved && !synced && s.manifestKnows != nil && s.unknownToManifest(files) {
+		if err == nil && len(vanished) == 0 && !moved && synced && s.manifestKnows != nil {
+			s.recordUnmanaged(m, files)
+		}
+		if err == nil && len(vanished) == 0 && !moved && !synced && s.manifestKnows != nil && s.unknownToManifest(m, files) {
 			// At most once per call: a file the manifest never learns of (an unmanaged
 			// object) must not turn every pass into a barrier per listing.
 			synced = true
@@ -335,9 +378,11 @@ func (s *StorageWalkSource) FilesAndLocal(ctx context.Context, m Measurement) ([
 			return files, local, nil
 		}
 		if attempt == vanishRetries {
+			// Busy, not failed (vanished.go): a writer path is rewriting the measurement. The
+			// guard itself is unchanged; only how the scheduler reports it.
 			return nil, nil, fmt.Errorf(
-				"file set of %s/%s kept changing under the listing (%d file(s) removed while it was read, %d attempts); keeping the previous snapshot this pass",
-				m.Database, m.Measurement, len(vanished), attempt)
+				"file set of %s/%s kept changing under the listing (%d file(s) removed while it was read, %d attempts); keeping the previous snapshot this pass: %w",
+				m.Database, m.Measurement, len(vanished), attempt, errSourcesMoving)
 		}
 		prev = vanished
 		s.logger.Debug().Str("database", m.Database).Str("measurement", m.Measurement).Int("vanished", len(vanished)).
@@ -352,9 +397,20 @@ func (s *StorageWalkSource) FileSchema(ctx context.Context, f FileRef) (ArcSchem
 		return s.coldSchema(ctx, f)
 	}
 	if f.LocalPath != "" {
+		// A local footer read is synchronous and cannot be interrupted, but a chunk whose time
+		// is up must not start new ones (#1686): the remote path checks ctx in its GETs.
+		if err := ctx.Err(); err != nil {
+			return ArcSchema{}, err
+		}
 		return SchemaFromParquet(f.LocalPath)
 	}
-	return SchemaFromBackend(ctx, s.backend, f.Key, f.SizeBytes)
+	sc, tail, err := schemaAndTailFromBackend(ctx, s.backend, f.Key, f.SizeBytes)
+	if err != nil {
+		return ArcSchema{}, err
+	}
+	// The same bytes iceberg-go needs to register the file (#1778).
+	exportReadsFrom(ctx).putTail(f.PhysicalPath, tail)
+	return sc, nil
 }
 
 // objectLister is the backend's sized listing when the backend is an object
@@ -382,13 +438,42 @@ func listSizes(ctx context.Context, lister storage.ObjectLister, prefix string) 
 }
 
 // unknownToManifest reports whether any listed file is unknown to the replicated manifest.
-func (s *StorageWalkSource) unknownToManifest(files []FileRef) bool {
+// unknownToManifest reports whether a listed file is unknown to the manifest
+// and not already known to stay so after an earlier barrier (unmanaged).
+func (s *StorageWalkSource) unknownToManifest(m Measurement, files []FileRef) bool {
+	s.unmanagedMu.Lock()
+	defer s.unmanagedMu.Unlock()
+	known := s.unmanaged[measurementKey(m.Database, m.Measurement)]
 	for _, f := range files {
-		if !s.manifestKnows(f.Key) {
+		if s.manifestKnows(f.Key) {
+			delete(known, f.Key)
+			continue
+		}
+		if _, ok := known[f.Key]; !ok {
 			return true
 		}
 	}
 	return false
+}
+
+// recordUnmanaged remembers the listed files a barrier did not make known.
+func (s *StorageWalkSource) recordUnmanaged(m Measurement, files []FileRef) {
+	still := make(map[string]struct{})
+	for _, f := range files {
+		if !s.manifestKnows(f.Key) {
+			still[f.Key] = struct{}{}
+		}
+	}
+	s.unmanagedMu.Lock()
+	defer s.unmanagedMu.Unlock()
+	if s.unmanaged == nil {
+		s.unmanaged = make(map[string]map[string]struct{})
+	}
+	if len(still) == 0 {
+		delete(s.unmanaged, measurementKey(m.Database, m.Measurement))
+		return
+	}
+	s.unmanaged[measurementKey(m.Database, m.Measurement)] = still
 }
 
 // vanishRetries bounds FilesAndLocal's attempts at a stable listing.
@@ -445,11 +530,27 @@ func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files 
 	// replacement of a key read here is in the listing below. Read after it,
 	// a key whose replacement landed in between would drop that key's rows
 	// from this pass.
-	var leaveOut map[string]struct{}
+	//
+	// replacing is the outputs of the compactions whose inputs are among
+	// them, from the same answer: a pending output in it is kept, because its
+	// inputs are left out. Only the job that leaves the inputs out can say
+	// so; an input left out for another reason (a DELETE rewrote it) does not
+	// make an output a replacement.
+	var leaveOut, replacing map[string]struct{}
 	if s.exclusions != nil {
-		keys, err := s.exclusions.ExcludedForStrict(ctx, prefix)
+		var keys, outputs []string
+		var err error
+		if re, ok := s.exclusions.(replacementExclusions); ok {
+			keys, outputs, err = re.ExcludedWithOutputsStrict(ctx, prefix)
+		} else {
+			keys, err = s.exclusions.ExcludedForStrict(ctx, prefix)
+		}
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("files Arc's reads leave out under %s/%s: %w", m.Database, m.Measurement, err)
+		}
+		replacing = make(map[string]struct{}, len(outputs))
+		for _, o := range outputs {
+			replacing[filepath.ToSlash(o)] = struct{}{}
 		}
 		leaveOut = make(map[string]struct{}, len(keys))
 		for _, k := range keys {
@@ -494,6 +595,10 @@ func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files 
 	// A key that started being left out while this listing ran: its
 	// replacement may have landed after the listing, so leaving it out could
 	// drop its rows, and keeping it could count them twice.
+	// newly is every key that started being left out while the listing ran,
+	// listed here or not: one of them may be a file on the cold tier, which
+	// only the cold listing below can show (#1825).
+	var newly map[string]struct{}
 	if s.exclusions != nil {
 		after, err := s.exclusions.ExcludedForStrict(ctx, prefix)
 		if err != nil {
@@ -508,6 +613,10 @@ func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files 
 			if _, before := leaveOut[k]; before {
 				continue
 			}
+			if newly == nil {
+				newly = make(map[string]struct{})
+			}
+			newly[k] = struct{}{}
 			if _, ok := listed[k]; ok {
 				vanished = append(vanished, k)
 			}
@@ -542,7 +651,7 @@ func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files 
 		if !isDataFile(p) {
 			continue
 		}
-		if _, skip := pending[filepath.ToSlash(p)]; skip {
+		if s.pendingSkips(pending, replacing, p) {
 			excluded++
 			continue
 		}
@@ -596,8 +705,17 @@ func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files 
 	}
 	sort.Strings(vanished)
 	if s.cold != nil {
+		// A cold file that started being left out while this listing ran:
+		// the files holding its rows may have landed on the hot tier after
+		// the hot listing, so keeping it could count them twice and leaving
+		// it out could drop them. The same answer as for a hot file above.
+		var movedCold []string
 		skip := func(key string) bool {
-			if _, ok := pending[key]; ok {
+			if _, ok := newly[key]; ok {
+				movedCold = append(movedCold, key)
+				return true
+			}
+			if s.pendingSkips(pending, replacing, key) {
 				return true
 			}
 			if _, ok := leaveOut[key]; ok {
@@ -608,8 +726,44 @@ func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files 
 		if files, local, err = s.mergeCold(ctx, prefix, files, local, skip); err != nil {
 			return nil, nil, nil, err
 		}
+		if len(movedCold) > 0 {
+			sort.Strings(movedCold)
+			return nil, nil, movedCold, errExclusionsMoved
+		}
 	}
 	return files, local, vanished, nil
+}
+
+// pendingSkips reports whether a listed key is a compaction output to leave
+// out of this pass: one whose crash-recovery manifest still lists an input on
+// disk (#638), unless the exclusions read before the listing leave that job's
+// inputs out (replacing), in which case the output is what holds their rows.
+func (s *StorageWalkSource) pendingSkips(pending, replacing map[string]struct{}, key string) bool {
+	key = filepath.ToSlash(key)
+	if _, ok := pending[key]; !ok {
+		return false
+	}
+	_, replaces := replacing[key]
+	return !replaces
+}
+
+// FileExists reports whether a listed file is still in storage, asked through the backend that
+// holds it: the cold tier for a cold file, this node's disk for a local one, the primary store
+// otherwise. The reconcile asks it after a footer read fails with a not-found (vanished.go), so a
+// file is only ever treated as deleted on its own backend's word.
+func (s *StorageWalkSource) FileExists(ctx context.Context, f FileRef) (bool, error) {
+	if f.Cold {
+		if s.cold == nil {
+			return false, fmt.Errorf("cold file %s listed with no cold tier configured", f.Key)
+		}
+		size, err := s.cold.backend.StatFile(ctx, f.Key)
+		if err != nil {
+			return false, err
+		}
+		return size >= 0, nil
+	}
+	_, present, err := s.statSize(ctx, f.Key, f.LocalPath)
+	return present, err
 }
 
 // statSize returns the file's current byte size, which the reconciler needs
@@ -617,10 +771,10 @@ func (s *StorageWalkSource) listOnce(ctx context.Context, m Measurement) (files 
 // partial-match branch publishes a fresh path instead, but restores and
 // edge-sync still write a known path, and only the size tells that
 // content apart from what the Iceberg manifest describes.
-// present=false means the file is gone. Local files are stat'ed directly; a
-// backend that is not an object store (objectLister) but has no local path
-// answers through StatFile. Object stores never get here: their size comes
-// from the listing.
+// present=false means the file is gone. Local files are stat'ed directly;
+// anything else answers through the backend's StatFile. The listing never
+// sends an object store here (its size comes from the listing itself), but
+// FileExists does, for one file whose footer read came back not-found.
 func (s *StorageWalkSource) statSize(ctx context.Context, key, localPath string) (size int64, present bool, err error) {
 	if localPath != "" {
 		st, err := os.Stat(localPath)
@@ -661,4 +815,73 @@ func isDataFile(p string) bool {
 		return false
 	}
 	return strings.HasSuffix(base, ".parquet")
+}
+
+// AppendRefs resolves files an ingest flush reported (storage keys of m) for
+// the append path (#1751), applying to each the rules of a listing that can
+// be judged for one file: it is a data file of the measurement, Arc's reads
+// do not leave it out, the cluster has not deleted it, and it is in storage.
+// A key that fails one is left out: the reconcile pass owns it. sizes holds
+// the size the flush reported for each key; on an object store it is used
+// as given and the footer read is what finds a file gone or of another
+// length (#1778), while a local file is stat'ed.
+//
+// The rules that need the whole listing (hidden data files, a listing that
+// moved, compaction outputs still replacing their inputs) are not applied:
+// the caller appends only between reconcile passes that settled, and an
+// ingest file is never a compaction output.
+//
+// ok is false when this source cannot judge a single file: a shared-storage
+// cluster, where a file counts only once the replicated manifest knows it.
+func (s *StorageWalkSource) AppendRefs(ctx context.Context, m Measurement, keys []string, sizes map[string]int64) (refs []FileRef, ok bool, err error) {
+	if s.manifestKnows != nil {
+		return nil, false, nil
+	}
+	prefix := m.Database + "/" + m.Measurement + "/"
+	// The measurement's prefix, as the listing asks: a job is matched by its
+	// output's path, and a daily output has no hour directory.
+	var leaveOut map[string]struct{}
+	if s.exclusions != nil {
+		excluded, err := s.exclusions.ExcludedForStrict(ctx, prefix)
+		if err != nil {
+			return nil, false, fmt.Errorf("files Arc's reads leave out under %s/%s: %w", m.Database, m.Measurement, err)
+		}
+		leaveOut = make(map[string]struct{}, len(excluded))
+		for _, k := range excluded {
+			leaveOut[filepath.ToSlash(k)] = struct{}{}
+		}
+	}
+	for _, key := range keys {
+		key = filepath.ToSlash(key)
+		if !strings.HasPrefix(key, prefix) || !isDataFile(key) {
+			continue
+		}
+		if _, skip := leaveOut[key]; skip {
+			continue
+		}
+		if s.deletedHere != nil && s.deletedHere(key) {
+			continue
+		}
+		uri, err := s.resolver.Resolve(key)
+		if err != nil {
+			return nil, false, fmt.Errorf("reported file %q has no usable storage path: %w", key, err)
+		}
+		lp := s.resolver.LocalPath(key)
+		// On an object store the flush's own size is used and the file is
+		// not asked for (#1778): a HEAD per file, one after another, was a
+		// fifth of an append's requests. A file that is gone, or whose
+		// stored length differs, is found by the read of its footer, which
+		// checks the length (readTail). A local file is still stat'ed.
+		size, present := sizes[key], true
+		if lp != "" || size <= 0 {
+			if size, present, err = s.statSize(ctx, key, lp); err != nil {
+				return nil, false, fmt.Errorf("stat reported file %q: %w", key, err)
+			}
+		}
+		if !present {
+			continue
+		}
+		refs = append(refs, FileRef{PhysicalPath: uri, SizeBytes: size, Key: key, LocalPath: lp})
+	}
+	return refs, true, nil
 }

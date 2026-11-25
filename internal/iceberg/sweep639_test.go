@@ -29,7 +29,7 @@ func TestWarehouseRelKey_SymlinkedWarehouseResolves(t *testing.T) {
 	// Warehouse configured through the SYMLINK; metadata location rendered
 	// through the REAL path (how a resolved writer would emit it). Raw string
 	// comparison never matches these; resolution must.
-	e := &Exporter{warehouse: "file://" + filepath.ToSlash(link)}
+	e := &Exporter{exporterShared: &exporterShared{warehouse: "file://" + filepath.ToSlash(link)}, passState: newPassState()}
 	metaLoc := "file://" + filepath.ToSlash(filepath.Join(real, "arc_db.db", "cpu", "metadata", "v3.metadata.json"))
 
 	rel, ok := e.warehouseRelKey(metaLoc)
@@ -56,7 +56,8 @@ func TestHardenLocalMetadataPerms_TightenOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	e := &Exporter{logger: zerolog.Nop()}
+	// Hardening only runs inside the configured warehouse (#1616).
+	e := &Exporter{exporterShared: &exporterShared{logger: zerolog.Nop(), warehouse: localFileURI(filepath.Join(base, "wh"))}, passState: newPassState()}
 	e.hardenLocalMetadataPerms("file://" + filepath.ToSlash(wide))
 
 	if info, _ := os.Stat(wide); info.Mode().Perm() != 0o600 {
