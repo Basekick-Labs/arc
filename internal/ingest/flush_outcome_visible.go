@@ -331,6 +331,16 @@ func WaitVisible(ctx context.Context, o *FlushOutcome, w VisibleWait) VisibleVer
 		}
 		f := newVisibleForcing(o, w)
 		defer f.stop()
+		if f != nil {
+			// Seal's token: the first round runs below, so a second one
+			// back to back would only ask an over-budget key again. The
+			// loop re-reads Resolved before every sleep, and a later
+			// resolution sends a new token.
+			select {
+			case <-v.changed:
+			default:
+			}
+		}
 	wait:
 		for !o.Resolved() && !v.overResolved.Load() {
 			// A forcing round before each sleep, the first one included:
@@ -404,9 +414,11 @@ func newVisibleForcing(o *FlushOutcome, w VisibleWait) *visibleForcing {
 // detach takes a key's whole slice: once this write's batches of a key were
 // sent (by this force or by another detach) or are not buffered, none will be
 // again. NotDue keeps it until its due time. OverBudget keeps it with no
-// timer: it is asked again only at a later round (a batch of this write
-// resolved, or another key's due time), never in a loop, and otherwise waits
-// for its natural flush. LedgerOff and Closing end forcing for this wait.
+// timer, and ends the round with the keys after it kept un-asked: the budget
+// is the node's, so they would be refused too. They are asked at a later
+// round (a batch of this write resolved, or a key's due time), never in a
+// loop, and otherwise wait for their natural flush. LedgerOff and Closing end
+// forcing for this wait.
 func (f *visibleForcing) round() <-chan time.Time {
 	if f == nil || len(f.live) == 0 {
 		return nil
@@ -414,7 +426,8 @@ func (f *visibleForcing) round() <-chan time.Time {
 	now := time.Now()
 	var next time.Time
 	kept := f.live[:0]
-	for _, k := range f.live {
+keys:
+	for i, k := range f.live {
 		if !k.due.IsZero() && now.Before(k.due) {
 			kept = append(kept, k)
 			next = earliest(next, k.due)
@@ -429,6 +442,13 @@ func (f *visibleForcing) round() <-chan time.Time {
 		case OverBudget:
 			k.due = time.Time{}
 			kept = append(kept, k)
+			for _, rest := range f.live[i+1:] {
+				kept = append(kept, rest)
+				if !rest.due.IsZero() && now.Before(rest.due) {
+					next = earliest(next, rest.due)
+				}
+			}
+			break keys
 		case LedgerOff, Closing:
 			f.live = nil
 			return nil

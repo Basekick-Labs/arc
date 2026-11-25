@@ -270,12 +270,54 @@ func TestVisibleForceOverBudgetWaitsForTheAgeFlush1759(t *testing.T) {
 	if n := cf.count(Forced); n != 0 {
 		t.Fatalf("%d forced while the only slot was held", n)
 	}
-	if n := cf.callsOf("db/m"); n > 2 {
-		t.Fatalf("m asked %d times during one wait: an over-budget key is asked again only at a later round, never in a loop", n)
+	if n := cf.callsOf("db/m"); n != 1 {
+		t.Fatalf("m asked %d times during one wait, want once: an over-budget key is asked again only at a later round (none came: no batch of this write resolved before the age flush), never in a loop", n)
 	}
 	if n := f.buf.countDeferredBuffers(); n != 0 {
 		t.Fatalf("%d buffers deferred by forcing", n)
 	}
+}
+
+// One over-budget key ends the round: the budget is the node's, so the keys
+// after it are kept un-asked, and over_budget counts once per round, not
+// once per key.
+func TestVisibleForceOverBudgetEndsTheRound1759(t *testing.T) {
+	o := NewVisibleOutcome(time.Now(), false, 0)
+	visibleBatch(o, 3, true)
+	keys := []string{"db/k0", "db/k1", "db/k2", "db/k3", "db/k4"}
+	for _, k := range keys {
+		noteVisibleKey(o, k)
+	}
+	var result atomic.Int32
+	result.Store(int32(OverBudget))
+	cf := newCountingForcer(forcerFunc(func() ForceResult { return ForceResult(result.Load()) }))
+	go func() {
+		for i := 0; i < 3; i++ {
+			time.Sleep(40 * time.Millisecond)
+			if i == 2 {
+				result.Store(int32(NotWanted)) // the budget allows again
+			}
+			o.vis.signal()
+		}
+	}()
+	if v := forceWait(o, 3, cf, time.Second, 300*time.Millisecond); v.Reason != VisibleReasonTimeout {
+		t.Fatalf("%+v", v)
+	}
+	if n := cf.callsOf("db/k0"); n != 4 {
+		t.Fatalf("k0 asked %d times, want 4: once per round (the first, then three signals)", n)
+	}
+	for _, k := range keys[1:] {
+		if n := cf.callsOf(k); n != 1 {
+			t.Fatalf("%s asked %d times, want once: never in a round where k0 was over budget, then once the budget allowed", k, n)
+		}
+	}
+}
+
+// forcerFunc answers every call with what its function returns.
+type forcerFunc func() ForceResult
+
+func (f forcerFunc) ForceFlushKey(string, time.Duration, ForceSource, func([]interface{}) bool) (ForceResult, time.Time) {
+	return f(), time.Time{}
 }
 
 // B6: a wait that forces keeps all four exits and the re-check of an outcome
