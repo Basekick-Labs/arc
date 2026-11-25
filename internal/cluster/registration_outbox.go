@@ -1037,6 +1037,26 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 			}
 		}
 	}
+	// What re-home jobs and fenced compactions hold, read BEFORE the storage
+	// checks: a job or a compaction removes the object, then lets go. Read
+	// only after, one that let go between the two would leave a stat taken
+	// while the object was still there to register a file that is gone
+	// (#1857). The checks in the loop stay, for a hold taken after this read.
+	rehomed, _ := manifest.(rehomeOwnedChecker)
+	fenced, _ := manifest.(fencedOwnedChecker)
+	ownedBefore := map[*outboxEntry]bool{} // the file itself: settles
+	heldBefore := map[*outboxEntry]bool{}  // a rewrite's source, or fenced: waits
+	for _, e := range candidates {
+		if rehomed != nil && rehomed.RehomeOwnsPath(e.rec.Path) {
+			ownedBefore[e] = true
+		}
+		if rehomed != nil && e.rec.Supersedes != "" && rehomed.RehomeOwnsPath(e.rec.Supersedes) {
+			heldBefore[e] = true
+		}
+		if fenced != nil && (fenced.CompactionFencedOwns(e.rec.Path) || (e.rec.Supersedes != "" && fenced.CompactionFencedOwns(e.rec.Supersedes))) {
+			heldBefore[e] = true
+		}
+	}
 	sizes, statErrs := r.statAll(ctx, store, toCheck)
 
 	var ops []raft.BatchFileOp
@@ -1048,7 +1068,6 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 	// an input of a compaction this FSM has not caught up with yet, so sync
 	// first, once per attempt; a fresh entry costs no barrier (#1358 review).
 	consumed, _ := manifest.(consumedInputChecker)
-	rehomed, _ := manifest.(rehomeOwnedChecker)
 	if consumed != nil && len(toCheck) > 0 && !synced {
 		bctx, cancel := context.WithTimeout(ctx, outboxAttemptTimeout)
 		synced = manifest.SyncManifest(bctx) == nil
@@ -1075,14 +1094,14 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 		// One superseding an owned file (a DELETE rewrite of a job's source)
 		// waits: the job reverts when it sees the rewrite, and the batch
 		// must not carry a refused op meanwhile.
-		if rehomed != nil && rehomed.RehomeOwnsPath(e.rec.Path) {
+		if ownedBefore[e] || (rehomed != nil && rehomed.RehomeOwnsPath(e.rec.Path)) {
 			r.markInManifest(e)
 			r.logger.Warn().Str("path", e.rec.Path).
 				Msg("Pending file is owned by a re-home job; not registered again (the job registered it, or removed it)")
 			settled = append(settled, e)
 			continue
 		}
-		if rehomed != nil && e.rec.Supersedes != "" && rehomed.RehomeOwnsPath(e.rec.Supersedes) {
+		if rehomed != nil && e.rec.Supersedes != "" && (heldBefore[e] || rehomed.RehomeOwnsPath(e.rec.Supersedes)) {
 			deferred = append(deferred, e)
 			continue
 		}
@@ -1091,8 +1110,8 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 		// and the whole batch with it. Deferred, not settled: once the job
 		// ends the entry settles (a consumed input, or an object gone) or
 		// registers.
-		if fenced, ok := manifest.(fencedOwnedChecker); ok && (fenced.CompactionFencedOwns(e.rec.Path) ||
-			(e.rec.Supersedes != "" && fenced.CompactionFencedOwns(e.rec.Supersedes))) {
+		if heldBefore[e] || (fenced != nil && (fenced.CompactionFencedOwns(e.rec.Path) ||
+			(e.rec.Supersedes != "" && fenced.CompactionFencedOwns(e.rec.Supersedes)))) {
 			deferred = append(deferred, e)
 			continue
 		}
