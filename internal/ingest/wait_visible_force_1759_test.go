@@ -303,8 +303,11 @@ func TestVisibleForceOverBudgetEndsTheRound1759(t *testing.T) {
 	if v := forceWait(o, 3, cf, time.Second, 300*time.Millisecond); v.Reason != VisibleReasonTimeout {
 		t.Fatalf("%+v", v)
 	}
-	if n := cf.callsOf("db/k0"); n != 4 {
-		t.Fatalf("k0 asked %d times, want 4: once per round (the first, then three signals)", n)
+	// The first round, then per signal: a round after a resolution and, while
+	// k0 is over budget, its one short retry (the slot may be the one the
+	// resolving flush has not released yet). 1 + 2 + 2 + 1.
+	if n := cf.callsOf("db/k0"); n != 6 {
+		t.Fatalf("k0 asked %d times, want 6: the first round, then per signal one round plus, while over budget, one retry", n)
 	}
 	for _, k := range keys[1:] {
 		if n := cf.callsOf(k); n != 1 {
@@ -673,4 +676,58 @@ func forcedFlushCount(t *testing.T, source, result string) int64 {
 	}
 	n, _ := strconv.ParseInt(m[1], 10, 64)
 	return n
+}
+
+// M0 of the (b) review: this write's own forced flush settles and wakes the
+// wait before its forced slot is released (runQueuedFlushTask releases it in
+// a defer, after the settle signals). A key over budget in the round that
+// settle wakes gets one short retry, which then finds the slot free. The
+// forcer models it: k2 is over budget on calls 1 and 2, forced from call 3.
+type ownSettleForcer struct {
+	mu    sync.Mutex
+	calls map[string]int
+	o     *FlushOutcome
+}
+
+func (s *ownSettleForcer) settleOne(after time.Duration) {
+	go func() {
+		time.Sleep(after)
+		s.o.vis.settledRows.Add(3)
+		s.o.vis.settledBatches.Add(1)
+		s.o.vis.signal()
+	}()
+}
+
+func (s *ownSettleForcer) ForceFlushKey(key string, _ time.Duration, _ ForceSource, _ func([]interface{}) bool) (ForceResult, time.Time) {
+	s.mu.Lock()
+	s.calls[key]++
+	n := s.calls[key]
+	s.mu.Unlock()
+	if key == "db/k1" {
+		s.settleOne(20 * time.Millisecond) // k1's forced flush settles a moment later
+		return Forced, time.Time{}
+	}
+	if n <= 2 {
+		return OverBudget, time.Time{}
+	}
+	s.settleOne(5 * time.Millisecond)
+	return Forced, time.Time{}
+}
+
+func TestVisibleForceRetriesAfterItsOwnSettle1759(t *testing.T) {
+	o := NewVisibleOutcome(time.Now(), false, 0)
+	visibleBatch(o, 3, true)
+	noteVisibleKey(o, "db/k1")
+	visibleBatch(o, 3, true)
+	noteVisibleKey(o, "db/k2")
+	sf := &ownSettleForcer{calls: map[string]int{}, o: o}
+	v := forceWait(o, 6, sf, time.Second, 2*time.Second)
+	sf.mu.Lock()
+	defer sf.mu.Unlock()
+	if !v.Visible || v.Waited > 500*time.Millisecond {
+		t.Fatalf("k2 not retried once the slot its own k1 flush held was freed: %+v (calls %v)", v, sf.calls)
+	}
+	if n := sf.calls["db/k2"]; n != 3 {
+		t.Fatalf("k2 asked %d times, want 3: over budget in round 1, again in the round k1's settle woke, then once on the short retry", n)
+	}
 }

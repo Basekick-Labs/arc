@@ -341,13 +341,16 @@ func WaitVisible(ctx context.Context, o *FlushOutcome, w VisibleWait) VisibleVer
 			default:
 			}
 		}
+		resolved := false // the last wake-up was a batch of o resolving
 	wait:
 		for !o.Resolved() && !v.overResolved.Load() {
 			// A forcing round before each sleep, the first one included:
 			// an idle key has no flush coming to wake the wait.
-			dueC := f.round()
+			dueC := f.round(resolved)
+			resolved = false
 			select {
 			case <-v.changed:
+				resolved = true
 			case <-dueC:
 			case <-timer.C:
 				ended = VisibleReasonTimeout
@@ -419,7 +422,14 @@ func newVisibleForcing(o *FlushOutcome, w VisibleWait) *visibleForcing {
 // round (a batch of this write resolved, or a key's due time), never in a
 // loop, and otherwise wait for their natural flush. LedgerOff and Closing end
 // forcing for this wait.
-func (f *visibleForcing) round() <-chan time.Time {
+//
+// afterResolution: the round was woken by a batch of this write resolving.
+// That batch's flush may be this write's own forced one, and its forced slot
+// is released only after the settle that woke the wait (runQueuedFlushTask's
+// deferred releaseForcedTask), so an over-budget answer then may be that very
+// slot. Such a round arms one retry after visibleForceMinDelay; the retry
+// round is not after a resolution and arms none, so the calls stay O(rounds).
+func (f *visibleForcing) round(afterResolution bool) <-chan time.Time {
 	if f == nil || len(f.live) == 0 {
 		return nil
 	}
@@ -447,6 +457,9 @@ keys:
 				if !rest.due.IsZero() && now.Before(rest.due) {
 					next = earliest(next, rest.due)
 				}
+			}
+			if afterResolution {
+				next = earliest(next, now.Add(visibleForceMinDelay))
 			}
 			break keys
 		case LedgerOff, Closing:
