@@ -16,7 +16,9 @@ The export of a table then follows within `iceberg.ingest_export_interval` (60 s
 as on a standalone node. Measured on a three-node cluster with local storage, a row written on one
 node was in the exporting node's table 58 seconds after its flush at the default (8 seconds with the
 interval at 10, under a second for a table's first file), against 276–300 seconds before. On local
-storage, rows written on the exporting node itself still wait for its timed pass (#1902).
+storage, rows written on the exporting node itself follow the same interval too
+([#1902](https://github.com/Basekick-Labs/arc/issues/1902)): on local storage every node's own
+flushes ask for the export, and the nodes that do not export drop the request.
 `iceberg.ingest_export_interval = 0` keeps the timed passes only.
 
 ## Change: a re-home job checks it can write the Iceberg table before it starts ([#1845](https://github.com/Basekick-Labs/arc/issues/1845) item 3)

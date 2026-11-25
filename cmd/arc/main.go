@@ -5213,12 +5213,15 @@ func main() {
 			// starts, like the path requests above: a scheduler that never
 			// starts would only collect them.
 			//
-			// Not from a cluster node's own flushes. There the node that
-			// flushes is usually not the one that exports (its request would
-			// be dropped at the gate), and on the exporter a request served
-			// before the file's registration lands costs a Raft barrier. A
-			// cluster node reports the files that reach it instead (#1756,
-			// SetIcebergFileArrived below).
+			// On a cluster node the files that reach it from other nodes
+			// report (#1756, SetIcebergFileArrived below), and its own
+			// flushes only on local storage (#1902): the node that flushes is
+			// usually not the one that exports, and the gate drops its
+			// request, but on the exporter its own files are otherwise left
+			// to the timed pass. Not on a shared bucket: there every node's
+			// registration already reports as an arrival, the exporter's own
+			// included, and a request served before that registration lands
+			// would cost a Raft barrier.
 			if clusterCoordinator != nil && icebergArrivalInterval(cfg.Iceberg.IngestExportInterval, true) > 0 {
 				// #1756: a file that reaches this node from another (pulled
 				// onto local storage, or registered in a shared bucket) asks
@@ -5236,7 +5239,7 @@ func main() {
 					icebergScheduler.RequestIngestReconcile(database, measurement)
 				})
 			}
-			if icebergIngestInterval(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil) > 0 {
+			if icebergOwnFlushReports(cfg.Iceberg.IngestExportInterval, clusterCoordinator != nil, storageBackend.Type()) {
 				if cfg.Iceberg.IngestAppendEnabled {
 					// The append path (#1751): each file the flush registers
 					// is named to the export, which adds just those. Reported
