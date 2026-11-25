@@ -147,6 +147,17 @@ longer than 16. With the Iceberg export, failover and replication on local stora
 so every node but the first was refused ("join rejected: authentication failed" on the joiner, "join capabilities exceed
 their bounds" on the member) and the cluster never formed. The limit is now 64; a node lists at most
 18 today. No released version had the limit.
+## Fix: a node that gets the Iceberg export back without restarting exports a current table ([#1903](https://github.com/Basekick-Labs/arc/issues/1903))
+
+**Who is affected:** clusters on local storage with the Iceberg export on, whose compactor lease moves
+between nodes (failover, or `POST /api/v1/cluster/compactor/assign`).
+
+While another node held the lease, a node dropped its own ingest export requests, and files its table
+named could go away (compaction inputs, retention, DELETE). When the lease came back, the next file it
+flushed was appended to the table as the node had left it: the published table then named the files
+that were gone and missed the ones written while another node exported, until the next timed pass
+(`iceberg.reconcile_interval`, 5 minutes by default). Now the first export of each table after the
+lease returns is a full pass, which brings the table in line with the node's files.
 
 
 

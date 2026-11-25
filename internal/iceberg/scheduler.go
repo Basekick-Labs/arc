@@ -808,7 +808,12 @@ func (s *Scheduler) noteOutcome(key string, outcome reconcileOutcome) {
 
 // gateOpen reports whether this node may export now. On the first open check
 // after a closed one it drops every cached cold listing: one kept from an
-// earlier turn as exporter has missed the cold removals since.
+// earlier turn as exporter has missed the cold removals since. It also takes
+// every table off the append path (#1903): while another node exported, this
+// node dropped its ingest reports and files its tables name may have gone
+// (compaction inputs, retention, DELETE), so an append would publish the table
+// as this node left it plus the new files. The next export of each table is a
+// pass, which diffs it against the listing; one that settles puts it back.
 func (s *Scheduler) gateOpen() bool {
 	if s.gate != nil && !s.gate.CanRun() {
 		s.wasGated = true
@@ -819,6 +824,7 @@ func (s *Scheduler) gateOpen() bool {
 		if ci, ok := s.source.(coldInvalidator); ok {
 			ci.InvalidateCold("")
 		}
+		clear(s.appendOK)
 	}
 	return true
 }
