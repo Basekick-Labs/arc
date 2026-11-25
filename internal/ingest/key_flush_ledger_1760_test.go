@@ -672,3 +672,42 @@ func TestKeyFlushLedger_RecordDetachOfAKnownKeyDoesNotAllocate(t *testing.T) {
 		t.Fatalf("recordDetach of a known key allocates %.1f per call; the per-detach cost with the ledger on must be a leaf lock and a map write", allocs)
 	}
 }
+
+// The due check and the budget take no shard lock: with the key's shard
+// write-locked by someone else, a not-due or over-budget call still returns
+// at once. (A busy visible writer's rounds end at the due check, V-M3; a
+// budget check under shard.mu could self-deadlock, L-a.)
+func TestForceFlushKey_DueAndBudgetChecksTakeNoShardLock(t *testing.T) {
+	f := newForceFixture(t, forceConfig(4, 8), &ForceBudget{})
+	key := "db/k"
+	shard := f.buf.getShard(key)
+	l := f.buf.ledger.Load()
+
+	call := func(name string, want ForceResult) {
+		t.Helper()
+		shard.mu.Lock()
+		done := make(chan ForceResult, 1)
+		go func() {
+			r, _ := f.force(key, nil)
+			done <- r
+		}()
+		select {
+		case r := <-done:
+			shard.mu.Unlock()
+			if r != want {
+				t.Fatalf("%s: got %v, want %v", name, r, want)
+			}
+		case <-time.After(2 * time.Second):
+			shard.mu.Unlock()
+			<-done
+			t.Fatalf("%s: ForceFlushKey waited for the shard lock; this check must take none", name)
+		}
+	}
+
+	l.recordDetach(key, 1)
+	call("not due", NotDue)
+
+	f.clock.Advance(time.Minute)
+	l.noteDeferral()
+	call("over budget (recent deferral)", OverBudget)
+}
