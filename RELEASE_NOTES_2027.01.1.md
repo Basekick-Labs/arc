@@ -20,6 +20,8 @@ is installed again on every start, so the value was printed on every start too.
 
 No new configuration keys.
 
+Contributed by [@branson404](https://github.com/branson404) in [#1917](https://github.com/Basekick-Labs/arc/pull/1917).
+
 ## Fix: a rejected `auth.bootstrap_token` stops Arc instead of leaving it with no admin token ([#1915](https://github.com/Basekick-Labs/arc/issues/1915))
 
 **Action required on upgrade** if `auth.bootstrap_token` (`ARC_AUTH_BOOTSTRAP_TOKEN`) is set to a value shorter than 32 bytes once surrounding whitespace is removed, with auth on. Arc now refuses to start with that value, where it used to log `Failed to create initial admin token` at every start and run on. Such a value has never been installed: every path that stores a token requires 32 bytes. So a deployment that runs today uses another token, and the short value can simply be removed, or replaced with a 32-byte one (`openssl rand -hex 32`). A Helm install that passes the value through `existingSecret` is not checked at render time: its pods stop at startup with the message instead.
