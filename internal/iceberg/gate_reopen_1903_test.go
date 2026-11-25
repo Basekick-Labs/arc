@@ -244,3 +244,46 @@ func TestGateReopenAbortedPromptPassIsRetried(t *testing.T) {
 		t.Fatalf("no table pass after the aborted prompt pass (listings +%d)", got)
 	}
 }
+
+// #1903 with #1886's shutdown drain: a role that came back while the loop was
+// already stopping is first seen by DrainStopped's gate check. The drain must
+// take that table off the append path too, or it appends the last flushed
+// file onto the table as this node left it.
+func TestGateReopenFirstSeenByTheShutdownDrainDoesNotAppend(t *testing.T) {
+	r := newAppendRig(t)
+	gate := &atomicGate{}
+	gate.on.Store(true)
+	r.sched = NewScheduler(SchedulerConfig{Exporter: r.exp, Source: r.src, Interval: time.Hour, Logger: r.sched.logger,
+		IngestInterval: time.Millisecond, IngestAppend: true, Gate: gate})
+	r.sched.started = time.Now().Add(-time.Second)
+	first := r.settled()
+
+	// Another node exports: the report is dropped and a file goes away.
+	gate.on.Store(false)
+	gap := r.newFile()
+	r.report(gap)
+	r.serve()
+	if err := os.Remove(filepath.Join(r.root, filepath.FromSlash(appendDir+first))); err != nil {
+		t.Fatal(err)
+	}
+
+	// Shutdown starts while the gate is still closed: the loop ends having
+	// exported nothing.
+	r.sched.Start()
+	if !r.sched.StopWithin(5 * time.Second) {
+		t.Fatal("the loop did not stop")
+	}
+
+	// The role comes back, and the final flush reports one more file.
+	gate.on.Store(true)
+	fresh := r.newFile()
+	before := r.listings()
+	r.report(fresh)
+	if n := r.sched.DrainStopped(context.Background()); n != 1 {
+		t.Fatalf("drain exported %d tables, want 1", n)
+	}
+	r.wantOnce(gap, fresh)
+	if got := r.listings() - before; got != 1 {
+		t.Fatalf("the drain's export after the role returned listed the measurement %d times, want 1 (a pass)", got)
+	}
+}
