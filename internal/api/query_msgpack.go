@@ -144,6 +144,9 @@ func executeArrowMsgPackQuery(
 			cancel()
 		}
 		if errors.Is(err, context.Canceled) && h.shuttingDown() {
+			// Shutdown cancelled it (#1644); onFail records it as cancelled
+			// in the registry. The metrics count a failed execution, as on
+			// every query route (#1292), so success + errors = requests holds.
 			m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			if onFail != nil {
 				onFail("server shutting down")

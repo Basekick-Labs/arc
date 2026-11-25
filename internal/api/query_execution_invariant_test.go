@@ -57,7 +57,7 @@ func TestQueryExecutionOutcomeInvariant(t *testing.T) {
 			check(q, 200, true)
 			arm("11")
 			check(q, 503, false)
-			if tc.name == "arrow_json" || tc.name == "msgpack" {
+			if tc.name == "arrow_json" || tc.name == "msgpack" || tc.name == "plain_json" {
 				before := queryMetricInt(t, "query_latency_count")
 				check("SELECT COUNT(*) FROM db1.nothing_here", 200, true)
 				require.Equal(t, before+1, queryMetricInt(t, "query_latency_count"))

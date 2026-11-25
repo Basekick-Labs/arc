@@ -2,6 +2,37 @@
 
 > **Status:** Planned — January 2027 release.
 
+## New: query latency and outcomes per engine (DuckDB, arcx) ([#1292](https://github.com/Basekick-Labs/arc/pull/1292), [#823](https://github.com/Basekick-Labs/arc/issues/823))
+
+**Who is affected:** anyone scraping Arc's Prometheus metrics, or reading `/api/v1/metrics`.
+
+Two new metrics:
+
+- `arc_query_engine_executions_total{engine,outcome}`: query executions by engine (`duckdb`,
+  `arcx`) and outcome (`success`, `error`). In the JSON metrics: `query_engine_executions`.
+- `arc_query_latency_seconds{engine}`: a latency histogram per engine, failures included, with
+  buckets from 1 ms to 30 s. Before, query latency was only a lifetime average.
+
+They count queries that reached an engine. A request refused earlier (validation, permissions, the
+SQL transform) appears only in `arc_query_requests_total` and `arc_query_errors_total`, so the sum
+of `arc_query_engine_executions_total` can be lower than `arc_query_requests_total` by design.
+
+Existing counters change too, so that `arc_query_success_total + arc_query_errors_total` matches
+`arc_query_requests_total` on every query route. Dashboards built on them may move after the
+upgrade:
+
+- An Arrow IPC query that times out before its stream starts now also counts as an error.
+- An empty result (a measurement with no data) counts as a success on every route and goes into
+  the lifetime latency average. Before, the Arrow-JSON and MessagePack routes counted it as neither,
+  and the JSON route left it out of the average.
+- A query that shutdown cancels counts as an error on every route. Before, only the JSON route
+  counted it. The query registry still records it as cancelled.
+- A response whose final flush fails now counts as a failed query and a client disconnect.
+- A stream that panics before it finishes counts once as a failure; a panic after the outcome was
+  recorded does not count the query again.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1292](https://github.com/Basekick-Labs/arc/pull/1292). Thank you.
+
 ## Fix: an import whose rows had no WAL copy answers only once they are stored, and fails if they were not ([#1888](https://github.com/Basekick-Labs/arc/issues/1888))
 
 A bulk import (Line Protocol, CSV, Parquet, TLE) answers once its rows are handed to the flush; the files follow as the flushes finish. With a WAL copy of every row that is a durable answer, because a failed flush is replayed from the WAL. Rows without a WAL copy are held only in memory, and a failed flush loses them. That happens with the WAL off (the default) or when a queued-mode WAL dropped the append. The import had already answered 200, and nothing told the client.
@@ -9380,22 +9411,6 @@ The fan-out is removed: the hours a query selects are read in one
 one). `/api/v1/query/arrow` was not affected. The query-management API still
 reports `is_parallel` and `partition_count`; they are now always `false` and
 omitted.
-
-### Query execution metrics distinguish DuckDB and Arcx
-
-Prometheus now exports `arc_query_engine_executions_total{engine,outcome}` and
-`arc_query_latency_seconds{engine}`, including failed executions. These count
-only requests that reach an engine; earlier validation, permission and SQL
-transform failures remain in the aggregate request and error counters. Thus
-engine executions can be fewer than `arc_query_requests_total`.
-
-Arrow IPC pre-stream timeouts now also count as query errors. Empty Arrow-JSON
-and MessagePack results now count as successes and contribute to aggregate
-latency. Stream panics before completion and final response flush failures
-count as failures; a panic after a recorded outcome does not count the same
-execution again. Existing dashboards using these counters may change after upgrading.
-
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1292](https://github.com/Basekick-Labs/arc/pull/1292).
 
 ### A new hour is queryable at its first flush; DELETE, retention and database delete no longer break query results
 

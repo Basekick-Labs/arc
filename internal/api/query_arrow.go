@@ -868,6 +868,10 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			})
 		}
 		if ctxErr == context.Canceled && h.endedByShutdown(queryID) {
+			// Shutdown cancelled it (#1644): the registry records it as
+			// cancelled, and the metrics as a failed execution, as on every
+			// query route (#1292), so success + errors = requests holds.
+			m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			h.logger.Warn().Str("sql", sqlutil.ForLog(req.SQL)).Str("query_id", queryID).Msg("Arrow query cancelled at shutdown")
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 				"success": false,

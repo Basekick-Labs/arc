@@ -2914,7 +2914,9 @@ localProcessing:
 		if kind == noFilesEmpty {
 			h.logger.Info().Str("sql", sqlutil.ForLog(req.SQL)).Msg("No files found for measurement, returning empty result")
 			m.IncQuerySuccess()
-			m.RecordQueryEngineExecution(metrics.QueryEngineDuckDB, true, time.Since(start).Microseconds())
+			// As the Arrow-JSON and MessagePack paths: an empty result is a
+			// completed execution, in the lifetime average too (#1292).
+			m.RecordQueryLatencyForEngine(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			if h.queryRegistry != nil && queryID != "" {
 				h.queryRegistry.Complete(queryID, 0)
 			}
