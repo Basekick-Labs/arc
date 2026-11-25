@@ -29,6 +29,9 @@ func TestLoad_WaitVisibleMinInterval1759(t *testing.T) {
 		{name: "on, interval at the age", env: map[string]string{
 			"ARC_INGEST_WAIT_VISIBLE_ENABLED": "true", "ARC_INGEST_WAIT_VISIBLE_MIN_INTERVAL_MS": "5000",
 		}, want: 5000},
+		{name: "on, age 0: no interval warning", env: map[string]string{
+			"ARC_INGEST_WAIT_VISIBLE_ENABLED": "true", "ARC_INGEST_MAX_BUFFER_AGE_MS": "0",
+		}, want: 5000},
 		{name: "off, interval above the age: no warning", env: map[string]string{
 			"ARC_INGEST_WAIT_VISIBLE_MIN_INTERVAL_MS": "6000",
 		}, want: 6000},

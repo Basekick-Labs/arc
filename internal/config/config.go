@@ -4001,7 +4001,9 @@ func waitVisibleWarnings(cfg *Config) []LoadWarning {
 			Message: fmt.Sprintf("ingest.max_buffer_age_ms is above %d with ingest.wait_visible_enabled = true: a write carrying x-arc-wait: visible that cannot flush its measurement early (flushed within ingest.wait_visible_min_interval_ms, or no spare flush capacity) waits for its rows' age or size flush, at most 20 s, so on a measurement that does not reach ingest.max_buffer_size within the age it can be answered 202 (timeout) instead of 204", waitVisibleMaxBufferAgeMS),
 		})
 	}
-	if iv := cfg.Ingest.WaitVisibleMinIntervalMS; iv > cfg.Ingest.MaxBufferAgeMS {
+	// At an age <= 0 (never validated) every sweep flushes every buffer, so
+	// the comparison means nothing.
+	if iv := cfg.Ingest.WaitVisibleMinIntervalMS; cfg.Ingest.MaxBufferAgeMS > 0 && iv > cfg.Ingest.MaxBufferAgeMS {
 		out = append(out, LoadWarning{
 			Key:     "ingest.wait_visible_min_interval_ms",
 			Value:   strconv.Itoa(iv),
