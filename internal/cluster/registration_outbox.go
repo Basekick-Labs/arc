@@ -1037,6 +1037,19 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 			}
 		}
 	}
+	// Which rewrites a re-home job holds, read BEFORE the storage checks: a
+	// job removes the object, then ends. Read after, a job that ended between
+	// the two would leave a stat taken while the object was still there to
+	// register a file that is gone (#1857).
+	rehomed, _ := manifest.(rehomeOwnedChecker)
+	heldBefore := map[*outboxEntry]bool{}
+	if rehomed != nil {
+		for _, e := range candidates {
+			if e.rec.Supersedes != "" && rehomed.RehomeOwnsPath(e.rec.Supersedes) {
+				heldBefore[e] = true
+			}
+		}
+	}
 	sizes, statErrs := r.statAll(ctx, store, toCheck)
 
 	var ops []raft.BatchFileOp
@@ -1048,7 +1061,6 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 	// an input of a compaction this FSM has not caught up with yet, so sync
 	// first, once per attempt; a fresh entry costs no barrier (#1358 review).
 	consumed, _ := manifest.(consumedInputChecker)
-	rehomed, _ := manifest.(rehomeOwnedChecker)
 	if consumed != nil && len(toCheck) > 0 && !synced {
 		bctx, cancel := context.WithTimeout(ctx, outboxAttemptTimeout)
 		synced = manifest.SyncManifest(bctx) == nil
@@ -1082,7 +1094,7 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 			settled = append(settled, e)
 			continue
 		}
-		if rehomed != nil && e.rec.Supersedes != "" && rehomed.RehomeOwnsPath(e.rec.Supersedes) {
+		if rehomed != nil && e.rec.Supersedes != "" && (heldBefore[e] || rehomed.RehomeOwnsPath(e.rec.Supersedes)) {
 			deferred = append(deferred, e)
 			continue
 		}
