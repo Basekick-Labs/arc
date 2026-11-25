@@ -2,6 +2,12 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: a single-hour flush registers its file in tiered storage after a slow write or at shutdown ([#1933](https://github.com/Basekick-Labs/arc/issues/1933))
+
+**Who is affected:** tiered storage (`tiered_storage.enabled`).
+
+A flush whose rows all fall in one hour recorded its file in the tiering metadata with the context its storage write had used. When that write outlasted `ingest.flush_timeout` but completed, or completed as shutdown cancelled the flush, the record failed with only a warning, and the file had no hot tier row until the next tier scan (at start-up and each migration cycle, daily by default). On a measurement whose tier rows were all cold, reads left out local files, so its new rows stayed invisible until then. The record now runs on its own context, as the multi-hour path's already did ([#1693](https://github.com/Basekick-Labs/arc/issues/1693)). A record that still fails for another reason is unchanged: a warning, and the next scan registers the file.
+
 ## Fix: an import whose rows had no WAL copy answers only once they are stored, and fails if they were not ([#1888](https://github.com/Basekick-Labs/arc/issues/1888))
 
 **Who is affected:** nobody on a released version. In 26.09.x an import flushed every buffer on the node before it answered. This release made imports answer once their rows are handed to the flush (#1296, #1429), and this fix closes the gap that change opened before it shipped.

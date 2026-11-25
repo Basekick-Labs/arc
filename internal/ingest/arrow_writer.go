@@ -5512,8 +5512,16 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 		observePublishDelay(merged.bufferedAt)
 		b.registerFieldSchema(ctx, database, measurement, fileSchema, sorted.TagColumns, storagePath)
 
-		// Register file in tiering metadata for query routing
-		b.registerFileInTiering(ctx, database, measurement, storagePath, minTime, int64(len(parquetData)), parquetSumHex, groupCoverage(group, 1))
+		// Register file in tiering metadata for query routing. On a fresh
+		// context, as the multi-hour path does (#1698/#1700): the file's
+		// context has been spent on the PUT, and a slow one must not starve
+		// the tiering record. Nor cancelled with the flush: a PUT that
+		// completed as Close's budget ran out (LocalBackend ignores its
+		// context) is stored. Without the row, the file is left out of a
+		// cold-only measurement's reads until the next tier scan.
+		regCtx, cancelReg := b.fileContext(context.WithoutCancel(ctx))
+		b.registerFileInTiering(regCtx, database, measurement, storagePath, minTime, int64(len(parquetData)), parquetSumHex, groupCoverage(group, 1))
+		cancelReg()
 
 		b.totalRecordsWritten.Add(int64(recordCount))
 		b.totalFlushes.Add(1)
