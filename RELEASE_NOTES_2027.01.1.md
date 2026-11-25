@@ -17,6 +17,7 @@ Now an import tracks its own rows through the flush:
 - **The TLE import now flushes its own measurement instead of the whole node.** A node-wide flush cut every other writer's buffers into small files, and failed the import on any of their errors.
 
 Measured on a laptop, local storage, WAL off. Five Line Protocol files of 1M rows, imported one after another, went from 8.67 s to 9.08 s, about 5%: an import's tail flush no longer overlaps the next file's parsing. Imported five at a time (`ingest.import_write_concurrency = 4`), it took 3.1–3.3 s either way, with the same memory.
+
 ## New: a REST catalog table load can wait for the files written before it ([#1752](https://github.com/Basekick-Labs/arc/issues/1752))
 
 **Who is affected:** deployments that read Arc's tables through its Iceberg REST catalog and set the new key. Off by default.
