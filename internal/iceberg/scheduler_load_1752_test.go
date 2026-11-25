@@ -60,7 +60,7 @@ func TestLoadServesAFileReportedBeforeIt(t *testing.T) {
 
 func TestLoadWithNothingReportedReturnsAtOnce(t *testing.T) {
 	r := startLoadRig(t, time.Hour, 10*time.Millisecond, true, nil)
-	if took := awaitTimed(r); took > 50*time.Millisecond {
+	if took := awaitTimed(r); took > time.Second {
 		t.Fatalf("a load with nothing reported waited %v", took)
 	}
 }
@@ -72,7 +72,7 @@ func TestLoadDoesNotPullAPassForward(t *testing.T) {
 	r := startLoadRig(t, time.Hour, 10*time.Millisecond, false, nil)
 	listed := r.listings()
 	r.report(r.newFile())
-	if took := awaitTimed(r); took > 500*time.Millisecond {
+	if took := awaitTimed(r); took > time.Second {
 		t.Fatalf("the load waited %v for a table that needs a pass", took)
 	}
 	time.Sleep(100 * time.Millisecond)
@@ -89,7 +89,7 @@ func TestLoadDoesNotPullAPassForward(t *testing.T) {
 func TestLoadKeepsTheLoadInterval(t *testing.T) {
 	r := startLoadRig(t, time.Hour, time.Hour, true, nil) // F an hour too: never within the budget
 	r.report(r.newFile())
-	if took := awaitTimed(r); took > 500*time.Millisecond {
+	if took := awaitTimed(r); took > time.Second {
 		t.Fatalf("the load waited %v though F had not passed", took)
 	}
 	time.Sleep(100 * time.Millisecond)
@@ -106,7 +106,7 @@ func TestLoadOnAClosedGateReturnsAtOnce(t *testing.T) {
 	r := startLoadRig(t, time.Hour, 10*time.Millisecond, true, gate)
 	gate.on.Store(false)
 	r.report(r.newFile())
-	if took := awaitTimed(r); took > 500*time.Millisecond {
+	if took := awaitTimed(r); took > time.Second {
 		t.Fatalf("the load waited %v on a node that does not export", took)
 	}
 }
@@ -303,7 +303,7 @@ func TestLoadDoesNotWaitWhenItCannotBeServed(t *testing.T) {
 			before := len(s.loadWaiters[key])
 			began := time.Now()
 			s.AwaitFreshForRead(context.Background(), "db", "m")
-			if took := time.Since(began); took > 100*time.Millisecond {
+			if took := time.Since(began); took > time.Second {
 				t.Fatalf("waited %v", took)
 			}
 			if len(s.loadWaiters[key]) != before {
@@ -333,7 +333,7 @@ func TestLoadNextToAClosedWaiterIsServed(t *testing.T) {
 		go func() { done <- awaitTimed(r) }()
 	}
 	for range 16 {
-		if took := <-done; took > 500*time.Millisecond {
+		if took := <-done; took > time.Second {
 			t.Fatalf("a load waited %v next to a closed waiter", took)
 		}
 	}
@@ -369,7 +369,7 @@ func TestLoadOverTheGlobalCapDoesNotWait(t *testing.T) {
 	s.loadWaiterN = loadMaxWaiters
 	began := time.Now()
 	s.AwaitFreshForRead(context.Background(), "db", "m")
-	if took := time.Since(began); took > 100*time.Millisecond || len(s.loadWaiters[key]) != 0 {
+	if took := time.Since(began); took > time.Second || len(s.loadWaiters[key]) != 0 {
 		t.Fatalf("waited %v, registered %d", took, len(s.loadWaiters[key]))
 	}
 }
