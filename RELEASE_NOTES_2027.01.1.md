@@ -148,6 +148,15 @@ so every node but the first was refused ("join rejected: authentication failed" 
 their bounds" on the member) and the cluster never formed. The limit is now 64; a node lists at most
 18 today. No released version had the limit.
 
+**Upgrading a cluster that runs an earlier main build with such a configuration.** That build
+refuses more than 16, and this one lists 17 for the same configuration, so a member restarted on
+this build is refused by the members still on the earlier one. Measured on three nodes on local
+storage with replication, the Iceberg export and failover, restarted one at a time (compactor,
+writer, reader): the compactor left the cluster and answered neither writes nor queries until the
+writer had been restarted too; then all three were healthy with all their rows, without
+intervention. The only procedure tested end to end is restarting all the nodes together: all three
+rejoined with every row, and the Iceberg table matched the files. No release has the limit.
+
 ## Fix: a node that gets the Iceberg export back without restarting exports a current table ([#1903](https://github.com/Basekick-Labs/arc/issues/1903))
 
 **Who is affected:** clusters on local storage with the Iceberg export on, whose compactor lease moves
