@@ -111,8 +111,9 @@ type Scheduler struct {
 	// (naming files gone meanwhile) for up to the interval, while the REST
 	// catalog already serves it again. runPass clears it.
 	passOnReopen bool
-	// gatePoll is how often the loop asks the gate while nothing else does, so
-	// that it sees the role move away and come back without traffic (#1903).
+	// gatePoll is how often the loop asks the gate on its own, so that it sees
+	// the role move away and come back without any traffic (#1903). Zero turns
+	// the poll off (tests).
 	gatePoll time.Duration
 
 	// busySince is when each measurement last stopped making progress while busy: the first busy
@@ -823,7 +824,8 @@ func (s *Scheduler) noteOutcome(key string, outcome reconcileOutcome) {
 // node dropped its ingest reports and files its tables name may have gone
 // (compaction inputs, retention, DELETE), so an append would publish the table
 // as this node left it plus the new files. The next export of each table is a
-// pass, which diffs it against the listing; one that settles puts it back.
+// pass, which diffs it against the listing; a pass that reconciles the table
+// puts it back on the append path.
 func (s *Scheduler) gateOpen() bool {
 	if s.gate != nil && !s.gate.CanRun() {
 		s.wasGated = true
@@ -868,10 +870,13 @@ func (s *Scheduler) loop(ctx context.Context) {
 	// Run one pass shortly after start so a fresh deployment publishes promptly.
 	partial := s.runPass(ctx)
 	// A Timer reset AFTER each pass (rather than a Ticker) guarantees a full interval of idle
-	// between passes. With a Ticker, a pass that runs longer than the interval (slow disk, many
-	// files) would queue ticks and cause back-to-back passes with no breathing room — starving
-	// I/O and, in cluster mode, competing with the write path. The reconciler is idempotent, so
-	// a slightly-later next pass is always safe.
+	// between timed passes. With a Ticker, a pass that runs longer than the interval (slow disk,
+	// many files) would queue ticks and cause back-to-back passes with no breathing room —
+	// starving I/O and, in cluster mode, competing with the write path. The reconciler is
+	// idempotent, so a slightly-later next pass is always safe. The one exception is the export
+	// role coming back to this node (passOnReopen, #1903): that pass runs at once, since the
+	// REST catalog serves this node's tables again from that moment; how often it can happen is
+	// bounded by how fast the compactor lease moves.
 	next := s.interval
 	if partial {
 		next = s.partialRetryInterval()
@@ -892,8 +897,9 @@ func (s *Scheduler) loop(ctx context.Context) {
 	for {
 		s.armIngestTimer(ingestTimer)
 		if s.passOnReopen {
-			// The role came back (seen here or by a request): pass now.
-			// Leaving it set, runPass clears it after its own gate check.
+			// The role came back (seen here, by a request or by a pass):
+			// pass now. runPass clears the flag on entry, whatever it then
+			// does, so a paused or gated pass cannot make this spin.
 			timer.Reset(0)
 		}
 		select {
@@ -901,8 +907,9 @@ func (s *Scheduler) loop(ctx context.Context) {
 			return
 		case <-s.wake:
 			// A request between passes: serve it now. The timer is not
-			// touched, so the next timed pass keeps its time however many
-			// requests come in. Drops first: they run whatever the gate.
+			// touched here, so the next timed pass keeps its time however
+			// many requests come in (a reopen a request sees is acted on at
+			// the top of the loop). Drops first: they run whatever the gate.
 			// Ingest requests last, and only the ones already due.
 			if s.pausedForRestore() {
 				continue
@@ -1105,6 +1112,9 @@ func (s *Scheduler) runPass(ctx context.Context) (partial bool) {
 		if s.gate != nil && !s.gate.CanRun() {
 			s.logger.Info().Msg("Iceberg reconcile: this node stopped being the active writer mid-pass; stopping the pass")
 			clear(s.busySince)
+			// Seen closed, as gateOpen would record it: a reopen then runs
+			// a pass again, even one no poll or request saw close (#1903).
+			s.wasGated = true
 			return false
 		}
 		if len(batch) == 1 {

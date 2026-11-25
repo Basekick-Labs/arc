@@ -150,16 +150,20 @@ their bounds" on the member) and the cluster never formed. The limit is now 64; 
 ## Fix: a node that gets the Iceberg export back without restarting exports a current table ([#1903](https://github.com/Basekick-Labs/arc/issues/1903))
 
 **Who is affected:** clusters on local storage with the Iceberg export on, whose compactor lease moves
-between nodes (failover, or `POST /api/v1/cluster/compactor/assign`).
+between nodes: by failover (such a cluster forms only with [#1914](https://github.com/Basekick-Labs/arc/issues/1914)),
+or by `POST /api/v1/cluster/compactor/assign`, which also moves a lease left from an earlier failover
+setup.
 
 While another node held the lease, a node dropped its own ingest export requests, and files its table
 named could go away (compaction inputs, retention, DELETE). When the lease came back, the next file it
-flushed was appended to the table as the node had left it: the published table then named the files
-that were gone and missed the ones written while another node exported, until the next timed pass
-(`iceberg.reconcile_interval`, 5 minutes by default). A table nobody wrote to stayed as the node
+flushed or received was appended to the table as the node had left it: the published table then named
+the files that were gone and missed the ones written while another node exported, until the next timed
+pass (`iceberg.reconcile_interval`, 5 minutes by default). A table nobody wrote to stayed as the node
 had left it for up to that long too, while the node's REST catalog already served it again. Now the
-node checks the lease every 5 seconds even when idle, and when it comes back runs a full pass at once
-instead of appending, which brings every table in line with the node's files.
+node checks the lease every 5 seconds even when idle, and when it gets it runs a full pass at once
+instead of appending, which brings every table in line with the node's files. That includes a node
+taking the lease for the first time; on a shared bucket that is the lease holder's pass of every table,
+run when it takes the lease instead of at its next timed pass.
 
 
 

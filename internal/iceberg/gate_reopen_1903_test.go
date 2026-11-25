@@ -1,6 +1,7 @@
 package iceberg
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -50,9 +51,44 @@ func TestGateReopenDoesNotAppendOntoAStaleTable(t *testing.T) {
 	}
 }
 
-type atomicGate struct{ on atomic.Bool }
+// atomicGate is a gate the test flips while the loop runs; calls counts the
+// checks, so a test can wait until the loop has seen a change.
+type atomicGate struct {
+	on    atomic.Bool
+	calls atomic.Int64
+}
 
-func (g *atomicGate) CanRun() bool { return g.on.Load() }
+func (g *atomicGate) CanRun() bool { g.calls.Add(1); return g.on.Load() }
+
+// gateFunc adapts a func to WriterGate.
+type gateFunc func() bool
+
+func (f gateFunc) CanRun() bool { return f() }
+
+// startGated starts a scheduler on the rig with gate g, a poll of poll and the
+// timed interval given, and waits for its start-up pass.
+func startGated(t *testing.T, r *appendRig, src FileSetSourceWithSchema, g WriterGate, interval, poll time.Duration) {
+	t.Helper()
+	r.sched = NewScheduler(SchedulerConfig{Exporter: r.exp, Source: src, Interval: interval, Logger: r.sched.logger,
+		IngestInterval: time.Millisecond, IngestAppend: true, Gate: g})
+	r.sched.started = time.Now().Add(-time.Second)
+	r.sched.gatePoll = poll
+	r.newFile()
+	r.sched.Start()
+	t.Cleanup(r.sched.Stop)
+	waitUntil(t, "the start-up pass did not run", func() bool { return r.listings() >= 1 })
+}
+
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal(what)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
 
 // #1903: with no traffic at all, the loop still sees the role leave and come
 // back, and runs a pass at once rather than at the next tick (an hour here),
@@ -61,35 +97,134 @@ func TestGateReopenRunsAPassWithoutWaitingForTheTimer(t *testing.T) {
 	r := newAppendRig(t)
 	gate := &atomicGate{}
 	gate.on.Store(true)
-	r.sched = NewScheduler(SchedulerConfig{Exporter: r.exp, Source: r.src, Interval: time.Hour, Logger: r.sched.logger,
-		IngestInterval: time.Millisecond, IngestAppend: true, Gate: gate})
-	r.sched.started = time.Now().Add(-time.Second)
-	r.sched.gatePoll = 10 * time.Millisecond
-	r.newFile()
-	r.sched.Start()
-	t.Cleanup(r.sched.Stop)
-	waitFor := func(what string, cond func() bool) {
-		t.Helper()
-		deadline := time.Now().Add(5 * time.Second)
-		for !cond() {
-			if time.Now().After(deadline) {
-				t.Fatal(what)
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
-	}
-	waitFor("the start-up pass did not run", func() bool { return r.listings() >= 1 })
+	startGated(t, r, r.src, gate, time.Hour, 10*time.Millisecond)
 	afterStart := r.listings()
 
 	gate.on.Store(false)
-	time.Sleep(100 * time.Millisecond) // several polls see it closed
+	// Ten polls' worth: the gate's call count cannot tell a poll from the
+	// canRun checks of work still running from the start-up pass, and a
+	// close that no gateOpen saw is, correctly, no reopen.
+	time.Sleep(100 * time.Millisecond)
 	if got := r.listings(); got != afterStart {
 		t.Fatalf("listed %d times while another node exported", got-afterStart)
 	}
 	gate.on.Store(true)
-	waitFor("no pass after the role came back (the next tick is an hour away)", func() bool { return r.listings() > afterStart })
+	waitUntil(t, "no pass after the role came back (the next tick is an hour away)", func() bool { return r.listings() > afterStart })
 	time.Sleep(100 * time.Millisecond)
 	if got := r.listings() - afterStart; got != 1 {
 		t.Fatalf("%d passes after one reopen, want 1", got)
+	}
+}
+
+// A reopen first seen by a timed pass's own gate check is answered by that
+// pass: no second pass right after it.
+func TestGateReopenSeenByATimedPassRunsOnePass(t *testing.T) {
+	r := newAppendRig(t)
+	gate := &atomicGate{}
+	gate.on.Store(true)
+	startGated(t, r, r.src, gate, 300*time.Millisecond, 0) // only timed passes ask the gate
+	gate.on.Store(false)
+	time.Sleep(400 * time.Millisecond) // past the 300 ms interval: a timed pass saw it closed
+	base := r.listings()
+	gate.on.Store(true)
+	waitUntil(t, "no pass after the reopen", func() bool { return r.listings() > base })
+	time.Sleep(100 * time.Millisecond) // well inside the 300 ms interval
+	if got := r.listings() - base; got != 1 {
+		t.Fatalf("%d passes right after a reopen seen by the timed pass, want 1", got)
+	}
+}
+
+// A reopen whose prompt pass finds the gate closed again must not make the
+// loop ask for a pass at once, forever.
+func TestGateReopenThenClosedAgainDoesNotSpin(t *testing.T) {
+	r := newAppendRig(t)
+	var mode atomic.Int32 // 0 open, 1 closed, 2 open for one check then closed
+	var calls atomic.Int64
+	gate := gateFunc(func() bool {
+		calls.Add(1)
+		switch mode.Load() {
+		case 0:
+			return true
+		case 2:
+			return mode.CompareAndSwap(2, 1)
+		}
+		return false
+	})
+	startGated(t, r, r.src, gate, time.Hour, 10*time.Millisecond)
+	mode.Store(1)
+	time.Sleep(50 * time.Millisecond)
+	mode.Store(2) // a poll sees it open once; the prompt pass finds it closed
+	waitUntil(t, "the reopen was never seen", func() bool { return mode.Load() == 1 })
+	before := calls.Load()
+	time.Sleep(200 * time.Millisecond)
+	if got := calls.Load() - before; got > 100 {
+		t.Fatalf("gate asked %d times in 200 ms: the loop spins", got)
+	}
+}
+
+// A reopen seen while a restore holds the export paused runs the paused
+// runPass once, not at once forever.
+func TestGateReopenUnderRestorePauseDoesNotSpin(t *testing.T) {
+	r := newAppendRig(t)
+	gate := &atomicGate{}
+	gate.on.Store(true)
+	startGated(t, r, r.src, gate, time.Hour, 10*time.Millisecond)
+	resume, err := r.exp.PauseExportForRestore(context.Background(), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(resume)
+	gate.on.Store(false)
+	time.Sleep(50 * time.Millisecond)
+	gate.on.Store(true)
+	time.Sleep(50 * time.Millisecond)
+	before := lagGeneration(r.exp)
+	time.Sleep(200 * time.Millisecond)
+	if got := lagGeneration(r.exp) - before; got > 5 {
+		t.Fatalf("the paused pass ran %d times in 200 ms: the loop spins", got)
+	}
+}
+
+// lagGeneration counts clearLastLag calls, which a paused runPass makes.
+func lagGeneration(e *Exporter) uint64 {
+	e.lag.mu.Lock()
+	defer e.lag.mu.Unlock()
+	return uint64(e.lag.gen)
+}
+
+// armingSource makes the gate answer closed once, at the pass's mid-pass check,
+// when armed: the pass lists measurements, then checks the gate per batch.
+type armingSource struct {
+	*recordingSource
+	failNext *atomic.Bool
+	arm      atomic.Bool
+}
+
+func (a *armingSource) Measurements(ctx context.Context) ([]Measurement, error) {
+	if a.arm.CompareAndSwap(true, false) {
+		a.failNext.Store(true)
+	}
+	return a.recordingSource.Measurements(ctx)
+}
+
+// The prompt pass is stopped by the mid-pass gate check, and the lease is back
+// before any poll or request saw it gone: a pass must still follow, or idle
+// tables stay as this node left them until the next tick.
+func TestGateReopenAbortedPromptPassIsRetried(t *testing.T) {
+	r := newAppendRig(t)
+	var on, failNext atomic.Bool
+	on.Store(true)
+	src := &armingSource{recordingSource: r.src, failNext: &failNext}
+	gate := gateFunc(func() bool { return on.Load() && !failNext.CompareAndSwap(true, false) })
+	startGated(t, r, src, gate, time.Hour, 10*time.Millisecond)
+	base := r.listings()
+	on.Store(false)
+	time.Sleep(60 * time.Millisecond)
+	src.arm.Store(true)
+	on.Store(true)
+	waitUntil(t, "the prompt pass never listed measurements", func() bool { return !src.arm.Load() })
+	time.Sleep(300 * time.Millisecond)
+	if got := r.listings() - base; got < 1 {
+		t.Fatalf("no table pass after the aborted prompt pass (listings +%d)", got)
 	}
 }
