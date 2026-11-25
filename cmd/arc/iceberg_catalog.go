@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"time"
 
 	"github.com/basekick-labs/arc/internal/api"
@@ -75,10 +74,10 @@ func registerIcebergRESTCatalog(app *fiber.App, exporter *iceberg.Exporter, auth
 // wireIcebergGlue builds the Glue sync (#1690 option B) and returns the
 // export's start function extended to start it: the sync runs only where and
 // when the export runs, on the export's own gate (nil: standalone, always).
-// The exporter reports each publish to it; the shutdown hook cancels
-// in-flight Glue calls.
+// The exporter reports each publish to it. At shutdown it stops after the
+// export's final drain and syncs what that drain published (#1886).
 func wireIcebergGlue(exporter *iceberg.Exporter, backend storage.Backend, gate iceberg.WriterGate, gcfg config.IcebergGlueConfig,
-	layout string, sc *shutdown.Coordinator, start func()) func() {
+	layout string, sc *shutdown.Coordinator, shutdownTimeout time.Duration, start func()) func() {
 	region := iceberg.GlueRegion(backend, gcfg.Region)
 	client, err := iceberg.NewGlueClient(backend, region)
 	if err != nil {
@@ -111,10 +110,7 @@ func wireIcebergGlue(exporter *iceberg.Exporter, backend storage.Backend, gate i
 	log.Warn().Msg("Iceberg Glue sync: Glue accepts writes, and " + where + ". Give Athena, Spark and every other Glue consumer read-only " +
 		"S3 access to Arc's bucket and leave Glue table optimizers off: a DROP TABLE ... PURGE, VACUUM or orphan-file cleanup run " +
 		"through Glue would delete Arc's data")
-	sc.RegisterHook("iceberg-glue", func(ctx context.Context) error {
-		gs.Stop()
-		return nil
-	}, shutdown.PriorityDatabase)
+	registerIcebergGlueShutdown(sc, &icebergGlueShutdown{flush: gs.Flush, timeout: shutdownTimeout})
 	return func() {
 		if start != nil {
 			start()

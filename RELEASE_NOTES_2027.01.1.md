@@ -2,6 +2,26 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: files flushed at shutdown reach the Iceberg table, and Glue, before Arc exits ([#1886](https://github.com/Basekick-Labs/arc/issues/1886))
+
+On SIGTERM, ingest's final flush writes what is still buffered. The Iceberg export had already stopped by then, so the files from that flush were not added to their tables. Files waiting for their next ingest export (up to `iceberg.ingest_export_interval`, 60 s by default) were left out too. The tables stayed behind the bucket until Arc started again; on a node that does not come back (decommissioned, scaled away) they stayed behind. Glue, stopped earlier still, never learned of a version published that late.
+
+Now, at shutdown:
+
+- The export's loop stops early, as before, so no timed pass competes with the final flush.
+- Once the buffer and the WAL have closed, the export serves what is queued, including the final flush's files. Each table is tried once and whatever its next export was due; at most one more version per table.
+- Glue syncs what that published. Then the export's own catalog database closes.
+
+This uses what is left of `server.shutdown_timeout` after the buffer's close. A tenth of it is kept for the closes that follow, plus a twentieth for Glue when Glue is on. Nothing is taken from the HTTP drain. The default `server.shutdown_timeout` (30 s) is unchanged: the final flush usually needs a fraction of it, and the drain's appends take milliseconds per table.
+
+What the drain does not do:
+
+- **It does not run a full pass.** A table whose export would need one gets it at the next start, as before. Typically that is a table being exported for the first time, or one with `iceberg.ingest_append_enabled = false` and little time left. A pass reads file footers only with more than 20 s before its deadline.
+- **It does nothing with `iceberg.ingest_export_interval = 0`.** That setting means "export on the timer only", so flushes report nothing to it.
+- **It does nothing on a cluster node that does not export.** The exporting node drains its own queue. On a shared bucket it first catches up with the cluster manifest, so the last registrations' files are queued.
+
+Verified with a binary on S3 (SeaweedFS): two writes ten seconds apart, then SIGTERM straight after the second. Before, the second file was in the bucket and not in the table when Arc exited. Now it is in the table, with the drain taking about 10 ms. The same holds with the WAL on (`ack_mode = durable`), with `iceberg.ingest_export_interval = 300`, with `iceberg.ingest_append_enabled = false`, and with `server.shutdown_timeout = 5`.
+
 ## Fix: Arc no longer prints the admin token you configured at startup ([#1883](https://github.com/Basekick-Labs/arc/issues/1883))
 
 **Who is affected:** anyone who sets `auth.bootstrap_token` (`ARC_AUTH_BOOTSTRAP_TOKEN`), with or without
@@ -58,6 +78,7 @@ version"). After a pass of its own, the export now takes the catalog's commit as
 On a cluster, nodes that do not export answer from the discovery files only, so in this layout a
 job still waits at them, as before: re-home with the warehouse outside the storage root is a
 standalone fix.
+
 
 
 

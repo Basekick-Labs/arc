@@ -5261,15 +5261,32 @@ func main() {
 				clusterCoordinator.SetIcebergPathCallbacks(icebergScheduler.RequestReconcilePathsHot, icebergScheduler.RequestReconcilePathsLater, icebergScheduler.RequestReconcilePaths)
 			}
 		}
-		shutdownCoordinator.RegisterHook("iceberg", func(ctx context.Context) error {
-			icebergScheduler.Stop()
-			// Close only a handle this block opened. A borrowed one belongs to
-			// the auth manager, which closes it at PriorityAuth.
-			if icebergOwnsDB {
-				return icebergDB.Close()
+		// #1886: the loop stops in a hook, the final flush's files are
+		// exported by a component after the WAL, Glue flushes after that,
+		// and the export's own SQLite handle closes last (iceberg_shutdown.go).
+		// A borrowed handle belongs to the auth manager, which closes it at
+		// PriorityAuth.
+		icebergStop := &icebergShutdown{
+			sched:   icebergScheduler,
+			timeout: shutdownTimeout,
+			glue:    cfg.Iceberg.Glue.Enabled,
+			logger:  logger.Get("iceberg"),
+		}
+		if clusterCoordinator != nil && (cfg.Cluster.SharedStorageMode || cluster.IsSharedObjectStore(storageBackend)) {
+			// A follower exporter learns of the final flush's files (its own
+			// included) from its FSM apply: catch up before draining.
+			coord := clusterCoordinator
+			icebergStop.before = func(ctx context.Context) {
+				if err := coord.SyncManifest(ctx); err != nil {
+					log.Debug().Err(err).Msg("Iceberg export: manifest sync before the final export failed; exporting what is queued")
+				}
 			}
-			return nil
-		}, shutdown.PriorityDatabase)
+		}
+		var closeIcebergDB func() error
+		if icebergOwnsDB {
+			closeIcebergDB = icebergDB.Close
+		}
+		registerIcebergShutdown(shutdownCoordinator, icebergStop, closeIcebergDB)
 		log.Info().Str("warehouse", warehouse).Int("interval_s", cfg.Iceberg.ReconcileInterval).Msg("Iceberg export enabled")
 		if cfg.Iceberg.RESTCatalogEnabled {
 			registerIcebergRESTCatalog(server.GetApp(), exporter, authManager, rbacManager, spokeRegistry, storageBackend,
@@ -5277,7 +5294,7 @@ func main() {
 		}
 		// #1690 option B: Glue sync starts and stops with the export.
 		if cfg.Iceberg.Glue.Enabled {
-			icebergStart = wireIcebergGlue(exporter, storageBackend, icebergGate, cfg.Iceberg.Glue, cfg.Iceberg.Layout, shutdownCoordinator, icebergStart)
+			icebergStart = wireIcebergGlue(exporter, storageBackend, icebergGate, cfg.Iceberg.Glue, cfg.Iceberg.Layout, shutdownCoordinator, shutdownTimeout, icebergStart)
 		}
 	}
 
