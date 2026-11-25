@@ -1137,6 +1137,10 @@ type TypedColumnBatch struct {
 	// An entry accepted and then failed by an async WAL writer still reads as
 	// a copy; that failure is logged by the WAL writer.
 	hasWALCopy bool
+	// outcome is the import this batch belongs to, if any (#1888,
+	// flush_outcome.go): a failed flush adds its rows without a WAL copy to
+	// it. nil for live writes.
+	outcome *FlushOutcome
 	// Coverage is the batch's coverage id on a coverage-enabled writer, or the
 	// pieces of a replayed covered entry (#1207). See coverage.go.
 	Coverage []CoveragePiece
@@ -3788,6 +3792,9 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 	// Hold lock ONLY to extract records, flush outside lock
 	var shouldFlush, flushDeferred bool
 
+	// Looked up before the lock: a context chain walk (#1888).
+	outcome := flushOutcomeFrom(ctx)
+
 	shard.mu.Lock()
 
 	// Schema evolution detection: flush buffer if columns changed.
@@ -3867,6 +3874,9 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 	if trackedPrep != nil {
 		walErr = commitTrackedLocked(trackedPrep, typedColumns)
 	}
+	// An import's batch carries its outcome (#1888): the LP import writes
+	// here when decimal columns are configured.
+	countOutcome(outcome, typedColumns, numRecords)
 
 	// Add typed columns to buffer (already converted via zero-copy fast paths)
 	shard.buffers[bufferKey] = append(shard.buffers[bufferKey], typedColumns)
@@ -4088,6 +4098,9 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 
 	var shouldFlush, flushDeferred bool
 
+	// Looked up before the lock: a context chain walk (#1888).
+	outcome := flushOutcomeFrom(ctx)
+
 	shard.mu.Lock()
 
 	// Schema evolution detection: see flushOnSchemaChangeLocked.
@@ -4162,6 +4175,9 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 	if trackedPrep != nil {
 		walErr = commitTrackedLocked(trackedPrep, typedColumns)
 	}
+	// An import's batch carries its outcome (#1888), counted after the
+	// commit, which can still clear hasWALCopy.
+	countOutcome(outcome, typedColumns, numRecords)
 
 	// Add typed columns to buffer directly (no conversion needed)
 	shard.buffers[bufferKey] = append(shard.buffers[bufferKey], typedColumns)
@@ -5196,7 +5212,8 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 	}
 	startTime := time.Now()
 	noWALRows := recordsWithoutWALCopy(records, recordCount)
-	var needParts []walNeedPart // #1635; read before the records are released
+	atRisk := outcomeRowsOf(records) // #1888; read before the records are released
+	var needParts []walNeedPart      // #1635; read before the records are released
 	if b.wal != nil {
 		needParts = walNeedPartsOf(records)
 	}
@@ -5212,7 +5229,7 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 
 	if err != nil {
 		b.logFlushFailure(err, bufferKey, recordCount, noWALRows)
-
+		noteOutcomeFailure(atRisk, err)
 		b.markFlushFailure()
 		group.failed()
 		return err
@@ -5225,6 +5242,7 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 		need, named := walNeedParts(needParts)
 		b.noteFailedWrite(err, need, named)
 		b.logFlushFailure(err, bufferKey, recordCount, noWALRows)
+		noteOutcomeFailure(atRisk, err)
 		b.markFlushFailure()
 		group.failed()
 		return err
@@ -5856,6 +5874,7 @@ func (b *ArrowBuffer) flushPartSync(ctx context.Context, bufferKey, database, me
 	merged, err := b.mergeBatchesForFlush(measurement, p.records)
 	if err != nil {
 		b.logFlushFailure(err, bufferKey, p.rows, recordsWithoutWALCopy(p.records, p.rows))
+		noteOutcomeFailure(outcomeRowsOf(p.records), err)
 		b.markFlushFailure()
 		p.group.failed()
 		return fmt.Errorf("failed to merge batches: %w", err)
@@ -5866,6 +5885,7 @@ func (b *ArrowBuffer) flushPartSync(ctx context.Context, bufferKey, database, me
 		need, named := walNeedOf(p.records)
 		b.noteFailedWrite(err, need, named)
 		b.logFlushFailure(err, bufferKey, p.rows, recordsWithoutWALCopy(p.records, p.rows))
+		noteOutcomeFailure(outcomeRowsOf(p.records), err)
 		b.markFlushFailure()
 		p.group.failed()
 		return err
@@ -5990,6 +6010,7 @@ func (b *ArrowBuffer) writeExtracted(ctx context.Context, e *extractedFlush, buf
 	merged, err := b.mergeBatchesForFlush(measurement, recordsToFlush)
 	if err != nil {
 		b.logFlushFailure(err, bufferKey, recordCount, recordsWithoutWALCopy(recordsToFlush, recordCount))
+		noteOutcomeFailure(outcomeRowsOf(recordsToFlush), err)
 		b.markFlushFailure()
 		group.failed()
 		completeTask()
@@ -6004,6 +6025,7 @@ func (b *ArrowBuffer) writeExtracted(ctx context.Context, e *extractedFlush, buf
 		need, named := walNeedOf(recordsToFlush)
 		b.noteFailedWrite(err, need, named)
 		b.logFlushFailure(err, bufferKey, recordCount, recordsWithoutWALCopy(recordsToFlush, recordCount))
+		noteOutcomeFailure(outcomeRowsOf(recordsToFlush), err)
 		b.markFlushFailure()
 		group.failed()
 		completeTask()
@@ -7751,6 +7773,7 @@ drain:
 			noWAL := recordsWithoutWALCopy(task.records, task.recordCount)
 			flushCtx, flushCancel, ok := b.closeFlushContext(deadline)
 			if !ok {
+				noteOutcomeFailure(outcomeRowsOf(task.records), nil)
 				b.finishQueuedFlushTask(task)
 				b.releaseFlushTask(task)
 				mu.Lock()

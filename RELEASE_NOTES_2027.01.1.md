@@ -2,6 +2,22 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: an import whose rows had no WAL copy answers only once they are stored, and fails if they were not ([#1888](https://github.com/Basekick-Labs/arc/issues/1888))
+
+A bulk import (Line Protocol, CSV, Parquet, TLE) answers once its rows are handed to the flush; the files follow as the flushes finish. With a WAL copy of every row that is a durable answer, because a failed flush is replayed from the WAL. Rows without a WAL copy are held only in memory, and a failed flush loses them. That happens with the WAL off (the default) or when a queued-mode WAL dropped the append. The import had already answered 200, and nothing told the client.
+
+Now an import tracks its own rows through the flush:
+
+- **If every row has a WAL copy, the import answers at once, as before.**
+- **If any row had no WAL copy, the import waits for the flushes holding its rows**, including the ones its size-triggered writes started on the workers, before it answers.
+  - If one of those flushes failed, it answers 500: "failed to flush imported data; the rows were accepted and may still be stored, check before running the file again", with how many of its rows were at risk. "May still be stored" is meant: a flush can fail after storing some of its hour files, or a write that timed out can land anyway.
+  - If the server shuts down during the wait, it answers 500 saying the outcome is not known.
+  - The wait takes no barrier lock, so a DELETE or another flush barrier never waits behind it.
+- **Only the import's own rows count.** This covers the flushes the import runs itself: the final flush, and the flushes it runs while pacing behind the memory limit. Another writer's failed flush, even on the same measurement, does not fail an import whose rows were stored. Before, any failure in those flushes failed the import, whoever's rows were lost. With every row WAL-copied, a failed flush the import runs itself still fails it, as before.
+- **The TLE import now flushes its own measurement instead of the whole node.** A node-wide flush cut every other writer's buffers into small files, and failed the import on any of their errors.
+
+Measured on a laptop, local storage, WAL off. Five Line Protocol files of 1M rows, imported one after another, went from 8.67 s to 9.08 s, about 5%: an import's tail flush no longer overlaps the next file's parsing. Imported five at a time (`ingest.import_write_concurrency = 4`), it took 3.1–3.3 s either way, with the same memory.
+
 ## Fix: compaction stops at shutdown, and no compaction child outlives Arc ([#1887](https://github.com/Basekick-Labs/arc/issues/1887))
 
 Shutdown used to stop only the compaction schedulers. A cycle started with `POST /api/v1/compaction/trigger` kept running. The scheduler's stop waited for its running cycle with no bound, so a long batch could use up the whole shutdown budget. A compaction subprocess could also outlive Arc and run beside the replacement process, which treats that job's manifest as orphaned.
@@ -78,6 +94,7 @@ This uses what is left of `server.shutdown_timeout` after the buffer's close, le
 - **A pass that ignores cancellation.** The loop's stop is bounded. If a pass does not stop in time (for example, a cluster manifest barrier), the drain and the catalog close are skipped, and that pass may still be running while the components after it close.
 
 Verified with a binary on S3 (SeaweedFS): two writes ten seconds apart, then SIGTERM straight after the second. Before, the second file was in the bucket and not in the table when Arc exited; now it is in the table. The same holds with the WAL on (`ack_mode = durable`), with `iceberg.ingest_export_interval = 300`, with `iceberg.ingest_append_enabled = false`, and with `server.shutdown_timeout = 5`.
+
 
 ## Fix: Arc no longer prints the admin token you configured at startup ([#1883](https://github.com/Basekick-Labs/arc/issues/1883))
 

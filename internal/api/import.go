@@ -327,9 +327,10 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 	importedMeasurements := w.order
 
 	// Hand what is still buffered of the import to the flush, its write slot
-	// already free for the next import (#1429). The rows are in the buffer
-	// and the WAL (when enabled) already; files follow as their flushes
-	// finish, so a 200 does not mean every file is written.
+	// already free for the next import (#1429). Rows with a WAL copy are
+	// answered for at once, their files following as the flushes finish;
+	// rows without one are answered for once their flushes are done
+	// (#1888).
 	if err := w.finalFlush(c.Context()); err != nil {
 		h.totalErrors.Add(1)
 		h.logger.Error().Err(err).Str("database", database).Msg("LP import: flush failed")
@@ -563,7 +564,10 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 		return respondWriteRefused(c, aerr)
 	}
 	defer release()
-	if err := h.arrowBuffer.WriteTypedColumnarDirect(writeCtx, database, measurement, batch, numRecords); err != nil {
+	// The import's own outcome (#1888): its rows without a WAL copy are
+	// waited for below, and only a failure of those fails it.
+	outcome := &ingest.FlushOutcome{}
+	if err := h.arrowBuffer.WriteTypedColumnarDirect(ingest.WithFlushOutcome(writeCtx, outcome), database, measurement, batch, numRecords); err != nil {
 		h.totalErrors.Add(1)
 		if ingest.IsWriteRefusal(err) {
 			return respondWriteRefused(c, err) // logged by reason (#1268)
@@ -580,8 +584,12 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 		})
 	}
 
-	// Force flush to ensure data is persisted before returning
-	if err := h.arrowBuffer.FlushAll(c.Context()); err != nil {
+	// Flush this import's measurement, not the whole node: a node-wide flush
+	// cut every other writer's buffers into small files and failed this
+	// import on any of their flush errors. Then the same wait and verdict as
+	// the other imports (#1888).
+	flushErr := h.arrowBuffer.FlushMeasurements(c.Context(), database, []string{measurement})
+	if err := h.arrowBuffer.ImportVerdict(c.Context(), outcome, database, []string{measurement}, flushErr); err != nil {
 		h.totalErrors.Add(1)
 		h.logger.Error().Err(err).Str("database", database).Msg("TLE import: flush failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
