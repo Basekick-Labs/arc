@@ -545,6 +545,11 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// Arrow path incremented only arc_query_errors_total, so errors/requests
 	// could exceed 1 — or divide by zero — on an Arrow-only workload (#801).
 	m.IncQueryRequests()
+	decimalMode, err := requestDecimalMode(c)
+	if err != nil {
+		m.IncQueryErrors()
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"success": false, "error": err.Error()})
+	}
 
 	// A node that cannot serve queries (a compactor) forwards, as
 	// executeQuery does (#1567); with no peer that accepts a forwarded Arrow
@@ -806,6 +811,13 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// A synchronous panic is caught here, before Fiber's recover middleware.
 	// Without this guard its registry entry would remain running forever.
 	arcxHandled := func() bool {
+		// arcx serves integer sums as int64 (Arc's default decimal contract)
+		// and never produces a decimal column: an exact request (#1784) runs on
+		// DuckDB, so its stream matches the decimal128 schema a Flight SQL
+		// prepare reported.
+		if decimalMode == decimalModeExact {
+			return false
+		}
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				if arcxOnFail != nil {
@@ -918,11 +930,14 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			cancel()
 		}
 	}
-	peeked, overflow := peekDecimalOverflowGuarded(reader, governanceMaxRows, releaseResult, func() {
-		if h.queryRegistry != nil && queryID != "" {
-			h.queryRegistry.Fail(queryID, "handler panicked")
-		}
-	})
+	peeked, overflow := reader, error(nil)
+	if decimalMode != decimalModeExact {
+		peeked, overflow = peekDecimalOverflowGuarded(reader, governanceMaxRows, releaseResult, func() {
+			if h.queryRegistry != nil && queryID != "" {
+				h.queryRegistry.Fail(queryID, "handler panicked")
+			}
+		})
+	}
 	if overflow != nil {
 		releaseResult()
 		m.IncQueryErrors()
@@ -942,7 +957,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// Normalize decimal columns in the schema — DuckDB returns SUM(integer) as
 	// decimal(38,0) which many Arrow clients (e.g. Grafana) cannot handle.
 	// castInfo is nil when there are no decimal columns (zero overhead on hot path).
-	castInfo := normalizeDecimalSchema(schema)
+	castInfo := normalizeDecimalSchemaForMode(schema, decimalMode)
 	if castInfo != nil {
 		schema = castInfo.schema
 	}
@@ -1139,9 +1154,17 @@ type decimalCastInfo struct {
 // a decimalCastInfo with a substituted schema if any are found, or nil if
 // there are no decimal columns (zero overhead on the common path).
 //
-//   - decimal(x, 0) → int64  (SUM/COUNT of integers)
+//   - decimal(x, 0) → int64  (SUM/COUNT of integers), unless exact mode retains
+//     a precision greater than 18
 //   - decimal(x, y) → float64 (AVG or user-configured decimals)
 func normalizeDecimalSchema(schema *arrow.Schema) *decimalCastInfo {
+	return normalizeDecimalSchemaForMode(schema, decimalModeDefault)
+}
+
+// normalizeDecimalSchemaForMode retains wide integral decimals only when the
+// caller explicitly requested an exact Arrow result. All other decimal
+// columns keep the historical integer/float conversion.
+func normalizeDecimalSchemaForMode(schema *arrow.Schema, mode string) *decimalCastInfo {
 	hasDecimal := false
 	for i := 0; i < schema.NumFields(); i++ {
 		// Match the arrow.DecimalType interface, not *arrow.Decimal128Type:
@@ -1163,7 +1186,10 @@ func normalizeDecimalSchema(schema *arrow.Schema) *decimalCastInfo {
 	for i := 0; i < schema.NumFields(); i++ {
 		f := schema.Field(i)
 		if dt, ok := f.Type.(arrow.DecimalType); ok {
-			if dt.GetScale() == 0 {
+			if mode == decimalModeExact && dt.GetScale() == 0 && dt.GetPrecision() > 18 {
+				fields[i] = f
+				continue
+			} else if dt.GetScale() == 0 {
 				targets[i] = arrow.PrimitiveTypes.Int64
 			} else {
 				targets[i] = arrow.PrimitiveTypes.Float64

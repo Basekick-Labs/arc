@@ -2597,6 +2597,17 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 	if fresh {
 		defer freshExit(c, &flushed)
 	}
+	// After freshExit's defer, like the other request validation: a fresh
+	// request refused here is answered x-arc-freshness: false (#1760).
+	decimalMode, decimalModeErr := requestDecimalMode(c)
+	if decimalModeErr != nil {
+		m.IncQueryErrors()
+		return respondError(c, fiber.StatusBadRequest, decimalModeErr.Error(), timestamp, start)
+	}
+	if decimalMode == decimalModeExact {
+		m.IncQueryErrors()
+		return respondError(c, fiber.StatusBadRequest, "x-arc-decimals=exact is supported only for Arrow IPC and Flight SQL", timestamp, start)
+	}
 
 	// Check if this request should be forwarded to a reader/writer node
 	// Compactor nodes cannot process queries locally, so they forward to readers/writers
@@ -6731,6 +6742,21 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		if handled, err := forwardRead(c, h.router, o); handled {
 			return err
 		}
+	}
+
+	// A JSON route, as /api/v1/query: exact decimals are Arrow IPC and
+	// Flight SQL only (#1784).
+	if decimalMode, err := requestDecimalMode(c); err != nil || decimalMode == decimalModeExact {
+		msg := "x-arc-decimals=exact is supported only for Arrow IPC and Flight SQL"
+		if err != nil {
+			msg = err.Error()
+		}
+		m.IncQueryErrors()
+		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
+			Success:   false,
+			Error:     msg,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
 	}
 
 	measurement := c.Params("measurement")

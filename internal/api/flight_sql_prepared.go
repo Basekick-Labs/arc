@@ -42,7 +42,8 @@ type flightPreparedStatement struct {
 	SQL     string `json:"sql"`
 	// Database is the x-arc-database call header the prepare saw, as a
 	// statement ticket carries the one GetFlightInfo saw.
-	Database string `json:"database,omitempty"`
+	Database    string `json:"database,omitempty"`
+	DecimalMode string `json:"decimal_mode,omitempty"`
 }
 
 // flightPivotPattern finds a PIVOT (or its alias PIVOT_WIDER), statement-
@@ -87,11 +88,19 @@ func (s *flightSQLService) CreatePreparedStatement(ctx context.Context, req flig
 	if err != nil {
 		return flightsql.ActionCreatePreparedStatementResult{}, err
 	}
+	decimalMode, _, err := flightSQLDecimalMode(ctx)
+	if err != nil {
+		return flightsql.ActionCreatePreparedStatementResult{}, err
+	}
 	schema, err := s.preparedSchema(ctx, req.GetQuery(), database)
 	if err != nil {
 		return flightsql.ActionCreatePreparedStatementResult{}, err
 	}
-	handle, err := json.Marshal(flightPreparedStatement{Version: flightPreparedStatementVersion, SQL: req.GetQuery(), Database: database})
+	storedDecimalMode := ""
+	if decimalMode == decimalModeExact {
+		storedDecimalMode = decimalModeExact
+	}
+	handle, err := json.Marshal(flightPreparedStatement{Version: flightPreparedStatementVersion, SQL: req.GetQuery(), Database: database, DecimalMode: storedDecimalMode})
 	if err != nil {
 		return flightsql.ActionCreatePreparedStatementResult{}, status.Errorf(codes.Internal, "encode prepared statement handle: %v", err)
 	}
@@ -166,6 +175,9 @@ func decodeFlightPreparedStatement(handle []byte) (flightPreparedStatement, erro
 	if err := validateHeaderDatabase(statement.Database); err != nil {
 		return flightPreparedStatement{}, status.Error(codes.InvalidArgument, "invalid database in prepared statement handle")
 	}
+	if statement.DecimalMode != "" && statement.DecimalMode != decimalModeDefault && statement.DecimalMode != decimalModeExact {
+		return flightPreparedStatement{}, status.Error(codes.InvalidArgument, "invalid decimal mode in prepared statement handle")
+	}
 	return statement, nil
 }
 
@@ -179,6 +191,9 @@ func (s *flightSQLService) GetSchemaPreparedStatement(ctx context.Context, cmd f
 	}
 	database, err := flightStatementDatabase(ctx, statement.Database)
 	if err != nil {
+		return nil, err
+	}
+	if _, err := flightStatementDecimalMode(ctx, statement.DecimalMode); err != nil {
 		return nil, err
 	}
 	schema, err := s.preparedSchema(ctx, statement.SQL, database)
@@ -205,7 +220,10 @@ func (s *flightSQLService) GetFlightInfoPreparedStatement(ctx context.Context, c
 	if err != nil {
 		return nil, err
 	}
-	return flightStatementInfo(desc, statement.SQL, database)
+	if _, err := flightStatementDecimalMode(ctx, statement.DecimalMode); err != nil {
+		return nil, err
+	}
+	return flightStatementInfo(desc, statement.SQL, database, statement.DecimalMode)
 }
 
 // DoGetPreparedStatement runs the statement as DoGetStatement runs a ticket.
@@ -217,7 +235,7 @@ func (s *flightSQLService) DoGetPreparedStatement(ctx context.Context, cmd fligh
 	if err != nil {
 		return nil, nil, err
 	}
-	handle, err := json.Marshal(flightStatement{SQL: statement.SQL, Database: statement.Database})
+	handle, err := json.Marshal(flightStatement{SQL: statement.SQL, Database: statement.Database, DecimalMode: statement.DecimalMode})
 	if err != nil {
 		return nil, nil, status.Errorf(codes.Internal, "encode statement ticket: %v", err)
 	}

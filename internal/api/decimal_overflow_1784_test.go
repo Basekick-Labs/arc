@@ -89,6 +89,45 @@ func (r *overflowRig) post(route, sql string) *http.Response {
 	return resp
 }
 
+func (r *overflowRig) postWithHeader(route, sql, name, value string) *http.Response {
+	r.t.Helper()
+	body, _ := json.Marshal(map[string]string{"sql": sql})
+	req, err := http.NewRequest(http.MethodPost, r.base+route, bytes.NewReader(body))
+	require.NoError(r.t, err)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(name, value)
+	resp, err := r.client.Do(req)
+	require.NoError(r.t, err)
+	return resp
+}
+
+func TestExactDecimalsAreOptInForArrowIPCOnly(t *testing.T) {
+	r := newOverflowRig(t)
+
+	resp := r.postWithHeader("/api/v1/query/arrow", overflowRepro, flightSQLDecimalsHeader, decimalModeExact)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	reader, err := ipc.NewReader(resp.Body)
+	require.NoError(t, err)
+	defer reader.Release()
+	defer resp.Body.Close()
+	require.True(t, reader.Next())
+	decimalType, ok := reader.Schema().Field(0).Type.(*arrow.Decimal128Type)
+	require.True(t, ok, reader.Schema().String())
+	require.Equal(t, int32(38), decimalType.Precision)
+	require.Equal(t, int32(0), decimalType.Scale)
+	require.Equal(t, "s", reader.Schema().Field(0).Name)
+	_, ok = reader.RecordBatch().Column(0).(*array.Decimal128)
+	require.True(t, ok, "exact mode must stream the value as decimal128")
+	require.NoError(t, reader.Err())
+
+	for _, route := range []string{"/api/v1/query", "/api/v1/query/msgpack"} {
+		resp := r.postWithHeader(route, overflowRepro, flightSQLDecimalsHeader, decimalModeExact)
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, route)
+		_, message := jsonError(t, resp)
+		require.Contains(t, message, "only for Arrow IPC and Flight SQL")
+	}
+}
+
 // jsonError reads an error body: JSON, or msgpack from the msgpack route.
 func jsonError(t *testing.T, resp *http.Response) (bool, string) {
 	t.Helper()
@@ -546,4 +585,42 @@ func TestDecimalOverflowJSONCapMidBatchPipeline(t *testing.T) {
 	for i, row := range data {
 		require.Equal(t, float64(i), row.([]any)[0], "row %d", i)
 	}
+}
+
+// An exact request never goes to arcx, which serves integer sums as int64
+// and so would stream a type other than the decimal128 a Flight SQL prepare
+// reported (#1784). A default request is offered to it as before.
+func TestExactDecimalsBypassArcx1784(t *testing.T) {
+	r := newOverflowRig(t)
+	original := arcxArrowDispatch
+	t.Cleanup(func() { arcxArrowDispatch = original })
+	offered := 0
+	arcxArrowDispatch = func(h *QueryHandler, c *fiber.Ctx, ctx context.Context, cancel context.CancelFunc, start time.Time,
+		sql, headerDB, convertedSQL string, maxRows int, onRows func(int64), onDisconnect func(), onComplete func(int), onFail func(string)) bool {
+		offered++
+		return false
+	}
+	resp := r.postWithHeader("/api/v1/query/arrow", "SELECT sum(i) AS s FROM range(3) t(i)", flightSQLDecimalsHeader, decimalModeExact)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	require.Equal(t, 0, offered, "an exact request was offered to arcx")
+	resp = r.postWithHeader("/api/v1/query/arrow", "SELECT sum(i) AS s FROM range(3) t(i)", flightSQLDecimalsHeader, decimalModeDefault)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	require.Equal(t, 1, offered, "a default request was not offered to arcx")
+}
+
+// /api/v1/query/:measurement is a JSON route too: exact is refused there.
+func TestExactDecimalsRefusedOnTheMeasurementRoute1784(t *testing.T) {
+	r := newOverflowRig(t)
+	req, err := http.NewRequest(http.MethodGet, r.base+"/api/v1/query/cpu?database=db1", nil)
+	require.NoError(t, err)
+	req.Header.Set(flightSQLDecimalsHeader, decimalModeExact)
+	resp, err := r.client.Do(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	_, message := jsonError(t, resp)
+	require.Contains(t, message, "only for Arrow IPC and Flight SQL")
 }

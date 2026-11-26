@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/basekick-labs/arc/internal/audit"
@@ -243,6 +244,30 @@ func TestFlightSQLPreparedStatementIsOneQuery(t *testing.T) {
 	require.Eventually(t, func() bool { return rig.registry.HistoryLen() == 1 }, 5*time.Second, 10*time.Millisecond)
 	require.Equal(t, 0, rig.registry.ActiveCount())
 	require.Equal(t, 99, rig.governance.GetTokenUsage(rig.tokenID).RateLimitRemainingPerMin, "governance admissions")
+}
+
+func TestFlightSQLPreparedExactDecimalModeIsStable(t *testing.T) {
+	rig := newPreparedRig(t, preparedRigOptions{})
+	ctx := metadata.AppendToOutgoingContext(rig.ctx, flightSQLDecimalsHeader, decimalModeExact)
+	ps, err := rig.client.Prepare(ctx, "SELECT 100000000000000000000::HUGEINT AS v")
+	require.NoError(t, err)
+	defer func() { require.NoError(t, ps.Close(ctx)) }()
+	preparedSchema := ps.DatasetSchema()
+	require.Equal(t, &arrow.Decimal128Type{Precision: 38, Scale: 0}, preparedSchema.Field(0).Type)
+
+	info, err := ps.Execute(ctx)
+	require.NoError(t, err)
+	reader, err := rig.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	require.NoError(t, err)
+	defer reader.Release()
+	require.True(t, reader.Next())
+	require.Equal(t, preparedSchema.String(), reader.Schema().String())
+	_, ok := reader.RecordBatch().Column(0).(*array.Decimal128)
+	require.True(t, ok)
+	require.NoError(t, reader.Err())
+
+	_, err = ps.Execute(rig.ctx)
+	require.Error(t, err, "executing a prepared exact statement in default mode must be refused")
 }
 
 // The prepared schema is the schema DoGet streams: Arc's decimal
