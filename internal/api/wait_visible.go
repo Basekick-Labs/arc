@@ -13,8 +13,11 @@ import (
 
 // A MessagePack or line-protocol write carrying "x-arc-wait: visible" is
 // answered once its rows are visible to a query on this node that starts
-// after the answer (#1759): it waits for its rows' normal age or size flush,
-// at most waitVisibleBudget, and never forces one.
+// after the answer (#1759), waiting at most waitVisibleBudget. With a forcer
+// set (SetForcer) the measurements it wrote are flushed early: at most once
+// per ingest.wait_visible_min_interval_ms per measurement, and only inside
+// the forced-flush budget (spare flush capacity). Otherwise it waits for its
+// rows' normal age or size flush.
 //
 //   - 204, X-Arc-Visible: true: every row is in a stored (and, with tiering,
 //     registered) file a query lists.
@@ -77,6 +80,21 @@ type WaitVisible struct {
 	enabled, clustered, storageConfirmable, futureCheck bool
 	margin                                              time.Duration
 	waiters                                             atomic.Int64
+	// forcer and forceInterval shorten a wait by flushing its measurements
+	// early; nil forcer: never (SetForcer).
+	forcer        ingest.KeyForcer
+	forceInterval time.Duration
+}
+
+// SetForcer lets a visible write flush the measurements it wrote early, at
+// most once per interval per measurement (ingest.wait_visible_min_interval_ms).
+// Set at startup, before the routes serve, and only where the buffer's ledger
+// is enabled; without it a wait never forces. A nil wv is a no-op.
+func (wv *WaitVisible) SetForcer(f ingest.KeyForcer, interval time.Duration) {
+	if wv == nil {
+		return
+	}
+	wv.forcer, wv.forceInterval = f, interval
 }
 
 // NewWaitVisible builds the node's WaitVisible; one shared by every handler,
@@ -206,6 +224,8 @@ func (vw *visibleWrite) answer(c *fiber.Ctx, rows int64, rowsKnown bool) error {
 		Budget:             waitVisibleBudget,
 		Done:               done,
 		StorageConfirmable: vw.wv.storageConfirmable,
+		Forcer:             vw.wv.forcer,
+		ForceInterval:      vw.wv.forceInterval,
 	})
 	m := metrics.Get()
 	m.ObserveIngestWaitVisible(verdict.Waited)

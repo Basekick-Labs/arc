@@ -111,6 +111,7 @@ type Metrics struct {
 	ingestPublishDelay    ingestPublishDelay                    // arc_ingest_publish_delay_seconds (ingest_publish_delay.go)
 	icebergExport         icebergExport                         // arc_iceberg_export_* (iceberg_export.go)
 	ingestWaitVisible     ingestWaitVisible                     // arc_ingest_wait_visible_* (ingest_wait_visible.go)
+	ingestForcedFlush     ingestForcedFlush                     // arc_ingest_forced_flushes_total (ingest_forced_flush.go)
 	icebergTableLag       atomic.Pointer[icebergTableLagSource] // per-table lag series (iceberg_export_tables.go)
 	flightSQLPrepare      flightSQLPrepare                      // arc_flight_sql_prepare_* (flight_sql_prepare.go)
 	bufferQueueDepth      atomic.Int64
@@ -1958,6 +1959,7 @@ func (m *Metrics) PrometheusFormat() string {
 	b = m.appendIngestPublishDelay(b)
 	b = m.appendIcebergExport(b)
 	b = m.appendIngestWaitVisible(b)
+	b = m.appendIngestForcedFlush(b)
 
 	b = append(b, "# HELP arc_buffer_queue_depth Current flush queue depth\n"...)
 	b = append(b, "# TYPE arc_buffer_queue_depth gauge\n"...)

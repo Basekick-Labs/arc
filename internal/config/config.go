@@ -214,6 +214,12 @@ type IngestConfig struct {
 	// such a request is refused with 403 and nothing written. Standalone
 	// only: on a cluster the header is refused with 400.
 	WaitVisibleEnabled bool
+	// WaitVisibleMinIntervalMS bounds how often such a write may flush a
+	// measurement early to shorten its wait (#1759): at most once per
+	// interval per measurement, and only while the flush pipeline has spare
+	// capacity; otherwise the write waits for its rows' age or size flush.
+	// In [MinWaitVisibleMinIntervalMS, MaxWaitVisibleMinIntervalMS].
+	WaitVisibleMinIntervalMS int
 }
 
 // minIcebergIngestExportInterval is the shortest iceberg.ingest_export_interval
@@ -1481,26 +1487,27 @@ func Load() (*Config, error) {
 			GCSEndpoint:        v.GetString("storage.gcs_endpoint"),
 		},
 		Ingest: IngestConfig{
-			MaxBufferSize:          v.GetInt("ingest.max_buffer_size"),
-			MaxBufferAgeMS:         v.GetInt("ingest.max_buffer_age_ms"),
-			Compression:            v.GetString("ingest.compression"),
-			UseDictionary:          v.GetBool("ingest.use_dictionary"),
-			NumericDictionary:      v.GetBool("ingest.numeric_dictionary"),
-			WriteStatistics:        v.GetBool("ingest.write_statistics"),
-			DataPageVersion:        v.GetString("ingest.data_page_version"),
-			MaxRowGroupRows:        v.GetInt("ingest.max_row_group_rows"),
-			WritePageIndex:         v.GetBool("ingest.write_page_index"),
-			FlushWorkers:           v.GetInt("ingest.flush_workers"),
-			FlushQueueSize:         v.GetInt("ingest.flush_queue_size"),
-			FlushTimeoutSeconds:    v.GetInt("ingest.flush_timeout_seconds"),
-			ShardCount:             v.GetInt("ingest.shard_count"),
-			SortKeys:               v.GetStringSlice("ingest.sort_keys"),
-			DefaultSortKeys:        v.GetString("ingest.default_sort_keys"),
-			DecimalColumns:         v.GetStringSlice("ingest.decimal_columns"),
-			DefaultDecimalColumns:  v.GetString("ingest.default_decimal_columns"),
-			ImportWriteConcurrency: v.GetInt("ingest.import_write_concurrency"),
-			ImportQueueTimeoutMS:   v.GetInt("ingest.import_queue_timeout_ms"),
-			WaitVisibleEnabled:     v.GetBool("ingest.wait_visible_enabled"),
+			MaxBufferSize:            v.GetInt("ingest.max_buffer_size"),
+			MaxBufferAgeMS:           v.GetInt("ingest.max_buffer_age_ms"),
+			Compression:              v.GetString("ingest.compression"),
+			UseDictionary:            v.GetBool("ingest.use_dictionary"),
+			NumericDictionary:        v.GetBool("ingest.numeric_dictionary"),
+			WriteStatistics:          v.GetBool("ingest.write_statistics"),
+			DataPageVersion:          v.GetString("ingest.data_page_version"),
+			MaxRowGroupRows:          v.GetInt("ingest.max_row_group_rows"),
+			WritePageIndex:           v.GetBool("ingest.write_page_index"),
+			FlushWorkers:             v.GetInt("ingest.flush_workers"),
+			FlushQueueSize:           v.GetInt("ingest.flush_queue_size"),
+			FlushTimeoutSeconds:      v.GetInt("ingest.flush_timeout_seconds"),
+			ShardCount:               v.GetInt("ingest.shard_count"),
+			SortKeys:                 v.GetStringSlice("ingest.sort_keys"),
+			DefaultSortKeys:          v.GetString("ingest.default_sort_keys"),
+			DecimalColumns:           v.GetStringSlice("ingest.decimal_columns"),
+			DefaultDecimalColumns:    v.GetString("ingest.default_decimal_columns"),
+			ImportWriteConcurrency:   v.GetInt("ingest.import_write_concurrency"),
+			ImportQueueTimeoutMS:     v.GetInt("ingest.import_queue_timeout_ms"),
+			WaitVisibleEnabled:       v.GetBool("ingest.wait_visible_enabled"),
+			WaitVisibleMinIntervalMS: v.GetInt("ingest.wait_visible_min_interval_ms"),
 		},
 		Cache: CacheConfig{
 			Enabled:    v.GetBool("cache.enabled"),
@@ -1923,6 +1930,10 @@ func Load() (*Config, error) {
 	// like a negative value rather than silently clamped.
 	if cfg.Ingest.MaxRowGroupRows != 0 && cfg.Ingest.MaxRowGroupRows < 1024 {
 		return nil, fmt.Errorf("invalid ingest.max_row_group_rows value: %d (must be 0 or >= 1024; 0 = one row group per flush)", cfg.Ingest.MaxRowGroupRows)
+	}
+	if ms := cfg.Ingest.WaitVisibleMinIntervalMS; ms < MinWaitVisibleMinIntervalMS || ms > MaxWaitVisibleMinIntervalMS {
+		return nil, fmt.Errorf("invalid ingest.wait_visible_min_interval_ms value: %d (must be between %d and %d: at least a second, so a measurement is flushed early at most 3600 times an hour; at most an hour, how long a measurement's last flush is remembered)",
+			ms, MinWaitVisibleMinIntervalMS, MaxWaitVisibleMinIntervalMS)
 	}
 	if cfg.Ingest.ImportQueueTimeoutMS < 0 {
 		return nil, fmt.Errorf("invalid ingest.import_queue_timeout_ms value: %d (must be >= 0; 0 = until a slot frees)", cfg.Ingest.ImportQueueTimeoutMS)
@@ -2734,6 +2745,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.import_queue_timeout_ms", 30000)
 	v.SetDefault("ingest.max_buffered_bytes", "0")     // off; "auto" = half the memory limit (#1468)
 	v.SetDefault("ingest.wait_visible_enabled", false) // x-arc-wait: visible refused with 403 (#1759)
+	v.SetDefault("ingest.wait_visible_min_interval_ms", defaultWaitVisibleMinIntervalMS)
 
 	// Log defaults
 	v.SetDefault("log.level", "info")
@@ -3945,6 +3957,21 @@ func (c *Config) checkIcebergGlue() error {
 // (#1759).
 const waitVisibleMaxBufferAgeMS = 10000
 
+// Bounds of ingest.wait_visible_min_interval_ms (#1759), the ones planned
+// for the fresh-query interval (#1760) too, since the two share one
+// per-measurement limiter.
+//   - The floor, a second, caps the early flushes of one measurement at 3600
+//     an hour, what the age trigger alone makes at max_buffer_age_ms = 1000.
+//     0 would allow a flush per waiting write.
+//   - The ceiling, an hour, is ingest.MaxForceInterval: how long the buffer
+//     remembers a measurement's last flush. Past it the entry is pruned and
+//     the measurement is due again, so a longer interval would not hold.
+const (
+	defaultWaitVisibleMinIntervalMS = 5000
+	MinWaitVisibleMinIntervalMS     = 1000
+	MaxWaitVisibleMinIntervalMS     = 3_600_000
+)
+
 // waitVisibleWarnings are the advisories for ingest.wait_visible_enabled
 // (#1759), each only with the key on.
 func waitVisibleWarnings(cfg *Config) []LoadWarning {
@@ -3971,7 +3998,16 @@ func waitVisibleWarnings(cfg *Config) []LoadWarning {
 		out = append(out, LoadWarning{
 			Key:     "ingest.max_buffer_age_ms",
 			Value:   strconv.Itoa(cfg.Ingest.MaxBufferAgeMS),
-			Message: fmt.Sprintf("ingest.max_buffer_age_ms is above %d with ingest.wait_visible_enabled = true: a write carrying x-arc-wait: visible waits for its rows' age or size flush, at most 20 s, so on a measurement that does not reach ingest.max_buffer_size within the age it can be answered 202 (timeout) instead of 204", waitVisibleMaxBufferAgeMS),
+			Message: fmt.Sprintf("ingest.max_buffer_age_ms is above %d with ingest.wait_visible_enabled = true: a write carrying x-arc-wait: visible that cannot flush its measurement early (flushed within ingest.wait_visible_min_interval_ms, or no spare flush capacity) waits for its rows' age or size flush, at most 20 s, so on a measurement that does not reach ingest.max_buffer_size within the age it can be answered 202 (timeout) instead of 204", waitVisibleMaxBufferAgeMS),
+		})
+	}
+	// At an age <= 0 (never validated) every sweep flushes every buffer, so
+	// the comparison means nothing.
+	if iv := cfg.Ingest.WaitVisibleMinIntervalMS; cfg.Ingest.MaxBufferAgeMS > 0 && iv > cfg.Ingest.MaxBufferAgeMS {
+		out = append(out, LoadWarning{
+			Key:     "ingest.wait_visible_min_interval_ms",
+			Value:   strconv.Itoa(iv),
+			Message: fmt.Sprintf("ingest.wait_visible_min_interval_ms (%d) is above ingest.max_buffer_age_ms (%d): on a measurement written continuously the age flush comes first, so a write carrying x-arc-wait: visible is flushed early only on a measurement that was idle for longer than the difference", iv, cfg.Ingest.MaxBufferAgeMS),
 		})
 	}
 	return out

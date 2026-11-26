@@ -4017,6 +4017,8 @@ func (b *ArrowBuffer) writeColumnarInternalWithWALCopy(ctx context.Context, data
 	// here when decimal columns are configured. A visible write's batch is
 	// marked (#1759).
 	countOutcome(outcome, typedColumns, numRecords, minFuture)
+	// A visible write also records the key, for forcing its flush (#1759).
+	noteVisibleKey(outcome, bufferKey)
 
 	// Add typed columns to buffer (already converted via zero-copy fast paths)
 	shard.buffers[bufferKey] = append(shard.buffers[bufferKey], typedColumns)
@@ -4322,6 +4324,8 @@ func (b *ArrowBuffer) writeTypedColumnarRaw(ctx context.Context, database, measu
 	// commit, which can still clear hasWALCopy. A visible write's batch is
 	// marked (#1759).
 	countOutcome(outcome, typedColumns, numRecords, minFuture)
+	// A visible write also records the key, for forcing its flush (#1759).
+	noteVisibleKey(outcome, bufferKey)
 
 	// Add typed columns to buffer directly (no conversion needed)
 	shard.buffers[bufferKey] = append(shard.buffers[bufferKey], typedColumns)
@@ -4996,6 +5000,11 @@ func (b *ArrowBuffer) periodicFlush() {
 
 		case <-b.flushTimer.C:
 			b.flushAgedBuffers()
+			// After the sweep, outside every shard hold: the ledger's
+			// last-detach entries past their retention (#1759).
+			if l := b.ledger.Load(); l != nil {
+				l.maybePrune()
+			}
 			// Rearm the timer for the next oldest buffer expiry.
 			b.flushDeadline = b.computeNextFlushDeadline()
 			b.flushTimer.Reset(time.Until(b.flushDeadline))

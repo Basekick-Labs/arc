@@ -47,54 +47,67 @@ func lpBenchBodies(shape string, n int) [][]byte {
 }
 
 func BenchmarkLPWrite(b *testing.B) {
-	for _, withWAL := range []bool{false, true} {
-		for _, shape := range []string{"iot", "financial", "mixed"} {
-			b.Run(fmt.Sprintf("wal=%t/%s", withWAL, shape), func(b *testing.B) {
-				dir := b.TempDir()
-				backend, err := storage.NewLocalBackend(filepath.Join(dir, "data"), zerolog.Nop())
-				if err != nil {
-					b.Fatal(err)
+	// ledger=on (#1759): the buffer's per-key flush ledger enabled, as on a
+	// node with ingest.wait_visible_enabled, and no x-arc-wait header: the
+	// cost every write pays there. Only adds names; ledger off keeps the
+	// existing ones, so runs against main line up.
+	for _, ledger := range []bool{false, true} {
+		for _, withWAL := range []bool{false, true} {
+			for _, shape := range []string{"iot", "financial", "mixed"} {
+				name := fmt.Sprintf("wal=%t/%s", withWAL, shape)
+				if ledger {
+					name = "ledger=on/" + name
 				}
-				buf := ingest.NewArrowBuffer(&config.IngestConfig{
-					MaxBufferSize: 50000, MaxBufferAgeMS: 5000, Compression: "snappy",
-					FlushWorkers: 4, FlushQueueSize: 64, ShardCount: 32, DataPageVersion: "2.0",
-				}, backend, zerolog.Nop())
-				defer buf.Close()
-				if withWAL {
-					w, err := wal.NewWriter(&wal.WriterConfig{WALDir: filepath.Join(dir, "wal"), SyncMode: wal.SyncModeAsync, Logger: zerolog.Nop()})
+				b.Run(name, func(b *testing.B) {
+					dir := b.TempDir()
+					backend, err := storage.NewLocalBackend(filepath.Join(dir, "data"), zerolog.Nop())
 					if err != nil {
 						b.Fatal(err)
 					}
-					defer w.Close()
-					buf.SetWAL(w)
-				}
-				app := fiber.New(appConfig(DefaultServerConfig(), zerolog.Nop()))
-				NewLineProtocolHandler(buf, zerolog.Nop()).RegisterRoutes(app)
-				handler := app.Handler()
-				bodies := lpBenchBodies(shape, 64)
-				b.SetBytes(int64(len(bodies[0])))
-				b.ReportAllocs()
-				b.ResetTimer()
-				b.RunParallel(func(pb *testing.PB) {
-					var ctx fasthttp.RequestCtx
-					ctx.Init(&fasthttp.Request{}, nil, nil) // a server for ctx.Err()
-					i := 0
-					for pb.Next() {
-						ctx.Request.Reset()
-						ctx.Response.Reset()
-						ctx.Request.Header.SetMethod("POST")
-						ctx.Request.SetRequestURI("/api/v1/write/line-protocol")
-						ctx.Request.Header.Set("x-arc-database", "production")
-						ctx.Request.SetBody(bodies[i%len(bodies)])
-						i++
-						handler(&ctx)
-						if sc := ctx.Response.StatusCode(); sc != fasthttp.StatusNoContent {
-							b.Fatalf("status %d: %s", sc, ctx.Response.Body())
-						}
+					buf := ingest.NewArrowBuffer(&config.IngestConfig{
+						MaxBufferSize: 50000, MaxBufferAgeMS: 5000, Compression: "snappy",
+						FlushWorkers: 4, FlushQueueSize: 64, ShardCount: 32, DataPageVersion: "2.0",
+					}, backend, zerolog.Nop())
+					defer buf.Close()
+					if ledger {
+						buf.EnableKeyFlushLedger(ingest.ForceBudget{})
 					}
+					if withWAL {
+						w, err := wal.NewWriter(&wal.WriterConfig{WALDir: filepath.Join(dir, "wal"), SyncMode: wal.SyncModeAsync, Logger: zerolog.Nop()})
+						if err != nil {
+							b.Fatal(err)
+						}
+						defer w.Close()
+						buf.SetWAL(w)
+					}
+					app := fiber.New(appConfig(DefaultServerConfig(), zerolog.Nop()))
+					NewLineProtocolHandler(buf, zerolog.Nop()).RegisterRoutes(app)
+					handler := app.Handler()
+					bodies := lpBenchBodies(shape, 64)
+					b.SetBytes(int64(len(bodies[0])))
+					b.ReportAllocs()
+					b.ResetTimer()
+					b.RunParallel(func(pb *testing.PB) {
+						var ctx fasthttp.RequestCtx
+						ctx.Init(&fasthttp.Request{}, nil, nil) // a server for ctx.Err()
+						i := 0
+						for pb.Next() {
+							ctx.Request.Reset()
+							ctx.Response.Reset()
+							ctx.Request.Header.SetMethod("POST")
+							ctx.Request.SetRequestURI("/api/v1/write/line-protocol")
+							ctx.Request.Header.Set("x-arc-database", "production")
+							ctx.Request.SetBody(bodies[i%len(bodies)])
+							i++
+							handler(&ctx)
+							if sc := ctx.Response.StatusCode(); sc != fasthttp.StatusNoContent {
+								b.Fatalf("status %d: %s", sc, ctx.Response.Body())
+							}
+						}
+					})
+					b.ReportMetric(float64(b.N)*1000/b.Elapsed().Seconds(), "rows/s")
 				})
-				b.ReportMetric(float64(b.N)*1000/b.Elapsed().Seconds(), "rows/s")
-			})
+			}
 		}
 	}
 }

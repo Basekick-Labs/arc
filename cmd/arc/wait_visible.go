@@ -21,3 +21,19 @@ func waitVisibleConfig(cfg *config.Config) api.WaitVisibleConfig {
 		FileTimePruningMargin: time.Duration(cfg.Query.FileTimePruningMarginSeconds) * time.Second,
 	}
 }
+
+// writeForcingEnabled says whether a visible write may flush the measurements
+// it wrote early (#1759): the key on, standalone, local storage. On a cluster
+// the header is refused; on object storage a waited write ends 202
+// storage_not_confirmable, so an early flush would only add files. Both the
+// buffer's ledger and the handlers' forcer key off it, so they cannot
+// disagree.
+func writeForcingEnabled(cfg *config.Config) bool {
+	return cfg.Ingest.WaitVisibleEnabled && !cfg.Cluster.Enabled && cfg.Storage.Backend == "local"
+}
+
+// waitVisibleForceInterval is ingest.wait_visible_min_interval_ms, which
+// config.Load bounds to [1 s, 1 h].
+func waitVisibleForceInterval(cfg *config.Config) time.Duration {
+	return time.Duration(cfg.Ingest.WaitVisibleMinIntervalMS) * time.Millisecond
+}

@@ -4,22 +4,25 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/basekick-labs/arc/internal/metrics"
 )
 
 // The per-key flush ledger and the force primitive (#1760, shared with #1759).
 //
 // ForceFlushKey asks for one key's buffer to be flushed now instead of at its
 // age or size trigger, at most once per interval per key, and only while the
-// flush pipeline has spare room. It is the primitive behind a fresh query
-// (x-arc-freshness: flush, #1760) and a visible write that shortens its own
-// wait (x-arc-wait: visible, #1759). Neither is wired yet: with the ledger
-// never enabled, every detach and deferral site pays one nil test.
+// flush pipeline has spare room. It is the primitive behind a visible write
+// that shortens its own wait (x-arc-wait: visible, #1759, which enables the
+// ledger with ingest.wait_visible_enabled) and a fresh query
+// (x-arc-freshness: flush, #1760, not wired yet). With the ledger off, every
+// detach and deferral site pays one nil test.
 //
 // Lock order: shard.mu → stripe.mu. stripe.mu is a leaf; nothing is called
 // while holding it except map operations.
 
-// ForceSource says who asked for a forced flush. It is the source label of
-// the forced-flush metric, which later PRs add.
+// ForceSource says who asked for a forced flush: the source label of
+// arc_ingest_forced_flushes_total.
 type ForceSource uint8
 
 const (
@@ -74,12 +77,28 @@ func (r ForceResult) String() string {
 	return "unknown"
 }
 
-// ForceBudget configures the forced-task cap. The zero value is the default:
-// max(1, flush_workers/4) forced tasks in flight.
+// KeyForcer is what a visible write's wait needs of the buffer to shorten
+// itself (#1759): ArrowBuffer.ForceFlushKey.
+type KeyForcer interface {
+	ForceFlushKey(key string, interval time.Duration, src ForceSource,
+		want func(batches []interface{}) bool) (ForceResult, time.Time)
+}
+
+// MaxForceInterval is the longest interval forcing is meant for: the ceiling
+// of ingest.wait_visible_min_interval_ms (config.MaxWaitVisibleMinIntervalMS)
+// and the ledger's default retention.
+const MaxForceInterval = time.Hour
+
+// ForceBudget configures the ledger. The zero value is the default:
+// max(1, flush_workers/4) forced tasks in flight, last detaches kept an hour.
 type ForceBudget struct {
 	// MaxInFlight caps the forced tasks queued or being flushed at once.
 	// 0 means max(1, flush_workers/4).
 	MaxInFlight int
+	// Retain is how long a key's last detach is kept after it happened;
+	// 0 means MaxForceInterval. It must be at least every interval passed
+	// to ForceFlushKey: an entry pruned sooner makes its key due sooner.
+	Retain time.Duration
 }
 
 const ledgerStripeCount = 64
@@ -97,14 +116,21 @@ type keyFlushLedger struct {
 	// in now()'s UnixNano; 0 = none since the ledger was enabled.
 	lastDeferredNano atomic.Int64
 
-	// now is time.Now; tests replace it before the first write.
+	// retain is the resolved ForceBudget.Retain; pruneEvery is how often
+	// maybePrune walks the stripes, and lastPrune when it last did. Only
+	// periodicFlush's goroutine calls maybePrune, so lastPrune needs no lock.
+	retain, pruneEvery time.Duration
+	lastPrune          time.Time
+
+	// now is time.Now; tests inject a clock (enableKeyFlushLedger).
 	now func() time.Time
 }
 
 type ledgerStripe struct {
 	mu sync.Mutex
-	// keys is never pruned in this PR: nothing can enable the ledger yet.
-	// Pruning must land in the PR that first enables it (#1760 (b) or (a2)).
+	// keys holds each key's last detach, pruned retain after it
+	// (maybePrune), so the map is bounded by the keys detached within the
+	// last retain, not by every key ever written.
 	keys map[string]keyDetach
 }
 
@@ -116,16 +142,35 @@ type keyDetach struct {
 	id uint64
 }
 
+// ledgerPruneEvery is how often the ledger is pruned at most (with a
+// shorter retention, every retention).
+const ledgerPruneEvery = time.Minute
+
 // EnableKeyFlushLedger turns forcing on. Callers enable it once, right after
 // NewArrowBuffer and before startup recovery, so the limiter sees every
 // detach; a detach before it is not recorded, which only makes that key due
 // sooner. Later calls are no-ops.
 func (b *ArrowBuffer) EnableKeyFlushLedger(budget ForceBudget) {
+	b.enableKeyFlushLedger(budget, time.Now)
+}
+
+// enableKeyFlushLedger is EnableKeyFlushLedger with the ledger's clock, set
+// before the ledger is published: periodicFlush may prune it at once.
+func (b *ArrowBuffer) enableKeyFlushLedger(budget ForceBudget, now func() time.Time) {
 	maxInFlight := budget.MaxInFlight
 	if maxInFlight <= 0 {
 		maxInFlight = max(1, b.flushWorkers/4)
 	}
-	l := &keyFlushLedger{maxInFlight: int64(maxInFlight), now: time.Now}
+	retain := budget.Retain
+	if retain <= 0 {
+		retain = MaxForceInterval
+	}
+	l := &keyFlushLedger{
+		maxInFlight: int64(maxInFlight),
+		retain:      retain,
+		pruneEvery:  min(retain, ledgerPruneEvery),
+		now:         now,
+	}
 	for i := range l.stripes {
 		l.stripes[i].keys = make(map[string]keyDetach)
 	}
@@ -161,6 +206,33 @@ func (l *keyFlushLedger) lastDetach(key string) (keyDetach, bool) {
 	return d, ok
 }
 
+// maybePrune deletes the last detaches older than retain, at most once per
+// pruneEvery. periodicFlush calls it after flushAgedBuffers, so it runs
+// outside every shard hold; it takes each stripe's lock alone, one at a time.
+// A pruned key is due again, which it already was: its detach is older than
+// any interval (retain is at least each). Returns the entries deleted.
+func (l *keyFlushLedger) maybePrune() int {
+	now := l.now()
+	if !l.lastPrune.IsZero() && now.Sub(l.lastPrune) < l.pruneEvery {
+		return 0
+	}
+	l.lastPrune = now
+	cutoff := now.Add(-l.retain)
+	deleted := 0
+	for i := range l.stripes {
+		s := &l.stripes[i]
+		s.mu.Lock()
+		for key, d := range s.keys {
+			if d.at.Before(cutoff) {
+				delete(s.keys, key)
+				deleted++
+			}
+		}
+		s.mu.Unlock()
+	}
+	return deleted
+}
+
 func (l *keyFlushLedger) noteDeferral() {
 	l.lastDeferredNano.Store(l.now().UnixNano())
 }
@@ -194,7 +266,12 @@ func (b *ArrowBuffer) reserveForcedSlot(l *keyFlushLedger, now time.Time) bool {
 	// Wall-clock nanoseconds: a clock stepped back gives a negative distance,
 	// which counts as expired rather than as a deferral that never ends.
 	if last := l.lastDeferredNano.Load(); last != 0 {
-		if d := now.UnixNano() - last; d >= 0 && d < int64(b.maxBufferAge) {
+		// The window is max_buffer_age_ms with a 1 s floor. The age is
+		// never validated: at <= 0 (every sweep then flushes every buffer)
+		// a zero window would silently turn this condition off, and ages of
+		// 1-999 ms are lifted to 1 s as well.
+		window := max(b.maxBufferAge, time.Second)
+		if d := now.UnixNano() - last; d >= 0 && d < int64(window) {
 			return false
 		}
 	}
@@ -224,7 +301,8 @@ var (
 // For NotDue the time is when the key becomes due; otherwise it is zero.
 //
 // It never blocks on I/O and never marks a key deferred. Over budget, the key
-// is left to its natural flush. src is the caller, for the metric.
+// is left to its natural flush. Every result but LedgerOff is counted in
+// arc_ingest_forced_flushes_total{source=src}.
 //
 // Locks, in order: the key's stripe alone (due check); none (budget); the
 // shard read lock (want); the shard write lock, and under it the stripe (the
@@ -232,7 +310,40 @@ var (
 // take shard or stripe locks.
 func (b *ArrowBuffer) ForceFlushKey(key string, interval time.Duration, src ForceSource,
 	want func(batches []interface{}) bool) (ForceResult, time.Time) {
-	_ = src // the metric label, wired with the metric
+	r, due := b.forceFlushKey(key, interval, want)
+	if r != LedgerOff {
+		metrics.Get().IncIngestForcedFlush(forcedFlushSourceLabel(src), forcedFlushResultLabel(r))
+	}
+	return r, due
+}
+
+// forcedFlushSourceLabel and forcedFlushResultLabel map to the metric's
+// fixed label set.
+func forcedFlushSourceLabel(src ForceSource) int {
+	if src == ForceWrite {
+		return metrics.ForcedFlushSourceWrite
+	}
+	return metrics.ForcedFlushSourceRead
+}
+
+func forcedFlushResultLabel(r ForceResult) int {
+	switch r {
+	case Forced:
+		return metrics.ForcedFlushForced
+	case NotDue:
+		return metrics.ForcedFlushNotDue
+	case OverBudget:
+		return metrics.ForcedFlushOverBudget
+	case NotWanted:
+		return metrics.ForcedFlushNotWanted
+	case Closing:
+		return metrics.ForcedFlushClosing
+	}
+	return metrics.ForcedFlushNothing
+}
+
+func (b *ArrowBuffer) forceFlushKey(key string, interval time.Duration,
+	want func(batches []interface{}) bool) (ForceResult, time.Time) {
 	l := b.ledger.Load()
 	if l == nil || interval <= 0 {
 		return LedgerOff, time.Time{}
@@ -293,7 +404,13 @@ func (b *ArrowBuffer) ForceFlushKey(key string, interval time.Duration, src Forc
 	// no detach, so the key is still due and, since a detach takes the whole
 	// slice and appends never remove batches, every batch want saw is still
 	// buffered. It also stops two concurrent callers from both sending.
-	if cur, _ := l.lastDetach(key); cur.id != seen.id {
+	//
+	// An entry gone since the due check was pruned, not detached: a detach
+	// always writes the entry, and pruning deletes only entries older than
+	// retain. It counts as unchanged. Were it a detach and then a prune of
+	// that detach, the detach was over retain ago, so the key is due anyway
+	// and the batches want saw went with it; the send flushes what is left.
+	if cur, ok := l.lastDetach(key); ok && cur.id != seen.id {
 		return NothingToForce, time.Time{}
 	}
 	if forceBeforeSendHook != nil {
