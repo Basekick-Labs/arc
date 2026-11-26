@@ -33,6 +33,21 @@ New metric `arc_ingest_flush_failure_latch_age_seconds` (gauge): how long the fa
 
 **Cost.** None on the write or successful flush path: a failed flush does one atomic compare-and-swap, a DELETE one atomic read.
 
+## Before upgrading from v26.02.2–v26.09.4 with the WAL on: check for a failed flush
+
+**Who is affected:** v26.02.2 through v26.09.4 with the WAL on (`wal.enabled`, off by default). Reproduced on v26.09.4; the earlier releases have the same code.
+
+In those releases, rows accepted with a WAL copy are lost if a flush fails and Arc is later stopped cleanly, at any time after the failure. The WAL recovery pass skips the active WAL file, which holds those rows, and clears the failure state anyway; the clean stop then deletes every WAL file. Upgrading means stopping the old release, so the upgrade can trigger it. This release does not have the problem: its recovery pass rotates the WAL before recovering ([#1118](https://github.com/Basekick-Labs/arc/pull/1118)), and [#1938](https://github.com/Basekick-Labs/arc/issues/1938) closes a smaller window.
+
+**Before stopping the old release,** look in its log since its last start for `Flush failed - data preserved in WAL for recovery`. If it is there:
+
+1. Stop writing to the node.
+2. Wait one buffer age (`ingest.max_buffer_age_ms`).
+3. Stop Arc with `SIGKILL` (for example `kill -9 <pid>` or `docker kill`), not a clean stop. The WAL files stay on disk.
+4. Start this release on the same data and WAL directories. It replays the WAL at startup and recovers the rows, without duplicating rows that were already stored.
+
+If the message is not in the log, upgrade as usual.
+
 ## New: query latency and outcomes per engine (DuckDB, arcx) ([#1292](https://github.com/Basekick-Labs/arc/pull/1292), [#823](https://github.com/Basekick-Labs/arc/issues/823))
 
 **Who is affected:** anyone scraping Arc's Prometheus metrics, or reading `/api/v1/metrics`.
