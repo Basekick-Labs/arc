@@ -47,6 +47,19 @@ func TestForceReply_DueAndTaskIDByResult1942(t *testing.T) {
 	f.assertReply("not wanted", f.force("db/m", func([]interface{}) bool { return false }), ForceReply{Result: NotWanted})
 	l.noteDeferral()
 	f.assertReply("over budget", f.force("db/m", nil), ForceReply{Result: OverBudget})
+
+	// Closing, on a key detached before (so a stray id would show): under the
+	// write lock, and at entry after Close.
+	c := newForceFixture(t, forceConfig(2, 100), &ForceBudget{})
+	c.write("m", 5)
+	c.flushAll()
+	c.clock.Advance(6 * time.Second)
+	c.write("m", 5)
+	forceAfterScanHook = func(string) { c.buf.closing.Store(true) }
+	c.assertReply("closing under the write lock", c.force("db/m", nil), ForceReply{Result: Closing})
+	forceAfterScanHook = nil
+	_ = c.buf.Close()
+	c.assertReply("closing at entry", c.force("db/m", nil), ForceReply{Result: Closing})
 }
 
 // Site 1: the want scan finds the key empty because a detach came after the
