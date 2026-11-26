@@ -491,33 +491,65 @@ func TestFreshFlush_ClocksAndLatency(t *testing.T) {
 	require.Equal(t, lat+1, queryMetricInt(t, "http_latency_count"), "control: a plain query is in the HTTP latency")
 }
 
-// M2: a client that disconnects during the execution that follows a fresh
-// wait is counted once: the wait's own disconnect watcher ended with the
-// wait. Over a real connection, which the watcher peeks.
+// M2: a client that disconnects after a fresh wait cancels the query and is
+// counted once, whether it leaves during the execution or between the wait
+// and the execution: the wait's own disconnect watcher ended with the wait,
+// and the execution's watcher sees a connection already closed. Over a real
+// connection, which the watchers peek. Synchronised on hooks, not sleeps:
+// the execution's watcher starts before the dispatch the test wraps.
 func TestFreshFlush_OneDisconnectCountedOnce(t *testing.T) {
-	w := &stubWaiter{}
-	r := newFreshOnRig(t, w, nil)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	go func() { _ = r.app.Listener(ln) }()
-	t.Cleanup(func() { _ = r.app.Shutdown() })
+	for _, window := range []string{"during the execution", "between the wait and the execution"} {
+		t.Run(window, func(t *testing.T) {
+			w := &stubWaiter{}
+			r := newFreshOnRig(t, w, nil)
+			started := make(chan context.Context, 1)
+			orig := arrowJSONQueryFunc
+			arrowJSONQueryFunc = func(h *QueryHandler, c *fiber.Ctx, ctx context.Context, cancel context.CancelFunc, sql string, profile bool, maxRows int, start time.Time, ts string, onComplete func(int), onFail func(string), onTimeout func()) (int, bool) {
+				started <- ctx
+				return orig(h, c, ctx, cancel, sql, profile, maxRows, start, ts, onComplete, onFail, onTimeout)
+			}
+			t.Cleanup(func() { arrowJSONQueryFunc = orig })
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			conn, err := net.Dial("tcp", ln.Addr().String())
+			require.NoError(t, err)
+			if window != "during the execution" {
+				freshAfterWaitHook = func() { _ = conn.Close() }
+				t.Cleanup(func() { freshAfterWaitHook = nil })
+			}
+			go func() { _ = r.app.Listener(ln) }() // after the swaps: the go statement orders them
+			t.Cleanup(func() { _ = r.app.Shutdown() })
 
-	before := queryMetricInt(t, "query_client_disconnects_sql_json_total")
-	conn, err := net.Dial("tcp", ln.Addr().String())
-	require.NoError(t, err)
-	// Long enough to be cancelled by the disconnect, not to finish.
-	body := `{"sql":"SELECT count(*) FROM sample.cpu, range(100000000000) t"}`
-	_, err = fmt.Fprintf(conn, "POST /api/v1/query HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\nContent-Type: application/json\r\n%s: flush\r\nContent-Length: %d\r\n\r\n%s",
-		r.read, FreshnessHeader, len(body), body)
-	require.NoError(t, err)
-	require.Eventually(t, func() bool { return w.calls.Load() == 1 }, 5*time.Second, 10*time.Millisecond)
-	time.Sleep(300 * time.Millisecond) // into the execution
-	require.NoError(t, conn.Close())
-	require.Eventually(t, func() bool {
-		return queryMetricInt(t, "query_client_disconnects_sql_json_total") > before
-	}, 5*time.Second, 20*time.Millisecond)
-	time.Sleep(4 * clientDisconnectPollInterval) // a second watcher would have fired by now
-	require.Equal(t, before+1, queryMetricInt(t, "query_client_disconnects_sql_json_total"), "one disconnect counted twice")
+			before := queryMetricInt(t, "query_client_disconnects_sql_json_total")
+			// Long enough to be cancelled by the disconnect, not to finish.
+			body := `{"sql":"SELECT count(*) FROM sample.cpu, range(100000000000) t"}`
+			_, err = fmt.Fprintf(conn, "POST /api/v1/query HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer %s\r\nContent-Type: application/json\r\n%s: flush\r\nContent-Length: %d\r\n\r\n%s",
+				r.read, FreshnessHeader, len(body), body)
+			require.NoError(t, err)
+			var execCtx context.Context
+			select {
+			case execCtx = <-started:
+			case <-time.After(30 * time.Second):
+				_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+				got, _ := io.ReadAll(conn)
+				t.Fatalf("the execution never started (waiter calls %d); answer: %q", w.calls.Load(), got)
+			}
+			require.Equal(t, int32(1), w.calls.Load())
+			if window == "during the execution" {
+				require.NoError(t, conn.Close())
+			}
+			select {
+			case <-execCtx.Done():
+			case <-time.After(30 * time.Second):
+				t.Fatal("the disconnect did not cancel the query")
+			}
+			require.Eventually(t, func() bool {
+				return queryMetricInt(t, "query_client_disconnects_sql_json_total") > before
+			}, 30*time.Second, 20*time.Millisecond, "the disconnect was never counted")
+			time.Sleep(4 * clientDisconnectPollInterval) // a second watcher would have fired by now
+			require.Equal(t, before+1, queryMetricInt(t, "query_client_disconnects_sql_json_total"), "one disconnect counted twice")
+		})
+	}
 }
 
 // A panic before or after the wait is answered 500 with false/query_error,

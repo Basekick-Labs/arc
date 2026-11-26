@@ -84,6 +84,9 @@ var (
 	// freshDrainDone is the channel the HTTP drain closes (fasthttp's
 	// RequestCtx.Done; nil under app.Test). A var so a test can close it.
 	freshDrainDone = func(c *fiber.Ctx) <-chan struct{} { return c.Context().Done() }
+	// freshAfterWaitHook, when set (tests only), runs once the wait's
+	// disconnect watcher is stopped and before execution starts its own.
+	freshAfterWaitHook func()
 )
 
 // FreshFlushConfig is what the node's configuration says about fresh
@@ -343,6 +346,9 @@ func (h *QueryHandler) freshWait(c *fiber.Ctx, sql, headerDB string, timeout tim
 	// At once: it stops the disconnect watcher, so execution's own watcher
 	// is the only one (a disconnect is counted once).
 	cancel()
+	if freshAfterWaitHook != nil {
+		freshAfterWaitHook()
+	}
 	m.ObserveQueryFreshFlushWait(waited)
 	c.Set(FreshnessWaitHeader, strconv.FormatInt(waited.Milliseconds(), 10))
 
