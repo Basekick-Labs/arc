@@ -6149,6 +6149,13 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	if status, msg := h.freshnessRefusal(c); status != 0 {
 		return c.Status(status).JSON(EstimateResponse{Success: false, Error: msg, WarningLevel: "error"})
 	}
+	// x-arc-decimals (#1784): checked as the query routes check it, before the
+	// forward. An estimate returns no column values, so exact (and default) is
+	// accepted and changes nothing: a client that sends it on every request
+	// is not refused here.
+	if _, err := requestDecimalMode(c); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(EstimateResponse{Success: false, Error: err.Error(), WarningLevel: "error"})
+	}
 
 	// A node that cannot serve queries forwards (before governance, so the
 	// request is counted once, on the node that answers it).
@@ -6734,18 +6741,9 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	m := metrics.Get()
 	m.IncQueryRequests()
 
-	// A node that cannot serve queries forwards it, as /api/v1/query.
-	{
-		o := h.readForwardOpts(h.router.RouteReadQuery, forwardedQueryDescription(c))
-		o.headerBound = h.queryForwardHeaderBound()
-		o.onError = m.IncQueryErrors
-		if handled, err := forwardRead(c, h.router, o); handled {
-			return err
-		}
-	}
-
 	// A JSON route, as /api/v1/query: exact decimals are Arrow IPC and
-	// Flight SQL only (#1784).
+	// Flight SQL only (#1784). Before the forward, as /api/v1/query checks it,
+	// so the peer never sees a request this node refuses.
 	if decimalMode, err := requestDecimalMode(c); err != nil || decimalMode == decimalModeExact {
 		msg := "x-arc-decimals=exact is supported only for Arrow IPC and Flight SQL"
 		if err != nil {
@@ -6757,6 +6755,16 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 			Error:     msg,
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
 		})
+	}
+
+	// A node that cannot serve queries forwards it, as /api/v1/query.
+	{
+		o := h.readForwardOpts(h.router.RouteReadQuery, forwardedQueryDescription(c))
+		o.headerBound = h.queryForwardHeaderBound()
+		o.onError = m.IncQueryErrors
+		if handled, err := forwardRead(c, h.router, o); handled {
+			return err
+		}
 	}
 
 	measurement := c.Params("measurement")
