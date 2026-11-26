@@ -466,6 +466,7 @@ func (h *QueryHandler) serveArcxArrowIPCResult(
 	trailers := newResponseTrailers()
 
 	var streamW *bufio.Writer
+	outcome := newQueryStreamOutcome(metrics.QueryEngineArcx, start)
 	streamReadsFiles(fctx)
 	h.setDirectBodyStream(fctx, cancel, trailers, "arcx_serve_arrow_ipc", func() {
 		poisonArrowStream(streamW, h.logger)
@@ -484,7 +485,6 @@ func (h *QueryHandler) serveArcxArrowIPCResult(
 			runtime.KeepAlive(reader) // LAST: nothing may collect the FFI-backed reader before this.
 		}()
 
-		m := metrics.Get()
 		rows, streamErr := streamArrowIPCFunc(
 			streamCtx, w, &contextArrowRecordReader{
 				RecordReader: reader,
@@ -500,9 +500,9 @@ func (h *QueryHandler) serveArcxArrowIPCResult(
 		}
 
 		if streamErr != nil {
-			m.IncQueryErrors()
+			outcome.fail()
 			if errors.Is(streamErr, context.DeadlineExceeded) {
-				m.IncQueryTimeouts()
+				metrics.Get().IncQueryTimeouts()
 			}
 			if isClientError(streamErr) && onDisconnect != nil {
 				onDisconnect()
@@ -523,13 +523,11 @@ func (h *QueryHandler) serveArcxArrowIPCResult(
 		if rowCapReached(governanceMaxRows, rows) {
 			trailers.set(arrowRowsCappedTrailer, strconv.Itoa(governanceMaxRows))
 		}
-		m.IncQuerySuccess()
-		m.IncQueryRows(rows)
-		m.RecordQueryLatency(time.Since(start).Microseconds())
+		outcome.succeed(rows)
 		if onComplete != nil {
 			onComplete(int(rows))
 		}
-	})
+	}, outcome.fail)
 	return true
 }
 
@@ -537,6 +535,10 @@ func (h *QueryHandler) serveArcxArrowIPCResult(
 // Optimized to stream rows directly into Arrow batches without intermediate buffering.
 func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	start := time.Now()
+	// x-arc-freshness: refused before the forward (#1760, fresh_flush.go).
+	if status, msg := h.freshnessRefusal(c); status != 0 {
+		return c.Status(status).JSON(fiber.Map{"success": false, "error": msg})
+	}
 	m := metrics.Get()
 	// Counted here, at the same point as the JSON path (executeQuery), so that
 	// arc_query_requests_total covers both query endpoints. Without it the
@@ -843,7 +845,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			if cancel != nil {
 				cancel()
 			}
-			m.IncQueryErrors()
+			m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			if h.queryRegistry != nil && queryID != "" {
 				h.queryRegistry.Fail(queryID, vanishedPartitionMessage)
 			}
@@ -863,6 +865,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			cancel()
 		}
 		if effectiveTimeout > 0 && ctxErr == context.DeadlineExceeded {
+			m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			m.IncQueryTimeouts()
 			if h.queryRegistry != nil && queryID != "" {
 				h.queryRegistry.TimedOut(queryID)
@@ -874,6 +877,10 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			})
 		}
 		if ctxErr == context.Canceled && h.endedByShutdown(queryID) {
+			// Shutdown cancelled it (#1644): the registry records it as
+			// cancelled, and the metrics as a failed execution, as on every
+			// query route (#1292), so success + errors = requests holds.
+			m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			h.logger.Warn().Str("sql", sqlutil.ForLog(req.SQL)).Str("query_id", queryID).Msg("Arrow query cancelled at shutdown")
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 				"success": false,
@@ -887,14 +894,14 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			// operator cancel that lands during
 			// execution — the common case for a long query — surfaces here as an
 			// error return, not as a mid-stream break with a truncation trailer.
-			m.IncQueryErrors()
+			m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			h.logger.Warn().Str("sql", sqlutil.ForLog(req.SQL)).Str("query_id", queryID).Msg("Arrow query cancelled")
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"success": false,
 				"error":   "Query cancelled",
 			})
 		}
-		m.IncQueryErrors()
+		m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 		if h.queryRegistry != nil && queryID != "" {
 			h.queryRegistry.Fail(queryID, sqlutil.SanitizeErrText(err.Error()))
 		}
@@ -993,6 +1000,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// through onPanic. That retry is gone. It is not worth restoring, but the
 	// change is not strictly better on every panic path.
 	var streamW *bufio.Writer
+	outcome := newQueryStreamOutcome(metrics.QueryEngineDuckDB, start)
 	h.setDirectBodyStream(fctx, cancel, trailers, "query_arrow_ipc", func() {
 		// A recovered panic leaves a stream the client would otherwise read as
 		// complete: fasthttp still writes the terminating chunk, and a cut on
@@ -1058,7 +1066,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		}
 
 		if streamErr != nil {
-			m.IncQueryErrors()
+			outcome.fail()
 			// Disposition, mirroring executeQuery: a deadline that fires
 			// mid-stream is a timeout (and counts as one — the pre-stream
 			// branch above already did, this path never had it); everything
@@ -1115,9 +1123,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		if h.queryRegistry != nil && queryID != "" {
 			h.queryRegistry.Complete(queryID, int(totalRows))
 		}
-		m.IncQuerySuccess()
-		m.IncQueryRows(totalRows)
-		m.RecordQueryLatency(time.Since(start).Microseconds())
+		outcome.succeed(totalRows)
 
 		h.logger.Info().
 			Int64("row_count", totalRows).
@@ -1125,7 +1131,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			Msg("Arrow streaming query completed")
 		// query.slow_query_threshold_ms covered only the JSON path until #309.
 		h.logSlowQuery(convertedSQL, start, int(totalRows), tokenName)
-	})
+	}, outcome.fail)
 
 	return nil
 }

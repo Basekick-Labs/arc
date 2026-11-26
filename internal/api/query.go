@@ -828,6 +828,8 @@ type QueryHandler struct {
 	// lifetime is the context read requests run on (SetLifetime); nil
 	// leaves them on Fiber's background context.
 	lifetime context.Context
+	// fresh serves x-arc-freshness (SetFreshFlush); nil: the feature off.
+	fresh *freshFlush
 	// warehouse names the Iceberg warehouse's directories in the storage
 	// root, which the listings leave out (#1626); nil with Iceberg off.
 	warehouse   WarehouseDirs
@@ -2581,6 +2583,13 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 	start := time.Now()
 	// Cache timestamp format once per request to avoid repeated formatting
 	timestamp := start.UTC().Format(time.RFC3339)
+	// x-arc-freshness (#1760, fresh_flush.go): its refusals come before
+	// anything is forwarded, counted or run. Also /api/v1/query/msgpack, in
+	// its wire format.
+	fresh, refused, refusal := h.freshBegin(c)
+	if refused != 0 {
+		return respondError(c, refused, refusal, timestamp, start)
+	}
 	m := metrics.Get()
 	m.IncQueryRequests()
 	decimalMode, decimalModeErr := requestDecimalMode(c)
@@ -2591,6 +2600,11 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 	if decimalMode == decimalModeExact {
 		m.IncQueryErrors()
 		return respondError(c, fiber.StatusBadRequest, "x-arc-decimals=exact is supported only for Arrow IPC and Flight SQL", timestamp, start)
+	}
+	// flushed: the fresh wait succeeded (below, after validation and RBAC).
+	var flushed bool
+	if fresh {
+		defer freshExit(c, &flushed)
 	}
 
 	// Check if this request should be forwarded to a reader/writer node
@@ -2656,6 +2670,11 @@ localProcessing:
 	// comment and executes it — returning the database/table list to a caller
 	// the SHOW RBAC gate would have denied. SECURITY: RBAC bypass.
 	showNormalised := normalizeSQLForShow(req.SQL)
+	if fresh && (showDatabasesPattern.MatchString(showNormalised) || showTablesPattern.MatchString(showNormalised)) {
+		m.IncQueryErrors()
+		freshReason(c, fresh, freshnessReasonShow)
+		return respondError(c, fiber.StatusBadRequest, "x-arc-freshness is not supported on SHOW commands; the query was not run", timestamp, start)
+	}
 
 	// Handle SHOW DATABASES command. A caller with a grant covering every
 	// database sees them all; any other sees the databases it can read
@@ -2709,6 +2728,7 @@ localProcessing:
 	// Check RBAC permissions for all tables referenced in the query
 	if err := h.checkQueryPermissions(c, req.SQL, "read"); err != nil {
 		m.IncQueryErrors()
+		freshReason(c, fresh, freshnessReasonForbidden)
 		return respondError(c, fiber.StatusForbidden, err.Error(), timestamp, start)
 	}
 
@@ -2719,6 +2739,24 @@ localProcessing:
 		effectiveTimeout = governanceTimeout
 	}
 	deadline := requestDeadline(effectiveTimeout)
+
+	// x-arc-freshness: flush the measurements the query reads and wait for
+	// them, outside the read gate, before its SQL is built below.
+	if fresh {
+		if status, msg := h.freshWait(c, req.SQL, headerDB, effectiveTimeout, deadline); status != 0 {
+			return respondError(c, status, msg, timestamp, start)
+		}
+		if freshAfterWaitHook != nil {
+			freshAfterWaitHook()
+		}
+		flushed = true
+		// Every execution clock below (execution_time_ms, the latency
+		// metrics, the stream outcome, the slow-query log) starts after the
+		// wait, which X-Arc-Freshness-Wait-Ms and
+		// arc_query_fresh_flush_seconds report. The deadline does not: it
+		// bounds the whole request.
+		start = time.Now()
+	}
 
 	// A read in flight, from before its SQL is built until its statement is
 	// bound (internal/readgate): a job that swaps files waits for it.
@@ -2908,7 +2946,7 @@ localProcessing:
 		// (classifyNoFiles).
 		kind := h.classifyNoFiles(err)
 		if kind == noFilesVanished {
-			m.IncQueryErrors()
+			m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			if h.queryRegistry != nil && queryID != "" {
 				h.queryRegistry.Fail(queryID, vanishedPartitionMessage)
 			}
@@ -2923,6 +2961,9 @@ localProcessing:
 		if kind == noFilesEmpty {
 			h.logger.Info().Str("sql", sqlutil.ForLog(req.SQL)).Msg("No files found for measurement, returning empty result")
 			m.IncQuerySuccess()
+			// As the Arrow-JSON and MessagePack paths: an empty result is a
+			// completed execution, in the lifetime average too (#1292).
+			m.RecordQueryLatencyForEngine(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			if h.queryRegistry != nil && queryID != "" {
 				h.queryRegistry.Complete(queryID, 0)
 			}
@@ -2936,7 +2977,7 @@ localProcessing:
 			})
 		}
 
-		m.IncQueryErrors()
+		m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 		// Check if it was a timeout
 		if effectiveTimeout > 0 && ctxErr == context.DeadlineExceeded {
 			m.IncQueryTimeouts()
@@ -2987,7 +3028,7 @@ localProcessing:
 		if cancel != nil {
 			cancel()
 		}
-		m.IncQueryErrors()
+		m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 		h.logger.Error().Err(err).Msg("Failed to get column names")
 		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 			Success:         false,
@@ -3016,6 +3057,7 @@ localProcessing:
 	// can fire inside the streaming callback. See C5.
 	streamCtx := ctx
 	c.Set("Content-Type", "application/json")
+	outcome := newQueryStreamOutcome(metrics.QueryEngineDuckDB, start)
 	h.setDirectBodyStream(c.Context(), cancel, nil, "query_json", func() {
 		if h.queryRegistry != nil && queryID != "" {
 			h.queryRegistry.Fail(queryID, "stream writer panicked")
@@ -3033,7 +3075,7 @@ localProcessing:
 			}
 		}()
 		rowCount, streamErr := streamTypedJSONFunc(streamCtx, w, columns, colTypes, rows, governanceMaxRows, profile, start, timestamp)
-		w.Flush()
+		streamErr = firstStreamWriteError(streamErr, w.Flush())
 
 		// Reported before the error branch below: a stream can reach the
 		// cap and then fail on the way out, and the envelope marks it
@@ -3054,7 +3096,7 @@ localProcessing:
 		// was already sent — operators must see the partial-result
 		// signal. See review/query-path-criticals C5.
 		if streamErr != nil {
-			m.IncQueryErrors()
+			outcome.fail()
 			if h.queryRegistry != nil && queryID != "" {
 				if errors.Is(streamErr, context.DeadlineExceeded) {
 					h.queryRegistry.TimedOut(queryID)
@@ -3079,16 +3121,14 @@ localProcessing:
 		if h.queryRegistry != nil && queryID != "" {
 			h.queryRegistry.Complete(queryID, rowCount)
 		}
-		m.IncQuerySuccess()
-		m.IncQueryRows(int64(rowCount))
-		m.RecordQueryLatency(time.Since(start).Microseconds())
+		outcome.succeed(int64(rowCount))
 
 		h.logger.Info().
 			Int("row_count", rowCount).
 			Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 			Msg("Query completed")
 		h.logSlowQuery(convertedSQL, start, rowCount, tokenName)
-	})
+	}, outcome.fail)
 	return nil
 }
 
@@ -6103,6 +6143,10 @@ type EstimateResponse struct {
 // estimateQuery handles POST /api/v1/query/estimate - returns row count estimate
 func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	start := time.Now()
+	// x-arc-freshness: refused before the forward (#1760, fresh_flush.go).
+	if status, msg := h.freshnessRefusal(c); status != 0 {
+		return c.Status(status).JSON(EstimateResponse{Success: false, Error: msg, WarningLevel: "error"})
+	}
 
 	// A node that cannot serve queries forwards (before governance, so the
 	// request is counted once, on the node that answers it).
@@ -6681,6 +6725,10 @@ func rowCapReached(maxRows int, rowCount int64) bool {
 // queryMeasurement handles GET /api/v1/query/:measurement - query a specific measurement
 func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	start := time.Now()
+	// x-arc-freshness: refused before the forward (#1760, fresh_flush.go).
+	if status, msg := h.freshnessRefusal(c); status != 0 {
+		return c.Status(status).JSON(QueryResponse{Success: false, Error: msg, Timestamp: start.UTC().Format(time.RFC3339)})
+	}
 	m := metrics.Get()
 	m.IncQueryRequests()
 
@@ -7009,7 +7057,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		if cancel != nil {
 			cancel()
 		}
-		m.IncQueryErrors()
+		m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 		// A partition or file removed mid-query: retryable, as on the other
 		// routes (classifyNoFiles).
 		if h.classifyNoFiles(err) == noFilesVanished {
@@ -7056,7 +7104,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		if cancel != nil {
 			cancel()
 		}
-		m.IncQueryErrors()
+		m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 		if onFail != nil {
 			onFail(sqlutil.SanitizeErrText(err.Error()))
 		}
@@ -7087,6 +7135,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	streamCtx := ctx
 	c.Set("Content-Type", "application/json")
 	streamStarted = true
+	outcome := newQueryStreamOutcome(metrics.QueryEngineDuckDB, start)
 	h.setDirectBodyStream(c.Context(), cancel, nil, "query_measurement", func() {
 		// A recovered panic skips the dispositions below, which would leave
 		// the entry listed as running forever with nothing to reap it (#731,
@@ -7102,7 +7151,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 			}
 		}()
 		rowCount, streamErr := streamTypedJSONFunc(streamCtx, w, columns, colTypes, rows, governanceMaxRows, nil, start, timestamp)
-		w.Flush()
+		streamErr = firstStreamWriteError(streamErr, w.Flush())
 
 		// Reported before the error branch below: a stream can reach the cap
 		// and then fail on the way out, and the envelope marks it capped
@@ -7112,7 +7161,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		h.logGovernanceRowCap("json", convertedSQL, tokenID, tokenName, governanceMaxRows, int64(rowCount))
 
 		if streamErr != nil {
-			m.IncQueryErrors()
+			outcome.fail()
 			// Per-handler client-disconnect counter (#426). queryMeasurement
 			// uses the pure database/sql streaming JSON path same as the
 			// other sites above, so it shares the sql_json label.
@@ -7139,9 +7188,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		}
 
 		// Record success metrics
-		m.IncQuerySuccess()
-		m.IncQueryRows(int64(rowCount))
-		m.RecordQueryLatency(time.Since(start).Microseconds())
+		outcome.succeed(int64(rowCount))
 
 		h.logger.Info().
 			Str("measurement", measurement).
@@ -7152,7 +7199,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		if onComplete != nil {
 			onComplete(rowCount)
 		}
-	})
+	}, outcome.fail)
 	return nil
 }
 

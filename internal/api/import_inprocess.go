@@ -37,6 +37,10 @@ const maxImportSize = 500 * 1024 * 1024 // 500MB
 // DuckDB sandbox allowlist.
 func (h *ImportHandler) handleCSVImport(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
+	// x-arc-wait is not supported on imports (#1759).
+	if handled, err := refuseWaitVisible(c); handled {
+		return err
+	}
 	if handled, err := h.forwardWriteIfNeeded(c); handled {
 		return err
 	}
@@ -373,8 +377,8 @@ func (h *ImportHandler) importCSV(c *fiber.Ctx, database, measurement string, up
 		return nil, err
 	}
 	// Hand what is still buffered of the import to the flush, its write slot
-	// already free (#1429): the rows are in the buffer and the WAL (when
-	// enabled); files follow as their flushes finish.
+	// already free (#1429); rows without a WAL copy are answered for once
+	// their flushes are done (#1888).
 	if err := w.finalFlush(writeCtx); err != nil {
 		return nil, &importError{StatusCode: fiber.StatusInternalServerError, Message: importFlushFailed, Err: err}
 	}
@@ -389,6 +393,10 @@ func (h *ImportHandler) importCSV(c *fiber.Ctx, database, measurement string, up
 // ingests it through the ArrowBuffer pipeline. No DuckDB queries against the file.
 func (h *ImportHandler) handleParquetImport(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
+	// x-arc-wait is not supported on imports (#1759).
+	if handled, err := refuseWaitVisible(c); handled {
+		return err
+	}
 	if handled, err := h.forwardWriteIfNeeded(c); handled {
 		return err
 	}
@@ -725,8 +733,8 @@ func (h *ImportHandler) importParquet(ctx fiberContext, database, measurement st
 		return nil, err
 	}
 	// Hand what is still buffered of the import to the flush, its write slot
-	// already free (#1429): the rows are in the buffer and the WAL (when
-	// enabled); files follow as their flushes finish.
+	// already free (#1429); rows without a WAL copy are answered for once
+	// their flushes are done (#1888).
 	if err := w.finalFlush(ctx); err != nil {
 		return nil, &importError{StatusCode: fiber.StatusInternalServerError, Message: importFlushFailed, Err: err}
 	}

@@ -319,6 +319,10 @@ func (m *ManifestManager) recoverOrphanedManifests(ctx context.Context, scope re
 }
 
 type recoveryHooks struct {
+	// stop, when set and returning an error, ends recovery before the next
+	// manifest with that error (#1887: shutdown). The manifests not reached
+	// stay for the next cycle.
+	stop func() error
 	// beforeInputDelete records the kept output before recovery removes sources.
 	beforeInputDelete func(context.Context, *Manifest) error
 	// afterInputDelete advances completion state after all source removals.
@@ -347,6 +351,11 @@ func (m *ManifestManager) recoverOrphanedManifestsWithHooks(ctx context.Context,
 		return 0, err
 	}
 	for _, path := range paths {
+		if hooks.stop != nil {
+			if err := hooks.stop(); err != nil {
+				return recovered, errors.Join(recoveryErr, err)
+			}
+		}
 		if err := ctx.Err(); err != nil {
 			return recovered, errors.Join(recoveryErr, err)
 		}

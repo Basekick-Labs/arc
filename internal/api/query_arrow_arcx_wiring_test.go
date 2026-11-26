@@ -200,7 +200,7 @@ func TestArcxArrowSourceWiring(t *testing.T) {
 				return true
 			}
 			sel, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok || sel.Sel.Name != "setDirectBodyStream" || len(call.Args) != 6 {
+			if !ok || sel.Sel.Name != "setDirectBodyStream" || len(call.Args) < 6 {
 				return true
 			}
 			writer, ok := call.Args[5].(*ast.FuncLit)

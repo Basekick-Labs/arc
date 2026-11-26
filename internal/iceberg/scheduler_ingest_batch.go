@@ -127,13 +127,18 @@ func (s *Scheduler) serviceIngestBatches(ctx context.Context, maxRequests, maxPa
 		}
 		passesDue = append(passesDue, needPass...)
 		for len(passesDue) > 0 {
-			if ctx.Err() != nil || !s.gateOpen() {
-				// Shutting down, or another node exports now (an append that
-				// lost the writer role is one way to get here): its passes
-				// converge the tables.
-				if ctx.Err() == nil {
-					s.dropIngest()
+			if ctx.Err() != nil {
+				// Stopping (#1886): the shutdown drain serves these, so they go
+				// back in the queue rather than with the loop.
+				for _, later := range passesDue {
+					s.ingestDueNow(later.m, later.key)
 				}
+				return
+			}
+			if !s.gateOpen() {
+				// Another node exports now (an append that lost the writer
+				// role is one way to get here): its passes converge the tables.
+				s.dropIngest()
 				return
 			}
 			if passes >= maxPasses {

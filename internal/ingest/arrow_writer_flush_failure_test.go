@@ -344,7 +344,7 @@ func TestFlushPartSync_ReportsRowsWithoutWALCopy(t *testing.T) {
 			data := map[string]interface{}{"time": []int64{start, start + 1}, "value": []float64{1, 2}}
 			batch := &TypedColumnBatch{Data: data, Signature: getColumnSignature(data), hasWALCopy: tt.hasWALCopy}
 			before := metrics.Get().Snapshot()["buffer_records_dropped_total"].(int64)
-			if err := buf.flushPartSync(context.Background(), "db/part", "db", "part", flushPart{records: []interface{}{batch}, rows: 2}); err == nil {
+			if err := buf.flushPartSync(context.Background(), "db/part", "db", "part", flushPart{records: []interface{}{batch}, rows: 2}, nil); err == nil {
 				t.Fatal("expected storage failure")
 			}
 			if d := metrics.Get().Snapshot()["buffer_records_dropped_total"].(int64) - before; d != tt.wantDropped {

@@ -89,6 +89,37 @@ func batchUnit(recordList []interface{}, converted []*models.ColumnarRecord, i i
 	return "", 0
 }
 
+// BatchRows is the rows a Write of records buffers when it succeeds (#1759):
+// len(time) of a columnar record, NumRecords of a typed one, one per row
+// record. Exact on the success path: a row record is dropped only with a
+// PointsDroppedError. false for any other record type, which Write refuses:
+// a visible write that cannot count its rows is not answered visible.
+func BatchRows(records []interface{}) (int64, bool) {
+	var n int64
+	for _, record := range records {
+		switch r := record.(type) {
+		case *models.ColumnarRecord:
+			if r == nil {
+				return 0, false
+			}
+			n += int64(len(r.Columns["time"]))
+		case *TypedColumnarRecord:
+			if r == nil {
+				return 0, false
+			}
+			n += int64(r.NumRecords)
+		case *models.Record:
+			if r == nil {
+				return 0, false
+			}
+			n++
+		default:
+			return 0, false
+		}
+	}
+	return n, true
+}
+
 // writtenUnits returns, for a Write that reached unit stop, the measurements
 // buffered before it (sorted, each once), their rows, and the records in the
 // decoder's unit (see unitRecords). Units refused for their content are not

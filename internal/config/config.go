@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"github.com/google/uuid"
 	"math"
 	"net"
 	"net/url"
@@ -187,7 +188,7 @@ type IngestConfig struct {
 	ShardCount            int      // Number of buffer shards for lock distribution (default: 32)
 	SortKeys              []string // Per-measurement sort keys: "measurement:col1,col2,time"
 	DefaultSortKeys       string   // Default sort keys for measurements not in SortKeys
-	FlushTimeoutSeconds   int      // Timeout per file of a flush: its storage write, registrations and WAL checkpoint (default: 30s; <= 0 means 30s). Not a cap on the whole flush (#1692).
+	FlushTimeoutSeconds   int      // Timeout per file of a flush: its storage write, schema registration and WAL checkpoint, and separately its tiering record (default: 30s; <= 0 means 30s). Not a cap on the whole flush (#1692, #1933).
 	DecimalColumns        []string // Per-measurement decimal columns: "measurement:col=precision,scale;col2=p,s"
 	DefaultDecimalColumns string   // Default decimal columns for unmapped measurements
 	// ImportWriteConcurrency is how many bulk imports (/api/v1/import/lp,
@@ -207,6 +208,18 @@ type IngestConfig struct {
 	// the memory limit it detects.
 	MaxBufferedBytes     int64
 	MaxBufferedBytesAuto bool
+	// WaitVisibleEnabled lets a MessagePack or line-protocol write carry
+	// x-arc-wait: visible and be answered once its rows are visible to a
+	// query on this node, at most 20 s later (#1759). false (the default):
+	// such a request is refused with 403 and nothing written. Standalone
+	// only: on a cluster the header is refused with 400.
+	WaitVisibleEnabled bool
+	// WaitVisibleMinIntervalMS bounds how often such a write may flush a
+	// measurement early to shorten its wait (#1759): at most once per
+	// interval per measurement, and only while the flush pipeline has spare
+	// capacity; otherwise the write waits for its rows' age or size flush.
+	// In [MinWaitVisibleMinIntervalMS, MaxWaitVisibleMinIntervalMS].
+	WaitVisibleMinIntervalMS int
 }
 
 // minIcebergIngestExportInterval is the shortest iceberg.ingest_export_interval
@@ -705,6 +718,16 @@ type TelemetryConfig struct {
 	Enabled         bool   // Enable telemetry (default: true)
 	Endpoint        string // Telemetry endpoint URL
 	IntervalSeconds int    // Reporting interval in seconds (default: 86400 = 24h)
+	// InstanceID, when set, is this installation's telemetry id (#1885): a
+	// UUID, stored in canonical form, used instead of the id file, so a
+	// deployment without a persistent disk keeps one id. Must be unique per
+	// node; on a cluster, main derives one per node from it and
+	// cluster.node_id. Empty: the id file in DataDir.
+	InstanceID string
+	// DataDir is where the id file (.instance_id) lives when InstanceID is
+	// empty (#1885). Default "./data", relative to the working directory; it
+	// does not follow auth.db_path or storage.local_path.
+	DataDir string
 }
 
 type DeleteConfig struct {
@@ -740,6 +763,12 @@ type IcebergConfig struct {
 	// is exported after at most this long instead of at the next timed pass.
 	// 0 turns the ingest trigger off (timed passes only). Default 60.
 	IngestExportInterval int
+	// LoadExportMinInterval lets a REST catalog table load pull its table's
+	// queued ingest export forward and wait for it, up to 2 s: the table is
+	// then exported no sooner than this many seconds after its last export
+	// (#1752). 0 (the default) is off. Otherwise at least
+	// minIcebergIngestExportInterval and at most IngestExportInterval.
+	LoadExportMinInterval int
 	// MinVersionAge is how long, in seconds, a published table version
 	// (v<N>.metadata.json) is kept after the next one is published, on top
 	// of the newest retain_snapshots+1 (#1751). It is what lets ingest
@@ -877,6 +906,22 @@ type QueryConfig struct {
 	// bare time bounds, a range of at most 7 days, a standard partition
 	// layout, and fresh verified listings. Opt-in while experimental.
 	EmptyRangeAnchorScan bool
+	// FreshFlushEnabled lets a query carry x-arc-freshness: flush (#1760):
+	// the measurements it reads are flushed, and the query runs once every
+	// row this node acknowledged before it is stored. false (the default):
+	// such a request is refused with 403. Standalone with local storage
+	// only; refused with 400 on a cluster, on object storage, and while
+	// tiered storage is active.
+	FreshFlushEnabled bool
+	// FreshFlushMinIntervalMS bounds how often a fresh query may flush a
+	// measurement early: at most once per interval per measurement, inside
+	// the forced-flush budget it shares with visible writes; otherwise the
+	// query waits for the measurement's next flush. In
+	// [MinWaitVisibleMinIntervalMS, MaxWaitVisibleMinIntervalMS].
+	FreshFlushMinIntervalMS int
+	// FreshFlushMaxWaiters bounds the fresh queries waiting at once on this
+	// node; one more is refused with 503 (busy). In [1, MaxFreshFlushMaxWaiters].
+	FreshFlushMaxWaiters int
 }
 
 // LicenseConfig holds configuration for enterprise license validation
@@ -1458,25 +1503,27 @@ func Load() (*Config, error) {
 			GCSEndpoint:        v.GetString("storage.gcs_endpoint"),
 		},
 		Ingest: IngestConfig{
-			MaxBufferSize:          v.GetInt("ingest.max_buffer_size"),
-			MaxBufferAgeMS:         v.GetInt("ingest.max_buffer_age_ms"),
-			Compression:            v.GetString("ingest.compression"),
-			UseDictionary:          v.GetBool("ingest.use_dictionary"),
-			NumericDictionary:      v.GetBool("ingest.numeric_dictionary"),
-			WriteStatistics:        v.GetBool("ingest.write_statistics"),
-			DataPageVersion:        v.GetString("ingest.data_page_version"),
-			MaxRowGroupRows:        v.GetInt("ingest.max_row_group_rows"),
-			WritePageIndex:         v.GetBool("ingest.write_page_index"),
-			FlushWorkers:           v.GetInt("ingest.flush_workers"),
-			FlushQueueSize:         v.GetInt("ingest.flush_queue_size"),
-			FlushTimeoutSeconds:    v.GetInt("ingest.flush_timeout_seconds"),
-			ShardCount:             v.GetInt("ingest.shard_count"),
-			SortKeys:               v.GetStringSlice("ingest.sort_keys"),
-			DefaultSortKeys:        v.GetString("ingest.default_sort_keys"),
-			DecimalColumns:         v.GetStringSlice("ingest.decimal_columns"),
-			DefaultDecimalColumns:  v.GetString("ingest.default_decimal_columns"),
-			ImportWriteConcurrency: v.GetInt("ingest.import_write_concurrency"),
-			ImportQueueTimeoutMS:   v.GetInt("ingest.import_queue_timeout_ms"),
+			MaxBufferSize:            v.GetInt("ingest.max_buffer_size"),
+			MaxBufferAgeMS:           v.GetInt("ingest.max_buffer_age_ms"),
+			Compression:              v.GetString("ingest.compression"),
+			UseDictionary:            v.GetBool("ingest.use_dictionary"),
+			NumericDictionary:        v.GetBool("ingest.numeric_dictionary"),
+			WriteStatistics:          v.GetBool("ingest.write_statistics"),
+			DataPageVersion:          v.GetString("ingest.data_page_version"),
+			MaxRowGroupRows:          v.GetInt("ingest.max_row_group_rows"),
+			WritePageIndex:           v.GetBool("ingest.write_page_index"),
+			FlushWorkers:             v.GetInt("ingest.flush_workers"),
+			FlushQueueSize:           v.GetInt("ingest.flush_queue_size"),
+			FlushTimeoutSeconds:      v.GetInt("ingest.flush_timeout_seconds"),
+			ShardCount:               v.GetInt("ingest.shard_count"),
+			SortKeys:                 v.GetStringSlice("ingest.sort_keys"),
+			DefaultSortKeys:          v.GetString("ingest.default_sort_keys"),
+			DecimalColumns:           v.GetStringSlice("ingest.decimal_columns"),
+			DefaultDecimalColumns:    v.GetString("ingest.default_decimal_columns"),
+			ImportWriteConcurrency:   v.GetInt("ingest.import_write_concurrency"),
+			ImportQueueTimeoutMS:     v.GetInt("ingest.import_queue_timeout_ms"),
+			WaitVisibleEnabled:       v.GetBool("ingest.wait_visible_enabled"),
+			WaitVisibleMinIntervalMS: v.GetInt("ingest.wait_visible_min_interval_ms"),
 		},
 		Cache: CacheConfig{
 			Enabled:    v.GetBool("cache.enabled"),
@@ -1582,6 +1629,8 @@ func Load() (*Config, error) {
 			Enabled:         v.GetBool("telemetry.enabled"),
 			Endpoint:        v.GetString("telemetry.endpoint"),
 			IntervalSeconds: v.GetInt("telemetry.interval_seconds"),
+			InstanceID:      strings.TrimSpace(v.GetString("telemetry.instance_id")),
+			DataDir:         strings.TrimSpace(v.GetString("telemetry.data_dir")),
 		},
 		Delete: DeleteConfig{
 			Enabled:               v.GetBool("delete.enabled"),
@@ -1600,6 +1649,7 @@ func Load() (*Config, error) {
 			NamespaceMigrationDryRun: v.GetBool("iceberg.namespace_migration_dry_run"),
 			ReconcileInterval:        v.GetInt("iceberg.reconcile_interval"),
 			IngestExportInterval:     v.GetInt("iceberg.ingest_export_interval"),
+			LoadExportMinInterval:    v.GetInt("iceberg.load_export_min_interval"),
 			MinVersionAge:            v.GetInt("iceberg.min_version_age"),
 			IngestAppendEnabled:      v.GetBool("iceberg.ingest_append_enabled"),
 			IngestExportConcurrency:  v.GetInt("iceberg.ingest_export_concurrency"),
@@ -1647,6 +1697,9 @@ func Load() (*Config, error) {
 			StableSchemaBootstrap:         v.GetBool("query.stable_schema_bootstrap"),
 			StableSchemaBootstrapMaxFiles: v.GetInt("query.stable_schema_bootstrap_max_files"),
 			EmptyRangeAnchorScan:          v.GetBool("query.empty_range_anchor_scan"),
+			FreshFlushEnabled:             v.GetBool("query.fresh_flush_enabled"),
+			FreshFlushMinIntervalMS:       v.GetInt("query.fresh_flush_min_interval_ms"),
+			FreshFlushMaxWaiters:          v.GetInt("query.fresh_flush_max_waiters"),
 			EnableS3Cache:                 v.GetBool("query.enable_s3_cache"),
 			S3CacheSize:                   s3CacheSize,
 			S3CacheTTLSeconds:             v.GetInt("query.s3_cache_ttl_seconds"),
@@ -1846,6 +1899,12 @@ func Load() (*Config, error) {
 	// The covered append (cluster.wal_coverage) commits under the ingest shard
 	// lock, where waiting for a sync would stall every writer to that
 	// measurement: durable acknowledgement does not support it yet.
+	// The periodic recovery pass ticks at this interval; time.NewTicker panics
+	// on a value <= 0, and a DELETE refused after a flush failure waits for
+	// that pass (#1938).
+	if cfg.WAL.Enabled && cfg.WAL.RecoveryIntervalSeconds <= 0 {
+		return nil, fmt.Errorf("wal.recovery_interval_seconds must be > 0 with wal.enabled = true (got %d)", cfg.WAL.RecoveryIntervalSeconds)
+	}
 	if !cfg.WAL.Enabled && cfg.WAL.AckMode == "durable" {
 		cfg.Warnings = append(cfg.Warnings, LoadWarning{
 			Key:     "wal.ack_mode",
@@ -1890,6 +1949,17 @@ func Load() (*Config, error) {
 	// like a negative value rather than silently clamped.
 	if cfg.Ingest.MaxRowGroupRows != 0 && cfg.Ingest.MaxRowGroupRows < 1024 {
 		return nil, fmt.Errorf("invalid ingest.max_row_group_rows value: %d (must be 0 or >= 1024; 0 = one row group per flush)", cfg.Ingest.MaxRowGroupRows)
+	}
+	if ms := cfg.Ingest.WaitVisibleMinIntervalMS; ms < MinWaitVisibleMinIntervalMS || ms > MaxWaitVisibleMinIntervalMS {
+		return nil, fmt.Errorf("invalid ingest.wait_visible_min_interval_ms value: %d (must be between %d and %d: at least a second, so a measurement is flushed early at most 3600 times an hour; at most an hour, how long a measurement's last flush is remembered)",
+			ms, MinWaitVisibleMinIntervalMS, MaxWaitVisibleMinIntervalMS)
+	}
+	if ms := cfg.Query.FreshFlushMinIntervalMS; ms < MinWaitVisibleMinIntervalMS || ms > MaxWaitVisibleMinIntervalMS {
+		return nil, fmt.Errorf("invalid query.fresh_flush_min_interval_ms value: %d (must be between %d and %d: at least a second, so a measurement is flushed early at most 3600 times an hour; at most an hour, how long a measurement's last flush is remembered)",
+			ms, MinWaitVisibleMinIntervalMS, MaxWaitVisibleMinIntervalMS)
+	}
+	if n := cfg.Query.FreshFlushMaxWaiters; n < 1 || n > MaxFreshFlushMaxWaiters {
+		return nil, fmt.Errorf("invalid query.fresh_flush_max_waiters value: %d (must be between 1 and %d)", n, MaxFreshFlushMaxWaiters)
 	}
 	if cfg.Ingest.ImportQueueTimeoutMS < 0 {
 		return nil, fmt.Errorf("invalid ingest.import_queue_timeout_ms value: %d (must be >= 0; 0 = until a slot frees)", cfg.Ingest.ImportQueueTimeoutMS)
@@ -2113,12 +2183,26 @@ func Load() (*Config, error) {
 		cfg.Warnings = append(cfg.Warnings, *w)
 	}
 
+	cfg.Warnings = append(cfg.Warnings, waitVisibleWarnings(cfg)...)
+	cfg.Warnings = append(cfg.Warnings, freshFlushWarnings(cfg)...)
+
 	cfg.ConfigFile = v.ConfigFileUsed()
 	if w := shadowedConfigFilesWarning(cfg.ConfigFile); w != nil {
 		cfg.Warnings = append(cfg.Warnings, *w)
 	}
 
+	if err := normalizeTelemetry(&cfg.Telemetry); err != nil {
+		return nil, err
+	}
+
 	w, err := normalizeBootstrapToken(&cfg.Auth)
+	if err != nil {
+		return nil, err
+	}
+	if w != nil {
+		cfg.Warnings = append(cfg.Warnings, *w)
+	}
+	w, err = validateBootstrapToken(cfg.Auth)
 	if err != nil {
 		return nil, err
 	}
@@ -2154,6 +2238,12 @@ func Load() (*Config, error) {
 		if n := cfg.Iceberg.IngestExportInterval; n < 0 || (n > 0 && n < minIcebergIngestExportInterval) {
 			return nil, fmt.Errorf("iceberg.ingest_export_interval must be 0 or at least %d (got %d): it is the least time, in seconds, "+
 				"between two exports of a table that ingest causes; 0 turns that trigger off", minIcebergIngestExportInterval, n)
+		}
+		if n := cfg.Iceberg.LoadExportMinInterval; n < 0 || (n > 0 && (n < minIcebergIngestExportInterval ||
+			cfg.Iceberg.IngestExportInterval == 0 || n > cfg.Iceberg.IngestExportInterval)) {
+			return nil, fmt.Errorf("iceberg.load_export_min_interval must be 0 or between %d and iceberg.ingest_export_interval (%d), "+
+				"which must be on (got %d): it is the least time, in seconds, between two exports of a table that REST catalog loads cause; 0 turns that off",
+				minIcebergIngestExportInterval, cfg.Iceberg.IngestExportInterval, n)
 		}
 		if n := cfg.Iceberg.ExportLagTableSeries; n < 0 || n > maxIcebergExportLagTableSeries {
 			return nil, fmt.Errorf("iceberg.export_lag_table_series must be between 0 and %d, got %d: how many tables get their own "+
@@ -2680,7 +2770,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ingest.default_decimal_columns", "")
 	v.SetDefault("ingest.import_write_concurrency", 0) // 0 = auto (#1429)
 	v.SetDefault("ingest.import_queue_timeout_ms", 30000)
-	v.SetDefault("ingest.max_buffered_bytes", "0") // off; "auto" = half the memory limit (#1468)
+	v.SetDefault("ingest.max_buffered_bytes", "0")     // off; "auto" = half the memory limit (#1468)
+	v.SetDefault("ingest.wait_visible_enabled", false) // x-arc-wait: visible refused with 403 (#1759)
+	v.SetDefault("ingest.wait_visible_min_interval_ms", defaultWaitVisibleMinIntervalMS)
 
 	// Log defaults
 	v.SetDefault("log.level", "info")
@@ -2808,6 +2900,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("telemetry.enabled", true)                                               // Enabled by default (opt-out)
 	v.SetDefault("telemetry.endpoint", "https://telemetry.basekick.net/api/v1/telemetry") // Telemetry endpoint
 	v.SetDefault("telemetry.interval_seconds", 86400)                                     // 24 hours
+	v.SetDefault("telemetry.instance_id", "")                                             // "" = the id file in telemetry.data_dir (#1885)
+	v.SetDefault("telemetry.data_dir", "./data")                                          // where the id file lives (#1885)
 
 	// Delete defaults
 	v.SetDefault("delete.enabled", false)                // Disabled by default for safety
@@ -2825,6 +2919,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("iceberg.namespace_migration_dry_run", true)
 	v.SetDefault("iceberg.reconcile_interval", 300)          // seconds
 	v.SetDefault("iceberg.ingest_export_interval", 60)       // seconds; 0 = export on the timer only (#1750)
+	v.SetDefault("iceberg.load_export_min_interval", 0)      // seconds; 0 = a REST catalog load never pulls an export forward (#1752)
 	v.SetDefault("iceberg.min_version_age", 300)             // seconds a published version outlives its successor (#1751)
 	v.SetDefault("iceberg.ingest_append_enabled", true)      // ingest exports add only the new files (#1751)
 	v.SetDefault("iceberg.ingest_export_concurrency", 8)     // tables whose ingest appends run at once (#1778)
@@ -2867,6 +2962,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("query.enable_s3_cache", false)                 // Disabled by default (opt-in feature)
 	v.SetDefault("query.s3_cache_size", "128MB")                 // 128MB cache (256 blocks × 512KB)
 	v.SetDefault("query.s3_cache_ttl_seconds", 3600)             // 1 hour
+	// x-arc-freshness: flush (#1760), refused with 403 while off.
+	v.SetDefault("query.fresh_flush_enabled", false)
+	v.SetDefault("query.fresh_flush_min_interval_ms", defaultFreshFlushMinIntervalMS)
+	v.SetDefault("query.fresh_flush_max_waiters", defaultFreshFlushMaxWaiters)
 
 	// License defaults (Enterprise features)
 	// Note: Server URL and validation interval are hardcoded in internal/license/client.go
@@ -3060,6 +3159,34 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("backup.operation_timeout", "2h")
 }
 
+// normalizeTelemetry checks telemetry.instance_id and fills an empty
+// telemetry.data_dir (#1885). The id must be a UUID: the telemetry pages
+// promise a random UUID not linked to anything, and every count on the
+// server is a count of distinct ids, so a free-form value ("prod") would
+// merge unrelated installations. Stored in canonical form, so case and
+// braces do not make two ids of one. Checked only with telemetry on; with it
+// off the keys are never read.
+func normalizeTelemetry(t *TelemetryConfig) error {
+	if t.DataDir == "" {
+		t.DataDir = "./data"
+	}
+	if !t.Enabled || t.InstanceID == "" {
+		return nil
+	}
+	id, err := uuid.Parse(t.InstanceID)
+	if err != nil {
+		return fmt.Errorf("telemetry.instance_id (ARC_TELEMETRY_INSTANCE_ID) must be a UUID; generate one with uuidgen (a standalone node needs its own; on a cluster one value serves every node)")
+	}
+	// Placeholders anyone might copy would merge every installation that used
+	// them: the nil and max UUIDs, and the textbook example.
+	switch id {
+	case uuid.Nil, uuid.Max, uuid.MustParse("550e8400-e29b-41d4-a716-446655440000"):
+		return fmt.Errorf("telemetry.instance_id (ARC_TELEMETRY_INSTANCE_ID) is a placeholder UUID (%s); generate your own with uuidgen", id)
+	}
+	t.InstanceID = id.String()
+	return nil
+}
+
 // fipsBuild is fips.BuildTagged; a variable so the refusal below can be
 // tested in the default build.
 var fipsBuild = fips.BuildTagged
@@ -3096,6 +3223,38 @@ func normalizeBootstrapToken(auth *AuthConfig) (*LoadWarning, error) {
 		Value:   "(not shown)",
 		Message: "auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN) had surrounding whitespace, such as the newline at the end of a file it was read from: it was removed, and the trimmed value is the token clients must present. Tokens already stored are unchanged: a token an earlier release stored with the whitespace cannot be sent in a header (see the release notes for #1713 to recover)",
 	}, nil
+}
+
+// MinBootstrapTokenLength is the shortest auth.bootstrap_token Arc accepts, in
+// bytes. internal/auth enforces the same rule on every token value it stores
+// (a test there pins the two equal); config cannot import auth.
+const MinBootstrapTokenLength = 32
+
+// validateBootstrapToken refuses, at load, an auth.bootstrap_token that the
+// bootstrap would reject (#1915). Before, Arc logged "Failed to create
+// initial admin token" and ran with auth on and no admin token, answering
+// 401 to everything. It runs after normalizeBootstrapToken, so the length is
+// that of the trimmed value, and the message says so. With auth disabled the
+// key is never read.
+//
+// auth.force_bootstrap without a token gets a warning: the flag acts only
+// with auth.bootstrap_token, and without one Arc generates a token only on an
+// empty auth database.
+func validateBootstrapToken(auth AuthConfig) (*LoadWarning, error) {
+	if !auth.Enabled {
+		return nil, nil
+	}
+	if auth.BootstrapToken != "" && len(auth.BootstrapToken) < MinBootstrapTokenLength {
+		return nil, fmt.Errorf("auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN) is %d bytes after surrounding whitespace is removed; it must be at least %d. Set a longer token (for example `openssl rand -hex 32`), or unset the key to have Arc generate one", len(auth.BootstrapToken), MinBootstrapTokenLength)
+	}
+	if auth.ForceBootstrap && auth.BootstrapToken == "" {
+		return &LoadWarning{
+			Key:     "auth.force_bootstrap",
+			Value:   "true",
+			Message: "auth.force_bootstrap adds a recovery token only together with auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN); without one, Arc generates an admin token only when the auth database has no tokens, and otherwise does nothing",
+		}, nil
+	}
+	return nil, nil
 }
 
 // refuseGCSInFIPSBuild refuses a "gcs" backend at key in the FIPS build, which
@@ -3822,4 +3981,123 @@ func (c *Config) checkIcebergGlue() error {
 		return fmt.Errorf("iceberg.glue.sync_interval must be >= 5 seconds (got %d)", g.SyncInterval)
 	}
 	return nil
+}
+
+// waitVisibleMaxBufferAgeMS is the largest ingest.max_buffer_age_ms that
+// leaves a write waiting with x-arc-wait: visible half its 20 s budget
+// (#1759).
+const waitVisibleMaxBufferAgeMS = 10000
+
+// Bounds of ingest.wait_visible_min_interval_ms (#1759) and
+// query.fresh_flush_min_interval_ms (#1760). Visible writes and fresh
+// queries share one per-measurement record of the last flush and one
+// forced-flush budget: an early flush from either makes the measurement not
+// due for the other, and either can take the slots the other would use.
+//   - The floor, a second, caps the early flushes of one measurement at 3600
+//     an hour, what the age trigger alone makes at max_buffer_age_ms = 1000.
+//     0 would allow a flush per waiting write.
+//   - The ceiling, an hour, is ingest.MaxForceInterval: how long the buffer
+//     remembers a measurement's last flush. Past it the entry is pruned and
+//     the measurement is due again, so a longer interval would not hold.
+const (
+	defaultWaitVisibleMinIntervalMS = 5000
+	MinWaitVisibleMinIntervalMS     = 1000
+	MaxWaitVisibleMinIntervalMS     = 3_600_000
+)
+
+// query.fresh_flush_* defaults and bounds (#1760).
+const (
+	defaultFreshFlushMinIntervalMS = 5000
+	defaultFreshFlushMaxWaiters    = 64
+	MaxFreshFlushMaxWaiters        = 1024
+	// freshFlushMaxBufferAgeMS is the largest ingest.max_buffer_age_ms that
+	// leaves a fresh query half its 30 s wait when it cannot flush early.
+	freshFlushMaxBufferAgeMS = 15000
+)
+
+// freshFlushWarnings are the advisories for query.fresh_flush_enabled
+// (#1760), each only with the key on.
+func freshFlushWarnings(cfg *Config) []LoadWarning {
+	if !cfg.Query.FreshFlushEnabled {
+		return nil
+	}
+	var out []LoadWarning
+	refused := func(key, value, why string) {
+		out = append(out, LoadWarning{Key: key, Value: value,
+			Message: "query.fresh_flush_enabled has no effect " + why + ": a query carrying x-arc-freshness: flush is refused with 400"})
+	}
+	if cfg.Cluster.Enabled {
+		refused("query.fresh_flush_enabled", "true", "with cluster.enabled = true")
+	}
+	if b := cfg.Storage.Backend; b != "local" {
+		refused("storage.backend", b, "on object storage")
+	}
+	if cfg.TieredStorage.Enabled {
+		refused("tiered_storage.enabled", "true", "while tiered storage is active (enabled and licensed)")
+	}
+	age := cfg.Ingest.MaxBufferAgeMS
+	if age > freshFlushMaxBufferAgeMS {
+		out = append(out, LoadWarning{
+			Key:     "ingest.max_buffer_age_ms",
+			Value:   strconv.Itoa(age),
+			Message: fmt.Sprintf("ingest.max_buffer_age_ms is above %d with query.fresh_flush_enabled = true: a query carrying x-arc-freshness: flush that cannot flush a measurement early (flushed within query.fresh_flush_min_interval_ms, or no spare flush capacity) waits for its age or size flush, at most 30 s, so it can be answered 504 (timeout)", freshFlushMaxBufferAgeMS),
+		})
+	}
+	if t := cfg.Query.Timeout; t > 0 && age >= t*1000 {
+		out = append(out, LoadWarning{
+			Key:     "ingest.max_buffer_age_ms",
+			Value:   strconv.Itoa(age),
+			Message: fmt.Sprintf("ingest.max_buffer_age_ms (%d) is at or above query.timeout (%d s) with query.fresh_flush_enabled = true: a query carrying x-arc-freshness: flush that waits for an age flush can time out first (504)", age, t),
+		})
+	}
+	// At an age <= 0 (never validated) every sweep flushes every buffer.
+	if iv := cfg.Query.FreshFlushMinIntervalMS; age > 0 && iv > age {
+		out = append(out, LoadWarning{
+			Key:     "query.fresh_flush_min_interval_ms",
+			Value:   strconv.Itoa(iv),
+			Message: fmt.Sprintf("query.fresh_flush_min_interval_ms (%d) is above ingest.max_buffer_age_ms (%d): on a measurement written continuously the age flush comes first, so a query carrying x-arc-freshness: flush flushes early only a measurement idle for longer than the difference", iv, age),
+		})
+	}
+	return out
+}
+
+// waitVisibleWarnings are the advisories for ingest.wait_visible_enabled
+// (#1759), each only with the key on.
+func waitVisibleWarnings(cfg *Config) []LoadWarning {
+	if !cfg.Ingest.WaitVisibleEnabled {
+		return nil
+	}
+	var out []LoadWarning
+	if cfg.Cluster.Enabled {
+		out = append(out, LoadWarning{
+			Key:     "ingest.wait_visible_enabled",
+			Value:   "true",
+			Message: "ingest.wait_visible_enabled has no effect with cluster.enabled = true: a write carrying x-arc-wait: visible is refused with 400 and nothing written",
+		})
+	}
+	// The same test as the handlers' storageConfirmable (api.WaitVisibleConfig).
+	if b := cfg.Storage.Backend; b != "local" {
+		out = append(out, LoadWarning{
+			Key:     "storage.backend",
+			Value:   b,
+			Message: "ingest.wait_visible_enabled = true on object storage: a write carrying x-arc-wait: visible still waits for its rows' flush, then is answered 202 (storage_not_confirmable); only local storage confirms visibility in this version",
+		})
+	}
+	if cfg.Ingest.MaxBufferAgeMS > waitVisibleMaxBufferAgeMS {
+		out = append(out, LoadWarning{
+			Key:     "ingest.max_buffer_age_ms",
+			Value:   strconv.Itoa(cfg.Ingest.MaxBufferAgeMS),
+			Message: fmt.Sprintf("ingest.max_buffer_age_ms is above %d with ingest.wait_visible_enabled = true: a write carrying x-arc-wait: visible that cannot flush its measurement early (flushed within ingest.wait_visible_min_interval_ms, or no spare flush capacity) waits for its rows' age or size flush, at most 20 s, so on a measurement that does not reach ingest.max_buffer_size within the age it can be answered 202 (timeout) instead of 204", waitVisibleMaxBufferAgeMS),
+		})
+	}
+	// At an age <= 0 (never validated) every sweep flushes every buffer, so
+	// the comparison means nothing.
+	if iv := cfg.Ingest.WaitVisibleMinIntervalMS; cfg.Ingest.MaxBufferAgeMS > 0 && iv > cfg.Ingest.MaxBufferAgeMS {
+		out = append(out, LoadWarning{
+			Key:     "ingest.wait_visible_min_interval_ms",
+			Value:   strconv.Itoa(iv),
+			Message: fmt.Sprintf("ingest.wait_visible_min_interval_ms (%d) is above ingest.max_buffer_age_ms (%d): on a measurement written continuously the age flush comes first, so a write carrying x-arc-wait: visible is flushed early only on a measurement that was idle for longer than the difference", iv, cfg.Ingest.MaxBufferAgeMS),
+		})
+	}
+	return out
 }

@@ -26,7 +26,12 @@ type DeleteFlusher interface {
 	// FlushScopeAndWait returns, per buffer key, the last batch it handed
 	// to the flush: the marks a DELETE record carries.
 	FlushScopeAndWait(ctx context.Context, database, measurement string) (map[string]uint64, error)
-	HasFlushFailure() bool
+	// FlushFailureState reads the WAL recovery latch once: its two reasons
+	// and the generation FlushScopeAndWaitSince then holds the flush to.
+	FlushFailureState() (flushFailed, recoveryPending bool, generation uint64)
+	// FlushScopeAndWaitSince is FlushScopeAndWait that also fails if a flush
+	// failed since baseline was read (#1938).
+	FlushScopeAndWaitSince(ctx context.Context, database, measurement string, baseline uint64) (map[string]uint64, error)
 }
 
 // SetFlusher installs the ingest buffer (nil on nodes that do not ingest).
@@ -61,7 +66,13 @@ var errFlushBeforeDelete = errors.New("buffered rows could not be flushed before
 // flushBeforeDelete flushes the database's buffered rows (measurement "" =
 // all of them), so a DELETE removes rows acknowledged before it that were
 // not in a file yet. Refused while a flush failure is outstanding: those
-// rows are only in the WAL, and its recovery would bring them back.
+// rows are only in the WAL, and its recovery would bring them back. Refused
+// too while a recovery pass left WAL files to replay, with its own message:
+// that is not a flush failure (#1170).
+//
+// The latch is read once, and its generation is the flush's baseline: a
+// flush that fails after the read, before the flush starts, refuses the
+// DELETE too (#1938). A second read would already count that failure.
 func (h *DeleteHandler) flushBeforeDelete(ctx context.Context, database, measurement string) (map[string]uint64, error) {
 	return flushBeforeDelete(ctx, h.flusher, database, measurement)
 }
@@ -70,15 +81,26 @@ func flushBeforeDelete(ctx context.Context, f DeleteFlusher, database, measureme
 	if f == nil {
 		return nil, nil
 	}
-	if f.HasFlushFailure() {
+	flushFailed, recoveryPending, generation := f.FlushFailureState()
+	switch {
+	case flushFailed:
 		return nil, fmt.Errorf("%w: an earlier flush failed and its rows wait for WAL recovery", errFlushBeforeDelete)
+	case recoveryPending:
+		return nil, fmt.Errorf("%w: a WAL recovery pass left files to replay; retry after the next pass (wal.recovery_interval_seconds)", errFlushBeforeDelete)
 	}
-	marks, err := f.FlushScopeAndWait(ctx, database, measurement)
+	if flushBeforeDeleteAfterState != nil {
+		flushBeforeDeleteAfterState()
+	}
+	marks, err := f.FlushScopeAndWaitSince(ctx, database, measurement, generation)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errFlushBeforeDelete, err)
 	}
 	return marks, nil
 }
+
+// flushBeforeDeleteAfterState, when set (tests only), runs between the latch
+// read and the flush (#1938).
+var flushBeforeDeleteAfterState func()
 
 // PeerFlusher is the coordinator's side of the flush a DELETE asks of the
 // other nodes in shared storage (#1265).

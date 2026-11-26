@@ -36,12 +36,15 @@ type Metrics struct {
 	// drainer acts on, so a value that stays non-zero while the queue has room
 	// means the drainer is not keeping up (or is wedged).
 	//
-	// Exported as arc_buffer_deferred_buffers, NOT arc_ingest_*: in this file
-	// arc_ingest_* is uniformly counters and arc_buffer_* holds the buffer-state
-	// gauges (arc_buffer_queue_depth, arc_buffer_records_buffered,
+	// Exported as arc_buffer_deferred_buffers, NOT arc_ingest_*: arc_buffer_*
+	// holds the buffer-state gauges (arc_buffer_queue_depth, arc_buffer_records_buffered,
 	// arc_buffer_records_queued, arc_buffer_records_inflight), which this sits
 	// beside and is published alongside.
 	bufferDeferredBuffers atomic.Int64
+	// flushFailureLatchAgeNS is a GAUGE (arc_ingest_flush_failure_latch_age_seconds):
+	// how long the WAL recovery latch has been set (#1938), 0 while clear and
+	// with the WAL off. While it is set, DELETEs and database drops that flush this node's buffer are refused (on shared storage, also those issued on other nodes).
+	flushFailureLatchAgeNS atomic.Int64
 
 	// MessagePack specific
 	msgpackRequestsTotal atomic.Int64
@@ -80,6 +83,8 @@ type Metrics struct {
 	queryColdMarkSkipped atomic.Int64
 	queryLatencySum      atomic.Int64 // microseconds
 	queryLatencyCount    atomic.Int64
+	queryExecutions      [2][2]atomic.Int64 // engine (DuckDB, arcx) by outcome (success, error)
+	queryEngineLatency   [2]queryLatencyHistogram
 
 	// Client-disconnect mid-stream counters, broken out by streaming
 	// handler so operators can disambiguate "Grafana panels giving up"
@@ -105,6 +110,9 @@ type Metrics struct {
 	bufferFlushFailures   atomic.Int64
 	ingestPublishDelay    ingestPublishDelay                    // arc_ingest_publish_delay_seconds (ingest_publish_delay.go)
 	icebergExport         icebergExport                         // arc_iceberg_export_* (iceberg_export.go)
+	ingestWaitVisible     ingestWaitVisible                     // arc_ingest_wait_visible_* (ingest_wait_visible.go)
+	queryFreshFlush       queryFreshFlush                       // arc_query_fresh_flush_* (query_fresh_flush.go)
+	ingestForcedFlush     ingestForcedFlush                     // arc_ingest_forced_flushes_total (ingest_forced_flush.go)
 	icebergTableLag       atomic.Pointer[icebergTableLagSource] // per-table lag series (iceberg_export_tables.go)
 	flightSQLPrepare      flightSQLPrepare                      // arc_flight_sql_prepare_* (flight_sql_prepare.go)
 	bufferQueueDepth      atomic.Int64
@@ -342,6 +350,10 @@ type Metrics struct {
 	// ingestFutureStampedRows: rows stamped more than the file-time pruning
 	// margin past their flush, in its hour.
 	ingestFutureStampedRows atomic.Int64
+	// ingestWaitVisibleOverResolved: visible writes (x-arc-wait: visible,
+	// #1759) whose outcome resolved more batches than it marked. Always 0
+	// unless a flush counts a batch twice (a bug).
+	ingestWaitVisibleOverResolved atomic.Int64
 	// compactionCopyFallbackTotal counts compaction outputs an object store
 	// refused to copy server-side, copied through the node instead;
 	// compactionFinishedTotal, committed object-store compactions their
@@ -477,6 +489,80 @@ type Metrics struct {
 	logger zerolog.Logger
 }
 
+// Query engines are a closed label set. Keep these values stable: they are
+// exported as Prometheus labels and must not contain request-controlled data.
+const (
+	QueryEngineDuckDB = "duckdb"
+	QueryEngineArcx   = "arcx"
+)
+
+const (
+	queryOutcomeSuccess = iota
+	queryOutcomeError
+)
+
+type queryLatencyHistogram struct {
+	buckets [13]atomic.Int64
+	sum     atomic.Int64 // microseconds
+}
+
+// RecordQueryEngineExecution records completed engine executions and their latency.
+// The buckets are 1ms, 5ms, 10ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s, 30s,
+// and +Inf. Query latency is recorded for failures as well as successes.
+func (m *Metrics) RecordQueryEngineExecution(engine string, succeeded bool, durationMicros int64) {
+	var engineIndex int
+	switch engine {
+	case QueryEngineDuckDB:
+		engineIndex = 0
+	case QueryEngineArcx:
+		engineIndex = 1
+	default:
+		return
+	}
+	if durationMicros < 0 {
+		durationMicros = 0
+	}
+	outcomeIndex := queryOutcomeError
+	if succeeded {
+		outcomeIndex = queryOutcomeSuccess
+	}
+	m.queryExecutions[engineIndex][outcomeIndex].Add(1)
+	h := &m.queryEngineLatency[engineIndex]
+	h.sum.Add(durationMicros)
+	h.buckets[queryLatencyBucket(durationMicros)].Add(1)
+}
+
+func queryLatencyBucket(micros int64) int {
+	switch {
+	case micros <= 1_000:
+		return 0
+	case micros <= 5_000:
+		return 1
+	case micros <= 10_000:
+		return 2
+	case micros <= 50_000:
+		return 3
+	case micros <= 100_000:
+		return 4
+	case micros <= 250_000:
+		return 5
+	case micros <= 500_000:
+		return 6
+	case micros <= 1_000_000:
+		return 7
+	case micros <= 2_500_000:
+		return 8
+	case micros <= 5_000_000:
+		return 9
+	case micros <= 10_000_000:
+		return 10
+	case micros <= 30_000_000:
+		return 11
+	default:
+		return 12
+	}
+}
+
 var (
 	instance *Metrics
 	once     sync.Once
@@ -551,6 +637,10 @@ func (m *Metrics) IncIngestFlushDeferred()      { m.ingestFlushDeferred.Add(1) }
 // SetBufferDeferredBuffers publishes the current deferred-buffer count.
 func (m *Metrics) SetBufferDeferredBuffers(n int64) { m.bufferDeferredBuffers.Store(n) }
 
+// SetFlushFailureLatchAge publishes how long the WAL recovery latch has been
+// set (0 = clear).
+func (m *Metrics) SetFlushFailureLatchAge(d time.Duration) { m.flushFailureLatchAgeNS.Store(int64(d)) }
+
 // MessagePack Metrics
 func (m *Metrics) IncMsgPackRequests()           { m.msgpackRequestsTotal.Add(1) }
 func (m *Metrics) IncMsgPackRecords(count int64) { m.msgpackRecordsTotal.Add(count) }
@@ -591,10 +681,19 @@ func (m *Metrics) IncQueryColdMarkSkipped() { m.queryColdMarkSkipped.Add(1) }
 // IncQueryRows adds count to the rows queries returned.
 func (m *Metrics) IncQueryRows(count int64) { m.queryRowsTotal.Add(count) }
 
-// RecordQueryLatency records query latency in microseconds
-func (m *Metrics) RecordQueryLatency(durationMicros int64) {
+// RecordQueryFailure pairs the aggregate failure and engine execution counters.
+// Call it only after execution reaches the named engine.
+func (m *Metrics) RecordQueryFailure(engine string, durationMicros int64) {
+	m.IncQueryErrors()
+	m.RecordQueryEngineExecution(engine, false, durationMicros)
+}
+
+// RecordQueryLatencyForEngine preserves the aggregate latency summary while
+// recording the completed query under its serving engine.
+func (m *Metrics) RecordQueryLatencyForEngine(engine string, durationMicros int64) {
 	m.queryLatencySum.Add(durationMicros)
 	m.queryLatencyCount.Add(1)
+	m.RecordQueryEngineExecution(engine, true, durationMicros)
 }
 
 // Label values for the arc_query_client_disconnects_total Prometheus
@@ -1152,6 +1251,10 @@ func (m *Metrics) IncFileTimePruningZeroSurvivors() { m.fileTimePruningZeroSurvi
 // pruning margin past their flush, in its hour.
 func (m *Metrics) AddIngestFutureStampedRows(n int) { m.ingestFutureStampedRows.Add(int64(n)) }
 
+// IncIngestWaitVisibleOverResolved counts a visible write whose outcome
+// resolved more batches than it marked (#1759): a bug, never expected.
+func (m *Metrics) IncIngestWaitVisibleOverResolved() { m.ingestWaitVisibleOverResolved.Add(1) }
+
 // AddFileTimePruningAnomalousKept records files kept because their name time
 // is before their directory's hour (future-stamped rows).
 func (m *Metrics) AddFileTimePruningAnomalousKept(n int) {
@@ -1344,6 +1447,8 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"ingest_flush_deferred_total": m.ingestFlushDeferred.Load(),
 		"buffer_deferred_buffers":     m.bufferDeferredBuffers.Load(),
 
+		"ingest_flush_failure_latch_age_seconds": float64(m.flushFailureLatchAgeNS.Load()) / float64(time.Second),
+
 		// MessagePack
 		"msgpack_requests_total": m.msgpackRequestsTotal.Load(),
 		"msgpack_records_total":  m.msgpackRecordsTotal.Load(),
@@ -1372,6 +1477,10 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"query_rows_total":                  m.queryRowsTotal.Load(),
 		"query_latency_sum_us":              m.queryLatencySum.Load(),
 		"query_latency_count":               m.queryLatencyCount.Load(),
+		"query_engine_executions": map[string]map[string]int64{
+			QueryEngineDuckDB: queryEngineExecutionSnapshot(&m.queryExecutions[0]),
+			QueryEngineArcx:   queryEngineExecutionSnapshot(&m.queryExecutions[1]),
+		},
 
 		"query_client_disconnects_arrow_ipc_total":  m.queryDisconnectsArrowIPC.Load(),
 		"query_client_disconnects_arrow_json_total": m.queryDisconnectsArrowJSON.Load(),
@@ -1400,6 +1509,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"iceberg_ingest_append_fallbacks":  m.icebergExport.appendFallbacks.Load(),
 		"iceberg_vanished_passes":          m.icebergExport.vanishedPasses.Load(),
 		"iceberg_files_left_out":           m.icebergExport.leftOut.Load(),
+		"ingest_wait_visible_waiters":      m.ingestWaitVisible.waiters.Load(),
 		"buffer_queue_depth":               m.bufferQueueDepth.Load(),
 		"buffer_records_queued":            m.bufferRecordsQueued.Load(),
 		"buffer_records_inflight":          m.bufferRecordsInflight.Load(),
@@ -1548,6 +1658,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"file_time_pruning_zero_survivors_total":  m.fileTimePruningZeroSurvivors.Load(),
 		"file_time_pruning_anomalous_kept_total":  m.fileTimePruningAnomalousKept.Load(),
 		"ingest_future_stamped_rows_total":        m.ingestFutureStampedRows.Load(),
+		"ingest_wait_visible_over_resolved_total": m.ingestWaitVisibleOverResolved.Load(),
 		"compaction_copy_fallback_total":          m.compactionCopyFallbackTotal.Load(),
 		"compaction_finished_total":               m.compactionFinishedTotal.Load(),
 		"compaction_wedged_total":                 m.compactionWedgedTotal.Load(),
@@ -1689,6 +1800,9 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_buffer_deferred_buffers Buffers currently holding records that no flush worker could take\n"...)
 	b = append(b, "# TYPE arc_buffer_deferred_buffers gauge\n"...)
 	b = appendMetric(b, "arc_buffer_deferred_buffers", float64(m.bufferDeferredBuffers.Load()))
+	b = append(b, "# HELP arc_ingest_flush_failure_latch_age_seconds How long the WAL recovery latch has been set, during which DELETEs and database drops that flush this node's buffer are refused; 0 when clear or with the WAL off\n"...)
+	b = append(b, "# TYPE arc_ingest_flush_failure_latch_age_seconds gauge\n"...)
+	b = appendMetric(b, "arc_ingest_flush_failure_latch_age_seconds", float64(m.flushFailureLatchAgeNS.Load())/float64(time.Second))
 
 	// MessagePack metrics
 	b = append(b, "# HELP arc_msgpack_requests_total Total MessagePack requests\n"...)
@@ -1737,6 +1851,37 @@ func (m *Metrics) PrometheusFormat() string {
 	b = append(b, "# HELP arc_query_errors_total Failed queries\n"...)
 	b = append(b, "# TYPE arc_query_errors_total counter\n"...)
 	b = appendMetric(b, "arc_query_errors_total", float64(m.queryErrorsTotal.Load()))
+
+	// Per-engine execution outcomes and latency. The label set is deliberately
+	// fixed to the engines Arc can dispatch to; request data is never used here.
+	b = append(b, "# HELP arc_query_engine_executions_total Completed query executions by engine and outcome\n"...)
+	b = append(b, "# TYPE arc_query_engine_executions_total counter\n"...)
+	engineNames := [...]string{QueryEngineDuckDB, QueryEngineArcx}
+	outcomeNames := [...]string{"success", "error"}
+	for engineIndex, engine := range engineNames {
+		for outcomeIndex, outcome := range outcomeNames {
+			b = appendMetricWithLabels(b, "arc_query_engine_executions_total",
+				[]string{"engine", "outcome"}, []string{engine, outcome},
+				float64(m.queryExecutions[engineIndex][outcomeIndex].Load()))
+		}
+	}
+
+	b = append(b, "# HELP arc_query_latency_seconds Query execution latency by engine\n"...)
+	b = append(b, "# TYPE arc_query_latency_seconds histogram\n"...)
+	queryLatencyBucketLabels := [...]string{"0.001", "0.005", "0.01", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "30", "+Inf"}
+	for engineIndex, engine := range engineNames {
+		h := &m.queryEngineLatency[engineIndex]
+		var cumulative int64
+		for i, label := range queryLatencyBucketLabels {
+			cumulative += h.buckets[i].Load()
+			b = appendMetricWithLabels(b, "arc_query_latency_seconds_bucket",
+				[]string{"engine", "le"}, []string{engine, label}, float64(cumulative))
+		}
+		b = appendMetricWithLabel(b, "arc_query_latency_seconds_sum", "engine", engine,
+			float64(h.sum.Load())/1_000_000.0)
+		b = appendMetricWithLabel(b, "arc_query_latency_seconds_count", "engine", engine,
+			float64(cumulative))
+	}
 
 	b = append(b, "# HELP arc_query_timeouts_total Queries that exceeded timeout\n"...)
 	b = append(b, "# TYPE arc_query_timeouts_total counter\n"...)
@@ -1814,6 +1959,9 @@ func (m *Metrics) PrometheusFormat() string {
 
 	b = m.appendIngestPublishDelay(b)
 	b = m.appendIcebergExport(b)
+	b = m.appendIngestWaitVisible(b)
+	b = m.appendIngestForcedFlush(b)
+	b = m.appendQueryFreshFlush(b)
 
 	b = append(b, "# HELP arc_buffer_queue_depth Current flush queue depth\n"...)
 	b = append(b, "# TYPE arc_buffer_queue_depth gauge\n"...)
@@ -2306,6 +2454,7 @@ func (m *Metrics) PrometheusFormat() string {
 		{"arc_query_file_time_pruning_zero_survivors_total", "File-time pruning passes that kept no live-hour file: with the hour as the only path the glob is kept (fail safe); with other paths the hour is dropped and the pass also counts as expanded.", m.fileTimePruningZeroSurvivors.Load()},
 		{"arc_query_file_time_pruning_anomalous_kept_total", "Live-hour files kept because their name time is before their hour (rows stamped ahead of the flushing node's clock).", m.fileTimePruningAnomalousKept.Load()},
 		{"arc_ingest_future_stamped_rows_total", "Rows stamped more than query.file_time_pruning_margin_seconds past their flush, in the flush's hour: with file-level time pruning on, a query can miss them until the hour closes.", m.ingestFutureStampedRows.Load()},
+		{"arc_ingest_wait_visible_over_resolved_total", "Visible writes (x-arc-wait: visible) whose outcome resolved more batches than it marked: a batch counted twice, a bug. Such a write is never answered visible.", m.ingestWaitVisibleOverResolved.Load()},
 	} {
 		b = append(b, "# HELP "+c.name+" "+c.help+"\n"...)
 		b = append(b, "# TYPE "+c.name+" counter\n"...)
@@ -2485,6 +2634,31 @@ func appendMetricWithLabel(b []byte, name, labelName, labelValue string, value f
 	b = appendFloat(b, value)
 	b = append(b, '\n')
 	return b
+}
+
+func appendMetricWithLabels(b []byte, name string, labelNames, labelValues []string, value float64) []byte {
+	b = append(b, name...)
+	b = append(b, '{')
+	for i := range labelNames {
+		if i > 0 {
+			b = append(b, ',')
+		}
+		b = append(b, labelNames[i]...)
+		b = append(b, '=', '"')
+		b = append(b, labelValues[i]...)
+		b = append(b, '"')
+	}
+	b = append(b, '}', ' ')
+	b = appendFloat(b, value)
+	b = append(b, '\n')
+	return b
+}
+
+func queryEngineExecutionSnapshot(counters *[2]atomic.Int64) map[string]int64 {
+	return map[string]int64{
+		"success": counters[queryOutcomeSuccess].Load(),
+		"error":   counters[queryOutcomeError].Load(),
+	}
 }
 
 func appendFloat(b []byte, v float64) []byte {

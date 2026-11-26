@@ -2,6 +2,320 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Change: Prometheus Remote Write builds typed columns directly ([#1748](https://github.com/Basekick-Labs/arc/issues/1748))
+
+The receiver now builds timestamp, sample and label columns in their native types instead of boxing each cell in an interface value. Labels keep the same null handling and tag metadata, and WAL reservations still match the bytes written. The existing Parquet output and WAL replay remain unchanged.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1949](https://github.com/Basekick-Labs/arc/pull/1949).
+
+## New: a query can flush and wait for the measurements it reads (`x-arc-freshness: flush`) ([#1760](https://github.com/Basekick-Labs/arc/issues/1760))
+
+**Who is affected:** standalone deployments with local storage that turn on the new key **`query.fresh_flush_enabled`** (`ARC_QUERY_FRESH_FLUSH_ENABLED`, default `false`). Off, a query carrying the header is refused with 403 (`disabled`) and not run. **Upgrade note:** earlier releases ignored the header and ran the query, so a client that already sends it gets 403 after the upgrade until the key is turned on or the header is removed.
+
+A write is acknowledged once its rows are buffered, and a query sees them only after their flush, up to `ingest.max_buffer_age_ms` (5 s by default) later. A reader that must see everything already acknowledged, including rows written by other clients, had to sleep or poll. With the key on, a query to `/api/v1/query` or `/api/v1/query/msgpack` can send **`x-arc-freshness: flush`**. Arc then flushes the measurements the query reads, waits until those flushes are stored, and runs the query unchanged:
+
+- **200, `X-Arc-Freshness: flushed`, `X-Arc-Freshness-Wait-Ms: <ms>`.** Every row this node acknowledged before the request arrived, in a measurement the query reads, was in a stored Parquet file before the query's SQL was built. There are two exceptions. First, rows without a WAL copy that were never stored: their flush failed, or Arc stopped before it ran (a crash, or a shutdown that ran out of time). A row has no WAL copy when the WAL is off, when it was dropped under WAL backpressure in queued ack mode, when its asynchronous WAL write failed, or when that write had not completed when Arc stopped. Second, rows in a WAL file that recovery quarantined (logged at Error and counted in `arc_wal_quarantined_files_total`). If acknowledged rows must survive a crash, turn the WAL on with `wal.ack_mode = durable`. As for any query, file-level time pruning can leave out rows stamped more than `query.file_time_pruning_margin_seconds` ahead of the server clock, in the current hour, until the hour closes. A later DELETE or retention can remove rows after the answer. For a query that ran, `execution_time_ms` and the query latency metrics start after the wait; a refusal's `execution_time_ms` includes it.
+- **Refused, with `X-Arc-Freshness: false` and `X-Arc-Freshness-Reason: <reason>`**, the query not run. Every exit after the checks below carries the two headers too.
+
+| Reason | Status | When |
+|---|---|---|
+| `invalid_value` | 400 | any value other than `flush` (any case; every value of a repeated header is read; empty values count as absent) |
+| `disabled` | 403 | the key off, on every query route |
+| `unsupported_route` | 400 | the key on: `/api/v1/query/arrow`, `/api/v1/query/estimate`, `/api/v1/query/:measurement` |
+| `cluster` | 400 | `cluster.enabled`, before any forward |
+| `storage_not_supported` | 400 | S3, MinIO, GCS or Azure, or a local volume that folds names |
+| `tiering_not_supported` | 400 | tiered storage active (enabled and licensed) |
+| `show_not_supported` | 400 | `SHOW DATABASES`, `SHOW TABLES` |
+| `forbidden` | 403 | RBAC denies a measurement the query reads; nothing is flushed |
+| `too_many_measurements` | 400 | the query reads more than 64 measurements |
+| `busy` | 503, `Retry-After: 5` | more than `query.fresh_flush_max_waiters` fresh queries waiting on the node |
+| `flush_failed_wal_replay` | 503, `Retry-After` | WAL on: an earlier flush failed and its rows wait for WAL recovery. `Retry-After` is `wal.recovery_interval_seconds`, at most 3600 |
+| `recovery_pending` | 503, `Retry-After` | WAL on: a recovery pass left files to replay |
+| `flush_failed` | 503 | a flush the query waited for failed |
+| `not_confirmed` | 503 | a flush the query waited for ended without a confirmed store |
+| `timeout` | 504 | 30 s, or the query's own timeout if sooner (`query.timeout`, or the token's governance time limit), passed during the wait |
+| `shutdown` | 503 | the server began shutting down during the wait |
+| `cancelled` | 503 | the client disconnected during the wait (with `query.cancel_on_client_disconnect`) |
+| `fresh_flush_unavailable` | 503 | the buffer cannot wait for flushes (a configuration fault; logged at Error) |
+| `query_error` | the query's own | any other error before or after the wait: an invalid body or SQL, governance, a failed execution |
+
+The refusals down to `tiering_not_supported` come before the query is counted in `arc_query_requests_total`; the others count there and in `arc_query_errors_total` (`busy` too, like a governance 429), and `timeout` also in `arc_query_timeouts_total` when the query's own timeout was what passed. A panic is answered 500 with `query_error`. An error inside a stream that already started with 200 is the query's own, and its rows were flushed. Flight SQL refuses the header with `InvalidArgument` for any non-empty value, the feature on or off. The checks run after authentication. The absence of `X-Arc-Freshness` never means fresh.
+
+**Latency.** A measurement is flushed early at most once per **`query.fresh_flush_min_interval_ms`** (`ARC_QUERY_FRESH_FLUSH_MIN_INTERVAL_MS`, default `5000`, between 1000 and 3600000; any other value stops Arc at startup), and only while the flush pipeline has spare capacity. That capacity, and each measurement's record of its last flush, are shared with visible writes (`x-arc-wait: visible`): an early flush from either makes the measurement not due for the other. So a fresh query on a measurement written continuously waits for its next flush, up to the interval: the option buys the guarantee, not lower latency. A query that cannot flush a measurement early (no spare capacity) waits for that measurement's age or size flush, up to `ingest.max_buffer_age_ms`. One fresh query over more measurements than the early-flush slots (`max(1, ingest.flush_workers / 4)`) flushes the first ones early and waits for the age flush of the rest. A measurement with nothing buffered and nothing in flight is not waited for.
+
+- **`query.fresh_flush_max_waiters`** (`ARC_QUERY_FRESH_FLUSH_MAX_WAITERS`, default `64`, between 1 and 1024) bounds the fresh queries waiting on the node at once. The limit is per node and shared by every client: one token can hold every slot for up to 30 s. A disconnected client's slot is released within a quarter second, unless `query.cancel_on_client_disconnect = false`, when it is held to the end of the wait. A waiting fresh query is not listed in `/api/v1/queries` and cannot be cancelled there until its wait ends; only a client disconnect ends it early.
+- **Files.** An early flush writes a file like an age flush, at most 3 600 000 / interval (in ms) per measurement an hour, 720 at the default.
+- **Security.** A read token can make Arc flush the measurements it can read, at most once per interval each, inside the spare capacity and the waiter limit. With auth off, any client can.
+
+A load warning names the key on a cluster, on object storage or with tiered storage enabled (refused there), `ingest.max_buffer_age_ms` above 15000 or at least `query.timeout` (a query that falls back to the age flush can end 504), and `query.fresh_flush_min_interval_ms` above `ingest.max_buffer_age_ms`. Browsers may send the header (CORS), and the three answer headers are exposed. Proxies and load balancers in front of Arc need idle timeouts above 30 s.
+
+New metrics: `arc_query_fresh_flush_total{outcome}` (the reason above, or `flushed`), `arc_query_fresh_flush_waiters`, and `arc_query_fresh_flush_seconds` (the wait; these requests are left out of `arc_http_*` latency). `arc_ingest_forced_flushes_total{source="read"}` counts the early flushes fresh queries asked for.
+
+**Cost.** Without the header, a query pays one header lookup. With the key on, every flush on the node also records its measurement's flush time (as with `ingest.wait_visible_enabled`) and tracks the flush until it is stored: one more small lock while the flush is handed to a worker, and one allocation for a measurement with no flush in flight. With tiered storage enabled and licensed the header is refused, but that cost is still paid. A fresh query transforms its SQL twice, once to learn the measurements it reads and once after the wait.
+
+## Fix: a DELETE could miss a flush failure, and a WAL recovery pass could clear the failure while its rows were still only in the WAL ([#1938](https://github.com/Basekick-Labs/arc/issues/1938))
+
+**Who is affected:** builds of `main` with the WAL on (`wal.enabled`).
+
+A DELETE (and dropping a database) refuses while a flush failure is waiting for WAL recovery, because recovery would bring the failed rows back. A failure in a short window just before the DELETE flushed its scope, or while a recovery pass was clearing the failure state, was not seen: the DELETE went ahead, and the next recovery pass restored the matching rows. Separately, a recovery pass could count a flush that failed during the pass as already handled and clear the failure state, although that flush's rows were only in the newest WAL file, which the pass does not read. A clean shutdown then deleted the WAL, and those rows with it.
+
+All three are closed:
+
+- The DELETE reads the failure state once, and its flush fails if any flush failed after that reading. The same holds for the flush a shared-storage DELETE asks of the other nodes.
+- Clearing the failure state is one atomic step that fails if anything was marked since the pass read it, so it can no longer hide a failure that arrives at the same moment.
+- A recovery pass reads the failure state before it rotates the WAL, so a flush that fails after the pass started keeps the state set for the next pass. Such a failure now keeps DELETEs refused for one more pass (`wal.recovery_interval_seconds`).
+
+A DELETE refused because a recovery pass left WAL files to replay now says so ("a WAL recovery pass left files to replay; retry after the next pass"), instead of reporting a flush failure. The status code is unchanged (503).
+
+New metric `arc_ingest_flush_failure_latch_age_seconds` (gauge): how long the failure state has been set, during which DELETEs and database drops that flush this node's buffer are refused (on shared storage, also those issued on other nodes). It is 0 when clear and with the WAL off, sampled once a second. A state that clears and is set again within one second reads as one continuing period.
+
+`wal.recovery_interval_seconds` must be greater than 0 when `wal.enabled = true`: Arc now refuses to start with a clear error instead of panicking when the recovery pass starts.
+
+**Cost.** None on the write or successful flush path: a failed flush does one atomic compare-and-swap, a DELETE one atomic read.
+
+## Before upgrading from v26.02.2–v26.09.4 with the WAL on: check for a failed flush
+
+**Who is affected:** v26.02.2 through v26.09.4 with the WAL on (`wal.enabled`, off by default). Reproduced on v26.09.4; the earlier releases have the same code.
+
+In those releases, rows accepted with a WAL copy are lost if a flush fails and Arc is later stopped cleanly, at any time after the failure. The WAL recovery pass skips the active WAL file, which holds those rows, and clears the failure state anyway; the clean stop then deletes every WAL file. Upgrading means stopping the old release, so the upgrade can trigger it. This release does not have the problem: its recovery pass rotates the WAL before recovering ([#1118](https://github.com/Basekick-Labs/arc/pull/1118)), and [#1938](https://github.com/Basekick-Labs/arc/issues/1938) closes a smaller window.
+
+**Before stopping the old release,** look in its log since its last start for `Flush failed - data preserved in WAL for recovery`. If it is there:
+
+1. Stop writing to the node.
+2. Wait one buffer age (`ingest.max_buffer_age_ms`).
+3. Stop Arc with `SIGKILL` (for example `kill -9 <pid>` or `docker kill`), not a clean stop. The WAL files stay on disk.
+4. Start this release on the same data and WAL directories. It replays the WAL at startup and recovers the rows, without duplicating rows that were already stored.
+
+If the message is not in the log, upgrade as usual.
+
+## New: query latency and outcomes per engine (DuckDB, arcx) ([#1292](https://github.com/Basekick-Labs/arc/pull/1292), [#823](https://github.com/Basekick-Labs/arc/issues/823))
+
+**Who is affected:** anyone scraping Arc's Prometheus metrics, or reading `/api/v1/metrics`.
+
+Two new metrics:
+
+- `arc_query_engine_executions_total{engine,outcome}`: query executions by engine (`duckdb`,
+  `arcx`) and outcome (`success`, `error`). In the JSON metrics: `query_engine_executions`.
+- `arc_query_latency_seconds{engine}`: a latency histogram per engine, failures included, with
+  buckets from 1 ms to 30 s. Before, query latency was only a lifetime average.
+
+They count queries that reached an engine. A request refused earlier (validation, permissions, the
+SQL transform) appears only in `arc_query_requests_total` and `arc_query_errors_total`, so the sum
+of `arc_query_engine_executions_total` can be lower than `arc_query_requests_total` by design.
+
+Existing counters change too, so that `arc_query_success_total + arc_query_errors_total` matches
+`arc_query_requests_total` on every query route. Dashboards built on them may move after the
+upgrade:
+
+- An Arrow IPC query that times out before its stream starts now also counts as an error.
+- An empty result (a measurement with no data) counts as a success on `/api/v1/query` (every
+  encoding), `/api/v1/query/msgpack` and `/api/v1/query/arrow`, and goes into the lifetime latency
+  average. Before, the Arrow-JSON and MessagePack paths counted it as neither, and the JSON path
+  left it out of the average. `/api/v1/query/:measurement` still answers it as an error.
+- A query that shutdown cancels counts as an error on every route. Before, the Arrow IPC,
+  Arrow-JSON and MessagePack paths did not count it. The query registry still records it as
+  cancelled.
+- A response whose final flush fails now counts as a failed query, and on the JSON and Arrow paths
+  also in `arc_query_client_disconnects_total`. Before, it counted as a success.
+- A stream that panics before it finishes counts once as a failure; a panic after the outcome was
+  recorded does not count the query again.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1292](https://github.com/Basekick-Labs/arc/pull/1292). Thank you.
+
+## New: a write can wait until its rows are visible to a query (`x-arc-wait: visible`) ([#1759](https://github.com/Basekick-Labs/arc/issues/1759))
+
+**Who is affected:** standalone deployments that turn on the new key **`ingest.wait_visible_enabled`** (`ARC_INGEST_WAIT_VISIBLE_ENABLED`, default `false`). Off, nothing changes. A request carrying the header is then refused with 403, and nothing is written.
+
+A write is acknowledged once its rows are buffered, and a query sees them only after their flush. That comes at most `ingest.max_buffer_age_ms` (5 s by default) later. A client that writes and then reads, such as a test, an agent's memory, or a job step, had to sleep or poll. With the key on, a write to `/api/v1/write/msgpack` or `/api/v1/write/line-protocol` can send **`x-arc-wait: visible`** and is answered once its rows are visible:
+
+- **204, `X-Arc-Visible: true`.** Every row is in a stored file. With tiered storage, that file is also registered. "Visible" means visible to a query over HTTP `/api/v1/query` on this node that starts after the answer. Flight SQL is not covered. A concurrent DELETE can still remove the rows afterwards.
+- **202, `X-Arc-Visible: false`, `X-Arc-Visible-Reason: <reason>`**, body `{"visible": false, "reason", "rows_written"}`. The rows were accepted, as a plain 204 says, but they are not known to be visible. Do not resend them. The reasons:
+  - `timeout`: 20 s passed first.
+  - `shutdown`: the server began shutting down. The rows are still flushed at close.
+  - `flush_failed_wal_replay`: the flush failed, and a WAL copy was accepted; recovery replays it. With `wal.sync_mode = "async"` that copy may not have reached the disk yet.
+  - `not_confirmed`: a tiering registration failed, or the rows did not all add up.
+  - `storage_not_confirmable`: the storage backend is S3, MinIO, GCS or Azure. In this version only local storage confirms.
+  - `future_stamped`: a row is stamped more than `query.file_time_pruning_margin_seconds` ahead, in the current hour. File-level time pruning can hide it until the hour closes.
+- **500, `X-Arc-Visible-Reason: flush_failed_rows_at_risk`.** A flush holding rows without a WAL copy failed. The body has `rows_at_risk` and says the rows may still be stored, so check before resending. An import answers the same way since #1888.
+- **Answered at once, status unchanged:** a partial write (400, some points dropped) carries `X-Arc-Visible: false` and `partial_write`; a write stopped part way (500) carries `write_stopped`. An empty MessagePack write keeps its 204, with `X-Arc-Visible: true`. The absence of `X-Arc-Visible` never means visible.
+- **Refused before anything is written:**
+  - any other value of the header: 400;
+  - a cluster (`cluster.enabled`): 400, before any forward;
+  - the header on `/write`, `/api/v2/write`, Prometheus remote write, TLE, or an import (`/api/v1/import/csv`, `parquet`, `lp`, `tle`): 400. Other routes, such as the edge-sync bundle routes, ignore it and answer without `X-Arc-Visible`;
+  - more than 1024 waiting writes on the node: 503 with `X-Arc-Ingest-Refused: wait_visible_busy` and `Retry-After: 5`. The limit is per node and shared by every client: one client sending visible writes faster than about 200 a second at the default age can hold it and leave the others at 503. Writes without the header are not limited.
+
+**Latency.** The write's measurements are flushed early, at most once per `ingest.wait_visible_min_interval_ms` (5000 by default) per measurement and only while the flush pipeline has spare capacity. Otherwise the write waits for its rows' normal age or size flush, which is up to `ingest.max_buffer_age_ms` plus the flush time. Visible writes and fresh queries (`x-arc-freshness: flush`, #1760) share one early-flush budget and one record of each measurement's last flush: an early flush from either makes the measurement not due for the other, and either can hold slots the other would use.
+
+- **The new key `ingest.wait_visible_min_interval_ms`** (`ARC_INGEST_WAIT_VISIBLE_MIN_INTERVAL_MS`, default `5000`) must be between 1000 and 3600000; any other value stops Arc at startup. A measurement idle for longer than the interval is flushed right after the write is buffered, when spare capacity allows. With the interval at most `ingest.max_buffer_age_ms`, a writer that keeps one measurement busy gets an early flush at most once per interval and waits about half the interval on average; with the interval above the age, the age flush comes first and the wait is about half the age, as without the key.
+- **Spare capacity** means: fewer than `max(1, ingest.flush_queue_size / 2)` flushes queued (rounded down, so a queue of 1 must be empty), no flush deferred within the last `ingest.max_buffer_age_ms` (at least 1 s), buffered bytes under half of `ingest.max_buffered_bytes` (when set), and at most `max(1, ingest.flush_workers / 4)` early flushes at once. A request flushes early only the measurements it wrote itself. A write that cannot flush early is not refused: it waits for the age flush. One request writing many measurements, or a fresh query reading many, can hold all of the node's early-flush slots for a while; other requests then fall back to the age flush.
+- **Files.** An early flush writes a file like an age flush. A measurement gets at most 3 600 000 / interval (in ms) early flushes an hour, 720 at the default. Every flush restarts its measurement's age, so a measurement written continuously is flushed at most once per the shorter of the interval and the age, plus its size flushes: at most `ingest.max_buffer_age_ms` / interval times the files of the age flush alone. That is no more at the defaults, and five times as many at the 1 s floor with the default age.
+- **Where.** Standalone with local storage only. On object storage the write is not flushed early and still ends as 202 `storage_not_confirmable`.
+- `arc_ingest_forced_flushes_total{source, result}` counts the early flushes asked for (`source="write"`), by result: `forced`, `not_due` (flushed within the interval), `over_budget` (no spare capacity), `nothing` (nothing buffered), `lost_race` (another flush took the rows first), `not_wanted` (nothing of the request's left to flush), `closing`. `over_budget` counts requests refused for lack of spare capacity. Such a write is often still answered early, by another request's early flush of the same measurement, so read it together with `arc_ingest_wait_visible_seconds`.
+
+A load warning names `ingest.max_buffer_age_ms` above 10000 with the key on, `ingest.wait_visible_min_interval_ms` above a positive `ingest.max_buffer_age_ms` (a measurement written continuously is then flushed by age first), the key on a cluster, and the key on object storage (where every waited write ends as 202 `storage_not_confirmable`). Proxies and load balancers in front of Arc need idle timeouts above 20 s. Browsers may send the header (CORS), and the two answer headers are exposed; every CORS answer now lists them in `Access-Control-Expose-Headers`.
+
+**Cost.** Without the header, a write pays a header lookup and a request-local lookup, within noise in the write benchmarks. A waiting write holds no lock while it waits, no WAL reservation and no request body; an early flush takes its measurement's locks briefly. With the key on, on a standalone node with local storage, every flush on the node also records when its measurement was flushed: one more small lock and a map write per flush, not per write. That record takes about 100 to 150 bytes per measurement flushed in the last hour, and an entry is pruned about an hour after its flush (up to a minute later) by a walk, once a minute, that locks each of its 64 stripes in turn. A visible write also records the measurements it wrote: a small lock per batch. Waited writes are left out of `arc_http_*` latency. Instead, metrics `arc_ingest_wait_visible_total{outcome}`, `arc_ingest_wait_visible_waiters` and `arc_ingest_wait_visible_seconds` record them.
+
+## Fix: a single-hour flush registers its file in tiered storage after a slow write or at shutdown ([#1933](https://github.com/Basekick-Labs/arc/issues/1933))
+
+**Who is affected:** tiered storage (`tiered_storage.enabled`).
+
+A flush whose rows all fall in one hour recorded its file in the tiering metadata with the context its storage write had used. When that write outlasted `ingest.flush_timeout_seconds` but completed, or completed as shutdown cancelled the flush, the record failed with only a warning, and the file had no hot tier row until the next tier scan (at start-up and each migration cycle, daily by default). On a measurement whose tier rows were all cold, reads left out local files, so its new rows stayed invisible until then. The record now runs on its own context, bounded by its own `flush_timeout_seconds` and not cancelled with the flush, as the multi-hour path's already did ([#1693](https://github.com/Basekick-Labs/arc/issues/1693)); at shutdown, a write that completes as the flush is cancelled can add that record's time to the close. A record that still fails for another reason is unchanged: a warning, and the next scan registers the file.
+
+## Fix: an import whose rows had no WAL copy answers only once they are stored, and fails if they were not ([#1888](https://github.com/Basekick-Labs/arc/issues/1888))
+
+**Who is affected:** nobody on a released version. In 26.09.x an import flushed every buffer on the node before it answered. This release made imports answer once their rows are handed to the flush (#1296, #1429), and this fix closes the gap that change opened before it shipped.
+
+A bulk import (Line Protocol, CSV, Parquet, TLE) answers once its rows are handed to the flush; the files follow as the flushes finish. With a WAL copy of every row that is a durable answer, because a failed flush is replayed from the WAL. Rows without a WAL copy are held only in memory, and a failed flush loses them. That happens with the WAL off (the default) or when a queued-mode WAL dropped the append. The import had already answered 200, and nothing told the client.
+
+Now an import tracks its own rows through the flush:
+
+- **If every row has a WAL copy, the import answers at once, as before.**
+- **If any row had no WAL copy, the import waits for the flushes holding its rows**, including the ones its size-triggered writes started on the workers, before it answers.
+  - If one of those flushes failed, it answers 500: "failed to flush imported data; the rows were accepted and may still be stored, check before running the file again", with how many of its rows were at risk. "May still be stored" is meant: a flush can fail after storing some of its hour files, or a write that timed out can land anyway.
+  - If the server shuts down during the wait, it answers 500 saying the outcome is not known.
+  - The wait takes no barrier lock, so a DELETE or another flush barrier never waits behind it.
+- **Only the import's own rows count.** This covers the flushes the import runs itself: the final flush, and the flushes it runs while pacing behind the memory limit. Another writer's failed flush, even on the same measurement, does not fail an import whose rows were stored. Before, any failure in those flushes failed the import, whoever's rows were lost. With every row WAL-copied, a failed flush the import runs itself still fails it, as before.
+- **The TLE import now flushes its own measurement instead of the whole node.** A node-wide flush cut every other writer's buffers into small files, and failed the import on any of their errors.
+
+Measured on a laptop, local storage, WAL off. Five Line Protocol files of 1M rows, imported one after another, went from 8.67 s to 9.08 s, about 5%: an import's tail flush no longer overlaps the next file's parsing. Imported five at a time (`ingest.import_write_concurrency = 4`), it took 3.1–3.3 s either way, with the same memory.
+
+## New: a REST catalog table load can wait for the files written before it ([#1752](https://github.com/Basekick-Labs/arc/issues/1752))
+
+**Who is affected:** deployments that read Arc's tables through its Iceberg REST catalog and set the new key. Off by default.
+
+An ingest file reaches its table at most `iceberg.ingest_export_interval` (60 s by default) after the table's previous export. A reader that loads the table in between got the version before it. With **`iceberg.load_export_min_interval`** (`ARC_ICEBERG_LOAD_EXPORT_MIN_INTERVAL`, seconds, default `0` = off) set, a `loadTable` on the REST catalog first waits, at most 2 s, until every file reported to the export for the table before the load is in the published version, then answers as before.
+
+- **It never commits from the request.** It moves the table's queued ingest export earlier, to no sooner than `load_export_min_interval` after the table's last export, and the export serves it as usual (an append). Concurrent loads share that export. A table nobody reads keeps `ingest_export_interval`. A value equal to `ingest_export_interval` moves nothing earlier; the load only waits for an export already due.
+- **It waits only where an append can serve it soon:** a table whose last export settled and whose last append did not fall back to a pass, not paused for a restore, with fewer than `ingest_export_concurrency` exports due within the next 2 s. Otherwise, during a timed pass, or beyond 64 waiting loads per table or 1024 in all, the load reads the published version at once. When the export is busy (a batch of appends or the requests ahead of it), it reads it after the 2 s.
+- **Bounds:** `0`, or between `5` and `ingest_export_interval`, which must be on; anything else is refused at startup. It does nothing, and changes nothing, with `ingest_append_enabled = false`, without `rest_catalog_enabled`, or on a cluster over a shared bucket (each logged at startup). On a cluster with local storage, only the exporting node answers the catalog, as before, and a file counts once it has reached that node. Not run on a cluster.
+- **Cost:** loads add at most `ingest_export_concurrency` exports per 2 s over all tables, and at most one per table per `load_export_min_interval`. A reader that loads a table often makes it export at that rate instead of every `ingest_export_interval`; a catalog that loads tables on its own clock does that for every table it loads, and such a table gets its full reconcile pass every 120 appends, so sooner. Table versions are then kept by the shorter spacing: iceberg-go keeps `min_version_age / load_export_min_interval` previous metadata files per table, at least `retain_snapshots` (60 instead of 10 at the defaults with the key at 5), and each table takes one metadata property commit when that spacing changes.
+- **Auth:** the load stays read-level. The wait runs after the caller's read permission on the table is checked, and only on a `GET`. With auth off, anyone who reaches the catalog can make loads wait, within the bounds above.
+- **Metric:** `arc_iceberg_load_fresh_total{outcome}`: `nothing_pending`, `covered`, `skipped` and `timeout` (the last two read the published version).
+- Checked with the binary, standalone, `load_export_min_interval = 7` and `ingest_export_interval = 10`: a load 6 s after a write returned the row 12 times in 12 (1 in 12 with the key off), each load taking 20–35 ms instead of 2 ms; a load with nothing pending took 0.7 ms either way.
+
+## Fix: compaction stops at shutdown, and no compaction child outlives Arc ([#1887](https://github.com/Basekick-Labs/arc/issues/1887))
+
+Shutdown used to stop only the compaction schedulers. A cycle started with `POST /api/v1/compaction/trigger` kept running. The scheduler's stop waited for its running cycle with no bound, so a long batch could use up the whole shutdown budget. A compaction subprocess could also outlive Arc and run beside the replacement process, which treats that job's manifest as orphaned.
+
+Now shutdown handles compaction in two steps:
+
+- **Compaction stops first.** Before the readiness flag drops and before the HTTP drain:
+  - No new cycle starts. Every trigger answers **503** with `"stopping": true`, even while a cycle is running; outside shutdown, a trigger during a running cycle still answers 409.
+  - A running cycle, scheduled or triggered, stops at its next boundary: before the next batch, measurement, database, manifest to recover, or half of a split batch. Its status is `"stopped"`. A stop is not counted as a failure, and a split stopped part way does not mark the partition as too wide.
+  - Batches already running keep going while requests drain and buffers flush.
+- **Arc waits for that batch later, with a bound.** The wait comes after the WAL closes and before the Iceberg export's drain, the cluster coordinator, storage and the databases. It lasts until a fifth of `server.shutdown_timeout` is left.
+  - If the batch is still running then, Arc kills its subprocess and waits for the cycle to finish its own clean-up.
+  - The next start recovers the killed job from its manifest, as after a crash.
+  - If the shutdown deadline passed before the wait could run, Arc kills the cycle as its last step before exiting. No compaction child is left running after Arc exits.
+- **On a cluster, the completion watcher drains after that wait.** Its final pass now sees the records of batches that ended during the wait, while Raft is still up. Before, a scheduled batch that ended after the watcher's final pass left its record unapplied.
+- When a batch overruns and is killed, the Iceberg export's final drain gets less of the budget: a tenth, or a twentieth with Glue on.
+- With auth off, an edge-sync node closes its own SQLite handle in a hook. A batch that ends during the wait then cannot record its output there. The manifest is kept and the next start re-applies it.
+
+Checked with the binary at `server.shutdown_timeout = 5`. A triggered cycle whose child was frozen (SIGSTOP) was killed 4.0 s after SIGTERM, and Arc exited cleanly with no child left. After restart, the next cycle compacted the partition.
+
+## New: `telemetry.instance_id` and `telemetry.data_dir` ([#1885](https://github.com/Basekick-Labs/arc/issues/1885))
+
+Telemetry identifies an installation by a random id kept in `./data/.instance_id`, relative to the working directory. A deployment without a persistent disk got a new id on every start, and counted as a new installation each time. Examples are a pod with an `emptyDir`, or a container with nothing mounted at `/app/data`.
+
+- **`telemetry.instance_id`** (`ARC_TELEMETRY_INSTANCE_ID`) is an id to use instead of the file; nothing is written to disk.
+  - It must be a UUID: generate one with `uuidgen`, and don't copy one from an example. A value that is not a UUID, or is a placeholder (the nil or max UUID, or the textbook `550e8400-…` example), stops Arc at startup while telemetry is on.
+  - It is stored in canonical form, so upper case or braces do not make a second id.
+  - On a standalone node it is the id: give each installation its own. On a cluster, Arc derives a per-node id from it and `cluster.node_id` (or the host name when `node_id` is unset). So one value in a multi-replica template still counts each replica once.
+  - Setting it on an installation that already has an id file changes its id for as long as it is set; unsetting it brings the file's id back. A standalone node can keep its current id by setting the key to the file's contents.
+- **`telemetry.data_dir`** (`ARC_TELEMETRY_DATA_DIR`) is where the id file lives when no id is configured. The default is `./data`, as before; an empty value means the same. It does not follow `auth.db_path` or `storage.local_path`.
+- The id file is now written `0600`. A file that holds only whitespace is replaced with a new id instead of sending an empty one.
+
+## Change: compaction cycle ids carry the process they belong to, and the trigger can wait ([#1884](https://github.com/Basekick-Labs/arc/issues/1884))
+
+Compaction cycle ids are counted from 1 in each Arc process. A client that keeps an id across requests can read another cycle's record under the same number. That happens when Arc restarts between its trigger and its poll, or when the poll lands on another node behind a load balancer. This was seen with a CronJob: two triggers an hour apart, with a restart between them, both got `cycle_id: 1`.
+
+- **`boot_id`:** a random 16-hex value made once per process. These responses carry it: the trigger (its 200, and its 409 "already running"), `/cycles`, `/cycles/{id}`, `/history` and `/stats`. Arc also logs it once at startup, so cycle log lines from before and after a restart can be told apart.
+- **Lookups that send `boot_id`:**
+  - `GET /api/v1/compaction/cycles/{id}?boot_id=<x>` answers 404 with `"boot_id_mismatch": true` when `x` is not this process's, even if this process has a record with that number. It names this process's `boot_id`, and the lease holder on a cluster. The cause can be a restart or another node; the server cannot tell which.
+  - `GET /api/v1/compaction/history?cycle_id=<n>&boot_id=<x>` answers 200 with `cycle_retained: false`, `boot_id_mismatch: true` and no jobs.
+  - Without `boot_id`, or with it empty, nothing changes.
+- **`POST /api/v1/compaction/trigger?wait=<duration>`** (for example `90s`, `5m`, at most 10 minutes) answers when the cycle ends: 200 with the cycle's record. Check its `status`: a cycle that failed is a 200 too.
+  - If the wait runs out, it answers 202 with the trigger's answer and `"status": "running"`; the cycle carries on.
+  - If the server starts shutting down meanwhile, it answers 202 with `"status": "unknown"`; a manual cycle stops with the process.
+  - A wait that is not a positive duration is rejected with 400 before any cycle is claimed. Without `wait` the trigger answers at once, as before.
+  - A client that gives up early does not stop the server waiting: the answer is written when the cycle ends or the wait runs out.
+  - Behind a load balancer, keep the wait under its idle timeout (often 60 s), or the balancer answers 504 while the cycle carries on.
+
+Ids stay numeric and still restart at 1. Seeding them from the clock would have made `arcli compaction run --wait` report a cycle as finished after a restart, because it compares the id against `/stats`' `current_cycle_id`.
+
+
+## Fix: files flushed at shutdown reach the Iceberg table, and Glue, before Arc exits ([#1886](https://github.com/Basekick-Labs/arc/issues/1886))
+
+On SIGTERM, ingest's final flush writes what is still buffered. The Iceberg export had already stopped by then, so the files from that flush were not added to their tables. Files waiting for their next ingest export (up to `iceberg.ingest_export_interval`, 60 s by default) were left out too, along with export requests the loop had taken but not served. The tables stayed behind the bucket until Arc started again; on a node that does not come back (decommissioned, scaled away) they stayed behind. Glue, stopped earlier still, never learned of a version published that late.
+
+Now, at shutdown:
+
+- The export's loop stops early, as before, so no timed pass competes with the final flush. Requests it had taken but not served go back in the queue.
+- Once the buffer and the WAL have closed, the export serves what is queued, the final flush's files included, whatever each request's due time:
+  - one table at a time, each tried once (again only if a newer file was reported for it);
+  - with an append where one is possible, otherwise that table's own pass;
+  - then the requests a compaction, DELETE, retention or tiering change made.
+- A pass's commit reserve, which keeps the end of its deadline for the commit, is scaled to the time left: a third of it, at most the usual 20 s. With the usual reserve, a pass with less than 20 s left read no file at all.
+- Glue then syncs what was published, and the export's own catalog database closes.
+
+This uses what is left of `server.shutdown_timeout` after the buffer's close, less a tenth for the closes that follow and, with Glue on, a twentieth for Glue. Nothing is taken from the HTTP drain. The default `server.shutdown_timeout` (30 s) is unchanged.
+
+**Limits:**
+
+- **Long shutdowns.** Tables are served one at a time, and on S3 an append is a few requests. With many tables and little time left, the drain stops at its deadline, and the next start's pass reconciles the rest. Raise `server.shutdown_timeout` if every table must be current at exit.
+- **Shared bucket.** A table there is exported by a pass, and on a cluster the shutdown spends part of the budget elsewhere first: the ready drain, the HTTP drain, the file registrar. There, the exporting node first catches up with the cluster manifest, for at most 5 s, so the last registrations' files are queued. On such a cluster, `server.shutdown_timeout` of 45 s or more gives the drain room.
+- **`iceberg.ingest_export_interval = 0`.** Flushes report nothing to the export, so the drain serves only the other requests: a compaction's, a DELETE's, database drops. The final flush's files wait for the next start, as before.
+- **A node that does not export.** It serves its database drops, as the loop always did, and nothing else.
+- **A pass that ignores cancellation.** The loop's stop is bounded. If a pass does not stop in time (for example, a cluster manifest barrier), the drain and the catalog close are skipped, and that pass may still be running while the components after it close.
+
+Verified with a binary on S3 (SeaweedFS): two writes ten seconds apart, then SIGTERM straight after the second. Before, the second file was in the bucket and not in the table when Arc exited; now it is in the table. The same holds with the WAL on (`ack_mode = durable`), with `iceberg.ingest_export_interval = 300`, with `iceberg.ingest_append_enabled = false`, and with `server.shutdown_timeout = 5`.
+
+
+## Fix: Arc no longer prints the admin token you configured at startup ([#1883](https://github.com/Basekick-Labs/arc/issues/1883))
+
+**Who is affected:** anyone who sets `auth.bootstrap_token` (`ARC_AUTH_BOOTSTRAP_TOKEN`), with or without
+`auth.force_bootstrap`.
+
+When Arc installed the initial admin token it printed a banner with the token value to stderr. That is
+right for a token Arc generated, because the operator has no other way to see it. When the value came
+from configuration the operator already has it, and printing it only copied a secret into the logs. On a
+deployment whose auth database is not persistent, such as a container with an ephemeral disk, the token
+is installed again on every start, so the value was printed on every start too.
+
+- The token value is printed only when Arc generated it.
+- For a configured token the banner says it was installed from configuration and leaves the value out.
+  With `auth.force_bootstrap` it keeps the recovery wording and the reminder to remove the setting.
+- The "FIRST RUN" wording appears only for a generated token.
+- `auth.force_bootstrap` without `auth.bootstrap_token` generates a token only when no tokens exist
+  (a first run), as before; the banner now says "FIRST RUN" for it instead of "RECOVERY TOKEN ADDED -
+  EXISTING TOKENS PRESERVED".
+
+No new configuration keys.
+
+Contributed by [@branson404](https://github.com/branson404) in [#1917](https://github.com/Basekick-Labs/arc/pull/1917).
+
+## Fix: a rejected `auth.bootstrap_token` stops Arc instead of leaving it with no admin token ([#1915](https://github.com/Basekick-Labs/arc/issues/1915))
+
+**Action required on upgrade** if `auth.bootstrap_token` (`ARC_AUTH_BOOTSTRAP_TOKEN`) is set to a value shorter than 32 bytes once surrounding whitespace is removed, with auth on. Arc now refuses to start with that value, where it used to log `Failed to create initial admin token` at every start and run on. Such a value has never been installed: every path that stores a token requires 32 bytes. So a deployment that runs today uses another token, and the short value can simply be removed, or replaced with a 32-byte one (`openssl rand -hex 32`). A Helm install that passes the value through `existingSecret` is not checked at render time: its pods stop at startup with the message instead.
+
+With a short value and auth on, Arc used to keep running with no admin token, so every request got 401. A fresh install looked healthy and nobody could log in. Now:
+
+- **A short token stops Arc at startup.** The message names `auth.bootstrap_token`, the length after trimming, and the 32-byte rule. It never includes the value.
+- **A configured value that was not installed now says so.** A value is installed only into an empty auth database. When the database already has tokens and the value is not one of them, Arc logs a warning that it was not installed, and how to add it: `auth.force_bootstrap=true` for one start. This used to be a debug line, so an operator who set or fixed the value on a populated database got 401 with nothing saying why.
+  - A value that is already a valid token stays quiet, which is the normal restart.
+  - A value matching a disabled (revoked) or expired token gets its own warning. `auth.force_bootstrap=true` adds it back as a new recovery token.
+  - The exception is a token from before token prefixes (December 2025): if the value equals one, it is reported as not installed although it authenticates.
+- **A forced recovery that adds nothing now says so.** Recovery adds a token named `arc-recovery`, and the name is unique. Two cases add nothing:
+  - one is left from an earlier recovery with a different value;
+  - it holds this value but is disabled.
+  
+  Arc used to log that the caller "still holds the token value they provided". It now says the value was not added and to **delete** `arc-recovery` through the API (`DELETE /api/v1/auth/tokens/<id>`); revoking only disables it, and the name stays taken. On a cluster, where the node's copy may lag, it says the same without checking the value.
+- **`auth.force_bootstrap` without `auth.bootstrap_token` logs a warning at load.** The flag acts only together with a token.
+
+The check for whether the value is installed reads the token table directly. It does not stamp `last_used_at` on the admin token at every start, as authenticating with it would. On a cluster the check is not exact on a follower, so Arc logs what to do at Info without claiming the value is absent.
+
+
 ## Fix: re-home jobs run with `iceberg.warehouse` outside the storage root ([#1906](https://github.com/Basekick-Labs/arc/issues/1906))
 
 **Who is affected:** standalone deployments with the Iceberg export on and `iceberg.warehouse` set to
@@ -14,6 +328,50 @@ version"). After a pass of its own, the export now takes the catalog's commit as
 On a cluster, nodes that do not export answer from the discovery files only, so in this layout a
 job still waits at them, as before: re-home with the warehouse outside the storage root is a
 standalone fix.
+## Fix: a node with the Iceberg export, failover and replication on local storage joins its cluster ([#1914](https://github.com/Basekick-Labs/arc/issues/1914))
+
+**Who is affected:** clusters whose nodes list more than 16 capabilities, for example on local
+storage with `cluster.replication_enabled`, `iceberg.enabled` and `cluster.failover_enabled` (with a
+licence that includes writer failover), or with `cluster.stream_takeover` (experimental) on top of
+replication on local storage or of the Iceberg export and failover on a shared object store.
+
+A joining node lists the cluster capabilities it supports, and the member it contacts refused a list
+longer than 16. With the Iceberg export, failover and replication on local storage a node lists 17,
+so every node but the first was refused ("join rejected: authentication failed" on the joiner, "join capabilities exceed
+their bounds" on the member) and the cluster never formed. The limit is now 64; a node lists at most
+18 today. No released version had the limit.
+
+**Upgrading a cluster that runs an earlier main build with such a configuration.** That build
+refuses more than 16, and this one lists 17 for the same configuration, so a member restarted on
+this build is refused by the members still on the earlier one. Measured on three nodes on local
+storage with replication, the Iceberg export and failover, restarted one at a time (compactor,
+writer, reader): the compactor left the cluster and answered neither writes nor queries until the
+writer had been restarted too; then all three were healthy with all their rows, without
+intervention. The only procedure tested end to end is restarting all the nodes together: all three
+rejoined with every row, and the Iceberg table matched the files. No release has the limit.
+
+## Fix: a node that gets the Iceberg export back without restarting exports a current table ([#1903](https://github.com/Basekick-Labs/arc/issues/1903))
+
+**Who is affected:** clusters on local storage with the Iceberg export on, whose compactor lease moves
+between nodes: by failover (such a cluster forms from this release on, [#1914](https://github.com/Basekick-Labs/arc/issues/1914)),
+or by `POST /api/v1/cluster/compactor/assign`, which also moves a lease left from an earlier failover
+setup.
+
+While another node held the lease, a node dropped its own ingest export requests, and files its table
+named could go away (compaction inputs, retention, DELETE). When the lease came back, the next file it
+flushed or received was appended to the table as the node had left it: the published table then named
+the files that were gone and missed the ones written while another node exported, until the next timed
+pass (`iceberg.reconcile_interval`, 5 minutes by default). A table nobody wrote to stayed as the node
+had left it for up to that long too, while the node's REST catalog already served it again. Now the
+node checks the lease every 5 seconds even when idle, and when it gets it runs a full pass at once
+instead of appending, which brings every table in line with the node's files. That includes a node
+taking the lease for the first time; on a shared bucket that is the lease holder's pass of every table,
+run when it takes the lease instead of at its next timed pass. The final export at shutdown
+([#1886](https://github.com/Basekick-Labs/arc/issues/1886)) does the same when the lease came back just
+before it.
+
+
+
 
 ## Change: an Iceberg pass that a compaction raced is retried within seconds, and counted ([#1755](https://github.com/Basekick-Labs/arc/issues/1755))
 
@@ -1197,11 +1555,11 @@ Reads of the JSON metrics family are no longer audited, whatever `include_reads`
 
 The node-wide `arc_iceberg_export_lag_seconds` and `arc_iceberg_export_pending_seconds` (#1750) say how late the export is, not which table is late. With `iceberg.export_lag_table_series` set to a number N (`ARC_ICEBERG_EXPORT_LAG_TABLE_SERIES`, 0–1000, default 0 = off), `/metrics` also has, labelled `database` and `measurement`:
 
-- **`arc_iceberg_export_table_pending_seconds`:** per table, how long its oldest file waiting for an export has waited. Only the N tables waiting longest are shown, and only those past a floor, so a healthy table between two exports is not listed. The floor is twice `ingest_export_interval`, or twice `reconcile_interval` where the ingest trigger is off, as on every cluster node. The wait is counted in one of two ways:
-  - from when the file was reported, on a standalone node with the ingest trigger on;
+- **`arc_iceberg_export_table_pending_seconds`:** per table, how long its oldest file waiting for an export has waited. Only the N tables waiting longest are shown, and only those past a floor, so a healthy table between two exports is not listed. The floor is twice `ingest_export_interval`, or twice `reconcile_interval` where the ingest trigger is off. The wait is counted in one of two ways:
+  - from when the file was reported, with the ingest trigger on (a standalone node, or a cluster's exporting node);
   - from when it was written, for files a table has committed but not yet published, in every mode, counting files written after the process started.
 
-  So on a cluster, or with `ingest_export_interval = 0`, a table whose commits keep failing is not shown, and after a restart neither is one whose publishes keep failing, until it commits again.
+  So with `ingest_export_interval = 0`, a table whose commits keep failing is not shown, and after a restart neither is one whose publishes keep failing, until it commits again.
 - **`arc_iceberg_export_tables_pending`:** how many tables are past that floor, so falling out of the top N can be told from catching up.
 - **`arc_iceberg_export_table_last_lag_seconds`:** per table, the longest time from an ingest file being written to its table version being published, among the files its last publish covered.
   - Only files written after the process started count.
@@ -1552,7 +1910,7 @@ On object storage an ingest-triggered export is a few hundred milliseconds of wa
 
 - **New key `iceberg.ingest_export_concurrency`** (default `8`, 1 to 32): how many tables' ingest appends run at once. `1` exports one table at a time, as before.
 - **Reconcile passes still run one table at a time**: a table's first export, the pass every `iceberg.reconcile_interval`, the pass after 120 appends, and any fallback. Only the append (#1751) is run for several tables at once.
-- **Standalone nodes only**, like the ingest trigger itself ([#1756](https://github.com/Basekick-Labs/arc/issues/1756)). On a cluster node nothing reads the key.
+- **On a cluster** (since [#1756](https://github.com/Basekick-Labs/arc/issues/1756), above), the exporting node uses it for its appends on local storage. Reconcile passes still run one table at a time there. Not run with several tables on a cluster.
 - A table is still exported by one thing at a time, and a file is still added to its table once: the scheduler starts a batch of appends, waits for all of them, and only then records what they did.
 
 Measured on AWS S3, standalone on EC2 in the bucket's region, over 4 to 5 minutes after a warm-up of 4 to 6 (one run each, except where two figures are given):
@@ -1660,7 +2018,7 @@ Since #1750 an ingest flush asks for an export of its table. Each of those expor
 - **New key `iceberg.min_version_age`** (seconds, default `300`): a published table version stays on disk for this long after the next one is published, on top of the newest `retain_snapshots + 1`. A reader that resolved a version, or Glue until its next sync, can still open it. It must be at least 120 s, and at least `iceberg.glue.sync_interval + 60` with Glue on. A value you set below that is refused at startup; the default is raised with a warning instead (to 660 s at `glue.sync_interval = 600`).
 - **`iceberg.ingest_export_interval` is no longer tied to `retain_snapshots`.** It must be `0` (off) or at least `5`. The rule from #1750 (`ingest_export_interval × retain_snapshots ≥ 120`) is gone: keeping versions by age gives the same guarantee directly. The default stays `60`.
 - **New key `iceberg.ingest_append_enabled`** (default `true`). `false` makes every ingest-triggered export a full pass, as in #1750.
-- **Standalone nodes only**, like the trigger itself ([#1756](https://github.com/Basekick-Labs/arc/issues/1756)). Keeping versions by age applies on every node.
+- **On a cluster** (since [#1756](https://github.com/Basekick-Labs/arc/issues/1756), above), on local storage, the exporting node appends the files that reach it and its own flushes. Keeping versions by age applies on every node.
 
 What one ingest export costs, as a full pass and as an append, through the scheduler on local disk (median of 7; `TestMeasure_AppendAgainstAPass`):
 
@@ -1758,7 +2116,7 @@ A file written by ingest used to reach its Iceberg table only at the next timed 
 
 - **New key `iceberg.ingest_export_interval`** (seconds, default `60`): the least time between two exports of one table that ingest causes. A flushed file is exported after at most this long, plus the export itself. `0` turns the trigger off and leaves the timed passes only.
 - **Bound:** it must be `0` or at least `5`. (As first merged, #1750 also required `ingest_export_interval × retain_snapshots ≥ 120`; #1751, above, replaced that with `iceberg.min_version_age`.)
-- **Standalone nodes only for now.** On a cluster node the trigger is not installed and the export runs on its timer as before: the node that flushes is usually not the node that exports. Tracked in [#1756](https://github.com/Basekick-Labs/arc/issues/1756). The lag histogram and the backlog counter are still filled there, by the timed passes; the pending gauge stays at 0. Not run on a cluster.
+- **On a cluster since [#1756](https://github.com/Basekick-Labs/arc/issues/1756)** (above): a file reaching the exporting node asks for the export, whichever node wrote it, and the pending gauge is set there; on the other nodes it stays at 0 (traced from code, not yet observed on a cluster).
 
 Measured on a standalone node, local storage, default buffer age:
 
@@ -1826,7 +2184,7 @@ Notes:
 - A flush that splits into several files (rows in more than one hour) observes each file, all measured from the same buffer start. An hour file that waits for the rest of its flush is observed when the flush registers it, not when it is written.
 - No labels: the histogram covers every database and measurement.
 
-`scripts/freshness` is a harness for the reader's side of the same question. It writes marker rows, polls a query, and reports the time from the write's acknowledgement to the first query that returned the row, next to the server's histogram for the same period. A second mode writes one late or future-stamped row into an hour that a query has just found empty and times how long queries keep answering without it ([#1757](https://github.com/Basekick-Labs/arc/issues/1757)). See `scripts/freshness/README.md`. No product behaviour changes.
+`scripts/freshness` is a harness for the reader's side of the same question. It writes marker rows, polls a query, and reports the time from the write's acknowledgement to the first query that returned the row, next to the server's histogram for the same period. A second mode writes one late or future-stamped row into an hour that a query has just found empty and times how long queries keep answering without it ([#1757](https://github.com/Basekick-Labs/arc/issues/1757)). On a cluster, `steady -probe <reader URL>` writes to the writer given with `-http` and queries the reader ([#1769](https://github.com/Basekick-Labs/arc/issues/1769)). See `scripts/freshness/README.md`. No product behaviour changes.
 
 ## Fix: on a node-local-storage cluster, deleting a database drops every node's Iceberg tables ([#1731](https://github.com/Basekick-Labs/arc/issues/1731))
 
@@ -2026,8 +2384,8 @@ No new configuration keys.
 - Arc now removes leading and trailing whitespace from the value when the configuration is loaded, from the environment or from `arc.toml`. Whitespace inside the value is kept. This covers both the first admin token and the recovery token added with `auth.force_bootstrap`.
 - When trimming changed the value, Arc logs a warning at startup for `auth.bootstrap_token`. The warning never includes the value.
 - With `auth.enabled = true`, a value that is only whitespace now stops Arc at startup with an error, instead of Arc quietly generating a random admin token. With auth disabled the key is not used and nothing changes; enabling auth later turns such a value into that startup error.
-- The 32-character minimum now applies to the trimmed value, so a 31-character token followed by a newline is refused (Arc logs the error and starts with no admin token, as for any short token). On a deployment that already has an admin token, such a value now logs `Failed to create initial admin token` at every start, where it used to be ignored; remove or fix the value. The `arc` and `arc-enterprise` Helm charts check the trimmed length too, so they refuse such a `auth.bootstrapToken.value` at render time.
-- Tokens already stored are not changed. A bootstrap token an earlier release stored with the whitespace cannot be sent in a header, but the `p` query parameter still accepts it with the whitespace URL-encoded, for example `curl -G --data-urlencode "p@token-file" http://<host>:8000/api/v1/auth/verify` (the `@file` form keeps the trailing newline; `$(cat token-file)` drops it). Use it once to create a new admin token through the API, then revoke the old one. Restarting with `ARC_AUTH_FORCE_BOOTSTRAP=true` and the token value also adds it, as the `arc-recovery` admin token; if an `arc-recovery` token already exists from an earlier attempt it is not replaced (the restart logs `Recovery token already exists` and adds nothing), so delete it through the API first.
+- The 32-character minimum now applies to the trimmed value, so a 31-character token followed by a newline is refused. Since #1915 that means Arc does not start; see that entry. The `arc` and `arc-enterprise` Helm charts check the trimmed length too, so they refuse such a `auth.bootstrapToken.value` at render time.
+- Tokens already stored are not changed. A bootstrap token an earlier release stored with the whitespace cannot be sent in a header, but the `p` query parameter still accepts it with the whitespace URL-encoded, for example `curl -G --data-urlencode "p@token-file" http://<host>:8000/api/v1/auth/verify` (the `@file` form keeps the trailing newline; `$(cat token-file)` drops it). Use it once to create a new admin token through the API, then revoke the old one. Restarting with `ARC_AUTH_FORCE_BOOTSTRAP=true` and the token value also adds it, as the `arc-recovery` admin token; if an `arc-recovery` token already exists from an earlier attempt it is not replaced (since #1915 the restart logs that the value was not added), so delete it through the API first.
 - During a rolling upgrade of a cluster that has never created its first admin token, a node still on the earlier release can create it with the untrimmed value. Upgrade every node before the first boot, or check that the token works afterwards.
 
 No new configuration keys.

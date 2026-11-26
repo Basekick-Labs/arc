@@ -83,7 +83,7 @@ func TestArcxArrowPanicWiring(t *testing.T) {
 		}
 		return true
 	})
-	if streamCall == nil || len(streamCall.Args) != 6 {
+	if streamCall == nil || len(streamCall.Args) != 7 {
 		t.Fatal("ArcX Arrow response helper lacks the panic-safe trailer stream")
 	}
 	onPanic, ok := streamCall.Args[4].(*ast.FuncLit)
@@ -95,6 +95,9 @@ func TestArcxArrowPanicWiring(t *testing.T) {
 	}
 	if id, ok := streamCall.Args[2].(*ast.Ident); !ok || id.Name != "trailers" {
 		t.Error("ArcX Arrow stream does not publish its trailers")
+	}
+	if metric, ok := streamCall.Args[6].(*ast.SelectorExpr); !ok || metric.Sel.Name != "fail" {
+		t.Error("ArcX Arrow panic path does not record its engine-specific failure metric")
 	}
 	// The panic callback can only poison the body through the writer the
 	// stream writer captured: streamW = w must stay.

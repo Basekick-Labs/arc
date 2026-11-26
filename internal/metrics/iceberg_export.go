@@ -45,6 +45,36 @@ type icebergExport struct {
 	// vanishedPasses counts reconcile passes that left files for the next
 	// pass because a file vanished under them (#1755).
 	vanishedPasses atomic.Int64
+	// loadFresh counts REST catalog table loads that asked the export for
+	// the files reported before them (#1752), by outcome (IcebergLoadFresh*).
+	loadFresh [icebergLoadFreshOutcomes]atomic.Int64
+}
+
+// Outcomes of a REST catalog table load that asked for the files reported
+// before it (iceberg.load_export_min_interval, #1752).
+const (
+	// IcebergLoadFreshNothing: nothing reported before the load was waiting.
+	IcebergLoadFreshNothing = iota
+	// IcebergLoadFreshCovered: every file reported before the load was in
+	// the table, or was given up on, when the load read it.
+	IcebergLoadFreshCovered
+	// IcebergLoadFreshSkipped: the export could not serve the table within
+	// the budget (not on the append path, its last export failed, paused,
+	// too many tables due); the load read the published version.
+	IcebergLoadFreshSkipped
+	// IcebergLoadFreshTimeout: the budget ran out; the load read the
+	// published version.
+	IcebergLoadFreshTimeout
+	icebergLoadFreshOutcomes
+)
+
+var icebergLoadFreshLabels = [icebergLoadFreshOutcomes]string{"nothing_pending", "covered", "skipped", "timeout"}
+
+// IncIcebergLoadFresh counts one REST catalog table load by outcome.
+func (m *Metrics) IncIcebergLoadFresh(outcome int) {
+	if outcome >= 0 && outcome < icebergLoadFreshOutcomes {
+		m.icebergExport.loadFresh[outcome].Add(1)
+	}
 }
 
 // IncIcebergVanishedPass counts a reconcile pass that left files for the
@@ -161,6 +191,11 @@ func (m *Metrics) appendIcebergExport(b []byte) []byte {
 	b = append(b, "# HELP arc_iceberg_vanished_passes_total Iceberg reconcile passes that left files for the next pass because a file vanished under them (a compaction, DELETE or retention deleting it mid-pass); each is retried within seconds\n"...)
 	b = append(b, "# TYPE arc_iceberg_vanished_passes_total counter\n"...)
 	b = appendMetric(b, "arc_iceberg_vanished_passes_total", float64(h.vanishedPasses.Load()))
+	b = append(b, "# HELP arc_iceberg_load_fresh_total REST catalog table loads that asked the export for the files reported before them (iceberg.load_export_min_interval), by outcome: nothing_pending, covered, skipped (the published version was read), timeout (the published version was read)\n"...)
+	b = append(b, "# TYPE arc_iceberg_load_fresh_total counter\n"...)
+	for i, label := range icebergLoadFreshLabels {
+		b = appendMetricWithLabel(b, "arc_iceberg_load_fresh_total", "outcome", label, float64(h.loadFresh[i].Load()))
+	}
 
 	b = append(b, "# HELP arc_iceberg_files_left_out Files readable through Arc that are in no Iceberg table because no single UTC day could be given to them (rows spanning more than one day, a time column with no value, or one that cannot be read), as of each table's last reconcile pass that went through all its new files. The export's Error log names them. 0 on a node that does not export, and after a restart until each table's first pass.\n"...)
 	b = append(b, "# TYPE arc_iceberg_files_left_out gauge\n"...)

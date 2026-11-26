@@ -173,6 +173,16 @@ default_sort_keys = ""
 # A refusal does not start a flush: keep an explicit value well above what
 # buffers hold before their size/age flush, or writes wait for the next one.
 # max_buffered_bytes = "0"   # or "auto", or a size such as "4GB"
+#
+# Wait until visible (#1759). With wait_visible_enabled = true, a write to
+# /api/v1/write/msgpack or /api/v1/write/line-protocol carrying the header
+# "x-arc-wait: visible" is answered once its rows are visible to a query on
+# this node: 204 with X-Arc-Visible: true. It waits for the rows' normal age or
+# size flush (up to max_buffer_age_ms plus the flush), at most 20 s; otherwise
+# 202 with X-Arc-Visible: false and X-Arc-Visible-Reason. Local storage only in
+# this version (object storage answers 202 storage_not_confirmable); refused
+# with 400 on a cluster. Off (the default): the header is refused with 403.
+# wait_visible_enabled = false
 
 # -----------------------------------------------------------------------------
 # Compaction
@@ -411,12 +421,17 @@ s3_cache_ttl_seconds = 3600
 # namespace_prefix = "arc"
 # namespace_migration_dry_run = true
 # reconcile_interval = 300
-# ingest_export_interval = 60        # seconds: a flushed file is exported after at
+# ingest_export_interval = 60        # seconds: a new file (flushed here, or reaching
+#                                    # a cluster's exporting node) is exported after at
 #                                    # most this long, not at the next timed pass.
 #                                    # 0 = timed passes only; otherwise >= 5.
 # reconcile_concurrency = 0          # tables whose reconcile passes run at once (1-16);
 #                                    # 0 = 4 on object storage, 1 on local storage.
 #                                    # Standalone nodes only, a cluster node runs one
+# load_export_min_interval = 0       # seconds: with the REST catalog on, a table load
+#                                    # waits up to 2 s for the files written before it,
+#                                    # exporting the table no sooner than this after its
+#                                    # last export. 0 = off; otherwise 5..ingest_export_interval.
 # ingest_export_concurrency = 8      # tables whose ingest appends run at once (1-32);
 #                                    # 1 exports one table at a time
 # export_lag_table_series = 0        # tables with their own export lag series on
@@ -561,6 +576,14 @@ enabled = false
 # -----------------------------------------------------------------------------
 [telemetry]
 enabled = true
+# instance_id = ""        # a UUID (uuidgen) to use instead of the id file, for a
+#                         # deployment without a persistent disk. Standalone: give
+#                         # each installation its own. On a cluster Arc derives one
+#                         # per node from it and cluster.node_id (or the host name
+#                         # when node_id is unset). Do not copy one from an example.
+# data_dir = "./data"     # where the id file (.instance_id) lives when instance_id
+#                         # is empty; relative to the working directory, not to
+#                         # auth.db_path
 
 # -----------------------------------------------------------------------------
 # Tiered Storage (Enterprise)

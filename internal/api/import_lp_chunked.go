@@ -240,7 +240,7 @@ func writeLPImport(ctx context.Context, w *importWriter, upload *importUpload, d
 		for _, m := range names {
 			rec := byMeasurement[m]
 			ingest.CoerceFirstValues(rec, kinds[m])
-			if err := w.buf.WriteColumnarRecord(ctx, database, rec); err != nil {
+			if err := w.buf.WriteColumnarRecord(ingest.WithFlushOutcome(ctx, w.outcome), database, rec); err != nil {
 				if w.started() {
 					return w.partial(err, m)
 				}

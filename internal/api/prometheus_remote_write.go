@@ -13,7 +13,6 @@ import (
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
-	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/gofiber/fiber/v2"
 	"github.com/klauspost/compress/snappy"
 	"google.golang.org/protobuf/encoding/protowire"
@@ -98,6 +97,10 @@ func (h *LineProtocolHandler) WritePrometheusRemoteWrite(c *fiber.Ctx) error {
 		}
 	}()
 
+	// x-arc-wait is not supported here (#1759).
+	if handled, err := refuseWaitVisible(c); handled {
+		return err
+	}
 	database := c.Query("db", "default")
 	if headerDB := c.Get("x-arc-database"); headerDB != "" {
 		database = headerDB
@@ -178,7 +181,7 @@ localProcessing:
 	}
 
 	for _, measurement := range measurements {
-		if err := h.buffer.CheckColumnsTextBinary(database, measurement, records[measurement].Columns); err != nil {
+		if err := h.buffer.CheckTypedTextBinary(database, measurement, records[measurement]); err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 		}
 	}
@@ -203,8 +206,9 @@ localProcessing:
 	defer release()
 
 	written, dropped, drops, stop := h.writeLPMeasurements(measurements, rows, dropped, drops, func(m string) (int, error) {
-		record := records[m]
-		return len(record.Columns["time"]), lpWriteRecord(h.buffer, writeCtx, database, record)
+		batch := records[m]
+		times := batch.Data["time"].([]int64)
+		return len(times), lpWriteTyped(h.buffer, writeCtx, database, m, batch, len(times))
 	})
 	if stop != nil {
 		return h.answerLPStop(c, remoteWriteProtocolName, database, stop, drops)
@@ -224,7 +228,7 @@ localProcessing:
 
 // remoteWriteBatch is a decoded request mapped to the records to write.
 type remoteWriteBatch struct {
-	records      map[string]*models.ColumnarRecord
+	records      map[string]*ingest.TypedColumnBatch
 	measurements []string // kept measurements, in name order
 	drops        []ingest.LPDrop
 	dropped      int // points dropped
@@ -265,7 +269,12 @@ func remoteWriteBuild(body []byte, database string, known ingest.KnownColumns, l
 	names := ingest.NewRecordNameFilter(known)
 	kept := measurements[:0]
 	for _, measurement := range measurements {
-		if names.Keep(records[measurement]) {
+		batch := records[measurement]
+		if names.Keep(&ingest.TypedColumnarRecord{
+			Measurement: measurement,
+			NumRecords:  len(batch.Data["time"].([]int64)),
+			Batch:       batch,
+		}) {
 			kept = append(kept, measurement)
 		}
 	}
@@ -275,7 +284,7 @@ func remoteWriteBuild(body []byte, database string, known ingest.KnownColumns, l
 	rows := 0
 	var walBytes int64
 	for _, measurement := range measurements {
-		rows += len(records[measurement].Columns["time"])
+		rows += len(records[measurement].Data["time"].([]int64))
 		walBytes += walSizes[measurement]
 	}
 	return &remoteWriteBatch{
@@ -628,10 +637,10 @@ const (
 // stored column's spelling (known, as the token may see it), otherwise the
 // byte-smallest spelling in the request, so the same set of series keeps the
 // same spelling whatever order they arrive in. walBytes is, per measurement,
-// what writing its record appends to the WAL (columnarToWALRecords then
-// msgpack, one entry per measurement), for the WAL space reservation.
-func prometheusRemoteWriteRecords(request *remoteWriteRequest, database string, known ingest.KnownColumns, limit int) (records map[string]*models.ColumnarRecord, walBytes map[string]int64, drops []ingest.LPDrop, err error) {
-	records = make(map[string]*models.ColumnarRecord)
+// what the typed batch's row-form WAL encoding appends, for the WAL space
+// reservation.
+func prometheusRemoteWriteRecords(request *remoteWriteRequest, database string, known ingest.KnownColumns, limit int) (records map[string]*ingest.TypedColumnBatch, walBytes map[string]int64, drops []ingest.LPDrop, err error) {
+	records = make(map[string]*ingest.TypedColumnBatch)
 	walBytes = make(map[string]int64)
 	tagNames := make(map[string]map[string]struct{})
 	dropAt := make(map[[3]string]int)
@@ -750,6 +759,10 @@ func prometheusRemoteWriteRecords(request *remoteWriteRequest, database string, 
 	columnCells := 0
 	repeatedBytes := 0
 	rows := make(map[string]int)
+	rowCapacity := make(map[string]int)
+	for _, k := range kept {
+		rowCapacity[k.measurement] += k.samples
+	}
 	for _, k := range kept {
 		measurement, tags, samples := k.measurement, k.tags, k.samples
 		mn := names[measurement]
@@ -778,23 +791,21 @@ func prometheusRemoteWriteRecords(request *remoteWriteRequest, database string, 
 
 		record := records[measurement]
 		if record == nil {
-			record = &models.ColumnarRecord{
-				Measurement: measurement,
-				Columnar:    true,
-				Columns: map[string][]interface{}{
-					"time":                {},
-					prometheusValueColumn: {},
+			record = &ingest.TypedColumnBatch{
+				Data: map[string]interface{}{
+					"time":                make([]int64, 0, rowCapacity[measurement]),
+					prometheusValueColumn: make([]float64, 0, rowCapacity[measurement]),
 				},
 			}
 			records[measurement] = record
 			tagNames[measurement] = make(map[string]struct{})
 		}
 
-		rowCount := len(record.Columns["time"])
-		columnCount := len(record.Columns)
+		rowCount := len(record.Data["time"].([]int64))
+		columnCount := len(record.Data)
 		newColumns := 0
 		for name := range tags {
-			if _, exists := record.Columns[name]; !exists {
+			if _, exists := record.Data[name]; !exists {
 				newColumns++
 			}
 		}
@@ -821,26 +832,38 @@ func prometheusRemoteWriteRecords(request *remoteWriteRequest, database string, 
 		rows[measurement] += samples
 
 		for name := range tags {
-			if _, exists := record.Columns[name]; !exists {
-				record.Columns[name] = make([]interface{}, rowCount)
+			if _, exists := record.Data[name]; !exists {
+				record.Data[name] = make([]string, rowCount, rowCapacity[measurement])
+				if record.Validity == nil {
+					record.Validity = make(map[string][]bool)
+				}
+				record.Validity[name] = make([]bool, rowCount, rowCapacity[measurement])
 			}
 			tagNames[measurement][name] = struct{}{}
 		}
+		times := record.Data["time"].([]int64)
+		values := record.Data[prometheusValueColumn].([]float64)
 		for _, sample := range k.series.Samples {
 			if math.Float64bits(sample.Value) == prometheusStaleNaN {
 				continue
 			}
-			record.Columns["time"] = append(record.Columns["time"], sample.Timestamp*1000)
-			record.Columns[prometheusValueColumn] = append(record.Columns[prometheusValueColumn], sample.Value)
-			for name, values := range record.Columns {
-				if name == "time" || name == prometheusValueColumn {
-					continue
-				}
-				if value, exists := tags[name]; exists {
-					record.Columns[name] = append(values, value)
-				} else {
-					record.Columns[name] = append(values, nil)
-				}
+			times = append(times, sample.Timestamp*1000)
+			values = append(values, sample.Value)
+		}
+		record.Data["time"] = times
+		record.Data[prometheusValueColumn] = values
+		for name, data := range record.Data {
+			if name == "time" || name == prometheusValueColumn {
+				continue
+			}
+			tagValues := data.([]string)
+			tagValue, exists := tags[name]
+			for i := 0; i < samples; i++ {
+				tagValues = append(tagValues, tagValue)
+			}
+			record.Data[name] = tagValues
+			for i := 0; i < samples; i++ {
+				record.Validity[name] = append(record.Validity[name], exists)
 			}
 		}
 	}

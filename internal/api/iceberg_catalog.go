@@ -94,6 +94,9 @@ type IcebergCatalogHandler struct {
 	// does not hold the warehouse (node-local storage, not the exporter)
 	// answers 503 with the reason rather than an empty catalog.
 	servable func() (bool, string)
+	// awaitFresh, when set, waits briefly for the files reported for a
+	// table before its load (#1752).
+	awaitFresh func(ctx context.Context, database, measurement string)
 	// spokes, on an edge-sync hub, names the storage-root directories that
 	// are spokes, not databases; the namespace listing does not scan them.
 	spokes   func(ctx context.Context) (map[string]struct{}, error)
@@ -132,6 +135,13 @@ func (h *IcebergCatalogHandler) SetRBAC(r IcebergCatalogRBAC) { h.rbac = r }
 
 // SetServable sets the per-request "can this node answer" check.
 func (h *IcebergCatalogHandler) SetServable(f func() (bool, string)) { h.servable = f }
+
+// SetAwaitFresh makes a table load first wait, briefly, for the files
+// ingest reported for the table before it (iceberg.load_export_min_interval,
+// #1752). nil, the default, reads the published version at once.
+func (h *IcebergCatalogHandler) SetAwaitFresh(f func(ctx context.Context, database, measurement string)) {
+	h.awaitFresh = f
+}
 
 // SetSpokeNamespaces names an edge-sync hub's spoke directories, which the
 // namespace listing skips: they hold no table of a single-level namespace, so
@@ -514,6 +524,12 @@ func (h *IcebergCatalogHandler) handleLoadTable(c *fiber.Ctx) error {
 	}
 	ctx, cancel := context.WithTimeout(c.Context(), icebergRequestTimeout)
 	defer cancel()
+	// Only a GET, and only for a table the caller may read: the wait can move
+	// the table's next export earlier (bounded per table by the load
+	// interval), never commit from here.
+	if h.awaitFresh != nil && c.Method() != fiber.MethodHead {
+		h.awaitFresh(ctx, db, m)
+	}
 	pt, found, err := h.src.LoadPublished(ctx, db, m)
 	if err != nil {
 		return h.storageUnavailable(c, err, "the table's published Iceberg metadata")

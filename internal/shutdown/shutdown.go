@@ -17,6 +17,17 @@ type Shutdownable interface {
 	Close() error
 }
 
+// ContextCloser is a Shutdownable that also takes the shutdown's context.
+// The coordinator calls CloseContext instead of Close for one. The context's
+// deadline is the end of the whole shutdown budget: a component that does
+// bounded work while the others are still to close (the Iceberg export's
+// final drain, #1886) needs it to leave time for the components after it,
+// which Close cannot tell it.
+type ContextCloser interface {
+	Shutdownable
+	CloseContext(ctx context.Context) error
+}
+
 // ShutdownFunc is a function that performs cleanup during shutdown
 type ShutdownFunc func(ctx context.Context) error
 
@@ -229,7 +240,13 @@ func (c *Coordinator) Shutdown() error {
 				Int("priority", comp.priority).
 				Msg("Shutting down component")
 
-			if err := comp.component.Close(); err != nil {
+			var err error
+			if cc, ok := comp.component.(ContextCloser); ok {
+				err = cc.CloseContext(ctx)
+			} else {
+				err = comp.component.Close()
+			}
+			if err != nil {
 				c.logger.Error().
 					Err(err).
 					Str("component", comp.name).
@@ -290,8 +307,10 @@ const (
 	PriorityBuffer     = 30 // Flush buffers
 	PriorityWAL        = 40 // Flush WAL
 	// PriorityScheduler stops the tick-driven schedulers that ask the cluster
-	// coordinator whether they may run — compaction, continuous queries,
-	// retention, reconciliation. They quiesce BEFORE the coordinator they
+	// coordinator whether they may run — continuous queries, retention,
+	// reconciliation. (Compaction stops in a hook at priority 1 and waits for
+	// its running cycle in a component before the coordinator, #1887.) They
+	// quiesce BEFORE the coordinator they
 	// depend on, so a tick in flight never finds it gone (#854).
 	PriorityScheduler  = 45 // Stop cluster-gated schedulers
 	PriorityCompaction = 50 // Stop compaction and the cluster coordinator

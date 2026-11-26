@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -351,6 +352,14 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 		})
 	}
 
+	// ?wait=<duration> (#1884): answer when the cycle ends, or after the
+	// wait, whichever comes first. Parsed before the claim, so a bad value
+	// claims nothing.
+	wait, err := parseTriggerWait(c.Query("wait"))
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+
 	// Parse database parameter (reuses same validation as database creation API)
 	dbParam := c.Query("database", "")
 	if dbParam != "" && !isValidDatabaseName(dbParam) {
@@ -421,6 +430,9 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 	// refuse up front, before the trigger is logged as accepted. Checked
 	// before the running-cycle check: a cycle that was already running when
 	// the pause landed is ending at its boundary.
+	if h.manager.Stopping() {
+		return h.refuseStopping(c, tierNames)
+	}
 	if h.manager.Paused() {
 		h.logger.Info().Strs("tiers", tierNames).Msg("Manual compaction trigger refused: compaction is paused cluster-wide")
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
@@ -453,6 +465,9 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 	// global last_cycle, so matching on cycle_id is the only way to tell
 	// whose result is whose.
 	claim, err := h.manager.ClaimCycle()
+	if errors.Is(err, compaction.ErrCompactionStopping) {
+		return h.refuseStopping(c, tierNames)
+	}
 	if err != nil {
 		// RunningCycleID rather than GetCurrentCycleID: it takes the same
 		// mutex as the claim, so it cannot report the previous, finished
@@ -468,6 +483,7 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 			"error":      "Compaction cycle already running",
 			"message":    "A compaction cycle is already in progress. Please wait for it to complete.",
 			"cycle_id":   running,
+			"boot_id":    h.manager.BootID(),
 			"is_running": true,
 		})
 	}
@@ -513,6 +529,10 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 			logger.Info().Err(ctx.Err()).Msg("Manual compaction interrupted")
 		} else if errors.Is(err, compaction.ErrCompactionPaused) {
 			logger.Info().Msg("Manual compaction stopped at a batch boundary: compaction is paused cluster-wide")
+		} else if errors.Is(err, compaction.ErrCompactionStopping) {
+			logger.Info().Msg("Manual compaction stopped at a batch boundary: the server is shutting down")
+		} else if h.manager.Stopping() && errors.Is(err, context.Canceled) {
+			logger.Warn().Msg("Manual compaction killed at the shutdown deadline; the next start recovers it from its manifest")
 		} else if err != nil {
 			logger.Error().Err(err).Msg("Manual compaction failed")
 		} else {
@@ -525,6 +545,7 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 		"status":   "running",
 		"tiers":    tierNames,
 		"cycle_id": claim.ID, // the id this cycle claimed, not a prediction
+		"boot_id":  h.manager.BootID(),
 	}
 	if dbParam != "" {
 		resp["database"] = dbParam
@@ -540,8 +561,82 @@ func (h *CompactionHandler) triggerCompaction(c *fiber.Ctx) error {
 			resp["exclude_databases"] = excluded
 		}
 	}
+	if wait > 0 {
+		return h.waitForCycle(c, claim.ID, wait, resp)
+	}
 	return c.JSON(resp)
 }
+
+// triggerWaitMax caps ?wait: a held request ties up a connection, and the
+// cycle carries on whether or not anyone waits for it.
+const triggerWaitMax = 10 * time.Minute
+
+// cycleWaitPoll is how often a waiting trigger looks for the cycle's record.
+const cycleWaitPoll = 250 * time.Millisecond
+
+// parseTriggerWait reads ?wait: absent or empty means do not wait; otherwise
+// a Go duration ("90s", "5m"), positive, capped at triggerWaitMax.
+func parseTriggerWait(raw string) (time.Duration, error) {
+	if raw == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("wait must be a positive duration such as 90s or 5m")
+	}
+	return min(d, triggerWaitMax), nil
+}
+
+// waitForCycle holds the trigger's answer until the cycle's record says it
+// finished (200, the record, whose status may be "failed"), or the wait runs
+// out (202, the trigger's answer with "status": "running": the cycle carries
+// on), or the server starts shutting down (202, "status": "unknown": a
+// manual cycle stops with the process). The record is looked up by this
+// process's id, so the answer is this cycle's.
+//
+// fasthttp does not tell a handler that its client went away: a caller that
+// gives up early leaves this loop polling until the cycle ends or the wait
+// runs out, and the answer is then written to nobody. Cheap (one lookup per
+// tick, admin-only route), and bounded by triggerWaitMax.
+func (h *CompactionHandler) waitForCycle(c *fiber.Ctx, id int64, wait time.Duration, running fiber.Map) error {
+	deadline := time.NewTimer(wait)
+	defer deadline.Stop()
+	tick := time.NewTicker(cycleWaitPoll)
+	defer tick.Stop()
+	for {
+		// While this cycle still holds the claim it has not finished: skip
+		// the lookup, which copies the record under the manager's lock.
+		if !(h.manager.IsCycleRunning() && h.manager.RunningCycleID() == id) {
+			if rec, found, _, _, _ := h.manager.CycleLookup(id); found && !rec.FinishedAt.IsZero() {
+				out := cycleResponse(rec)
+				out["boot_id"] = h.manager.BootID()
+				return c.JSON(out)
+			}
+		}
+		select {
+		case <-tick.C:
+		case <-deadline.C:
+			running["message"] = "the cycle is still running after the wait; it carries on. Poll /api/v1/compaction/cycles/{id}?boot_id= for its outcome"
+			return c.Status(fiber.StatusAccepted).JSON(running)
+		case <-c.Context().Done():
+			running["status"] = "unknown"
+			running["message"] = "the server is shutting down, and a manual cycle stops with the process; its outcome is not known to this request"
+			return c.Status(fiber.StatusAccepted).JSON(running)
+		}
+	}
+}
+
+// bootIDMismatch reports whether the request names another process's cycle
+// ids (#1884): ?boot_id= set, and not this process's. Empty means not given.
+func (h *CompactionHandler) bootIDMismatch(c *fiber.Ctx) bool {
+	raw := c.Query("boot_id")
+	return raw != "" && raw != h.manager.BootID()
+}
+
+// bootIDMismatchMessage is what a lookup by another process's id says. The
+// server knows only that the id is not this process's: the process may have
+// restarted since, or the request may have reached another node.
+const bootIDMismatchMessage = "this cycle id was handed out by another Arc process: this one has restarted since, or the request reached another node. Cycle ids restart at 1 with each process, so a record with the same number here is another cycle. boot_id is this process's."
 
 // getActiveJobs handles GET /api/v1/compaction/jobs
 func (h *CompactionHandler) getActiveJobs(c *fiber.Ctx) error {
@@ -602,6 +697,24 @@ func (h *CompactionHandler) getHistory(c *fiber.Ctx) error {
 		}
 	}
 
+	// Another process's cycle id (#1884): the jobs here with that number are
+	// another cycle's, so none is returned. 200 and cycle_retained=false, as
+	// for any cycle this process has no record of.
+	if cycleID > 0 && h.bootIDMismatch(c) {
+		return c.JSON(fiber.Map{
+			"recent_jobs":      []interface{}{},
+			"matched":          0,
+			"page_size":        0,
+			"capacity":         compaction.JobHistoryLimit,
+			"unit":             "attempts",
+			"cycle_id":         cycleID,
+			"cycle_retained":   false,
+			"boot_id":          h.manager.BootID(),
+			"boot_id_mismatch": true,
+			"message":          bootIDMismatchMessage,
+		})
+	}
+
 	// One acquisition: the page, the match count and the cycle cross-check all
 	// come from the same snapshot, so no two fields in this response can
 	// disagree. Also avoids building the whole Stats map to read one counter.
@@ -621,6 +734,7 @@ func (h *CompactionHandler) getHistory(c *fiber.Ctx) error {
 	// To reconcile, use the cycle record: sum(failed_partitions) ==
 	// failed_batches when not truncated.
 	resp := fiber.Map{
+		"boot_id":     h.manager.BootID(),
 		"total_jobs":  page.TotalJobsCompleted,
 		"recent_jobs": recentJobs,
 		"matched":     page.Matched,
@@ -663,7 +777,7 @@ func (h *CompactionHandler) getHistory(c *fiber.Ctx) error {
 				resp["oldest_retained_cycle"] = page.OldestRetainedCycle
 				resp["newest_retained_cycle"] = page.NewestRetainedCycle
 			}
-			resp["message"] = "this node retains no record of that compaction cycle, so an empty result here does not mean the cycle failed nothing. Cycle ids restart at 1 when the process restarts, and cycles run on the node holding the compactor lease."
+			resp["message"] = "this node retains no record of that compaction cycle, so an empty result here does not mean the cycle failed nothing. Cycle ids restart at 1 when the process restarts (send the trigger's boot_id with the id to tell processes apart), and cycles run on the node holding the compactor lease."
 		}
 	}
 	return c.JSON(resp)
@@ -762,6 +876,25 @@ func (h *CompactionHandler) getCycle(c *fiber.Ctx) error {
 		})
 	}
 
+	// Another process's id (#1884), checked before the record and before the
+	// synthesized "claimed" answer: a record or a claim with the same number
+	// here is another cycle.
+	if h.bootIDMismatch(c) {
+		resp := fiber.Map{
+			"error":            "no record of this compaction cycle in this process",
+			"cycle_id":         id,
+			"boot_id":          h.manager.BootID(),
+			"boot_id_mismatch": true,
+			"message":          bootIDMismatchMessage,
+		}
+		if h.gate != nil {
+			if holder := h.gate.LeaseHolder(); holder != "" {
+				resp["lease_holder"] = holder
+			}
+		}
+		return c.Status(fiber.StatusNotFound).JSON(resp)
+	}
+
 	// History first, and only then the claim. The claim is taken before the
 	// cycle records anything and released after the terminal record is
 	// written, so it is held during two windows where it disagrees with the
@@ -773,7 +906,9 @@ func (h *CompactionHandler) getCycle(c *fiber.Ctx) error {
 	// range a 404 reports is the same snapshot that produced the miss.
 	rec, found, oldest, newest, haveRange := h.manager.CycleLookup(id)
 	if found {
-		return c.JSON(cycleResponse(rec))
+		out := cycleResponse(rec)
+		out["boot_id"] = h.manager.BootID()
+		return c.JSON(out)
 	}
 
 	// Claimed, not yet started. The trigger answers with the cycle id as soon
@@ -785,6 +920,7 @@ func (h *CompactionHandler) getCycle(c *fiber.Ctx) error {
 	if h.manager.IsCycleRunning() && h.manager.RunningCycleID() == id {
 		return c.JSON(fiber.Map{
 			"cycle_id": id,
+			"boot_id":  h.manager.BootID(),
 			"status":   "claimed",
 			"message":  "this cycle is claimed and starting; its record appears within milliseconds",
 		})
@@ -793,6 +929,7 @@ func (h *CompactionHandler) getCycle(c *fiber.Ctx) error {
 	resp := fiber.Map{
 		"error":    "no retained record of this compaction cycle on this node",
 		"cycle_id": id,
+		"boot_id":  h.manager.BootID(),
 	}
 	// On a cluster the holder is the only actionable datum in this response:
 	// it names where the cycle actually ran. The trigger 503 already reports
@@ -819,7 +956,7 @@ func (h *CompactionHandler) getCycle(c *fiber.Ctx) error {
 		// Deliberately not "this cycle never ran": cycle ids restart at 1 on
 		// every restart, so an id recorded before one is genuinely absent here
 		// and did run.
-		resp["message"] = "this node has recorded no cycle with that id. Cycle ids restart at 1 when the process restarts, and cycles run on the node holding the compactor lease, so a cycle triggered elsewhere is not recorded here."
+		resp["message"] = "this node has recorded no cycle with that id. Cycle ids restart at 1 when the process restarts (send the trigger's boot_id with the id to tell processes apart), and cycles run on the node holding the compactor lease, so a cycle triggered elsewhere is not recorded here."
 	}
 	return c.Status(fiber.StatusNotFound).JSON(resp)
 }
@@ -853,6 +990,7 @@ func (h *CompactionHandler) listCycles(c *fiber.Ctx) error {
 	resp := fiber.Map{
 		"cycles":   cycles,
 		"retained": page.Retained,
+		"boot_id":  h.manager.BootID(),
 	}
 	if page.HasRange {
 		resp["oldest_retained"] = page.Oldest
@@ -864,4 +1002,16 @@ func (h *CompactionHandler) listCycles(c *fiber.Ctx) error {
 		resp["running_cycle_id"] = page.RunningCycleID
 	}
 	return c.JSON(resp)
+}
+
+// refuseStopping answers a trigger after shutdown began (#1887): no new
+// cycle. 503, not 409: retrying against another node, or this one once
+// restarted, is the answer.
+func (h *CompactionHandler) refuseStopping(c *fiber.Ctx, tierNames []string) error {
+	h.logger.Info().Strs("tiers", tierNames).Msg("Manual compaction trigger refused: the server is shutting down")
+	return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+		"error":    "the server is shutting down",
+		"message":  "compaction is not taking new cycles; retry once the server is back",
+		"stopping": true,
+	})
 }
