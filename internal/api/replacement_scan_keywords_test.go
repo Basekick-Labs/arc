@@ -67,7 +67,7 @@ func TestValidateSQLRequest_RejectsLiteralAfterRelationKeywords(t *testing.T) {
 	}
 	for _, tt := range rejected {
 		t.Run("rejected/"+tt.name, func(t *testing.T) {
-			if err := ValidateSQLRequest(tt.sql); err == nil {
+			if err := validateSQLErr(tt.sql); err == nil {
 				t.Errorf("accepted a path literal in relation position: %s", tt.sql)
 			}
 		})
@@ -109,7 +109,7 @@ func TestValidateSQLRequest_RejectsLiteralAfterRelationKeywords(t *testing.T) {
 	}
 	for _, tt := range accepted {
 		t.Run("accepted/"+tt.name, func(t *testing.T) {
-			if err := ValidateSQLRequest(tt.sql); err != nil {
+			if err := validateSQLErr(tt.sql); err != nil {
 				t.Errorf("false denial: %s -> %v", tt.sql, err)
 			}
 		})
@@ -119,7 +119,7 @@ func TestValidateSQLRequest_RejectsLiteralAfterRelationKeywords(t *testing.T) {
 // The guard must name the offending construct, not leak the path back.
 func TestValidateSQLRequest_RelationKeywordErrorDoesNotEchoPath(t *testing.T) {
 	const victim = "./data/db2/secrets/**/*.parquet"
-	err := ValidateSQLRequest("TABLE '" + victim + "'")
+	err := validateSQLErr("TABLE '" + victim + "'")
 	if err == nil {
 		t.Fatal("expected rejection")
 	}

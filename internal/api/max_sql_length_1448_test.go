@@ -19,10 +19,10 @@ func sqlOfLength(n int) string {
 // the cap is the default, not unlimited.
 func TestValidateSQLRequestDefaultCap_Issue1448(t *testing.T) {
 	SetMaxSQLLength(0)
-	if err := ValidateSQLRequest(sqlOfLength(config.DefaultMaxSQLLength)); err != nil {
+	if err := validateSQLErr(sqlOfLength(config.DefaultMaxSQLLength)); err != nil {
 		t.Fatalf("a statement at the default cap was refused: %v", err)
 	}
-	err := ValidateSQLRequest(sqlOfLength(config.DefaultMaxSQLLength + 1))
+	err := validateSQLErr(sqlOfLength(config.DefaultMaxSQLLength + 1))
 	if err == nil || !strings.Contains(err.Error(), "query.max_sql_length") {
 		t.Fatalf("a statement over the default cap: %v", err)
 	}
@@ -31,10 +31,10 @@ func TestValidateSQLRequestDefaultCap_Issue1448(t *testing.T) {
 func TestValidateSQLRequestHonoursMaxSQLLength_Issue1448(t *testing.T) {
 	SetMaxSQLLength(50000)
 	t.Cleanup(func() { SetMaxSQLLength(0) })
-	if err := ValidateSQLRequest(sqlOfLength(50000)); err != nil {
+	if err := validateSQLErr(sqlOfLength(50000)); err != nil {
 		t.Fatalf("a statement at the raised cap was refused: %v", err)
 	}
-	err := ValidateSQLRequest(sqlOfLength(50001))
+	err := validateSQLErr(sqlOfLength(50001))
 	if err == nil || !strings.Contains(err.Error(), "50000 characters") {
 		t.Fatalf("a statement over the raised cap: %v", err)
 	}

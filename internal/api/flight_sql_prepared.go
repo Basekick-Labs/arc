@@ -115,9 +115,11 @@ func (s *flightSQLService) CreatePreparedStatement(ctx context.Context, req flig
 // refusal that the client can work around by running the statement
 // unprepared is Unimplemented, the code ADBC falls back on.
 func (s *flightSQLService) preparedSchema(ctx context.Context, sql, database string) (*arrow.Schema, error) {
-	if err := ValidateSQLRequest(sql); err != nil {
+	canonicalSQL, err := ValidateSQLRequest(sql)
+	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
+	sql = canonicalSQL
 	// A node that does not run queries forwards them (a compactor); a bind
 	// cannot be forwarded, so it prepares nothing, SHOW included.
 	if router := s.queryHandler.router; router != nil && !router.CanRouteLocally(false) {
@@ -213,9 +215,11 @@ func (s *flightSQLService) GetFlightInfoPreparedStatement(ctx context.Context, c
 	if err != nil {
 		return nil, err
 	}
-	if err := ValidateSQLRequest(statement.SQL); err != nil {
+	canonicalSQL, err := ValidateSQLRequest(statement.SQL)
+	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
+	statement.SQL = canonicalSQL
 	database, err := flightStatementDatabase(ctx, statement.Database)
 	if err != nil {
 		return nil, err

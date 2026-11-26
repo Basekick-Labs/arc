@@ -26,7 +26,7 @@ func TestValidateSQLRequestRejectsUserStoragePaths(t *testing.T) {
 		{"nested reader with authorised table", "SELECT * FROM db1.cpu WHERE x IN (SELECT y FROM read_parquet('" + root + "'))"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := ValidateSQLRequest(tc.sql); err == nil {
+			if err := validateSQLErr(tc.sql); err == nil {
 				t.Fatalf("ValidateSQLRequest accepted a user-supplied storage path in %q", tc.sql)
 			}
 		})

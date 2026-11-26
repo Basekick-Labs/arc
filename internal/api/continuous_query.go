@@ -1464,9 +1464,11 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	// A body that fails is surfaced, not swallowed: both callers record a
 	// "failed" execution carrying this error, readable via
 	// GET /api/v1/continuous_queries/:id/executions.
-	if err := ValidateSQLRequest(query); err != nil {
+	canonicalSQL, err := ValidateSQLRequest(query)
+	if err != nil {
 		return 0, fmt.Errorf("stored continuous-query definition %q is not valid SQL to execute: %w", cq.Name, err)
 	}
+	query = canonicalSQL
 
 	// A run whose output would be refused (fenced, or WAL volume disk
 	// pressure, #676) fails before it queries: the aggregation can spill to
@@ -2059,7 +2061,7 @@ func validateCQQuery(query string) error {
 	}
 	probe := strings.ReplaceAll(query, "{start_time}", "'2026-01-01T00:00:00Z'")
 	probe = strings.ReplaceAll(probe, "{end_time}", "'2026-01-01T01:00:00Z'")
-	if err := ValidateSQLRequest(probe); err != nil {
+	if _, err := ValidateSQLRequest(probe); err != nil {
 		return fmt.Errorf("invalid query: %w", err)
 	}
 	return nil

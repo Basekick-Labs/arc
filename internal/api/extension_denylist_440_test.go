@@ -31,7 +31,7 @@ func TestExtensionFileFunctionsRefused(t *testing.T) {
 			"SELECT * FROM cpu WHERE EXISTS (FROM " + fn + "('x'))",
 			"SELECT (SELECT count(*) FROM " + fn + "('x'))",
 		} {
-			if err := ValidateSQLRequest(sql); err == nil {
+			if err := validateSQLErr(sql); err == nil {
 				t.Errorf("query: %q was accepted", sql)
 			}
 			if err := validateCQQuery(sql); err == nil {
@@ -43,12 +43,12 @@ func TestExtensionFileFunctionsRefused(t *testing.T) {
 			"1=1 OR " + upper + "('x') IS NULL",
 			`"` + fn + `"('x') IS NOT NULL`,
 		} {
-			if _, err := h.validateWhereClause(where); err == nil {
+			if _, _, err := h.validateWhereClause(where); err == nil {
 				t.Errorf("DELETE WHERE: %q was accepted", where)
 			}
 		}
 		// The name as an ordinary identifier, not a call, is not refused.
-		if err := ValidateSQLRequest("SELECT " + fn + "_x FROM cpu"); err != nil {
+		if err := validateSQLErr("SELECT " + fn + "_x FROM cpu"); err != nil {
 			t.Errorf("false positive on identifier %s_x: %v", fn, err)
 		}
 	}
@@ -58,7 +58,7 @@ func TestExtensionFileFunctionsRefused(t *testing.T) {
 // and the other way round: each name is its own alternative.
 func TestExtensionFileFunctionsPrefixes(t *testing.T) {
 	for _, sql := range []string{"SELECT * FROM st_read_meta('x')", "SELECT * FROM st_read('x')", "SELECT * FROM st_readshp('x')"} {
-		if err := ValidateSQLRequest(sql); err == nil {
+		if err := validateSQLErr(sql); err == nil {
 			t.Errorf("%q was accepted", sql)
 		}
 	}
@@ -71,16 +71,16 @@ func TestExtensionFileFunctionsPrefixes(t *testing.T) {
 func TestUnicodeEscapedIdentifiersRefused(t *testing.T) {
 	h := &DeleteHandler{}
 	for _, sql := range []string{`SELECT * FROM U&"\0073t_read"('x')`, `SELECT * FROM u&"st\005Fread"('x')`, `SELECT U&'\0061' AS a`} {
-		if err := ValidateSQLRequest(sql); err == nil {
+		if err := validateSQLErr(sql); err == nil {
 			t.Errorf("query: %q was accepted", sql)
 		}
 	}
-	if _, err := h.validateWhereClause(`u&"st\005Fread"('x') IS NOT NULL`); err == nil {
+	if _, _, err := h.validateWhereClause(`u&"st\005Fread"('x') IS NOT NULL`); err == nil {
 		t.Error("DELETE WHERE: a unicode-escaped call was accepted")
 	}
 	// Not an escape: U& inside a string, and a bitwise AND.
 	for _, sql := range []string{`SELECT 'U&"x"' AS s`, "SELECT a & b FROM cpu"} {
-		if err := ValidateSQLRequest(sql); err != nil {
+		if err := validateSQLErr(sql); err != nil {
 			t.Errorf("%q refused: %v", sql, err)
 		}
 	}
@@ -93,12 +93,12 @@ func TestExtensionGeometryFunctionsAccepted(t *testing.T) {
 		"SELECT ST_AsText(ST_GeomFromWKB(geom)) FROM places WHERE ST_Within(ST_GeomFromWKB(geom), ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 0))'))",
 		"SELECT ST_Distance(ST_Point(0, 0), ST_Point(lon, lat)) AS d FROM cpu ORDER BY d LIMIT 5",
 	} {
-		if err := ValidateSQLRequest(sql); err != nil {
+		if err := validateSQLErr(sql); err != nil {
 			t.Errorf("%q refused: %v", sql, err)
 		}
 	}
 	h := &DeleteHandler{}
-	if _, err := h.validateWhereClause("ST_X(ST_Point(lon, lat)) > 0"); err != nil {
+	if _, _, err := h.validateWhereClause("ST_X(ST_Point(lon, lat)) > 0"); err != nil {
 		t.Errorf("DELETE WHERE on a geometry predicate refused: %v", err)
 	}
 }
@@ -115,7 +115,7 @@ func TestExtensionFileAccessWithoutAFunctionName(t *testing.T) {
 		"SELECT * FROM 'x.geojson'",
 		"SELECT * FROM 'x.vrt'",
 	} {
-		if err := ValidateSQLRequest(sql); err == nil {
+		if err := validateSQLErr(sql); err == nil {
 			t.Errorf("%q was accepted", sql)
 		}
 	}

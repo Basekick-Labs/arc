@@ -25,7 +25,7 @@ func TestValidateSQLAcceptsDistinctFromOperator(t *testing.T) {
 		"SELECT trim(BOTH FROM '  x  ') AS t FROM cpu",
 		"SELECT trim(LEADING 'x' FROM 'xxa') AS t FROM cpu",
 	} {
-		if err := ValidateSQLRequest(sql); err != nil {
+		if err := validateSQLErr(sql); err != nil {
 			t.Errorf("ValidateSQLRequest(%q) = %v, want nil", sql, err)
 		}
 	}
@@ -57,7 +57,7 @@ func TestValidateSQLStillRefusesReplacementScans(t *testing.T) {
 		"block delimiters inside line comments":        "SELECT a IS DISTINCT -- /*\nFROM cpu, 1 AS z -- */\nFROM '" + victim + "'",
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := ValidateSQLRequest(sql); err == nil {
+			if err := validateSQLErr(sql); err == nil {
 				t.Errorf("ValidateSQLRequest(%q) accepted a path literal in table position", sql)
 			}
 		})
@@ -143,7 +143,7 @@ func TestDeleteWhereAcceptsDistinctFromOperator(t *testing.T) {
 		"host IS DISTINCT FROM 'a'",
 		"host IS NOT DISTINCT FROM 'a' AND time > '2026-01-01'",
 	} {
-		if _, err := h.validateWhereClause(where); err != nil {
+		if _, _, err := h.validateWhereClause(where); err != nil {
 			t.Errorf("validateWhereClause(%q) = %v, want nil", where, err)
 		}
 	}
@@ -152,7 +152,7 @@ func TestDeleteWhereAcceptsDistinctFromOperator(t *testing.T) {
 		"x IS DISTINCT FROM (FROM '/data/db2/x.parquet')",
 		"1=1 /* trim( */ AND EXISTS (FROM '/data/db2/x.parquet') /* ) */",
 	} {
-		if _, err := h.validateWhereClause(where); err == nil {
+		if _, _, err := h.validateWhereClause(where); err == nil {
 			t.Errorf("validateWhereClause(%q) accepted a path literal in table position", where)
 		}
 	}

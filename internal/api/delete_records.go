@@ -211,13 +211,15 @@ func (h *DeleteHandler) RewriteForRecords(ctx context.Context, relativePath stri
 		// stay in this file; returning an error instead would hold the file
 		// back for good. The log carries the clause so the DELETE can be
 		// issued again.
-		if _, err := h.validateWhereClause(w); err != nil {
+		canonicalWhere, _, err := h.validateWhereClause(w)
+		if err != nil {
 			h.logger.Error().Err(err).Str("file", relativePath).Str("where", sqlutil.ForLog(w)).
 				Msg("DELETE record refused by WHERE validation; not applied, so its rows remain in this file; issue the DELETE again")
 			continue
 		}
+		w = canonicalWhere
 		var n int64
-		err := h.db.DB().QueryRowContext(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE %s`, source, w)).Scan(&n)
+		err = h.db.DB().QueryRowContext(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE %s`, source, w)).Scan(&n)
 		var de *duckdb.Error
 		switch {
 		case err == nil:

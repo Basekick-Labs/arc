@@ -74,9 +74,11 @@ func (h *QueryHandler) describeFlightSQLSchema(c *fiber.Ctx, binds chan struct{}
 	if err := c.BodyParser(&req); err != nil {
 		return flightSQLSchemaRefusal(c, fiber.StatusBadRequest, "Invalid request body: "+err.Error())
 	}
-	if err := ValidateSQLRequest(req.SQL); err != nil {
+	canonicalSQL, err := ValidateSQLRequest(req.SQL)
+	if err != nil {
 		return flightSQLSchemaRefusal(c, fiber.StatusBadRequest, err.Error())
 	}
+	req.SQL = canonicalSQL
 	headerDB := c.Get(flightSQLDatabaseHeader)
 	if err := validateHeaderDatabase(headerDB); err != nil {
 		return flightSQLSchemaRefusal(c, fiber.StatusBadRequest, "invalid x-arc-database header: "+err.Error())

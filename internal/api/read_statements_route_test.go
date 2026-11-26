@@ -41,7 +41,7 @@ func TestSideEffectFunctionPattern_Family(t *testing.T) {
 		}
 		n++
 		for _, q := range []string{"SELECT * FROM " + name + "()", "SELECT " + name + "('x')"} {
-			if ValidateSQLRequest(q) == nil {
+			if validateSQLErr(q) == nil {
 				t.Errorf("%s is not refused: %q", name, q)
 			}
 		}

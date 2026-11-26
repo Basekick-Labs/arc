@@ -979,7 +979,7 @@ func TestDangerousSQLPatterns(t *testing.T) {
 			// (e.g. `DROP /* */ TABLE`, `SELECT 'DROP TABLE x'`) only
 			// behave correctly through the pipeline. See
 			// TestValidateSQLRequest_BypassesAndFalsePositives.
-			err := ValidateSQLRequest(tt.sql)
+			err := validateSQLErr(tt.sql)
 			matched := err != nil
 			if matched != tt.shouldFail {
 				t.Errorf("ValidateSQLRequest for %q: matched=%v, shouldFail=%v (err=%v)", tt.sql, matched, tt.shouldFail, err)
@@ -1277,7 +1277,7 @@ func TestValidateSQLRequest_BypassesAndFalsePositives(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := ValidateSQLRequest(tt.sql)
+			err := validateSQLErr(tt.sql)
 			matched := err != nil
 			if matched != tt.shouldFail {
 				t.Errorf("ValidateSQLRequest for %q: matched=%v, shouldFail=%v (err=%v)", tt.sql, matched, tt.shouldFail, err)
@@ -1313,12 +1313,12 @@ func TestIOTableFunctionPattern_Family(t *testing.T) {
 			"SELECT * FROM cpu, " + fn + "('/x')",
 			"SELECT * FROM " + strings.ToUpper(fn) + "  ('/x')",
 		} {
-			if err := ValidateSQLRequest(sql); err == nil {
+			if err := validateSQLErr(sql); err == nil {
 				t.Errorf("ValidateSQLRequest(%q): expected rejection for I/O function %q, got nil", sql, fn)
 			}
 		}
 		// Bare identifier with the same prefix but no call form must NOT match.
-		if err := ValidateSQLRequest("SELECT * FROM " + fn + "_notacall_x"); err != nil {
+		if err := validateSQLErr("SELECT * FROM " + fn + "_notacall_x"); err != nil {
 			t.Errorf("ValidateSQLRequest: false positive on identifier %q_notacall_x: %v", fn, err)
 		}
 	}
@@ -1341,7 +1341,7 @@ func TestValidateSQLRequest_GHSAr7vmPayloads(t *testing.T) {
 		"SELECT * FROM duckdb_prepared_statements()",
 		"SELECT * FROM enable_peg_parser()",
 	} {
-		if err := ValidateSQLRequest(sql); err == nil {
+		if err := validateSQLErr(sql); err == nil {
 			t.Errorf("ValidateSQLRequest accepted %q", sql)
 		}
 	}
@@ -1364,7 +1364,7 @@ func TestValidateSQLRequest_GHSAr7vmPayloads(t *testing.T) {
 		"SELECT * FROM pg_prepared_statements",
 		"SELECT * FROM sql_auto_complete('SELECT * FROM ''./data/')",
 	} {
-		if err := ValidateSQLRequest(sql); err == nil {
+		if err := validateSQLErr(sql); err == nil {
 			t.Errorf("ValidateSQLRequest accepted %q", sql)
 		}
 	}
@@ -1378,7 +1378,7 @@ func TestValidateSQLRequest_GHSAr7vmPayloads(t *testing.T) {
 		"SELECT * FROM histogram",
 		"SELECT * FROM cpu, histogram WHERE cpu.time = histogram.time",
 	} {
-		if err := ValidateSQLRequest(sql); err != nil {
+		if err := validateSQLErr(sql); err != nil {
 			t.Errorf("ValidateSQLRequest refused %q: %v", sql, err)
 		}
 	}
@@ -2408,7 +2408,7 @@ func TestValidateSQLRequest_BlocksSecretStatements(t *testing.T) {
 		"drop secret if exists arc_s3_cold",
 	}
 	for _, q := range blocked {
-		if err := ValidateSQLRequest(q); err == nil {
+		if err := validateSQLErr(q); err == nil {
 			t.Errorf("must block: %s", q)
 		}
 	}
@@ -2419,7 +2419,7 @@ func TestValidateSQLRequest_BlocksSecretStatements(t *testing.T) {
 		"SELECT count(*) FROM secrets_audit",
 	}
 	for _, q := range allowed {
-		if err := ValidateSQLRequest(q); err != nil {
+		if err := validateSQLErr(q); err != nil {
 			t.Errorf("must allow %q, got: %v", q, err)
 		}
 	}
@@ -2439,7 +2439,7 @@ func TestValidateSQLRequest_BlocksPrepareAndExecute(t *testing.T) {
 		"EXECUTE/**/p",
 	}
 	for _, q := range blocked {
-		if err := ValidateSQLRequest(q); err == nil {
+		if err := validateSQLErr(q); err == nil {
 			t.Errorf("ValidateSQLRequest(%q): expected rejection for PREPARE/EXECUTE, got nil", q)
 		}
 	}
@@ -2453,7 +2453,7 @@ func TestValidateSQLRequest_BlocksPrepareAndExecute(t *testing.T) {
 		"SELECT * FROM cpu WHERE msg = 'EXECUTE(x)'",
 	}
 	for _, q := range allowed {
-		if err := ValidateSQLRequest(q); err != nil {
+		if err := validateSQLErr(q); err != nil {
 			t.Errorf("ValidateSQLRequest(%q): expected allowed, got %v", q, err)
 		}
 	}

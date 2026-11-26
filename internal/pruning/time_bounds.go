@@ -478,12 +478,12 @@ func stripMaskedComments(s string) (string, bool) {
 			b.WriteByte(' ')
 			i += j
 		case strings.HasPrefix(s[i:], "/*"):
-			j := strings.Index(s[i+2:], "*/")
-			if j < 0 || strings.Contains(s[i+2:i+2+j], "/*") {
+			end, closed, nested := sql.BlockComment(s, i)
+			if nested || !closed {
 				return "", false
 			}
 			b.WriteByte(' ')
-			i += 2 + j + 2
+			i = end
 		default:
 			b.WriteByte(s[i])
 			i++

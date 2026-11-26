@@ -168,7 +168,7 @@ func TestValidateSQLRequestRefusesNUL(t *testing.T) {
 		"SELECT * FROM cpu WHERE host = 'a\x00b'",
 		"SELECT \"a\x00b\" FROM cpu",
 	} {
-		err := ValidateSQLRequest(sql)
+		err := validateSQLErr(sql)
 		require.Error(t, err, "%q", sql)
 		require.Contains(t, err.Error(), "NUL")
 	}
