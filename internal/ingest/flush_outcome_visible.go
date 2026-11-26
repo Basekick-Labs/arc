@@ -412,11 +412,11 @@ func newVisibleForcing(o *FlushOutcome, w VisibleWait) *visibleForcing {
 // round asks once for each live key whose due time has come, and returns the
 // channel of the timer armed for the earliest not-due key (nil: none).
 //
-// Per result: Forced, NothingToForce and NotWanted drop the key. The wait
-// runs after Seal, so no batch of this write is appended any more, and a
-// detach takes a key's whole slice: once this write's batches of a key were
-// sent (by this force or by another detach) or are not buffered, none will be
-// again. NotDue keeps it until its due time. OverBudget keeps it with no
+// Per result: Forced, NothingToForce, LostRace and NotWanted drop the key.
+// The wait runs after Seal, so no batch of this write is appended any more,
+// and a detach takes a key's whole slice: once this write's batches of a key
+// were sent (by this force or by another detach, LostRace's) or are not
+// buffered, none will be again. NotDue keeps it until its due time. OverBudget keeps it with no
 // timer, and ends the round with the keys after it kept un-asked: the budget
 // is the node's, so they would be refused too. They are asked at a later
 // round (a batch of this write resolved, or a key's due time), never in a
@@ -443,12 +443,12 @@ keys:
 			next = earliest(next, k.due)
 			continue
 		}
-		r, due := f.forcer.ForceFlushKey(k.key, f.interval, ForceWrite, f.want)
-		switch r {
+		rep := f.forcer.ForceFlushKey(k.key, f.interval, ForceWrite, f.want)
+		switch rep.Result {
 		case NotDue:
-			k.due = due
+			k.due = rep.Due
 			kept = append(kept, k)
-			next = earliest(next, due)
+			next = earliest(next, rep.Due)
 		case OverBudget:
 			k.due = time.Time{}
 			kept = append(kept, k)
@@ -465,8 +465,9 @@ keys:
 		case LedgerOff, Closing:
 			f.live = nil
 			return nil
+		case Forced, NothingToForce, LostRace, NotWanted:
+			// Dropped: not appended to kept.
 		}
-		// Forced, NothingToForce, NotWanted: dropped.
 	}
 	f.live = kept
 	if next.IsZero() {

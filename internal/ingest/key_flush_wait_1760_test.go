@@ -62,8 +62,10 @@ func resetWaitSeams() {
 	waitBeforeSnapshotHook = nil
 	waitAfterSnapshotHook = nil
 	waitBeforeForceHook = nil
+	waitAfterForceHook = nil
 	sendSentHook = nil
 	flushUnlockedHook = nil
+	forceAfterDueCheckHook = nil
 	forceAfterScanHook = nil
 	forceBeforeSendHook = nil
 }
