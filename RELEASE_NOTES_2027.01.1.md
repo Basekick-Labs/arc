@@ -2,6 +2,20 @@
 
 > **Status:** Planned — January 2027 release.
 
+## New: exact integer decimals for Arrow IPC and Flight SQL (`x-arc-decimals: exact`) ([#1784](https://github.com/Basekick-Labs/arc/issues/1784))
+
+**Who is affected:** Arrow IPC (`/api/v1/query/arrow`) and Flight SQL clients that need integer results beyond int64, for example `sum()` over a large `BIGINT` column. Nothing changes for a client that does not send the new header.
+
+Arc converts decimal result columns before sending them: scale 0 to `int64`, other scales to `float64`. DuckDB returns `sum()` of any integer column as `decimal(38,0)`, so a sum beyond int64 cannot be returned in that type. A request can now send **`x-arc-decimals: exact`** (or `default`, the same as sending nothing). With `exact`, a scale-0 decimal column with a precision above 18 keeps its Arrow `decimal128` type, so its value arrives exact. Other decimal columns are converted as before.
+
+- **It is per column, not per value.** With `exact`, every integer `sum()` comes back as `decimal128(38,0)`, including sums that fit in int64. Opt in only from a client that reads Arrow decimals.
+- **Flight SQL:** the prepared schema, the result stream and the table schemas in metadata (`GetTables` with schemas) all follow the mode. The mode is fixed when a statement is prepared, and an execute that sends a different value is refused with `InvalidArgument`. JDBC (URL parameter or driver property) and ADBC (`rpc.call_header`) send such headers on every call.
+- **JSON and MessagePack** (`/api/v1/query`, `/api/v1/query/msgpack`, `/api/v1/query/:measurement`) answer `exact` with 400: neither format has a numeric encoding for these values that every client reads. Cast in SQL there (`::VARCHAR` for the exact digits).
+- An unknown value is refused with 400, or `InvalidArgument` on Flight SQL, which also refuses the header sent twice.
+- **Clusters:** a node from before this release ignores the header and answers with the default types. Upgrade every node before relying on it.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1922](https://github.com/Basekick-Labs/arc/pull/1922).
+
 ## Change: Prometheus Remote Write builds typed columns directly ([#1748](https://github.com/Basekick-Labs/arc/issues/1748))
 
 The receiver now builds timestamp, sample and label columns in their native types instead of boxing each cell in an interface value. Labels keep the same null handling and tag metadata, and WAL reservations still match the bytes written. The existing Parquet output and WAL replay remain unchanged.
@@ -7232,12 +7246,6 @@ negative or unparseable value is a startup error naming the value rather than
 an unbounded operation.
 
 ## Bug fixes
-
-### Exact decimal results are available to Arrow IPC and Flight SQL clients ([#1784](https://github.com/Basekick-Labs/arc/issues/1784))
-
-Clients can send `x-arc-decimals: exact` to keep scale-0 decimals with precision greater than 18 as Arrow decimal128 values, including integers that do not fit in int64. This is opt-in: existing response types are unchanged by default, and JSON and MessagePack requests that ask for exact decimals receive `400`. Flight SQL prepared schemas and result streams use the same decimal mode; changing the mode after preparing a statement is refused.
-
-Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1922](https://github.com/Basekick-Labs/arc/pull/1922).
 
 ### Fix: an Arrow query served by arcx honours the governance row cap ([#727](https://github.com/Basekick-Labs/arc/issues/727))
 
