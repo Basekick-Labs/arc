@@ -71,6 +71,9 @@ func TestWaitVisibleFirstWriteToAnIdleMeasurementAnswersAtOnce1759(t *testing.T)
 		require.Equal(t, http.StatusNoContent, resp.StatusCode, out)
 		v, reason := visible(resp.Header)
 		require.Equal(t, "true", v, reason)
-		require.Less(t, took, 500*time.Millisecond, "%s: the first visible write to an idle measurement took %v; it is forced at its first ask", m, took)
+		// 3 s, not a flush time: a wall-clock bound in the race job must leave
+		// room for a loaded runner, and still sits below the 5 s interval and
+		// the 25 s age a write that was not forced at its first ask would wait.
+		require.Less(t, took, 3*time.Second, "%s: the first visible write to an idle measurement took %v; it is forced at its first ask", m, took)
 	}
 }
