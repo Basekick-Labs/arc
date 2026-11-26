@@ -365,7 +365,8 @@ var (
 // arc_ingest_forced_flushes_total{source=src}.
 //
 // Locks, in order: the key's stripe alone (due check); none (budget); the
-// shard read lock (want); the shard write lock, and under it the stripe (the
+// shard read lock (want, and under it the stripe when the key is empty); the
+// shard write lock, and under it the stripe (the empty-key check, the
 // re-check and the send). The caller must hold no shard or stripe lock: a
 // held stripe deadlocks the due check, and a held shard lock, read or write,
 // deadlocks the write lock or the scan (a recursive RLock waits behind a
