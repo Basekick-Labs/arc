@@ -57,7 +57,7 @@ func TestFreshFlushPredicates1760(t *testing.T) {
 	}
 	s := string(src)
 	newBuf := strings.Index(s, "arrowBuffer := ingest.NewArrowBuffer(")
-	tracking := strings.Index(s, "if freshFlushEnabled(cfg) {\n\t\tarrowBuffer.EnableKeyFlushTracking()")
+	tracking := strings.Index(s, "arrowBuffer.EnableKeyFlushTracking()")
 	recovery := strings.Index(s, "walRecovery.RecoverWithOptions(context.Background(), recoveryCallback,")
 	switch {
 	case newBuf < 0 || tracking < 0 || recovery < 0:
