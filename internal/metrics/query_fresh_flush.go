@@ -95,3 +95,12 @@ func (m *Metrics) appendQueryFreshFlush(b []byte) []byte {
 	b = appendMetric(b, "arc_query_fresh_flush_seconds_sum", time.Duration(h.sumNS.Load()).Seconds())
 	return appendMetric(b, "arc_query_fresh_flush_seconds_count", float64(cumulative))
 }
+
+// QueryFreshFlushCount is arc_query_fresh_flush_total for outcome (0 for an
+// unknown one).
+func (m *Metrics) QueryFreshFlushCount(outcome string) int64 {
+	if i := freshFlushOutcomeIndex(outcome); i >= 0 {
+		return m.queryFreshFlush.outcomes[i].Load()
+	}
+	return 0
+}
