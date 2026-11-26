@@ -1332,6 +1332,9 @@ func (s *flightSQLService) GetFlightInfoTables(_ context.Context, cmd flightsql.
 }
 
 func (s *flightSQLService) DoGetTables(ctx context.Context, cmd flightsql.GetTables) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+	if err := flightTablesDecimalMode(ctx, cmd); err != nil {
+		return nil, nil, err
+	}
 	token := s.token(ctx)
 	catalogPattern := compileFlightPattern(cmd.GetCatalog())
 	dbSchemaPattern := compileFlightPattern(cmd.GetDBSchemaFilterPattern())
@@ -1386,6 +1389,19 @@ func (s *flightSQLService) DoGetTables(ctx context.Context, cmd flightsql.GetTab
 		}
 	}
 	return flightRecordStream(ctx, tableSchema, builder)
+}
+
+// flightTablesDecimalMode checks x-arc-decimals on a GetTables call that
+// includes schemas: each table's schema follows the mode (#1784), so the
+// value is checked once, before any table is listed, and refused even when
+// no table matches. Without schemas the header is ignored, as on every other
+// catalog call.
+func flightTablesDecimalMode(ctx context.Context, cmd flightsql.GetTables) error {
+	if !cmd.GetIncludeSchema() {
+		return nil
+	}
+	_, _, err := flightSQLDecimalMode(ctx)
+	return err
 }
 
 // skipFlightTableSchemaError reports whether a measurement whose schema query
