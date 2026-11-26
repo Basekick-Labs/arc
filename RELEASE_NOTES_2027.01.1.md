@@ -2,6 +2,17 @@
 
 > **Status:** Planned — January 2027 release.
 
+## New: queries recognise `x-arc-freshness` and refuse it in this build ([#1760](https://github.com/Basekick-Labs/arc/issues/1760))
+
+A query can send **`x-arc-freshness: flush`** to ask for an answer that includes every row this node acknowledged before the request. This build recognises the header and refuses it, before the query is forwarded, parsed or run, on `/api/v1/query`, `/api/v1/query/msgpack`, `/api/v1/query/arrow`, `/api/v1/query/estimate` and `/api/v1/query/:measurement`:
+
+- `flush` (any case): 403, `X-Arc-Freshness: false`, `X-Arc-Freshness-Reason: disabled`;
+- any other value: 400, `X-Arc-Freshness: false`, `X-Arc-Freshness-Reason: invalid_value`.
+
+Flight SQL does not support the header: a call that runs, plans or prepares a statement (`GetFlightInfo` and `DoGet` for a statement or a prepared statement, `CreatePreparedStatement`, `GetSchema` for a prepared statement) and sends it with any non-empty value is refused with `InvalidArgument`. An empty or whitespace-only value counts as absent, as on HTTP.
+
+An empty header value counts as absent. Browsers may send the header (CORS), and the two answer headers are exposed. The check runs after authentication, so a request without valid credentials gets the usual 401 or 403. A query without the header is unchanged, at the cost of one header lookup. The absence of `X-Arc-Freshness` never means fresh.
+
 ## Fix: a DELETE could miss a flush failure, and a WAL recovery pass could clear the failure while its rows were still only in the WAL ([#1938](https://github.com/Basekick-Labs/arc/issues/1938))
 
 **Who is affected:** builds of `main` with the WAL on (`wal.enabled`).

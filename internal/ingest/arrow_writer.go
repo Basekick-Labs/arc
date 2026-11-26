@@ -1445,6 +1445,12 @@ type ArrowBuffer struct {
 	// are already running when it is enabled; once set it never changes.
 	ledger atomic.Pointer[keyFlushLedger]
 
+	// tracking is the per-task flush tracking behind WaitKeysFlushed (#1760,
+	// key_flush_wait.go). Nil unless EnableKeyFlushTracking was called: its
+	// own switch, so the ledger alone never pays for it. Off, every detach
+	// and resolution site pays one nil test.
+	tracking atomic.Pointer[keyTaskTracker]
+
 	// drainCh wakes flushDrainer when a flush-queue slot may have freed. Capacity
 	// 1 with a non-blocking send: the signal is an edge, not a count, and the
 	// drainer re-reads the real state when it wakes, so a coalesced signal costs
@@ -1881,10 +1887,11 @@ func (b *ArrowBuffer) finishFlushTask(task flushTask) {
 	b.adjustFlushRecordMetrics(0, -int64(task.recordCount))
 }
 
-func (b *ArrowBuffer) flushTrackedTask(ctx context.Context, task flushTask) error {
+// res collects the task's outcome for task tracking (#1760); nil when off.
+func (b *ArrowBuffer) flushTrackedTask(ctx context.Context, task flushTask, res *taskResult) error {
 	defer b.finishFlushTask(task)
 	defer b.releaseFlushTask(task)
-	return b.flushRecordsAsync(ctx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount, task.walHashes, task.group, task.bufferedAt)
+	return b.flushRecordsAsync(ctx, task.bufferKey, task.database, task.measurement, task.records, task.recordCount, task.walHashes, task.group, task.bufferedAt, res)
 }
 
 func (b *ArrowBuffer) publishBufferMemoryMetrics() {
@@ -3141,8 +3148,21 @@ func (b *ArrowBuffer) sendFlushLocked(
 	b.adjustFlushRecordMetrics(queuedRecords, 0)
 
 	task.taskID = b.beginAsyncFlushTask(bufferKey)
+	// Task tracking (#1760, key_flush_wait.go): the key's track stripe is
+	// held across the non-blocking send, so the worker's resolution (R1),
+	// which takes it, cannot run before this detach is recorded; and a send
+	// that fails records nothing. Released before completeAsyncFlushTask on
+	// the failure arms: asyncFlushMu is never taken under a track stripe.
+	var ts *trackStripe
+	if tr := b.tracking.Load(); tr != nil {
+		ts = tr.stripe(bufferKey)
+		ts.mu.Lock()
+	}
 	select {
 	case b.flushQueue <- task:
+		if ts != nil && sendSentHook != nil { // test seam, tracking on only
+			sendSentHook(bufferKey)
+		}
 		b.queueDepth.Add(1)
 		// Only now does the buffer stop owning these records.
 		delete(shard.deferredKeys, bufferKey)
@@ -3150,6 +3170,11 @@ func (b *ArrowBuffer) sendFlushLocked(
 		delete(shard.bufferStartTimes, bufferKey)
 		delete(shard.bufferRecordCounts, bufferKey)
 		delete(shard.bufferSchemas, bufferKey)
+		if ts != nil {
+			// D1: recorded, and waiters joined, inside this shard.mu hold.
+			ts.recordLocked(bufferKey, task.taskID)
+			ts.mu.Unlock()
+		}
 		// A detach (D1, #1760): recorded inside this shard.mu hold, so
 		// ForceFlushKey's re-check under the same lock always sees it.
 		if l := b.ledger.Load(); l != nil {
@@ -3157,11 +3182,17 @@ func (b *ArrowBuffer) sendFlushLocked(
 		}
 		return flushSent
 	case <-b.ctx.Done():
+		if ts != nil {
+			ts.mu.Unlock()
+		}
 		b.completeAsyncFlushTask(task.taskID)
 		b.adjustFlushRecordMetrics(-queuedRecords, 0)
 		b.untrackFlush(task.trackingID)
 		return flushSendClosing
 	default:
+		if ts != nil {
+			ts.mu.Unlock()
+		}
 		b.completeAsyncFlushTask(task.taskID)
 		b.adjustFlushRecordMetrics(-queuedRecords, 0)
 		b.untrackFlush(task.trackingID)
@@ -5296,9 +5327,19 @@ func (b *ArrowBuffer) runQueuedFlushTask(workerID int, task flushTask) {
 	// b.ctx does not abort a write already in progress (#1007).
 	flushCtx, flushCancel := b.newFlushContext()
 	defer flushCancel()
+	tr := b.tracking.Load()
+	var res *taskResult
+	if tr != nil {
+		res = new(taskResult)
+	}
 	// Error is already logged and recorded by flushRecordsAsync via
 	// markFlushFailure; the worker has nowhere to return it to.
-	_ = b.flushTrackedTask(flushCtx, task)
+	_ = b.flushTrackedTask(flushCtx, task, res)
+	// R1 (#1760): resolved here, never in a defer, so a panicking flush
+	// stays unresolved and its waiter times out instead of answering.
+	if tr != nil {
+		tr.resolve(task.bufferKey, task.taskID, res.outcome())
+	}
 }
 
 func flushRecordRows(record interface{}) (int, bool) {
@@ -5378,7 +5419,7 @@ func (b *ArrowBuffer) logFlushFailure(err error, bufferKey string, recordCount, 
 // itself, and it has to know WHICH tasks failed in order to count only those as
 // WAL-only. markFlushFailure alone cannot say — the latch's flush-failure bit
 // is process-wide with no per-task attribution.
-func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database, measurement string, records []interface{}, recordCount int, walHashes []string, group *flushGroup, bufferedAt time.Time) error {
+func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database, measurement string, records []interface{}, recordCount int, walHashes []string, group *flushGroup, bufferedAt time.Time, res *taskResult) error {
 	if parts := b.splitForCoverage(bufferKey, records); parts != nil {
 		// Each class is its own group and file set (flush_split.go); the
 		// group built for the whole buffer is never announced.
@@ -5387,7 +5428,7 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 		}
 		var first error
 		for _, p := range parts {
-			if err := b.flushRecordsAsync(ctx, bufferKey, database, measurement, p.records, p.rows, p.walHashes, p.group, bufferedAt); err != nil && first == nil {
+			if err := b.flushRecordsAsync(ctx, bufferKey, database, measurement, p.records, p.rows, p.walHashes, p.group, bufferedAt, res); err != nil && first == nil {
 				first = err
 			}
 		}
@@ -5414,6 +5455,7 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 		b.logFlushFailure(err, bufferKey, recordCount, noWALRows)
 		b.noteOutcomeFailure(tally, err)
 		b.markFlushFailure()
+		res.fail() // #1760
 		group.failed()
 		return err
 	}
@@ -5427,11 +5469,13 @@ func (b *ArrowBuffer) flushRecordsAsync(ctx context.Context, bufferKey, database
 		b.logFlushFailure(err, bufferKey, recordCount, noWALRows)
 		b.noteOutcomeFailure(tally, err)
 		b.markFlushFailure()
+		res.fail() // #1760
 		group.failed()
 		return err
 	}
 	b.completeFlush(walHashes, group)
 	b.noteOutcomeSettled(tally, !merged.tierUnregistered) // #1759; never deferred
+	res.settle(!merged.tierUnregistered)                  // #1760
 	return nil
 }
 
@@ -6068,13 +6112,14 @@ func (b *ArrowBuffer) flushPartitionedData(ctx context.Context, bufferKey, datab
 }
 
 // flushPartSync flushes one class of a split synchronous flush.
-func (b *ArrowBuffer) flushPartSync(ctx context.Context, bufferKey, database, measurement string, p flushPart) error {
+func (b *ArrowBuffer) flushPartSync(ctx context.Context, bufferKey, database, measurement string, p flushPart, res *taskResult) error {
 	tally := outcomeTallyOf(p.records) // #1888, #1759
 	merged, err := b.mergeBatchesForFlush(measurement, p.records)
 	if err != nil {
 		b.logFlushFailure(err, bufferKey, p.rows, recordsWithoutWALCopy(p.records, p.rows))
 		b.noteOutcomeFailure(tally, err)
 		b.markFlushFailure()
+		res.fail() // #1760
 		p.group.failed()
 		return fmt.Errorf("failed to merge batches: %w", err)
 	}
@@ -6086,11 +6131,13 @@ func (b *ArrowBuffer) flushPartSync(ctx context.Context, bufferKey, database, me
 		b.logFlushFailure(err, bufferKey, p.rows, recordsWithoutWALCopy(p.records, p.rows))
 		b.noteOutcomeFailure(tally, err)
 		b.markFlushFailure()
+		res.fail() // #1760
 		p.group.failed()
 		return err
 	}
 	b.completeFlush(p.walHashes, p.group)
 	b.noteOutcomeSettled(tally, !merged.tierUnregistered) // #1759; never deferred
+	res.settle(!merged.tierUnregistered)                  // #1760
 	return nil
 }
 
@@ -6103,6 +6150,9 @@ func (b *ArrowBuffer) flushBufferLocked(ctx context.Context, shard *bufferShard,
 	}
 	// Release lock before expensive operations
 	shard.mu.Unlock()
+	if flushUnlockedHook != nil {
+		flushUnlockedHook(bufferKey)
+	}
 	err := b.writeExtracted(ctx, e, bufferKey, database, measurement)
 	// Re-acquire lock for caller
 	shard.mu.Lock()
@@ -6179,6 +6229,12 @@ func (b *ArrowBuffer) extractBufferLocked(shard *bufferShard, bufferKey string) 
 	if l := b.ledger.Load(); l != nil {
 		l.recordDetach(bufferKey, e.taskID)
 	}
+	// D2 task tracking (#1760): recorded inside the caller's shard.mu hold.
+	// Not after the caller's unlock (flushBufferLocked, extractAged): a
+	// snapshot in that gap would see the key neither buffered nor in flight.
+	if tr := b.tracking.Load(); tr != nil {
+		tr.record(bufferKey, e.taskID)
+	}
 
 	// The records have left the buffer and never enter the flush queue, so
 	// they count as in flight until the write ends; otherwise no gauge sees a
@@ -6196,14 +6252,26 @@ func (b *ArrowBuffer) writeExtracted(ctx context.Context, e *extractedFlush, buf
 		b.bufferBytesBuffered.Add(-e.estimatedBytes)
 	}()
 	defer b.adjustFlushRecordMetrics(0, -int64(recordCount))
-	completeTask := func() { b.completeAsyncFlushTask(e.taskID) }
+	tr := b.tracking.Load()
+	var res *taskResult
+	if tr != nil {
+		res = new(taskResult)
+	}
+	// R2 (#1760): every path below resolves, then completes; never deferred,
+	// so a panicking write stays unresolved.
+	completeTask := func() {
+		if tr != nil {
+			tr.resolve(bufferKey, e.taskID, res.outcome())
+		}
+		b.completeAsyncFlushTask(e.taskID)
+	}
 
 	if parts := b.splitForCoverage(bufferKey, recordsToFlush); parts != nil {
 		// Each class is its own group and file set (flush_split.go).
 		var first error
 		for _, p := range parts {
 			p.bufferedAt = e.bufferedAt
-			if err := b.flushPartSync(ctx, bufferKey, database, measurement, p); err != nil && first == nil {
+			if err := b.flushPartSync(ctx, bufferKey, database, measurement, p, res); err != nil && first == nil {
 				first = err
 			}
 		}
@@ -6218,6 +6286,7 @@ func (b *ArrowBuffer) writeExtracted(ctx context.Context, e *extractedFlush, buf
 		b.logFlushFailure(err, bufferKey, recordCount, recordsWithoutWALCopy(recordsToFlush, recordCount))
 		b.noteOutcomeFailure(tally, err)
 		b.markFlushFailure()
+		res.fail() // #1760
 		group.failed()
 		completeTask()
 		return fmt.Errorf("failed to merge batches: %w", err)
@@ -6233,12 +6302,14 @@ func (b *ArrowBuffer) writeExtracted(ctx context.Context, e *extractedFlush, buf
 		b.logFlushFailure(err, bufferKey, recordCount, recordsWithoutWALCopy(recordsToFlush, recordCount))
 		b.noteOutcomeFailure(tally, err)
 		b.markFlushFailure()
+		res.fail() // #1760
 		group.failed()
 		completeTask()
 		return err
 	}
 	b.completeFlush(walHashes, group)
 	b.noteOutcomeSettled(tally, !merged.tierUnregistered) // #1759; never deferred, before the task completes
+	res.settle(!merged.tierUnregistered)                  // #1760
 	completeTask()
 	return nil
 }
@@ -8003,11 +8074,16 @@ drain:
 			// slot, which is #1006 all over again inside Close.
 			// Counted before the task is flushed and released.
 			noWAL := recordsWithoutWALCopy(task.records, task.recordCount)
+			tr := b.tracking.Load()
 			flushCtx, flushCancel, ok := b.closeFlushContext(deadline)
 			if !ok {
 				// Abandoned: a visible write's batches count as failed,
 				// by WAL copy (#1759); an import's as before (#1888).
 				b.noteOutcomeFailure(outcomeTallyOf(task.records), nil)
+				// R4 (#1760): the abandoned task resolves failed.
+				if tr != nil {
+					tr.resolve(task.bufferKey, task.taskID, outcomeFailed)
+				}
 				b.finishQueuedFlushTask(task)
 				b.releaseFlushTask(task)
 				mu.Lock()
@@ -8019,7 +8095,16 @@ drain:
 			defer flushCancel()
 
 			b.markFlushTaskInFlight(task)
-			if err := b.flushTrackedTask(flushCtx, task); err != nil {
+			var res *taskResult
+			if tr != nil {
+				res = new(taskResult)
+			}
+			err := b.flushTrackedTask(flushCtx, task, res)
+			// R3 (#1760): resolved here, not in a defer.
+			if tr != nil {
+				tr.resolve(task.bufferKey, task.taskID, res.outcome())
+			}
+			if err != nil {
 				// Unwritten rows that the WAL still holds: the rows with a WAL
 				// copy, less those a multi-hour flush stored before failing
 				// (#1492, #1693). Only stored rows WITH a copy come off:

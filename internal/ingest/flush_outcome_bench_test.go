@@ -48,7 +48,7 @@ func BenchmarkFlushRecordsAsyncLive(b *testing.B) {
 		b.StopTimer()
 		records, rows := liveFlushBatches(1000, 10)
 		b.StartTimer()
-		if err := buf.flushRecordsAsync(ctx, "db/bench", "db", "bench", records, rows, nil, nil, time.Now()); err != nil {
+		if err := buf.flushRecordsAsync(ctx, "db/bench", "db", "bench", records, rows, nil, nil, time.Now(), nil); err != nil {
 			b.Fatal(err)
 		}
 	}

@@ -535,6 +535,10 @@ func (h *QueryHandler) serveArcxArrowIPCResult(
 // Optimized to stream rows directly into Arrow batches without intermediate buffering.
 func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	start := time.Now()
+	// x-arc-freshness: refused before the forward (#1760, fresh_flush.go).
+	if status, msg := freshnessRefusal(c); status != 0 {
+		return c.Status(status).JSON(fiber.Map{"success": false, "error": msg})
+	}
 	m := metrics.Get()
 	// Counted here, at the same point as the JSON path (executeQuery), so that
 	// arc_query_requests_total covers both query endpoints. Without it the

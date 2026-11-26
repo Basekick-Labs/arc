@@ -187,9 +187,10 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: "*",
 		AllowMethods: "GET,POST,PUT,DELETE,OPTIONS",
-		AllowHeaders: "Origin,Content-Type,Accept,Authorization,x-api-key,x-arc-database,Content-Encoding,Arcli-Installation-Id,Arc-Client-Installation-Id," + WaitVisibleHeader,
-		// A browser reads a visible write's answer (#1759).
-		ExposeHeaders: VisibleHeader + "," + VisibleReasonHeader,
+		AllowHeaders: "Origin,Content-Type,Accept,Authorization,x-api-key,x-arc-database,Content-Encoding,Arcli-Installation-Id,Arc-Client-Installation-Id," + WaitVisibleHeader + "," + FreshnessHeader,
+		// A browser reads a visible write's answer (#1759) and a fresh
+		// query's (#1760).
+		ExposeHeaders: VisibleHeader + "," + VisibleReasonHeader + "," + FreshnessAnswerHeader + "," + FreshnessReasonHeader,
 	}))
 
 	// Security headers middleware (pass TLS flag for HSTS)

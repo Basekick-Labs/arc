@@ -77,6 +77,9 @@ func hasFlightPivot(sql string) bool {
 }
 
 func (s *flightSQLService) CreatePreparedStatement(ctx context.Context, req flightsql.ActionCreatePreparedStatementRequest) (flightsql.ActionCreatePreparedStatementResult, error) {
+	if err := flightFreshnessRefusal(ctx); err != nil { // #1760
+		return flightsql.ActionCreatePreparedStatementResult{}, err
+	}
 	if len(req.GetTransactionId()) != 0 {
 		return flightsql.ActionCreatePreparedStatementResult{}, status.Error(codes.Unimplemented, "Flight SQL transactions are not supported")
 	}
@@ -167,6 +170,9 @@ func decodeFlightPreparedStatement(handle []byte) (flightPreparedStatement, erro
 }
 
 func (s *flightSQLService) GetSchemaPreparedStatement(ctx context.Context, cmd flightsql.PreparedStatementQuery, _ *flight.FlightDescriptor) (*flight.SchemaResult, error) {
+	if err := flightFreshnessRefusal(ctx); err != nil { // #1760
+		return nil, err
+	}
 	statement, err := decodeFlightPreparedStatement(cmd.GetPreparedStatementHandle())
 	if err != nil {
 		return nil, err
@@ -185,6 +191,9 @@ func (s *flightSQLService) GetSchemaPreparedStatement(ctx context.Context, cmd f
 // GetFlightInfoPreparedStatement answers an ordinary statement ticket, so the
 // statement executes as GetFlightInfoStatement's do.
 func (s *flightSQLService) GetFlightInfoPreparedStatement(ctx context.Context, cmd flightsql.PreparedStatementQuery, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
+	if err := flightFreshnessRefusal(ctx); err != nil { // #1760
+		return nil, err
+	}
 	statement, err := decodeFlightPreparedStatement(cmd.GetPreparedStatementHandle())
 	if err != nil {
 		return nil, err
@@ -201,6 +210,9 @@ func (s *flightSQLService) GetFlightInfoPreparedStatement(ctx context.Context, c
 
 // DoGetPreparedStatement runs the statement as DoGetStatement runs a ticket.
 func (s *flightSQLService) DoGetPreparedStatement(ctx context.Context, cmd flightsql.PreparedStatementQuery) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+	if err := flightFreshnessRefusal(ctx); err != nil { // #1760
+		return nil, nil, err
+	}
 	statement, err := decodeFlightPreparedStatement(cmd.GetPreparedStatementHandle())
 	if err != nil {
 		return nil, nil, err
