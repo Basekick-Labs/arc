@@ -12,9 +12,9 @@ import (
 // WaitKeysFlushed returns once every row of the given keys that was
 // acknowledged before the call is in a flush that ended settled (stored, and
 // registered where registration applies), or with the reason it cannot say
-// so. It is the ingest half of a fresh query (x-arc-freshness: flush). The
-// query routes still refuse that header (internal/api/fresh_flush.go);
-// wiring the waiter to them is a later PR, and nothing enables it yet.
+// so. It is the ingest half of a fresh query (x-arc-freshness: flush,
+// internal/api/fresh_flush.go); main enables tracking with
+// query.fresh_flush_enabled, before startup WAL recovery.
 //
 // Tracking has its own switch, EnableKeyFlushTracking, separate from the
 // ledger: the ledger alone (forcing, #1759's visible writes) never pays for
@@ -261,6 +261,9 @@ var (
 	waitAfterSnapshotHook func()
 	// waitBeforeForceHook runs before each ForceFlushKey call of a wait.
 	waitBeforeForceHook func(key string)
+	// waitAfterForceHook runs right after each ForceFlushKey call of a wait,
+	// with its reply and no lock held.
+	waitAfterForceHook func(key string, rep ForceReply)
 	// sendSentHook is the first statement of sendFlushLocked's successful
 	// send arm (D1), under shard.mu and the track stripe; tracking on only,
 	// so a buffer with tracking off pays no load for it.
@@ -344,6 +347,10 @@ func (b *ArrowBuffer) WaitKeysFlushed(ctx context.Context, keys []string, interv
 		}
 	}
 
+	// A caller already gone forces nothing, not even the first round.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	var timer *time.Timer
 	defer func() {
 		if timer != nil {
@@ -397,14 +404,20 @@ func (b *ArrowBuffer) WaitKeysFlushed(ctx context.Context, keys []string, interv
 			if waitBeforeForceHook != nil {
 				waitBeforeForceHook(k.key)
 			}
-			r, due := b.ForceFlushKey(k.key, interval, ForceRead, nil)
-			switch r {
+			rep := b.ForceFlushKey(k.key, interval, ForceRead, nil)
+			if waitAfterForceHook != nil {
+				waitAfterForceHook(k.key, rep)
+			}
+			// rep.TaskID is not waited on: the tracker joined the first
+			// detach after this waiter registered, which a LostRace's id (the
+			// newest) need not be (ForceReply).
+			switch rep.Result {
 			case NotDue:
-				k.force, k.due = forceNotDue, due
-				next = earliest(next, due)
+				k.force, k.due = forceNotDue, rep.Due
+				next = earliest(next, rep.Due)
 			case Closing:
 				return ErrBufferClosing
-			case Forced, NothingToForce:
+			case Forced, NothingToForce, LostRace:
 				// Its detach (this send, or another) joined the waiter.
 				k.force = forceDone
 			case OverBudget:

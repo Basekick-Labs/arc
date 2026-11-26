@@ -536,7 +536,7 @@ func (h *QueryHandler) serveArcxArrowIPCResult(
 func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	start := time.Now()
 	// x-arc-freshness: refused before the forward (#1760, fresh_flush.go).
-	if status, msg := freshnessRefusal(c); status != 0 {
+	if status, msg := h.freshnessRefusal(c); status != 0 {
 		return c.Status(status).JSON(fiber.Map{"success": false, "error": msg})
 	}
 	m := metrics.Get()

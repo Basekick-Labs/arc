@@ -190,7 +190,7 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 		AllowHeaders: "Origin,Content-Type,Accept,Authorization,x-api-key,x-arc-database,Content-Encoding,Arcli-Installation-Id,Arc-Client-Installation-Id," + WaitVisibleHeader + "," + FreshnessHeader,
 		// A browser reads a visible write's answer (#1759) and a fresh
 		// query's (#1760).
-		ExposeHeaders: VisibleHeader + "," + VisibleReasonHeader + "," + FreshnessAnswerHeader + "," + FreshnessReasonHeader,
+		ExposeHeaders: VisibleHeader + "," + VisibleReasonHeader + "," + FreshnessAnswerHeader + "," + FreshnessReasonHeader + "," + FreshnessWaitHeader,
 	}))
 
 	// Security headers middleware (pass TLS flag for HSTS)
@@ -1068,7 +1068,11 @@ func requestLogger(logger zerolog.Logger) fiber.Handler {
 		// A write that waited until its rows were visible (#1759) is
 		// recorded in arc_ingest_wait_visible_seconds instead: its seconds
 		// would swamp the HTTP latency of every other request.
-		if waited, _ := c.Locals(waitVisibleLocal).(bool); !waited {
+		// So is a fresh query that waited for its flushes (#1760), in
+		// arc_query_fresh_flush_seconds.
+		waited, _ := c.Locals(waitVisibleLocal).(bool)
+		freshWaited, _ := c.Locals(freshWaitedLocal).(bool)
+		if !waited && !freshWaited {
 			m.RecordHTTPLatency(duration.Microseconds())
 		}
 

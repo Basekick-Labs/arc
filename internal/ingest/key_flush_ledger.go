@@ -15,8 +15,9 @@ import (
 // flush pipeline has spare room. It is the primitive behind a visible write
 // that shortens its own wait (x-arc-wait: visible, #1759, which enables the
 // ledger with ingest.wait_visible_enabled) and a fresh query
-// (x-arc-freshness: flush, #1760, not wired yet). With the ledger off, every
-// detach and deferral site pays one nil test.
+// (x-arc-freshness: flush, #1760, with query.fresh_flush_enabled). Both share
+// the one ledger and its budget. With the ledger off, every detach and
+// deferral site pays one nil test.
 //
 // Lock order: shard.mu → stripe.mu. stripe.mu is a leaf; nothing is called
 // while holding it except map operations.
@@ -45,8 +46,8 @@ const (
 	// queue filled before the send. Nothing was marked deferred: the key
 	// waits for its natural flush. The caller must not retry in a loop.
 	OverBudget
-	// NothingToForce: nothing is buffered for the key, or another detach
-	// took it after the due check.
+	// NothingToForce: nothing is buffered for the key, and its last detach
+	// is the one the due check saw (or was pruned since, which is no detach).
 	NothingToForce
 	// NotWanted: the key is buffered, but want returned false.
 	NotWanted
@@ -55,7 +56,35 @@ const (
 	// LedgerOff: forcing is off, because the ledger was never enabled or the
 	// interval is not positive. The caller waits for the natural flush.
 	LedgerOff
+	// LostRace: another detach of the key came after the due check, seen
+	// where the key was found empty or at the re-check before the send.
+	// Another flush took the rows; new rows may be buffered again, and are
+	// left to their own flush. (A detach followed by rows want rejects still
+	// answers NotWanted.)
+	LostRace
 )
+
+// ForceReply is ForceFlushKey's answer.
+//
+// TaskID identifies a task but is not one to wait on alone: "every row
+// acknowledged before X is stored" is the task tracker's job
+// (WaitKeysFlushed joins the first detach after a waiter registered), and task
+// ids are not ordered by completion.
+type ForceReply struct {
+	Result ForceResult
+	// Due is set on NotDue only: when the key becomes due.
+	Due time.Time
+	// TaskID is set on Forced and LostRace only, and zero otherwise.
+	// Forced: the task this call's send created. A detach between a caller's
+	// own snapshot and the due check normally answers NotDue, but answers
+	// Forced when that gap is at least the interval, so it is not
+	// necessarily the first detach after the caller's snapshot, and rows may
+	// have been buffered again since.
+	// LostRace: the key's newest detach at the check; at least one detach
+	// came after the due check, and the one that took the caller's rows may
+	// be an earlier one (the ledger keeps only the last).
+	TaskID uint64
+}
 
 func (r ForceResult) String() string {
 	switch r {
@@ -73,6 +102,8 @@ func (r ForceResult) String() string {
 		return "closing"
 	case LedgerOff:
 		return "ledger_off"
+	case LostRace:
+		return "lost_race"
 	}
 	return "unknown"
 }
@@ -81,7 +112,7 @@ func (r ForceResult) String() string {
 // itself (#1759): ArrowBuffer.ForceFlushKey.
 type KeyForcer interface {
 	ForceFlushKey(key string, interval time.Duration, src ForceSource,
-		want func(batches []interface{}) bool) (ForceResult, time.Time)
+		want func(batches []interface{}) bool) ForceReply
 }
 
 // MaxForceInterval is the longest interval forcing is meant for: the ceiling
@@ -313,8 +344,13 @@ func (b *ArrowBuffer) reserveForcedSlot(l *keyFlushLedger) bool {
 
 // Test seams, nil in production.
 var (
+	// forceAfterDueCheckHook runs in ForceFlushKey after the due and budget
+	// checks and before the want scan, with no lock held: a detach in it is
+	// seen at the scan (want non-nil) or under the write lock.
+	forceAfterDueCheckHook func(key string)
 	// forceAfterScanHook runs in ForceFlushKey after the want scan and before
-	// the write lock, with no lock held.
+	// the write lock, with no lock held: a detach in it is seen under the
+	// write lock (empty key, or the re-check), never by the scan.
 	forceAfterScanHook func(key string)
 	// forceBeforeSendHook runs in ForceFlushKey under the shard write lock,
 	// right before the send.
@@ -324,14 +360,15 @@ var (
 // ForceFlushKey flushes key ("database/measurement") now if it is due (not
 // detached by anything within interval), the budget allows, something is
 // buffered, and want (nil: anything buffered) accepts the buffered batches.
-// For NotDue the time is when the key becomes due; otherwise it is zero.
+// The reply's Due and TaskID are set as ForceReply says.
 //
 // It never blocks on I/O and never marks a key deferred. Over budget, the key
 // is left to its natural flush. Every result but LedgerOff is counted in
 // arc_ingest_forced_flushes_total{source=src}.
 //
 // Locks, in order: the key's stripe alone (due check); none (budget); the
-// shard read lock (want); the shard write lock, and under it the stripe (the
+// shard read lock (want, and under it the stripe when the key is empty); the
+// shard write lock, and under it the stripe (the empty-key check, the
 // re-check and the send). The caller must hold no shard or stripe lock: a
 // held stripe deadlocks the due check, and a held shard lock, read or write,
 // deadlocks the write lock or the scan (a recursive RLock waits behind a
@@ -339,17 +376,17 @@ var (
 // shard or stripe locks, nor keep the slice it is given: that slice goes to
 // the flush task, and the flush nils out its entries.
 func (b *ArrowBuffer) ForceFlushKey(key string, interval time.Duration, src ForceSource,
-	want func(batches []interface{}) bool) (ForceResult, time.Time) {
-	r, due := b.forceFlushKey(key, interval, want)
-	if r == Forced {
+	want func(batches []interface{}) bool) ForceReply {
+	rep := b.forceFlushKey(key, interval, want)
+	if rep.Result == Forced {
 		// As the write path does after its send (#1944), outside the shard
 		// lock. The other results did not change the queue.
 		metrics.Get().SetBufferQueueDepth(b.queueDepth.Load())
 	}
-	if r != LedgerOff {
-		metrics.Get().IncIngestForcedFlush(forcedFlushSourceLabel(src), forcedFlushResultLabel(r))
+	if rep.Result != LedgerOff {
+		metrics.Get().IncIngestForcedFlush(forcedFlushSourceLabel(src), forcedFlushResultLabel(rep.Result))
 	}
-	return r, due
+	return rep
 }
 
 // forcedFlushSourceLabel and forcedFlushResultLabel map to the metric's
@@ -373,18 +410,20 @@ func forcedFlushResultLabel(r ForceResult) int {
 		return metrics.ForcedFlushNotWanted
 	case Closing:
 		return metrics.ForcedFlushClosing
+	case LostRace:
+		return metrics.ForcedFlushLostRace
 	}
 	return metrics.ForcedFlushNothing
 }
 
 func (b *ArrowBuffer) forceFlushKey(key string, interval time.Duration,
-	want func(batches []interface{}) bool) (ForceResult, time.Time) {
+	want func(batches []interface{}) bool) ForceReply {
 	l := b.ledger.Load()
 	if l == nil || interval <= 0 {
-		return LedgerOff, time.Time{}
+		return ForceReply{Result: LedgerOff}
 	}
 	if b.closing.Load() {
-		return Closing, time.Time{}
+		return ForceReply{Result: Closing}
 	}
 
 	// Due check, under the stripe lock alone. Most calls for a busy key end
@@ -393,14 +432,14 @@ func (b *ArrowBuffer) forceFlushKey(key string, interval time.Duration,
 	seen, _ := l.lastDetach(key) // zero id when never detached
 	if !seen.at.IsZero() {
 		if due := seen.at.Add(interval); now.Before(due) {
-			return NotDue, due
+			return ForceReply{Result: NotDue, Due: due}
 		}
 	}
 
 	// Budget, before any lock. It reads the clock itself, after loading the
 	// deferral stamp: now, read above, may predate the newest deferral.
 	if !b.reserveForcedSlot(l) {
-		return OverBudget, time.Time{}
+		return ForceReply{Result: OverBudget}
 	}
 	// The slot is ours until the send succeeds, and given back on every other
 	// exit, a panic in want included.
@@ -410,15 +449,34 @@ func (b *ArrowBuffer) forceFlushKey(key string, interval time.Duration,
 			l.inFlight.Add(-1)
 		}
 	}()
+	if forceAfterDueCheckHook != nil {
+		forceAfterDueCheckHook(key)
+	}
 
+	// A detach since the due check recorded a new task id (under a shard.mu
+	// hold, which each check below holds too). It is looked for at three
+	// sites: the key found empty by the scan, found empty under the write
+	// lock, and the re-check before the send. A changed id there answers
+	// LostRace with that id; an unchanged one, NothingToForce at the first
+	// two sites and the send at the third.
+	//
+	// An entry gone since the due check was pruned, not detached: a detach
+	// always writes the entry, and pruning deletes only entries older than
+	// retain. It counts as unchanged (hence ok && at each site). Were it a
+	// detach and then a prune of that detach, the detach was over retain ago,
+	// so the key is due anyway and the batches want saw went with it; an
+	// empty key is NothingToForce, and the send flushes what is left.
 	shard := b.getShard(key)
 	if want != nil {
-		buffered, wanted := scanWanted(shard, key, want)
+		buffered, wanted, cur, ok := scanWanted(shard, key, want, l)
 		if !buffered {
-			return NothingToForce, time.Time{}
+			if ok && cur.id != seen.id {
+				return ForceReply{Result: LostRace, TaskID: cur.id}
+			}
+			return ForceReply{Result: NothingToForce}
 		}
 		if !wanted {
-			return NotWanted, time.Time{}
+			return ForceReply{Result: NotWanted}
 		}
 	}
 	if forceAfterScanHook != nil {
@@ -428,56 +486,55 @@ func (b *ArrowBuffer) forceFlushKey(key string, interval time.Duration,
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 	if b.closing.Load() {
-		return Closing, time.Time{}
+		return ForceReply{Result: Closing}
 	}
 	// len, not presence: an existing but empty slice would flush nothing and
 	// fail with "no batches to merge", setting the flush-failure latch.
 	if len(shard.buffers[key]) == 0 {
-		return NothingToForce, time.Time{}
+		if cur, ok := l.lastDetach(key); ok && cur.id != seen.id {
+			return ForceReply{Result: LostRace, TaskID: cur.id}
+		}
+		return ForceReply{Result: NothingToForce}
 	}
-	// O(1) re-check: a detach since the due check recorded a new task id
-	// (under a shard.mu hold, which this one now excludes). Unchanged means
-	// no detach, so the key is still due and, since a detach takes the whole
-	// slice and appends never remove batches, every batch want saw is still
-	// buffered. It also stops two concurrent callers from both sending.
-	// Both detach sites load the ledger inside that hold, so even a detach
-	// racing EnableKeyFlushLedger either ended before want's scan or was
-	// recorded.
-	//
-	// An entry gone since the due check was pruned, not detached: a detach
-	// always writes the entry, and pruning deletes only entries older than
-	// retain. It counts as unchanged. Were it a detach and then a prune of
-	// that detach, the detach was over retain ago, so the key is due anyway
-	// and the batches want saw went with it; the send flushes what is left.
+	// O(1) re-check. Unchanged means no detach, so the key is still due and,
+	// since a detach takes the whole slice and appends never remove batches,
+	// every batch want saw is still buffered. It also stops two concurrent
+	// callers from both sending. Both detach sites load the ledger inside
+	// their shard.mu hold, so even a detach racing EnableKeyFlushLedger
+	// either ended before want's scan or was recorded.
 	if cur, ok := l.lastDetach(key); ok && cur.id != seen.id {
-		return NothingToForce, time.Time{}
+		return ForceReply{Result: LostRace, TaskID: cur.id}
 	}
 	if forceBeforeSendHook != nil {
 		forceBeforeSendHook(key)
 	}
 	database, measurement := splitDatabaseAndMeasurement(key)
-	switch b.sendFlushLocked(shard, key, database, measurement, shard.bufferRecordCounts[key], true) {
+	switch res, id := b.sendFlushLocked(shard, key, database, measurement, shard.bufferRecordCounts[key], true); res {
 	case flushSent:
 		reserved = false // the task holds the slot now
-		return Forced, time.Time{}
+		return ForceReply{Result: Forced, TaskID: id}
 	case flushSendClosing:
-		return Closing, time.Time{}
+		return ForceReply{Result: Closing}
 	default:
 		// The queue filled after the budget check. Not deferred: the key
 		// waits for its natural flush.
-		return OverBudget, time.Time{}
+		return ForceReply{Result: OverBudget}
 	}
 }
 
 // scanWanted reports, under shard's read lock, whether key has buffered
-// batches and whether want accepts them. The unlock is deferred so a panic in
-// want cannot leave the shard locked.
-func scanWanted(shard *bufferShard, key string, want func([]interface{}) bool) (buffered, wanted bool) {
+// batches and whether want accepts them. With none buffered it returns the
+// key's last detach (lastDetach), read under the same lock: no detach runs
+// while it is held, so the id is the one the empty slice reflects. The unlock
+// is deferred so a panic in want cannot leave the shard locked.
+func scanWanted(shard *bufferShard, key string, want func([]interface{}) bool,
+	l *keyFlushLedger) (buffered, wanted bool, cur keyDetach, curOK bool) {
 	shard.mu.RLock()
 	defer shard.mu.RUnlock()
 	batches := shard.buffers[key]
 	if len(batches) == 0 {
-		return false, false
+		cur, curOK = l.lastDetach(key)
+		return false, false, cur, curOK
 	}
-	return true, want(batches)
+	return true, want(batches), keyDetach{}, false
 }

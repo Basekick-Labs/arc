@@ -15,15 +15,16 @@ const (
 	ForcedFlushForced     = iota // handed to a flush worker
 	ForcedFlushNotDue            // the key was detached within the interval
 	ForcedFlushOverBudget        // no spare flush capacity: left to its natural flush
-	ForcedFlushNothing           // nothing buffered, or another detach took it first
+	ForcedFlushNothing           // nothing buffered, and no detach since the due check
 	ForcedFlushNotWanted         // buffered, but none of it was the caller's
 	ForcedFlushClosing           // the buffer is shutting down
+	ForcedFlushLostRace          // another detach took the rows after the due check
 	forcedFlushResults
 )
 
 var (
 	forcedFlushSourceLabels = [forcedFlushSources]string{"read", "write"}
-	forcedFlushResultLabels = [forcedFlushResults]string{"forced", "not_due", "over_budget", "nothing", "not_wanted", "closing"}
+	forcedFlushResultLabels = [forcedFlushResults]string{"forced", "not_due", "over_budget", "nothing", "not_wanted", "closing", "lost_race"}
 )
 
 type ingestForcedFlush struct {
@@ -39,7 +40,7 @@ func (m *Metrics) IncIngestForcedFlush(source, result int) {
 }
 
 func (m *Metrics) appendIngestForcedFlush(b []byte) []byte {
-	b = append(b, "# HELP arc_ingest_forced_flushes_total Requests to flush one measurement's buffer early, by source (write: x-arc-wait: visible; read: reserved for fresh queries) and result: forced, not_due (flushed within the interval), over_budget (no spare flush capacity: the rows wait for their age or size flush), nothing (nothing left to flush), not_wanted (nothing of the caller's left to flush), closing\n"...)
+	b = append(b, "# HELP arc_ingest_forced_flushes_total Requests to flush one measurement's buffer early, by source (write: x-arc-wait: visible; read: x-arc-freshness: flush; the two share one budget of early flushes) and result: forced, not_due (flushed within the interval), over_budget (no spare flush capacity: the rows wait for their age or size flush), nothing (nothing buffered), not_wanted (nothing of the caller's left to flush), closing, lost_race (another flush took the rows first)\n"...)
 	b = append(b, "# TYPE arc_ingest_forced_flushes_total counter\n"...)
 	names := []string{"source", "result"}
 	for s, source := range forcedFlushSourceLabels {

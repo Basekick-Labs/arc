@@ -46,7 +46,7 @@ func TestWriteForcingEnabled1759(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := string(src)
-	enable := strings.Index(s, "if writeForcingEnabled(cfg) {\n\t\tarrowBuffer.EnableKeyFlushLedger(ingest.ForceBudget{})")
+	enable := strings.Index(s, "if keyFlushLedgerEnabled(cfg) {\n\t\tarrowBuffer.EnableKeyFlushLedger(ingest.ForceBudget{})")
 	forcer := strings.Index(s, "if writeForcingEnabled(cfg) {\n\t\twaitVisible.SetForcer(arrowBuffer, waitVisibleForceInterval(cfg))")
 	newBuf := strings.Index(s, "arrowBuffer := ingest.NewArrowBuffer(")
 	recovery := strings.Index(s, "walRecovery.RecoverWithOptions(context.Background(), recoveryCallback,")

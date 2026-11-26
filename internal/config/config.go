@@ -906,6 +906,22 @@ type QueryConfig struct {
 	// bare time bounds, a range of at most 7 days, a standard partition
 	// layout, and fresh verified listings. Opt-in while experimental.
 	EmptyRangeAnchorScan bool
+	// FreshFlushEnabled lets a query carry x-arc-freshness: flush (#1760):
+	// the measurements it reads are flushed, and the query runs once every
+	// row this node acknowledged before it is stored. false (the default):
+	// such a request is refused with 403. Standalone with local storage
+	// only; refused with 400 on a cluster, on object storage, and while
+	// tiered storage is active.
+	FreshFlushEnabled bool
+	// FreshFlushMinIntervalMS bounds how often a fresh query may flush a
+	// measurement early: at most once per interval per measurement, inside
+	// the forced-flush budget it shares with visible writes; otherwise the
+	// query waits for the measurement's next flush. In
+	// [MinWaitVisibleMinIntervalMS, MaxWaitVisibleMinIntervalMS].
+	FreshFlushMinIntervalMS int
+	// FreshFlushMaxWaiters bounds the fresh queries waiting at once on this
+	// node; one more is refused with 503 (busy). In [1, MaxFreshFlushMaxWaiters].
+	FreshFlushMaxWaiters int
 }
 
 // LicenseConfig holds configuration for enterprise license validation
@@ -1681,6 +1697,9 @@ func Load() (*Config, error) {
 			StableSchemaBootstrap:         v.GetBool("query.stable_schema_bootstrap"),
 			StableSchemaBootstrapMaxFiles: v.GetInt("query.stable_schema_bootstrap_max_files"),
 			EmptyRangeAnchorScan:          v.GetBool("query.empty_range_anchor_scan"),
+			FreshFlushEnabled:             v.GetBool("query.fresh_flush_enabled"),
+			FreshFlushMinIntervalMS:       v.GetInt("query.fresh_flush_min_interval_ms"),
+			FreshFlushMaxWaiters:          v.GetInt("query.fresh_flush_max_waiters"),
 			EnableS3Cache:                 v.GetBool("query.enable_s3_cache"),
 			S3CacheSize:                   s3CacheSize,
 			S3CacheTTLSeconds:             v.GetInt("query.s3_cache_ttl_seconds"),
@@ -1935,6 +1954,13 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("invalid ingest.wait_visible_min_interval_ms value: %d (must be between %d and %d: at least a second, so a measurement is flushed early at most 3600 times an hour; at most an hour, how long a measurement's last flush is remembered)",
 			ms, MinWaitVisibleMinIntervalMS, MaxWaitVisibleMinIntervalMS)
 	}
+	if ms := cfg.Query.FreshFlushMinIntervalMS; ms < MinWaitVisibleMinIntervalMS || ms > MaxWaitVisibleMinIntervalMS {
+		return nil, fmt.Errorf("invalid query.fresh_flush_min_interval_ms value: %d (must be between %d and %d: at least a second, so a measurement is flushed early at most 3600 times an hour; at most an hour, how long a measurement's last flush is remembered)",
+			ms, MinWaitVisibleMinIntervalMS, MaxWaitVisibleMinIntervalMS)
+	}
+	if n := cfg.Query.FreshFlushMaxWaiters; n < 1 || n > MaxFreshFlushMaxWaiters {
+		return nil, fmt.Errorf("invalid query.fresh_flush_max_waiters value: %d (must be between 1 and %d)", n, MaxFreshFlushMaxWaiters)
+	}
 	if cfg.Ingest.ImportQueueTimeoutMS < 0 {
 		return nil, fmt.Errorf("invalid ingest.import_queue_timeout_ms value: %d (must be >= 0; 0 = until a slot frees)", cfg.Ingest.ImportQueueTimeoutMS)
 	}
@@ -2158,6 +2184,7 @@ func Load() (*Config, error) {
 	}
 
 	cfg.Warnings = append(cfg.Warnings, waitVisibleWarnings(cfg)...)
+	cfg.Warnings = append(cfg.Warnings, freshFlushWarnings(cfg)...)
 
 	cfg.ConfigFile = v.ConfigFileUsed()
 	if w := shadowedConfigFilesWarning(cfg.ConfigFile); w != nil {
@@ -2935,6 +2962,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("query.enable_s3_cache", false)                 // Disabled by default (opt-in feature)
 	v.SetDefault("query.s3_cache_size", "128MB")                 // 128MB cache (256 blocks × 512KB)
 	v.SetDefault("query.s3_cache_ttl_seconds", 3600)             // 1 hour
+	// x-arc-freshness: flush (#1760), refused with 403 while off.
+	v.SetDefault("query.fresh_flush_enabled", false)
+	v.SetDefault("query.fresh_flush_min_interval_ms", defaultFreshFlushMinIntervalMS)
+	v.SetDefault("query.fresh_flush_max_waiters", defaultFreshFlushMaxWaiters)
 
 	// License defaults (Enterprise features)
 	// Note: Server URL and validation interval are hardcoded in internal/license/client.go
@@ -3957,9 +3988,11 @@ func (c *Config) checkIcebergGlue() error {
 // (#1759).
 const waitVisibleMaxBufferAgeMS = 10000
 
-// Bounds of ingest.wait_visible_min_interval_ms (#1759), the ones planned
-// for the fresh-query interval (#1760) too, since the two share one
-// per-measurement limiter.
+// Bounds of ingest.wait_visible_min_interval_ms (#1759) and
+// query.fresh_flush_min_interval_ms (#1760). Visible writes and fresh
+// queries share one per-measurement record of the last flush and one
+// forced-flush budget: an early flush from either makes the measurement not
+// due for the other, and either can take the slots the other would use.
 //   - The floor, a second, caps the early flushes of one measurement at 3600
 //     an hour, what the age trigger alone makes at max_buffer_age_ms = 1000.
 //     0 would allow a flush per waiting write.
@@ -3971,6 +4004,62 @@ const (
 	MinWaitVisibleMinIntervalMS     = 1000
 	MaxWaitVisibleMinIntervalMS     = 3_600_000
 )
+
+// query.fresh_flush_* defaults and bounds (#1760).
+const (
+	defaultFreshFlushMinIntervalMS = 5000
+	defaultFreshFlushMaxWaiters    = 64
+	MaxFreshFlushMaxWaiters        = 1024
+	// freshFlushMaxBufferAgeMS is the largest ingest.max_buffer_age_ms that
+	// leaves a fresh query half its 30 s wait when it cannot flush early.
+	freshFlushMaxBufferAgeMS = 15000
+)
+
+// freshFlushWarnings are the advisories for query.fresh_flush_enabled
+// (#1760), each only with the key on.
+func freshFlushWarnings(cfg *Config) []LoadWarning {
+	if !cfg.Query.FreshFlushEnabled {
+		return nil
+	}
+	var out []LoadWarning
+	refused := func(key, value, why string) {
+		out = append(out, LoadWarning{Key: key, Value: value,
+			Message: "query.fresh_flush_enabled has no effect " + why + ": a query carrying x-arc-freshness: flush is refused with 400"})
+	}
+	if cfg.Cluster.Enabled {
+		refused("query.fresh_flush_enabled", "true", "with cluster.enabled = true")
+	}
+	if b := cfg.Storage.Backend; b != "local" {
+		refused("storage.backend", b, "on object storage")
+	}
+	if cfg.TieredStorage.Enabled {
+		refused("tiered_storage.enabled", "true", "while tiered storage is active (enabled and licensed)")
+	}
+	age := cfg.Ingest.MaxBufferAgeMS
+	if age > freshFlushMaxBufferAgeMS {
+		out = append(out, LoadWarning{
+			Key:     "ingest.max_buffer_age_ms",
+			Value:   strconv.Itoa(age),
+			Message: fmt.Sprintf("ingest.max_buffer_age_ms is above %d with query.fresh_flush_enabled = true: a query carrying x-arc-freshness: flush that cannot flush a measurement early (flushed within query.fresh_flush_min_interval_ms, or no spare flush capacity) waits for its age or size flush, at most 30 s, so it can be answered 504 (timeout)", freshFlushMaxBufferAgeMS),
+		})
+	}
+	if t := cfg.Query.Timeout; t > 0 && age >= t*1000 {
+		out = append(out, LoadWarning{
+			Key:     "ingest.max_buffer_age_ms",
+			Value:   strconv.Itoa(age),
+			Message: fmt.Sprintf("ingest.max_buffer_age_ms (%d) is at or above query.timeout (%d s) with query.fresh_flush_enabled = true: a query carrying x-arc-freshness: flush that waits for an age flush can time out first (504)", age, t),
+		})
+	}
+	// At an age <= 0 (never validated) every sweep flushes every buffer.
+	if iv := cfg.Query.FreshFlushMinIntervalMS; age > 0 && iv > age {
+		out = append(out, LoadWarning{
+			Key:     "query.fresh_flush_min_interval_ms",
+			Value:   strconv.Itoa(iv),
+			Message: fmt.Sprintf("query.fresh_flush_min_interval_ms (%d) is above ingest.max_buffer_age_ms (%d): on a measurement written continuously the age flush comes first, so a query carrying x-arc-freshness: flush flushes early only a measurement idle for longer than the difference", iv, age),
+		})
+	}
+	return out
+}
 
 // waitVisibleWarnings are the advisories for ingest.wait_visible_enabled
 // (#1759), each only with the key on.
