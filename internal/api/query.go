@@ -2592,6 +2592,13 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 	}
 	m := metrics.Get()
 	m.IncQueryRequests()
+	// flushed: the fresh wait succeeded (below, after validation and RBAC).
+	var flushed bool
+	if fresh {
+		defer freshExit(c, &flushed)
+	}
+	// After freshExit's defer, like the other request validation: a fresh
+	// request refused here is answered x-arc-freshness: false (#1760).
 	decimalMode, decimalModeErr := requestDecimalMode(c)
 	if decimalModeErr != nil {
 		m.IncQueryErrors()
@@ -2600,11 +2607,6 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 	if decimalMode == decimalModeExact {
 		m.IncQueryErrors()
 		return respondError(c, fiber.StatusBadRequest, "x-arc-decimals=exact is supported only for Arrow IPC and Flight SQL", timestamp, start)
-	}
-	// flushed: the fresh wait succeeded (below, after validation and RBAC).
-	var flushed bool
-	if fresh {
-		defer freshExit(c, &flushed)
 	}
 
 	// Check if this request should be forwarded to a reader/writer node
