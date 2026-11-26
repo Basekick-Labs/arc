@@ -336,6 +336,11 @@ var (
 func (b *ArrowBuffer) ForceFlushKey(key string, interval time.Duration, src ForceSource,
 	want func(batches []interface{}) bool) (ForceResult, time.Time) {
 	r, due := b.forceFlushKey(key, interval, want)
+	if r == Forced {
+		// As the write path does after its send (#1944), outside the shard
+		// lock. The other results did not change the queue.
+		metrics.Get().SetBufferQueueDepth(b.queueDepth.Load())
+	}
 	if r != LedgerOff {
 		metrics.Get().IncIngestForcedFlush(forcedFlushSourceLabel(src), forcedFlushResultLabel(r))
 	}

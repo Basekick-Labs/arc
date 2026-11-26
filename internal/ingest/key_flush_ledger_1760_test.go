@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/config"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
 
@@ -659,6 +660,20 @@ func TestForceFlushKey_Closing(t *testing.T) {
 	_ = f.buf.Close()
 	if r, _ := f.force("db/k", nil); r != Closing {
 		t.Fatalf("after Close: got %v, want closing", r)
+	}
+}
+
+// #1944: a forced send publishes the queue-depth gauge, as the write path
+// does after its send, instead of leaving it to the next sampler tick (up to
+// 1 s). The only worker is held, so the forced task stays queued.
+func TestForceFlushKey_ForcedSendPublishesQueueDepth1944(t *testing.T) {
+	f := newForceFixture(t, forceConfig(1, 4), &ForceBudget{MaxInFlight: 10})
+	f.occupyWorker()
+	f.write("k", 10)
+	metrics.Get().SetBufferQueueDepth(-1)
+	f.expect("db/k", Forced)
+	if got := metrics.Get().Snapshot()["buffer_queue_depth"]; got != any(int64(1)) || f.buf.queueDepth.Load() != 1 {
+		t.Fatalf("buffer_queue_depth = %v after a forced send (queueDepth %d), want 1", got, f.buf.queueDepth.Load())
 	}
 }
 
