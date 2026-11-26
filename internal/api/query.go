@@ -6744,6 +6744,21 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		}
 	}
 
+	// A JSON route, as /api/v1/query: exact decimals are Arrow IPC and
+	// Flight SQL only (#1784).
+	if decimalMode, err := requestDecimalMode(c); err != nil || decimalMode == decimalModeExact {
+		msg := "x-arc-decimals=exact is supported only for Arrow IPC and Flight SQL"
+		if err != nil {
+			msg = err.Error()
+		}
+		m.IncQueryErrors()
+		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
+			Success:   false,
+			Error:     msg,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+	}
+
 	measurement := c.Params("measurement")
 	if measurement == "" {
 		m.IncQueryErrors()

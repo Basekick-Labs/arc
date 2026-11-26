@@ -811,6 +811,13 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// A synchronous panic is caught here, before Fiber's recover middleware.
 	// Without this guard its registry entry would remain running forever.
 	arcxHandled := func() bool {
+		// arcx serves integer sums as int64 (Arc's default decimal contract)
+		// and never produces a decimal column: an exact request (#1784) runs on
+		// DuckDB, so its stream matches the decimal128 schema a Flight SQL
+		// prepare reported.
+		if decimalMode == decimalModeExact {
+			return false
+		}
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				if arcxOnFail != nil {
