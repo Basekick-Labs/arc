@@ -6,6 +6,8 @@
 
 The receiver now builds timestamp, sample and label columns in their native types instead of boxing each cell in an interface value. Labels keep the same null handling and tag metadata, and WAL reservations still match the bytes written. The existing Parquet output and WAL replay remain unchanged.
 
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1949](https://github.com/Basekick-Labs/arc/pull/1949).
+
 ## New: queries recognise `x-arc-freshness` and refuse it in this build ([#1760](https://github.com/Basekick-Labs/arc/issues/1760))
 
 A query can send **`x-arc-freshness: flush`** to ask for an answer that includes every row this node acknowledged before the request. This build recognises the header and refuses it, before the query is forwarded, parsed or run, on `/api/v1/query`, `/api/v1/query/msgpack`, `/api/v1/query/arrow`, `/api/v1/query/estimate` and `/api/v1/query/:measurement`:
