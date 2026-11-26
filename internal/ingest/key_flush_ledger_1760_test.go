@@ -441,7 +441,20 @@ func TestForceFlushKey_BudgetQueueOfOneForcesOnlyWhenEmpty(t *testing.T) {
 	d0 := f.buf.totalFlushDeferred.Load()
 
 	f.expect("db/k1", Forced) // queue empty -> 1
+	// The refusal must come from the budget: the send's lost-slot branch
+	// also returns OverBudget at a full queue (#1944). A flag, not t.Fatal:
+	// the hook runs under the shard write lock.
+	reachedSend := false
+	forceBeforeSendHook = func(key string) {
+		if key == "db/k2" {
+			reachedSend = true
+		}
+	}
 	f.expect("db/k2", OverBudget)
+	forceBeforeSendHook = nil
+	if reachedSend {
+		t.Fatal("db/k2 reached the send: the budget let it through at a full queue of one, and only the lost-slot branch refused it")
+	}
 	f.assertNotDeferred(d0, 1)
 }
 
@@ -759,9 +772,13 @@ func TestForcedSlot_ReleasedWhenWantPanics(t *testing.T) {
 	shard.mu.Unlock()
 }
 
-// I11: with the ledger off no state is built, whatever detaches and defers.
-// With it on, a detach of a known key allocates nothing.
-func TestKeyFlushLedger_OffBuildsNothing(t *testing.T) {
+// I11 (#1944): with the ledger off, every detach and deferral site is
+// nil-safe. The test reaches all three: D1, sendFlushLocked's recordDetach
+// (blocker0 and blocker1's size-triggered sends); the deferral,
+// markDeferredLocked's noteDeferral (blocker2); and D2,
+// extractBufferLocked's recordDetach (FlushAll of m). Removing any one of
+// those nil guards panics it on the nil ledger.
+func TestKeyFlushLedger_OffSitesAreNilSafe(t *testing.T) {
 	f := newForceFixture(t, forceConfig(1, 1), nil)
 	f.occupyWorker()
 	f.write("blocker1", 100) // fills the queue
@@ -774,11 +791,9 @@ func TestKeyFlushLedger_OffBuildsNothing(t *testing.T) {
 	if err := f.buf.FlushAll(context.Background()); err != nil {
 		t.Fatalf("FlushAll: %v", err)
 	}
-	if f.buf.ledger.Load() != nil {
-		t.Fatal("the ledger was built with forcing never enabled")
-	}
 }
 
+// With the ledger on, a detach of a known key allocates nothing.
 func TestKeyFlushLedger_RecordDetachOfAKnownKeyDoesNotAllocate(t *testing.T) {
 	f := newForceFixture(t, forceConfig(1, 4), &ForceBudget{})
 	l := f.buf.ledger.Load()

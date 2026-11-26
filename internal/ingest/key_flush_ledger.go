@@ -276,7 +276,8 @@ func (b *ArrowBuffer) releaseForcedTask(task flushTask) {
 // is an atomic or channel-length read, plus a clock read after a deferral.
 // It is advisory; the send's lost-slot branch is the backstop. Force only
 // while ALL hold:
-//  1. the flush queue is under half full (only when empty at capacity 1);
+//  1. fewer than max(1, ⌊cap/2⌋) tasks are queued (at capacity 1, only an
+//     empty queue);
 //  2. no buffer was deferred within the last max_buffer_age_ms;
 //  3. buffered bytes are under half the resolved max_buffered_bytes (or the
 //     limit is off);
@@ -331,8 +332,12 @@ var (
 //
 // Locks, in order: the key's stripe alone (due check); none (budget); the
 // shard read lock (want); the shard write lock, and under it the stripe (the
-// re-check and the send). want runs under the shard read lock and must not
-// take shard or stripe locks.
+// re-check and the send). The caller must hold no shard or stripe lock: a
+// held stripe deadlocks the due check, and a held shard lock, read or write,
+// deadlocks the write lock or the scan (a recursive RLock waits behind a
+// waiting writer). want runs under the shard read lock and must not take
+// shard or stripe locks, nor keep the slice it is given: that slice goes to
+// the flush task, and the flush nils out its entries.
 func (b *ArrowBuffer) ForceFlushKey(key string, interval time.Duration, src ForceSource,
 	want func(batches []interface{}) bool) (ForceResult, time.Time) {
 	r, due := b.forceFlushKey(key, interval, want)
@@ -435,6 +440,9 @@ func (b *ArrowBuffer) forceFlushKey(key string, interval time.Duration,
 	// no detach, so the key is still due and, since a detach takes the whole
 	// slice and appends never remove batches, every batch want saw is still
 	// buffered. It also stops two concurrent callers from both sending.
+	// Both detach sites load the ledger inside that hold, so even a detach
+	// racing EnableKeyFlushLedger either ended before want's scan or was
+	// recorded.
 	//
 	// An entry gone since the due check was pruned, not detached: a detach
 	// always writes the entry, and pruning deletes only entries older than
