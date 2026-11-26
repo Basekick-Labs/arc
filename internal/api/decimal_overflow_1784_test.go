@@ -104,7 +104,7 @@ func (r *overflowRig) postWithHeader(route, sql, name, value string) *http.Respo
 func TestExactDecimalsAreOptInForArrowIPCOnly(t *testing.T) {
 	r := newOverflowRig(t)
 
-	resp := r.postWithHeader("/api/v1/query/arrow", overflowRepro, flightSQLDecimalsHeader, decimalModeExact)
+	resp := r.postWithHeader("/api/v1/query/arrow", overflowRepro, decimalsHeader, decimalModeExact)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	reader, err := ipc.NewReader(resp.Body)
 	require.NoError(t, err)
@@ -121,7 +121,7 @@ func TestExactDecimalsAreOptInForArrowIPCOnly(t *testing.T) {
 	require.NoError(t, reader.Err())
 
 	for _, route := range []string{"/api/v1/query", "/api/v1/query/msgpack"} {
-		resp := r.postWithHeader(route, overflowRepro, flightSQLDecimalsHeader, decimalModeExact)
+		resp := r.postWithHeader(route, overflowRepro, decimalsHeader, decimalModeExact)
 		require.Equal(t, http.StatusBadRequest, resp.StatusCode, route)
 		_, message := jsonError(t, resp)
 		require.Contains(t, message, "only for Arrow IPC and Flight SQL")
@@ -600,12 +600,12 @@ func TestExactDecimalsBypassArcx1784(t *testing.T) {
 		offered++
 		return false
 	}
-	resp := r.postWithHeader("/api/v1/query/arrow", "SELECT sum(i) AS s FROM range(3) t(i)", flightSQLDecimalsHeader, decimalModeExact)
+	resp := r.postWithHeader("/api/v1/query/arrow", "SELECT sum(i) AS s FROM range(3) t(i)", decimalsHeader, decimalModeExact)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	_, _ = io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	require.Equal(t, 0, offered, "an exact request was offered to arcx")
-	resp = r.postWithHeader("/api/v1/query/arrow", "SELECT sum(i) AS s FROM range(3) t(i)", flightSQLDecimalsHeader, decimalModeDefault)
+	resp = r.postWithHeader("/api/v1/query/arrow", "SELECT sum(i) AS s FROM range(3) t(i)", decimalsHeader, decimalModeDefault)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	_, _ = io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
@@ -617,7 +617,7 @@ func TestExactDecimalsRefusedOnTheMeasurementRoute1784(t *testing.T) {
 	r := newOverflowRig(t)
 	req, err := http.NewRequest(http.MethodGet, r.base+"/api/v1/query/cpu?database=db1", nil)
 	require.NoError(t, err)
-	req.Header.Set(flightSQLDecimalsHeader, decimalModeExact)
+	req.Header.Set(decimalsHeader, decimalModeExact)
 	resp, err := r.client.Do(req)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)

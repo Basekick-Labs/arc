@@ -248,7 +248,7 @@ func TestFlightSQLPreparedStatementIsOneQuery(t *testing.T) {
 
 func TestFlightSQLPreparedExactDecimalModeIsStable(t *testing.T) {
 	rig := newPreparedRig(t, preparedRigOptions{})
-	ctx := metadata.AppendToOutgoingContext(rig.ctx, flightSQLDecimalsHeader, decimalModeExact)
+	ctx := metadata.AppendToOutgoingContext(rig.ctx, decimalsHeader, decimalModeExact)
 	ps, err := rig.client.Prepare(ctx, "SELECT 100000000000000000000::HUGEINT AS v")
 	require.NoError(t, err)
 	defer func() { require.NoError(t, ps.Close(ctx)) }()

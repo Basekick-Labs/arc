@@ -39,14 +39,14 @@ func TestFlightSQLDecimalMode(t *testing.T) {
 	if mode, present, err := flightSQLDecimalMode(ctx); err != nil || present || mode != decimalModeDefault {
 		t.Fatalf("absent mode = %q, %v, %v", mode, present, err)
 	}
-	exactCtx := metadata.NewIncomingContext(ctx, metadata.Pairs(flightSQLDecimalsHeader, decimalModeExact))
+	exactCtx := metadata.NewIncomingContext(ctx, metadata.Pairs(decimalsHeader, decimalModeExact))
 	if mode, present, err := flightSQLDecimalMode(exactCtx); err != nil || !present || mode != decimalModeExact {
 		t.Fatalf("exact mode = %q, %v, %v", mode, present, err)
 	}
 	if _, err := flightStatementDecimalMode(ctx, decimalModeExact); err == nil {
 		t.Fatal("expected statement execution with a different mode to fail")
 	}
-	duplicateCtx := metadata.NewIncomingContext(ctx, metadata.Pairs(flightSQLDecimalsHeader, decimalModeExact, flightSQLDecimalsHeader, decimalModeDefault))
+	duplicateCtx := metadata.NewIncomingContext(ctx, metadata.Pairs(decimalsHeader, decimalModeExact, decimalsHeader, decimalModeDefault))
 	if _, _, err := flightSQLDecimalMode(duplicateCtx); err == nil {
 		t.Fatal("expected duplicate mode headers to fail")
 	}
