@@ -196,6 +196,18 @@ func TestFreshFlush_ReturnsRowsAcknowledgedBefore(t *testing.T) {
 			n, _ = r.count(t, q, rng, "sample", true)
 			require.Equal(t, int64(3), n, "rows outside the current hour after a warm cache")
 
+			// The live hour with a range inside it: file-time pruning lists
+			// that hour's files when the SQL is built, so the SQL must be
+			// built after the flush.
+			r.write(t, "sample", "live", time.Now(), "a")
+			require.NoError(t, r.buf.FlushAllAndWait(context.Background()))
+			recent := "SELECT count(*) FROM live WHERE time >= '" + time.Now().Add(-10*time.Minute).UTC().Format("2006-01-02 15:04:05") + "'"
+			n, _ = r.count(t, q, recent, "sample", false)
+			require.Equal(t, int64(1), n)
+			r.write(t, "sample", "live", time.Now(), "b")
+			n, _ = r.count(t, q, recent, "sample", true)
+			require.Equal(t, int64(2), n, "a row in the live hour, after a file of that hour was listed")
+
 			// MessagePack.
 			r.write(t, "sample", "mp", time.Now(), "probe-1760-mp")
 			a, _ = r.query(t, "/api/v1/query/msgpack", "SELECT host FROM mp", "sample", true)
@@ -392,7 +404,14 @@ func TestFreshFlush_KeysAreBufferKeys(t *testing.T) {
 func TestFreshFlush_Busy(t *testing.T) {
 	release := make(chan struct{})
 	entered := make(chan struct{}, 1)
-	w := &stubWaiter{fn: func(context.Context) error { entered <- struct{}{}; <-release; return nil }}
+	var held atomic.Bool
+	w := &stubWaiter{fn: func(context.Context) error {
+		if held.CompareAndSwap(false, true) { // only the first waits: a second admitted would answer at once
+			entered <- struct{}{}
+			<-release
+		}
+		return nil
+	}}
 	r := newFreshOnRig(t, w, func(c *FreshFlushConfig) { c.MaxWaiters = 1 })
 	done := make(chan freshAnswer)
 	go func() { a, _ := r.query(t, "/api/v1/query", "SELECT * FROM sample.cpu", "", true); done <- a }()
