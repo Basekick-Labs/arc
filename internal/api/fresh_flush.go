@@ -206,11 +206,16 @@ func (h *QueryHandler) freshBegin(c *fiber.Ctx) (fresh bool, status int, msg str
 // returns one to Fiber's error handler: keep it that way. A non-200 answer
 // that set no reason of its own (any error before the wait, or any error
 // after a wait that succeeded) becomes false/query_error; an error inside a
-// stream that started with 200 stays the query's own. Every such request is
+// stream that started with 200 stays the query's own. A panic, before or
+// after the wait, is answered 500 by the recover middleware with
+// false/query_error, never flushed; it is re-raised. (An emitted-refs refusal
+// after the wait, possible only if the two transforms disagree, is
+// query_error too, since it comes after flushed.) Every such request is
 // counted once in arc_query_fresh_flush_total.
 func freshExit(c *fiber.Ctx, flushed *bool) {
+	p := recover()
 	reason := string(c.Response().Header.Peek(FreshnessReasonHeader))
-	if c.Response().StatusCode() != fiber.StatusOK && (*flushed || reason == "") {
+	if p != nil || (c.Response().StatusCode() != fiber.StatusOK && (*flushed || reason == "")) {
 		reason = freshnessReasonQueryError
 		c.Set(FreshnessAnswerHeader, "false")
 		c.Set(FreshnessReasonHeader, reason)
@@ -218,6 +223,9 @@ func freshExit(c *fiber.Ctx, flushed *bool) {
 		reason = freshnessFlushed
 	}
 	metrics.Get().IncQueryFreshFlush(reason)
+	if p != nil {
+		panic(p)
+	}
 }
 
 // freshReason sets the reason of an exit before the wait that has one of its
@@ -254,13 +262,17 @@ func freshKeys(refs []TableReference) []string {
 // its headers and counters done.
 func (h *QueryHandler) freshWait(c *fiber.Ctx, sql, headerDB string, timeout time.Duration, deadline time.Time) (status int, msg string) {
 	m := metrics.Get()
-	// Not holdRead: it parks its entry on the request for the stream
-	// writer, and the real transform's entry would overwrite it.
-	_, leave := h.reads.EnterAt()
-	transformCtx, cancelTransform := transformContext(c.Context(), deadline)
-	_, _, refs, err := h.getTransformedSQLForQueryWithRefs(transformCtx, sql, headerDB)
-	cancelTransform()
-	leave()
+	refs, err := func() ([]TableReference, error) {
+		// Not holdRead: it parks its entry on the request for the stream
+		// writer, and the real transform's entry would overwrite it. Left
+		// before the wait, and on a panic.
+		_, leave := h.reads.EnterAt()
+		defer leave()
+		transformCtx, cancelTransform := transformContext(c.Context(), deadline)
+		defer cancelTransform()
+		_, _, refs, err := h.getTransformedSQLForQueryWithRefs(transformCtx, sql, headerDB)
+		return refs, err
+	}()
 	if err != nil {
 		m.IncQueryErrors()
 		if errors.Is(err, errQueryTimedOut) {
@@ -291,13 +303,19 @@ func (h *QueryHandler) freshWait(c *fiber.Ctx, sql, headerDB string, timeout tim
 	f := h.fresh
 	if f.waiters.Add(1) > int64(f.cfg.MaxWaiters) {
 		f.waiters.Add(-1)
-		// Admission, not a failure: no error counted, as governance's 429.
+		// Counted as an error, as governance counts its own 429
+		// (checkQueryGovernance).
+		m.IncQueryErrors()
 		c.Set(FreshnessAnswerHeader, "false")
 		c.Set(FreshnessReasonHeader, freshnessReasonBusy)
 		c.Set(fiber.HeaderRetryAfter, "5")
 		return fiber.StatusServiceUnavailable, "x-arc-freshness: too many fresh queries waiting on this node; retry later; the query was not run"
 	}
 	m.AddQueryFreshFlushWaiters(1)
+	defer func() { // the slot and the gauge, on every return and on a panic
+		f.waiters.Add(-1)
+		m.AddQueryFreshFlushWaiters(-1)
+	}()
 	c.Locals(freshWaitedLocal, true)
 
 	budget := time.Now().Add(freshFlushBudget)
@@ -306,6 +324,7 @@ func (h *QueryHandler) freshWait(c *fiber.Ctx, sql, headerDB string, timeout tim
 		budget = deadline
 	}
 	ctx, cancel := context.WithDeadline(c.UserContext(), budget)
+	defer cancel() // also called right after the wait, below
 	drained := freshDrainDone(c)
 	if drained != nil {
 		go func() {
@@ -324,8 +343,6 @@ func (h *QueryHandler) freshWait(c *fiber.Ctx, sql, headerDB string, timeout tim
 	// At once: it stops the disconnect watcher, so execution's own watcher
 	// is the only one (a disconnect is counted once).
 	cancel()
-	f.waiters.Add(-1)
-	m.AddQueryFreshFlushWaiters(-1)
 	m.ObserveQueryFreshFlushWait(waited)
 	c.Set(FreshnessWaitHeader, strconv.FormatInt(waited.Milliseconds(), 10))
 

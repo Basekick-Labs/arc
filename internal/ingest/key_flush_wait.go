@@ -347,6 +347,10 @@ func (b *ArrowBuffer) WaitKeysFlushed(ctx context.Context, keys []string, interv
 		}
 	}
 
+	// A caller already gone forces nothing, not even the first round.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	var timer *time.Timer
 	defer func() {
 		if timer != nil {

@@ -21,11 +21,13 @@ import (
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
+	"github.com/basekick-labs/arc/internal/governance"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/gofiber/fiber/v2"
+	recoverMiddleware "github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 )
@@ -57,6 +59,7 @@ func (s *stubWaiter) WaitKeysFlushed(ctx context.Context, keys []string, _ time.
 type freshOnRig struct {
 	*freshRig
 	buf     *ingest.ArrowBuffer
+	am      *auth.AuthManager
 	userCtx context.Context // set as the request's user context when non-nil
 }
 
@@ -92,6 +95,7 @@ func newFreshOnRig(t *testing.T, waiter FreshFlushWaiter, edit func(*FreshFlushC
 
 	app := fiber.New(fiber.Config{DisableStartupMessage: true})
 	app.Use(requestLogger(logger))
+	app.Use(recoverMiddleware.New()) // as the server: a panic is answered 500
 	mw := auth.DefaultMiddlewareConfig()
 	mw.AuthManager = am
 	app.Use(auth.NewMiddleware(mw))
@@ -115,6 +119,7 @@ func newFreshOnRig(t *testing.T, waiter FreshFlushWaiter, edit func(*FreshFlushC
 	buffer.AddOnFilePublished(qh.FilePublished) // as main wires it (#1757)
 	qh.RegisterRoutes(app)
 	r.freshRig = &freshRig{app: app, qh: qh, dataDir: dataDir, read: read}
+	r.am = am
 	return r
 }
 
@@ -286,6 +291,16 @@ func TestFreshFlush_ExitTable(t *testing.T) {
 		}, status: 400, reason: "tiering_not_supported"},
 		{name: "arrow", path: "/api/v1/query/arrow", sql: "SELECT * FROM sample.cpu", status: 400, reason: "unsupported_route"},
 		{name: "estimate", path: "/api/v1/query/estimate", sql: "SELECT * FROM sample.cpu", status: 400, reason: "unsupported_route"},
+		{name: "governance 429", path: "/api/v1/query", sql: "SELECT * FROM sample.cpu", setup: func(t *testing.T, r *freshOnRig, _ *stubWaiter) {
+			old := queryGovernanceLicensed
+			queryGovernanceLicensed = func(*QueryHandler) bool { return true }
+			t.Cleanup(func() { queryGovernanceLicensed = old })
+			info := r.am.VerifyToken(r.read)
+			require.NotNil(t, info)
+			r.qh.governanceManager = newGovernanceTestManager(t, &governance.Policy{TokenID: info.ID, RateLimitPerMinute: 1})
+			a, _ := r.query(t, "/api/v1/query", "SELECT 1", "", false) // the one admitted query
+			require.Equal(t, http.StatusOK, a.status, a.body)
+		}, status: 429, reason: "query_error", retryAfter: "*", delta: counts{1, 1, 0}},
 		{name: "bad body", path: "/api/v1/query", sql: "\x00", status: 400, reason: "query_error", delta: counts{1, 1, 0}},
 		{name: "SHOW", path: "/api/v1/query", sql: "SHOW TABLES FROM sample", status: 400, reason: "show_not_supported", delta: counts{1, 1, 0}},
 		{name: "RBAC", path: "/api/v1/query", sql: "SELECT * FROM sample.fresh", setup: func(t *testing.T, r *freshOnRig, _ *stubWaiter) {
@@ -368,7 +383,9 @@ func TestFreshFlush_ExitTable(t *testing.T) {
 				require.Equal(t, "false", a.fresh, a.body)
 				require.Equal(t, tc.reason, a.reason, a.body)
 			}
-			if hd != nil {
+			if hd != nil && tc.retryAfter == "*" { // governance's own
+				require.NotEmpty(t, hd.Get(fiber.HeaderRetryAfter))
+			} else if hd != nil {
 				require.Equal(t, tc.retryAfter, hd.Get(fiber.HeaderRetryAfter))
 			}
 			after := counts{queryMetricInt(t, "query_requests_total"), queryMetricInt(t, "query_errors_total"), queryMetricInt(t, "query_timeouts_total")}
@@ -434,7 +451,7 @@ func TestFreshFlush_Busy(t *testing.T) {
 	require.Equal(t, http.StatusServiceUnavailable, a.status, a.body)
 	require.Equal(t, "busy", a.reason)
 	require.Equal(t, "5", hd.Get(fiber.HeaderRetryAfter))
-	require.Equal(t, errs, queryMetricInt(t, "query_errors_total"), "busy is admission, not an error")
+	require.Equal(t, errs+1, queryMetricInt(t, "query_errors_total"), "busy is counted as an error, as governance's 429")
 	close(release)
 	require.Equal(t, "flushed", (<-done).fresh)
 	w.fn = nil
@@ -501,4 +518,69 @@ func TestFreshFlush_OneDisconnectCountedOnce(t *testing.T) {
 	}, 5*time.Second, 20*time.Millisecond)
 	time.Sleep(4 * clientDisconnectPollInterval) // a second watcher would have fired by now
 	require.Equal(t, before+1, queryMetricInt(t, "query_client_disconnects_sql_json_total"), "one disconnect counted twice")
+}
+
+// A panic before or after the wait is answered 500 with false/query_error,
+// never flushed, and returns the waiter slot and the read-gate entry.
+func TestFreshFlush_PanicLeaksNothing(t *testing.T) {
+	var boom atomic.Bool
+	w := &stubWaiter{fn: func(context.Context) error {
+		if boom.Load() {
+			panic("wait")
+		}
+		return nil
+	}}
+	r := newFreshOnRig(t, w, func(c *FreshFlushConfig) { c.MaxWaiters = 1 })
+	before := freshOutcomes()[freshnessReasonQueryError]
+	boom.Store(true)
+	a, _ := r.query(t, "/api/v1/query", "SELECT * FROM sample.cpu", "", true)
+	require.Equal(t, http.StatusInternalServerError, a.status, a.body)
+	require.Equal(t, "false", a.fresh)
+	require.Equal(t, "query_error", a.reason)
+	boom.Store(false)
+	a, _ = r.query(t, "/api/v1/query", "SELECT * FROM sample.cpu", "", true)
+	require.Equal(t, "flushed", a.fresh, "the panicked wait kept its slot: %s", a.body)
+
+	// After the wait: the execution panics.
+	old := arrowJSONQueryFunc
+	arrowJSONQueryFunc = func(*QueryHandler, *fiber.Ctx, context.Context, context.CancelFunc, string, bool, int, time.Time, string, func(int), func(string), func()) (int, bool) {
+		panic("execution")
+	}
+	a, _ = r.query(t, "/api/v1/query", "SELECT * FROM sample.cpu", "", true)
+	arrowJSONQueryFunc = old
+	require.Equal(t, http.StatusInternalServerError, a.status, a.body)
+	require.Equal(t, "false", a.fresh, "a panic after the wait was answered flushed")
+	require.Equal(t, "query_error", a.reason)
+	require.Equal(t, before+2, freshOutcomes()[freshnessReasonQueryError])
+	require.Zero(t, r.qh.reads.InFlight(), "a read-gate entry leaked")
+}
+
+// #764 staged as in TestEmittedScopeOutsideTheCheckedSetIsRefusedOnEveryEndpoint:
+// the SQL names db1.cpu, which the token may read, and the cached transform
+// reads db2.secret, which it may not. The dry transform's refs are checked
+// before anything is flushed: 403 forbidden, and the waiter is never called.
+func TestFreshFlush_EmittedRefsCheckedBeforeTheWait(t *testing.T) {
+	metrics.Init(zerolog.Nop())
+	h := newParityTestHandler()
+	h.rbacManager = &mockRBACChecker{enabled: true, allowedDBs: map[string]bool{"db1": true}}
+	h.queryCache.SetWithMetadata(h.queryTransformCacheKey("SELECT * FROM db1.cpu", ""),
+		"SELECT * FROM read_parquet('./data/db2/secret/**/*.parquet')", []string{"db2\x00secret"})
+	w := &stubWaiter{}
+	h.SetFreshFlush(FreshFlushConfig{Enabled: true, StorageBackend: "local", MinInterval: time.Second, MaxWaiters: 4}, w)
+	app := fiber.New()
+	app.Use(tokenMiddleware(1, "reader"))
+	app.Use(recoverMiddleware.New())
+	h.RegisterRoutes(app)
+	forbidden := metrics.Get().QueryFreshFlushCount(freshnessReasonForbidden)
+	req := httptest.NewRequest("POST", "/api/v1/query", strings.NewReader(`{"sql":"SELECT * FROM db1.cpu"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(FreshnessHeader, "flush")
+	resp, err := app.Test(req, -1)
+	require.NoError(t, err)
+	body, _ := io.ReadAll(resp.Body)
+	require.Equal(t, http.StatusForbidden, resp.StatusCode, string(body))
+	require.Equal(t, "forbidden", resp.Header.Get(FreshnessReasonHeader), string(body))
+	require.Contains(t, string(body), "db2.secret")
+	require.Zero(t, w.calls.Load(), "a scope the token cannot read was flushed")
+	require.Equal(t, forbidden+1, metrics.Get().QueryFreshFlushCount(freshnessReasonForbidden))
 }
