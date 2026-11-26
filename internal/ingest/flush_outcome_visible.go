@@ -416,8 +416,9 @@ func newVisibleForcing(o *FlushOutcome, w VisibleWait) *visibleForcing {
 // The wait runs after Seal, so no batch of this write is appended any more,
 // and a detach takes a key's whole slice: once this write's batches of a key
 // were sent (by this force or by another detach, LostRace's) or are not
-// buffered, none will be again. NotDue keeps it until its due time. OverBudget keeps it with no
-// timer, and ends the round with the keys after it kept un-asked: the budget
+// buffered, none will be again. NotDue keeps it until its due time.
+// OverBudget keeps it with no timer, and ends the round with the keys after
+// it kept un-asked: the budget
 // is the node's, so they would be refused too. They are asked at a later
 // round (a batch of this write resolved, or a key's due time), never in a
 // loop, and otherwise wait for their natural flush. LedgerOff and Closing end

@@ -77,7 +77,8 @@ type ForceReply struct {
 	// Forced: the task this call's send created. A detach between a caller's
 	// own snapshot and the due check normally answers NotDue, but answers
 	// Forced when that gap is at least the interval, so it is not
-	// necessarily the first detach after the caller's snapshot.
+	// necessarily the first detach after the caller's snapshot, and rows may
+	// have been buffered again since.
 	// LostRace: the key's newest detach at the check; at least one detach
 	// came after the due check, and the one that took the caller's rows may
 	// be an earlier one (the ledger keeps only the last).
