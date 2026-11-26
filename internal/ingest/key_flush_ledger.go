@@ -112,9 +112,14 @@ type keyFlushLedger struct {
 	// released by ForceFlushKey itself unless the send succeeded, otherwise
 	// by whoever takes the task off the queue (releaseForcedTask).
 	inFlight atomic.Int64
-	// lastDeferredNano is the time of the last deferral (markDeferredLocked),
-	// in now()'s UnixNano; 0 = none since the ledger was enabled.
-	lastDeferredNano atomic.Int64
+	// lastDeferredMono is when the last deferral (markDeferredLocked)
+	// happened, as sinceCreated() in nanoseconds plus 1; 0 = none since the
+	// ledger was enabled (#1943).
+	lastDeferredMono atomic.Int64
+	// created is when the ledger was built, read from now before the ledger
+	// is published. With time.Now it carries Go's monotonic reading, so
+	// sinceCreated is immune to wall-clock steps.
+	created time.Time
 
 	// retain is the resolved ForceBudget.Retain; pruneEvery is how often
 	// maybePrune walks the stripes, and lastPrune when it last did. Only
@@ -170,6 +175,10 @@ func (b *ArrowBuffer) enableKeyFlushLedger(budget ForceBudget, now func() time.T
 		retain:      retain,
 		pruneEvery:  min(retain, ledgerPruneEvery),
 		now:         now,
+		// Never .UTC(), .Round, .Truncate or a time.Unix round trip: each
+		// drops the monotonic reading, and sinceCreated falls back to the
+		// wall clock.
+		created: now(),
 	}
 	for i := range l.stripes {
 		l.stripes[i].keys = make(map[string]keyDetach)
@@ -233,8 +242,20 @@ func (l *keyFlushLedger) maybePrune() int {
 	return deleted
 }
 
+// sinceCreated is the ledger's age on its own clock: monotonic in production,
+// where created and now() both carry Go's monotonic reading. Not
+// time.Since(l.created): that bypasses an injected clock.
+func (l *keyFlushLedger) sinceCreated() time.Duration {
+	return l.now().Sub(l.created)
+}
+
+// noteDeferral stamps a deferral. A plain store, so of two concurrent
+// deferrals the later store wins even if its stamp is older; the window then
+// ends that read-to-store gap early. The age is clamped at 0: only a test
+// clock set below created makes it negative, and at -1 ns the stamp would be
+// 0, "none".
 func (l *keyFlushLedger) noteDeferral() {
-	l.lastDeferredNano.Store(l.now().UnixNano())
+	l.lastDeferredMono.Store(int64(max(l.sinceCreated(), 0)) + 1)
 }
 
 // releaseForcedTask frees the forced-task slot a queued task holds. Every site
@@ -252,26 +273,31 @@ func (b *ArrowBuffer) releaseForcedTask(task flushTask) {
 
 // reserveForcedSlot checks the forced-flush budget and, when it allows,
 // reserves one forced-task slot. Called with no lock held: every condition
-// is an atomic or channel-length read. It is advisory; the send's lost-slot
-// branch is the backstop. Force only while ALL hold:
-//  1. the flush queue is under half full (only when empty at capacity 1);
+// is an atomic or channel-length read, plus a clock read after a deferral.
+// It is advisory; the send's lost-slot branch is the backstop. Force only
+// while ALL hold:
+//  1. fewer than max(1, ⌊cap/2⌋) tasks are queued (at capacity 1, only an
+//     empty queue);
 //  2. no buffer was deferred within the last max_buffer_age_ms;
 //  3. buffered bytes are under half the resolved max_buffered_bytes (or the
 //     limit is off);
 //  4. fewer than maxInFlight forced tasks hold a slot.
-func (b *ArrowBuffer) reserveForcedSlot(l *keyFlushLedger, now time.Time) bool {
+func (b *ArrowBuffer) reserveForcedSlot(l *keyFlushLedger) bool {
 	if len(b.flushQueue) >= max(1, cap(b.flushQueue)/2) {
 		return false
 	}
-	// Wall-clock nanoseconds: a clock stepped back gives a negative distance,
-	// which counts as expired rather than as a deferral that never ends.
-	if last := l.lastDeferredNano.Load(); last != 0 {
+	// The stamp is loaded first and the clock read after it, both on the
+	// ledger's monotonic base (#1943), so a deferral this load sees is never
+	// later than the read. A negative distance, possible only on a test clock
+	// stepped back, refuses rather than counting as expired. A deferral
+	// stored after the load is not seen; the lost-slot branch covers it.
+	if last := l.lastDeferredMono.Load(); last != 0 {
 		// The window is max_buffer_age_ms with a 1 s floor. The age is
 		// never validated: at <= 0 (every sweep then flushes every buffer)
 		// a zero window would silently turn this condition off, and ages of
 		// 1-999 ms are lifted to 1 s as well.
 		window := max(b.maxBufferAge, time.Second)
-		if d := now.UnixNano() - last; d >= 0 && d < int64(window) {
+		if l.sinceCreated()-time.Duration(last-1) < window {
 			return false
 		}
 	}
@@ -306,11 +332,20 @@ var (
 //
 // Locks, in order: the key's stripe alone (due check); none (budget); the
 // shard read lock (want); the shard write lock, and under it the stripe (the
-// re-check and the send). want runs under the shard read lock and must not
-// take shard or stripe locks.
+// re-check and the send). The caller must hold no shard or stripe lock: a
+// held stripe deadlocks the due check, and a held shard lock, read or write,
+// deadlocks the write lock or the scan (a recursive RLock waits behind a
+// waiting writer). want runs under the shard read lock and must not take
+// shard or stripe locks, nor keep the slice it is given: that slice goes to
+// the flush task, and the flush nils out its entries.
 func (b *ArrowBuffer) ForceFlushKey(key string, interval time.Duration, src ForceSource,
 	want func(batches []interface{}) bool) (ForceResult, time.Time) {
 	r, due := b.forceFlushKey(key, interval, want)
+	if r == Forced {
+		// As the write path does after its send (#1944), outside the shard
+		// lock. The other results did not change the queue.
+		metrics.Get().SetBufferQueueDepth(b.queueDepth.Load())
+	}
 	if r != LedgerOff {
 		metrics.Get().IncIngestForcedFlush(forcedFlushSourceLabel(src), forcedFlushResultLabel(r))
 	}
@@ -362,8 +397,9 @@ func (b *ArrowBuffer) forceFlushKey(key string, interval time.Duration,
 		}
 	}
 
-	// Budget, before any lock.
-	if !b.reserveForcedSlot(l, now) {
+	// Budget, before any lock. It reads the clock itself, after loading the
+	// deferral stamp: now, read above, may predate the newest deferral.
+	if !b.reserveForcedSlot(l) {
 		return OverBudget, time.Time{}
 	}
 	// The slot is ours until the send succeeds, and given back on every other
@@ -404,6 +440,9 @@ func (b *ArrowBuffer) forceFlushKey(key string, interval time.Duration,
 	// no detach, so the key is still due and, since a detach takes the whole
 	// slice and appends never remove batches, every batch want saw is still
 	// buffered. It also stops two concurrent callers from both sending.
+	// Both detach sites load the ledger inside that hold, so even a detach
+	// racing EnableKeyFlushLedger either ended before want's scan or was
+	// recorded.
 	//
 	// An entry gone since the due check was pruned, not detached: a detach
 	// always writes the entry, and pruning deletes only entries older than

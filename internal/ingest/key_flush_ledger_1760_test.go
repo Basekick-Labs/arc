@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/config"
+	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
 )
 
@@ -440,7 +441,20 @@ func TestForceFlushKey_BudgetQueueOfOneForcesOnlyWhenEmpty(t *testing.T) {
 	d0 := f.buf.totalFlushDeferred.Load()
 
 	f.expect("db/k1", Forced) // queue empty -> 1
+	// The refusal must come from the budget: the send's lost-slot branch
+	// also returns OverBudget at a full queue (#1944). A flag, not t.Fatal:
+	// the hook runs under the shard write lock.
+	reachedSend := false
+	forceBeforeSendHook = func(key string) {
+		if key == "db/k2" {
+			reachedSend = true
+		}
+	}
 	f.expect("db/k2", OverBudget)
+	forceBeforeSendHook = nil
+	if reachedSend {
+		t.Fatal("db/k2 reached the send: the budget let it through at a full queue of one, and only the lost-slot branch refused it")
+	}
 	f.assertNotDeferred(d0, 1)
 }
 
@@ -466,9 +480,12 @@ func TestForceFlushKey_BudgetRecentDeferral(t *testing.T) {
 	f.expect("db/k", Forced)
 }
 
-// A clock stepped back after a deferral does not hold forcing off until it
-// catches up: a negative distance counts as expired.
-func TestForceFlushKey_BudgetDeferralClockStepBack(t *testing.T) {
+// #1943: a negative distance, a deferral stamped after the budget's clock
+// read, refuses (it counted as expired before). On the production monotonic
+// clock it cannot happen; a test clock stepped back is the only way to make
+// one. A deferral stamped with the clock below the ledger's base still counts:
+// its stamp is clamped and never becomes 0, "no deferral".
+func TestForceFlushKey_BudgetNegativeDeferralDistanceRefuses1943(t *testing.T) {
 	cfg := forceConfig(4, 8)
 	f := newForceFixture(t, cfg, &ForceBudget{})
 	f.write("k", 10)
@@ -481,7 +498,66 @@ func TestForceFlushKey_BudgetDeferralClockStepBack(t *testing.T) {
 	shard.mu.Unlock()
 
 	f.clock.Advance(-time.Hour)
-	f.expect("db/k", Forced)
+	f.expect("db/k", OverBudget)
+
+	// 1 ns below the base: unclamped, the stamp would be 0.
+	f.clock.Advance(time.Hour - time.Nanosecond)
+	f.buf.ledger.Load().noteDeferral()
+	f.expect("db/k", OverBudget)
+}
+
+// #1943: the due check reads the clock before the budget does. A deferral
+// stamped between the two still refuses. The wrapped clock, on the due
+// check's read (no lock held there), advances 1 ms and records a real
+// deferral, then returns the time before the advance. Before #1943 the budget
+// measured the stamp from that earlier read, got a negative distance and
+// counted it as expired: Forced.
+func TestForceFlushKey_BudgetSeesADeferralAfterTheDueCheck1943(t *testing.T) {
+	f := newForceFixture(t, forceConfig(4, 8), nil)
+	ghost := "db/ghost"
+	var armed, fired atomic.Bool
+	f.buf.enableKeyFlushLedger(ForceBudget{}, func() time.Time {
+		// Disarmed before the deferral, whose stamp reads this clock again.
+		if !armed.CompareAndSwap(true, false) {
+			return f.clock.Now()
+		}
+		t0 := f.clock.Now()
+		f.clock.Advance(time.Millisecond)
+		shard := f.buf.getShard(ghost)
+		shard.mu.Lock()
+		f.buf.markDeferredLocked(shard, ghost)
+		delete(shard.deferredKeys, ghost)
+		shard.mu.Unlock()
+		fired.Store(true)
+		return t0
+	})
+	f.write("k", 10)
+
+	armed.Store(true)
+	r, _ := f.force("db/k", nil)
+	if !fired.Load() {
+		t.Fatal("fixture: the clock hook did not run")
+	}
+	if r != OverBudget {
+		t.Fatalf("a deferral 1 ms after the due check's clock read: got %v, want over_budget", r)
+	}
+	if got := f.inFlight(); got != 0 {
+		t.Fatalf("slot kept: %d", got)
+	}
+}
+
+// #1943: on the production path the ledger's base carries Go's monotonic
+// reading (time.Time.String prints it as m=), so the deferral window ignores
+// wall-clock steps. Fails for a base taken through .UTC(), .Round(0),
+// .Truncate or a time.Unix round trip. Sub against UnixNano arithmetic is
+// reviewed, not tested: no injected clock can make the wall and monotonic
+// readings disagree.
+func TestKeyFlushLedger_BaseCarriesTheMonotonicReading1943(t *testing.T) {
+	f := newForceFixture(t, forceConfig(1, 4), nil)
+	f.buf.EnableKeyFlushLedger(ForceBudget{})
+	if s := f.buf.ledger.Load().created.String(); !strings.Contains(s, "m=") {
+		t.Fatalf("ledger base %q has no monotonic reading", s)
+	}
 }
 
 // max_buffer_age_ms is never validated by Load. A recent-deferral window
@@ -497,12 +573,12 @@ func TestForceFlushKey_BudgetDeferralWindowFloor(t *testing.T) {
 		l := f.buf.ledger.Load()
 		l.noteDeferral()
 		f.clock.Advance(time.Second - time.Millisecond)
-		if f.buf.reserveForcedSlot(l, f.clock.Now()) {
+		if f.buf.reserveForcedSlot(l) {
 			l.inFlight.Add(-1)
 			t.Fatalf("age %d ms: a slot was reserved 999 ms after a deferral; the window has a 1 s floor", ageMS)
 		}
 		f.clock.Advance(time.Millisecond)
-		if !f.buf.reserveForcedSlot(l, f.clock.Now()) {
+		if !f.buf.reserveForcedSlot(l) {
 			t.Fatalf("age %d ms: no slot 1 s after a deferral", ageMS)
 		}
 		l.inFlight.Add(-1)
@@ -600,6 +676,20 @@ func TestForceFlushKey_Closing(t *testing.T) {
 	}
 }
 
+// #1944: a forced send publishes the queue-depth gauge, as the write path
+// does after its send, instead of leaving it to the next sampler tick (up to
+// 1 s). The only worker is held, so the forced task stays queued.
+func TestForceFlushKey_ForcedSendPublishesQueueDepth1944(t *testing.T) {
+	f := newForceFixture(t, forceConfig(1, 4), &ForceBudget{MaxInFlight: 10})
+	f.occupyWorker()
+	f.write("k", 10)
+	metrics.Get().SetBufferQueueDepth(-1)
+	f.expect("db/k", Forced)
+	if got := metrics.Get().Snapshot()["buffer_queue_depth"]; got != any(int64(1)) || f.buf.queueDepth.Load() != 1 {
+		t.Fatalf("buffer_queue_depth = %v after a forced send (queueDepth %d), want 1", got, f.buf.queueDepth.Load())
+	}
+}
+
 // I20: the forced slot comes back on every exit of a forced task.
 func TestForcedSlot_ReleasedAfterAFailedFlush(t *testing.T) {
 	f := newForceFixture(t, forceConfig(4, 8), &ForceBudget{})
@@ -682,9 +772,15 @@ func TestForcedSlot_ReleasedWhenWantPanics(t *testing.T) {
 	shard.mu.Unlock()
 }
 
-// I11: with the ledger off no state is built, whatever detaches and defers.
-// With it on, a detach of a known key allocates nothing.
-func TestKeyFlushLedger_OffBuildsNothing(t *testing.T) {
+// I11 (#1944): with the ledger off, every detach and deferral site is
+// nil-safe. The test reaches all three: D1, sendFlushLocked's recordDetach
+// (blocker0 and blocker1's size-triggered sends); the deferral,
+// markDeferredLocked's noteDeferral (blocker2); and D2,
+// extractBufferLocked's recordDetach (FlushAll of m). Removing any one of
+// those nil guards panics the test goroutine on the nil ledger while it holds
+// a shard lock; the fixture's Close then blocks on that lock, so the test
+// fails by -timeout with the nil-receiver frame in its stack.
+func TestKeyFlushLedger_OffSitesAreNilSafe(t *testing.T) {
 	f := newForceFixture(t, forceConfig(1, 1), nil)
 	f.occupyWorker()
 	f.write("blocker1", 100) // fills the queue
@@ -697,11 +793,9 @@ func TestKeyFlushLedger_OffBuildsNothing(t *testing.T) {
 	if err := f.buf.FlushAll(context.Background()); err != nil {
 		t.Fatalf("FlushAll: %v", err)
 	}
-	if f.buf.ledger.Load() != nil {
-		t.Fatal("the ledger was built with forcing never enabled")
-	}
 }
 
+// With the ledger on, a detach of a known key allocates nothing.
 func TestKeyFlushLedger_RecordDetachOfAKnownKeyDoesNotAllocate(t *testing.T) {
 	f := newForceFixture(t, forceConfig(1, 4), &ForceBudget{})
 	l := f.buf.ledger.Load()

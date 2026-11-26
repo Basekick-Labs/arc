@@ -3093,9 +3093,10 @@ const (
 
 // sendFlushLocked hands bufferKey's whole buffer to a flush worker with a
 // non-blocking send, or touches nothing. Caller holds shard.mu (write); the
-// forced caller has checked that the buffer has batches. It never marks the key deferred: that
-// is the caller's decision, and the forced caller (ForceFlushKey, #1760) never
-// makes it, so a forced attempt cannot leave a deferral behind.
+// forced caller has checked that the buffer has batches. It never marks the
+// key deferred: that is the caller's decision, and the forced caller
+// (ForceFlushKey, #1760) never makes it, so a forced attempt cannot leave a
+// deferral behind.
 //
 // forced marks the task as holding a forced-task slot of the ledger; the
 // caller reserved it and keeps ownership unless the result is flushSent.

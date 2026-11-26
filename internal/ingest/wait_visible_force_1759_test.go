@@ -596,6 +596,35 @@ func TestKeyFlushLedgerPrune1759(t *testing.T) {
 	}
 }
 
+// #1941: at the production pair, the default retention and an interval at
+// the config ceiling, pruning never makes a key due early. A key detached at
+// T is NotDue, due at T+interval, after a prune walk 1 ns before T+interval,
+// and is forced at T+interval. Fails for a prune cutoff shorter than the
+// retention. A cutoff that also prunes at exactly the retention (Before as
+// !After, or retain - 1 ns) passes, and is harmless: the key is due there.
+func TestForceFlushKeyPruneBoundary1941(t *testing.T) {
+	f := newForceFixture(t, forceConfig(2, 100), &ForceBudget{})
+	l := f.buf.ledger.Load()
+	interval := time.Duration(config.MaxWaitVisibleMinIntervalMS) * time.Millisecond
+	t0 := f.clock.Now()
+	f.write("m", 5)
+	f.flushAll() // D2 at t0
+	f.write("m", 5)
+
+	f.clock.Advance(interval - time.Nanosecond)
+	l.maybePrune() // the first walk always runs
+	if _, ok := l.lastDetach("db/m"); !ok {
+		t.Fatal("pruned 1 ns before the longest interval")
+	}
+	if r, due := f.buf.ForceFlushKey("db/m", interval, ForceWrite, nil); r != NotDue || !due.Equal(t0.Add(interval)) {
+		t.Fatalf("1 ns before the interval: got (%v, %v), want (not_due, %v)", r, due, t0.Add(interval))
+	}
+	f.clock.Advance(time.Nanosecond)
+	if r, _ := f.buf.ForceFlushKey("db/m", interval, ForceWrite, nil); r != Forced {
+		t.Fatalf("at the interval: got %v, want forced", r)
+	}
+}
+
 // The periodic sweep prunes the ledger after the aged flush.
 func TestPeriodicFlushPrunesTheLedger1759(t *testing.T) {
 	cfg := forceConfig(2, 100)
