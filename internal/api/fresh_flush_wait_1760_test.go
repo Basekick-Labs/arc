@@ -18,7 +18,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/governance"
@@ -59,9 +58,10 @@ func (s *stubWaiter) WaitKeysFlushed(ctx context.Context, keys []string, _ time.
 type freshOnRig struct {
 	*freshRig
 	buf     *ingest.ArrowBuffer
-	am      *auth.AuthManager
 	userCtx context.Context // set as the request's user context when non-nil
 }
+
+const freshRigTokenID = 1
 
 func newFreshOnRig(t *testing.T, waiter FreshFlushWaiter, edit func(*FreshFlushConfig)) *freshOnRig {
 	t.Helper()
@@ -87,18 +87,14 @@ func newFreshOnRig(t *testing.T, waiter FreshFlushWaiter, edit func(*FreshFlushC
 	duck, err := database.New(&database.Config{MemoryLimit: "256MB", ThreadCount: 2, MaxConnections: 4, LocalStorageRoot: dataDir}, logger)
 	require.NoError(t, err)
 	t.Cleanup(func() { duck.Close() })
-	am, err := auth.NewAuthManager(filepath.Join(root, "auth.db"), time.Minute, 100, logger)
-	require.NoError(t, err)
-	t.Cleanup(func() { am.Close() })
-	read, err := am.CreateToken(ctx, "fresh-read", "", "read", nil)
-	require.NoError(t, err)
 
 	app := fiber.New(fiber.Config{DisableStartupMessage: true})
 	app.Use(requestLogger(logger))
 	app.Use(recoverMiddleware.New()) // as the server: a panic is answered 500
-	mw := auth.DefaultMiddlewareConfig()
-	mw.AuthManager = am
-	app.Use(auth.NewMiddleware(mw))
+	// The request's token, as the auth middleware leaves it. Real tokens
+	// cost a second each to create and to verify the first time under
+	// -race; the refusals after auth are TestFreshness_*'s (a2's rig).
+	app.Use(tokenMiddleware(freshRigTokenID, "fresh-read"))
 	app.Use(func(c *fiber.Ctx) error {
 		if r.userCtx != nil {
 			c.SetUserContext(r.userCtx)
@@ -106,7 +102,6 @@ func newFreshOnRig(t *testing.T, waiter FreshFlushWaiter, edit func(*FreshFlushC
 		return c.Next()
 	})
 	qh := NewQueryHandler(duck, backend, logger, 0, 0)
-	qh.SetAuthAndRBAC(am, nil)
 	qh.SetFileTimePruning(true, 300*time.Second) // the default
 	cfg := FreshFlushConfig{Enabled: true, StorageBackend: "local", MinInterval: time.Second, MaxWaiters: 4, RetryAfter: 7 * time.Second}
 	if edit != nil {
@@ -118,8 +113,7 @@ func newFreshOnRig(t *testing.T, waiter FreshFlushWaiter, edit func(*FreshFlushC
 	qh.SetFreshFlush(cfg, waiter)
 	buffer.AddOnFilePublished(qh.FilePublished) // as main wires it (#1757)
 	qh.RegisterRoutes(app)
-	r.freshRig = &freshRig{app: app, qh: qh, dataDir: dataDir, read: read}
-	r.am = am
+	r.freshRig = &freshRig{app: app, qh: qh, dataDir: dataDir}
 	return r
 }
 
@@ -295,9 +289,7 @@ func TestFreshFlush_ExitTable(t *testing.T) {
 			old := queryGovernanceLicensed
 			queryGovernanceLicensed = func(*QueryHandler) bool { return true }
 			t.Cleanup(func() { queryGovernanceLicensed = old })
-			info := r.am.VerifyToken(r.read)
-			require.NotNil(t, info)
-			r.qh.governanceManager = newGovernanceTestManager(t, &governance.Policy{TokenID: info.ID, RateLimitPerMinute: 1})
+			r.qh.governanceManager = newGovernanceTestManager(t, &governance.Policy{TokenID: freshRigTokenID, RateLimitPerMinute: 1})
 			a, _ := r.query(t, "/api/v1/query", "SELECT 1", "", false) // the one admitted query
 			require.Equal(t, http.StatusOK, a.status, a.body)
 		}, status: 429, reason: "query_error", retryAfter: "*", delta: counts{1, 1, 0}},

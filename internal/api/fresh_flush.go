@@ -84,8 +84,9 @@ var (
 	// freshDrainDone is the channel the HTTP drain closes (fasthttp's
 	// RequestCtx.Done; nil under app.Test). A var so a test can close it.
 	freshDrainDone = func(c *fiber.Ctx) <-chan struct{} { return c.Context().Done() }
-	// freshAfterWaitHook, when set (tests only), runs once the wait's
-	// disconnect watcher is stopped and before execution starts its own.
+	// freshAfterWaitHook, when set (tests only), runs in executeQuery once
+	// freshWait has returned (its deferred cancel stopped the wait's
+	// disconnect watcher) and before execution starts its own.
 	freshAfterWaitHook func()
 )
 
@@ -327,7 +328,10 @@ func (h *QueryHandler) freshWait(c *fiber.Ctx, sql, headerDB string, timeout tim
 		budget = deadline
 	}
 	ctx, cancel := context.WithDeadline(c.UserContext(), budget)
-	defer cancel() // also called right after the wait, below
+	// Stops the disconnect watcher (and the drain goroutine) when freshWait
+	// returns, before execution starts its own watcher: a disconnect is
+	// counted once.
+	defer cancel()
 	drained := freshDrainDone(c)
 	if drained != nil {
 		go func() {
@@ -343,12 +347,6 @@ func (h *QueryHandler) freshWait(c *fiber.Ctx, sql, headerDB string, timeout tim
 	err = f.waiter.WaitKeysFlushed(ctx, keys, f.cfg.MinInterval)
 	waited := time.Since(t0)
 	ctxErr := ctx.Err()
-	// At once: it stops the disconnect watcher, so execution's own watcher
-	// is the only one (a disconnect is counted once).
-	cancel()
-	if freshAfterWaitHook != nil {
-		freshAfterWaitHook()
-	}
 	m.ObserveQueryFreshFlushWait(waited)
 	c.Set(FreshnessWaitHeader, strconv.FormatInt(waited.Milliseconds(), 10))
 

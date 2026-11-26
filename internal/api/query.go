@@ -2737,6 +2737,9 @@ localProcessing:
 		if status, msg := h.freshWait(c, req.SQL, headerDB, effectiveTimeout, deadline); status != 0 {
 			return respondError(c, status, msg, timestamp, start)
 		}
+		if freshAfterWaitHook != nil {
+			freshAfterWaitHook()
+		}
 		flushed = true
 		// Every execution clock below (execution_time_ms, the latency
 		// metrics, the stream outcome, the slow-query log) starts after the
