@@ -112,6 +112,7 @@ func newFreshOnRig(t *testing.T, waiter FreshFlushWaiter, edit func(*FreshFlushC
 		waiter = buffer
 	}
 	qh.SetFreshFlush(cfg, waiter)
+	buffer.AddOnFilePublished(qh.FilePublished) // as main wires it (#1757)
 	qh.RegisterRoutes(app)
 	r.freshRig = &freshRig{app: app, qh: qh, dataDir: dataDir, read: read}
 	return r
@@ -207,6 +208,18 @@ func TestFreshFlush_ReturnsRowsAcknowledgedBefore(t *testing.T) {
 			r.write(t, "sample", "live", time.Now(), "b")
 			n, _ = r.count(t, q, recent, "sample", true)
 			require.Equal(t, int64(2), n, "a row in the live hour, after a file of that hour was listed")
+
+			// One past hour, its absence listed and cached by a plain query
+			// before its first file: the SQL must be built after the flush.
+			hour := now.Add(-5 * time.Hour).Truncate(time.Hour)
+			narrow := "SELECT count(*) FROM gap WHERE time >= '" + hour.UTC().Format("2006-01-02 15:04:05") + "' AND time < '" + hour.Add(time.Hour).UTC().Format("2006-01-02 15:04:05") + "'"
+			r.write(t, "sample", "gap", now, "a")
+			require.NoError(t, r.buf.FlushAllAndWait(context.Background()))
+			n, _ = r.count(t, q, narrow, "sample", false)
+			require.Equal(t, int64(0), n)
+			r.write(t, "sample", "gap", hour.Add(30*time.Minute), "b")
+			n, _ = r.count(t, q, narrow, "sample", true)
+			require.Equal(t, int64(1), n, "a row in a past hour whose absence was listed before")
 
 			// MessagePack.
 			r.write(t, "sample", "mp", time.Now(), "probe-1760-mp")
