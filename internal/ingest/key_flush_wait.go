@@ -12,9 +12,9 @@ import (
 // WaitKeysFlushed returns once every row of the given keys that was
 // acknowledged before the call is in a flush that ended settled (stored, and
 // registered where registration applies), or with the reason it cannot say
-// so. It is the ingest half of a fresh query (x-arc-freshness: flush). The
-// query routes still refuse that header (internal/api/fresh_flush.go);
-// wiring the waiter to them is a later PR, and nothing enables it yet.
+// so. It is the ingest half of a fresh query (x-arc-freshness: flush,
+// internal/api/fresh_flush.go); main enables tracking with
+// query.fresh_flush_enabled, before startup WAL recovery.
 //
 // Tracking has its own switch, EnableKeyFlushTracking, separate from the
 // ledger: the ledger alone (forcing, #1759's visible writes) never pays for

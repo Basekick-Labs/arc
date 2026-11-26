@@ -15,8 +15,9 @@ import (
 // flush pipeline has spare room. It is the primitive behind a visible write
 // that shortens its own wait (x-arc-wait: visible, #1759, which enables the
 // ledger with ingest.wait_visible_enabled) and a fresh query
-// (x-arc-freshness: flush, #1760, not wired yet). With the ledger off, every
-// detach and deferral site pays one nil test.
+// (x-arc-freshness: flush, #1760, with query.fresh_flush_enabled). Both share
+// the one ledger and its budget. With the ledger off, every detach and
+// deferral site pays one nil test.
 //
 // Lock order: shard.mu → stripe.mu. stripe.mu is a leaf; nothing is called
 // while holding it except map operations.
