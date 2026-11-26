@@ -267,7 +267,7 @@ func TestPrometheusRemoteWriteCaseTwinStoredSpellingWins(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, batch.rows)
 	require.Equal(t, []ingest.LPDrop{{Measurement: "up", Column: "Host", Reason: ingest.ColumnNameCaseTwin, Points: 2}}, batch.drops)
-	require.Contains(t, batch.records["up"].Columns, "host")
+	require.Contains(t, batch.records["up"].Data, "host")
 
 	// A stored "Value" (a line-protocol field) leaves no room for the sample
 	// column: every series of the measurement is dropped, naming it, and the
@@ -289,8 +289,8 @@ func TestPrometheusRemoteWriteCaseTwinWithinOneSeries(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, batch.rows)
 	require.Equal(t, []ingest.LPDrop{{Measurement: "up", Column: "host", Reason: ingest.ColumnNameCaseTwin, Points: 1}}, batch.drops)
-	require.NotContains(t, batch.records["up"].Columns, "Host")
-	require.NotContains(t, batch.records["up"].Columns, "host")
+	require.NotContains(t, batch.records["up"].Data, "Host")
+	require.NotContains(t, batch.records["up"].Data, "host")
 }
 
 // A dropped series takes no budget: a twin series that alone would pass the
