@@ -3072,7 +3072,7 @@ func (b *ArrowBuffer) enqueueOrDeferLocked(
 		return false, false
 	}
 
-	switch b.sendFlushLocked(shard, bufferKey, database, measurement, totalBuffered, false) {
+	switch res, _ := b.sendFlushLocked(shard, bufferKey, database, measurement, totalBuffered, false); res {
 	case flushSent:
 		return true, false
 	case flushSendClosing:
@@ -3107,12 +3107,13 @@ const (
 //
 // forced marks the task as holding a forced-task slot of the ledger; the
 // caller reserved it and keeps ownership unless the result is flushSent.
+// The id is the sent task's on flushSent, and zero otherwise.
 func (b *ArrowBuffer) sendFlushLocked(
 	shard *bufferShard,
 	bufferKey, database, measurement string,
 	totalBuffered int,
 	forced bool,
-) flushSendResult {
+) (flushSendResult, uint64) {
 	// Hand the buffer's slice straight to the task rather than copying it. Safe
 	// because the map entries are deleted below on success, so the next write to
 	// this key starts a fresh slice and nothing appends to the one in flight.
@@ -3180,7 +3181,7 @@ func (b *ArrowBuffer) sendFlushLocked(
 		if l := b.ledger.Load(); l != nil {
 			l.recordDetach(bufferKey, task.taskID)
 		}
-		return flushSent
+		return flushSent, task.taskID
 	case <-b.ctx.Done():
 		if ts != nil {
 			ts.mu.Unlock()
@@ -3188,7 +3189,7 @@ func (b *ArrowBuffer) sendFlushLocked(
 		b.completeAsyncFlushTask(task.taskID)
 		b.adjustFlushRecordMetrics(-queuedRecords, 0)
 		b.untrackFlush(task.trackingID)
-		return flushSendClosing
+		return flushSendClosing, 0
 	default:
 		if ts != nil {
 			ts.mu.Unlock()
@@ -3196,7 +3197,7 @@ func (b *ArrowBuffer) sendFlushLocked(
 		b.completeAsyncFlushTask(task.taskID)
 		b.adjustFlushRecordMetrics(-queuedRecords, 0)
 		b.untrackFlush(task.trackingID)
-		return flushSendLostSlot
+		return flushSendLostSlot, 0
 	}
 }
 

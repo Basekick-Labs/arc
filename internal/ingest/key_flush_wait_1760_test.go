@@ -62,8 +62,10 @@ func resetWaitSeams() {
 	waitBeforeSnapshotHook = nil
 	waitAfterSnapshotHook = nil
 	waitBeforeForceHook = nil
+	waitAfterForceHook = nil
 	sendSentHook = nil
 	flushUnlockedHook = nil
+	forceAfterDueCheckHook = nil
 	forceAfterScanHook = nil
 	forceBeforeSendHook = nil
 }
@@ -1176,10 +1178,12 @@ func TestWaitKeysFlushed_InFlightOnlyJoinsNoLaterDetach(t *testing.T) {
 // #1942's case, through the tracker. A waiter's force loses the race: between
 // ForceFlushKey's due check and its write-lock re-check another detach takes
 // the key's rows (here a synchronous extraction, made in the seam so the
-// interleaving is fixed), so the force answers NothingToForce. The waiter
-// registered before that detach, so the detach joined it: it waits for the
-// winning task and answers with that task's outcome. No task id from
-// ForceFlushKey is needed.
+// interleaving is fixed), so the force answers LostRace with the winner's id
+// (counted as {source="read",result="lost_race"}). The waiter registered
+// before that detach, so the detach joined it: it waits for the winning task
+// and answers with that task's outcome. It waits through the tracker, not on
+// the reply's id: with one detach in the window they agree, with more they
+// need not (TestWaitKeysFlushed_LostRaceTaskIDIsTheNewestDetach1942).
 func TestWaitKeysFlushed_LostForceRaceWaitsForTheWinningDetach1942(t *testing.T) {
 	for _, tc := range []struct {
 		name, meas string
@@ -1198,8 +1202,17 @@ func TestWaitKeysFlushed_LostForceRaceWaitsForTheWinningDetach1942(t *testing.T)
 					won <- f.extract(key) // the concurrent detach wins
 				}
 			}
+			replies := make(chan ForceReply, 1)
+			waitAfterForceHook = func(_ string, rep ForceReply) { replies <- rep }
+			lost := forcedFlushCount(t, "read", "lost_race")
 			ch := f.startWait(5*time.Second, time.Hour, key)
 			winner := <-won
+			if rep := <-replies; rep != (ForceReply{Result: LostRace, TaskID: winner.taskID}) {
+				t.Fatalf("reply %+v, want lost_race with the winner's task %d", rep, winner.taskID)
+			}
+			if got := forcedFlushCount(t, "read", "lost_race"); got != lost+1 {
+				t.Fatalf("{read,lost_race} = %d, want %d", got, lost+1)
+			}
 			ws := f.waiterStates(key)
 			if len(ws) != 1 || ws[0].joined != winner.taskID || len(ws[0].need) != 1 {
 				t.Fatalf("the winning detach (task %d) did not join the waiter: %+v", winner.taskID, ws)
@@ -1261,8 +1274,13 @@ func TestWaitKeysFlushed_LostRaceWithRowsBufferedAgain1942(t *testing.T) {
 				won <- e
 			}
 		}
+		replies := make(chan ForceReply, 1)
+		waitAfterForceHook = func(_ string, rep ForceReply) { replies <- rep }
 		ch := f.startWait(5*time.Second, time.Hour, "db/k")
 		winner := <-won
+		if rep := <-replies; rep != (ForceReply{Result: LostRace, TaskID: winner.taskID}) {
+			t.Fatalf("reply %+v, want lost_race with the winner's task %d (the re-check)", rep, winner.taskID)
+		}
 		_ = f.buf.writeExtracted(context.Background(), winner, "db/k", "db", "k")
 		if err := f.waitResult(ch); err != nil {
 			t.Fatalf("WaitKeysFlushed = %v", err)

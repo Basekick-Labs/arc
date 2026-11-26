@@ -132,6 +132,7 @@ func newForceFixture(t *testing.T, cfg *config.IngestConfig, budget *ForceBudget
 		buf.enableKeyFlushLedger(*budget, f.clock.Now)
 	}
 	t.Cleanup(func() {
+		forceAfterDueCheckHook = nil
 		forceAfterScanHook = nil
 		forceBeforeSendHook = nil
 		store.releaseAll()
@@ -175,13 +176,16 @@ func (f *forceFixture) occupyWorker() {
 	f.waitFor("a worker blocked on blocker0", func() bool { return f.store.blocked.Load() >= 1 })
 }
 
-func (f *forceFixture) force(key string, want func([]interface{}) bool) (ForceResult, time.Time) {
+func (f *forceFixture) force(key string, want func([]interface{}) bool) ForceReply {
 	return f.buf.ForceFlushKey(key, 5*time.Second, ForceRead, want)
 }
 
+// resultDue is the reply as the (result, due) pair the pre-#1942 tests check.
+func (r ForceReply) resultDue() (ForceResult, time.Time) { return r.Result, r.Due }
+
 func (f *forceFixture) expect(key string, want ForceResult) {
 	f.t.Helper()
-	if got, _ := f.force(key, nil); got != want {
+	if got := f.force(key, nil).Result; got != want {
 		f.t.Fatalf("ForceFlushKey(%s) = %v, want %v", key, got, want)
 	}
 }
@@ -204,13 +208,13 @@ func (f *forceFixture) assertNotDeferred(deferredBefore int64, slotsBefore int64
 func TestForceFlushKey_LedgerOffAndNonPositiveInterval(t *testing.T) {
 	f := newForceFixture(t, forceConfig(1, 4), nil)
 	f.write("m", 10)
-	if got, _ := f.force("db/m", nil); got != LedgerOff {
+	if got := f.force("db/m", nil).Result; got != LedgerOff {
 		t.Fatalf("ledger never enabled: got %v, want ledger_off", got)
 	}
 
 	f.buf.EnableKeyFlushLedger(ForceBudget{})
 	for _, interval := range []time.Duration{0, -time.Second} {
-		if got, _ := f.buf.ForceFlushKey("db/m", interval, ForceWrite, nil); got != LedgerOff {
+		if got := f.buf.ForceFlushKey("db/m", interval, ForceWrite, nil).Result; got != LedgerOff {
 			t.Fatalf("interval %v: got %v, want ledger_off (no forcing without a positive interval)", interval, got)
 		}
 	}
@@ -231,7 +235,7 @@ func TestForceFlushKey_ForcesBufferedKey(t *testing.T) {
 	}
 	done := make(chan res, 1)
 	go func() {
-		r, due := f.force("db/m", nil)
+		r, due := f.force("db/m", nil).resultDue()
 		done <- res{r, due}
 	}()
 	select {
@@ -263,7 +267,7 @@ func TestForceFlushKey_NaturalDetachStartsTheInterval(t *testing.T) {
 	f.waitFor("the size-triggered file", func() bool { return f.store.files("m") == 1 })
 	f.write("m", 10)
 	f.clock.Advance(time.Second)
-	r, due := f.force("db/m", nil)
+	r, due := f.force("db/m", nil).resultDue()
 	if r != NotDue || !due.Equal(t0.Add(5*time.Second)) {
 		t.Fatalf("1 s after a size-triggered detach: got (%v, %v), want (not_due, t0+5s)", r, due)
 	}
@@ -280,7 +284,7 @@ func TestForceFlushKey_NaturalDetachStartsTheInterval(t *testing.T) {
 	}
 	f.write("m", 10)
 	f.clock.Advance(time.Second)
-	r, due = f.force("db/m", nil)
+	r, due = f.force("db/m", nil).resultDue()
 	if r != NotDue || !due.Equal(t1.Add(5*time.Second)) {
 		t.Fatalf("1 s after a FlushAll detach: got (%v, %v), want (not_due, t1+5s)", r, due)
 	}
@@ -329,13 +333,13 @@ func TestForceFlushKey_NothingAndNotWanted(t *testing.T) {
 	never := func([]interface{}) bool { return false }
 
 	f.expect("db/absent", NothingToForce)
-	if r, _ := f.force("db/absent", never); r != NothingToForce {
+	if r := f.force("db/absent", never).Result; r != NothingToForce {
 		t.Fatalf("unbuffered key with a want: got %v, want nothing", r)
 	}
 
 	f.write("m", 10)
 	var seen int
-	r, _ := f.force("db/m", func(bs []interface{}) bool { seen = len(bs); return false })
+	r := f.force("db/m", func(bs []interface{}) bool { seen = len(bs); return false }).Result
 	if r != NotWanted {
 		t.Fatalf("want false: got %v, want not_wanted", r)
 	}
@@ -345,7 +349,7 @@ func TestForceFlushKey_NothingAndNotWanted(t *testing.T) {
 	if f.buffered("db/m") == 0 || f.inFlight() != 0 {
 		t.Fatal("a not-wanted key was flushed, or its slot kept")
 	}
-	if r, _ := f.force("db/m", func([]interface{}) bool { return true }); r != Forced {
+	if r := f.force("db/m", func([]interface{}) bool { return true }).Result; r != Forced {
 		t.Fatalf("want true: got %v, want forced", r)
 	}
 }
@@ -357,7 +361,7 @@ func TestForceFlushKey_WantRunsUnderTheReadLock(t *testing.T) {
 	f.write("m", 10)
 	shard := f.buf.getShard("db/m")
 	var writeExcluded, readAllowed bool
-	r, _ := f.force("db/m", func([]interface{}) bool {
+	r := f.force("db/m", func([]interface{}) bool {
 		writeExcluded = !shard.mu.TryLock()
 		if !writeExcluded {
 			shard.mu.Unlock()
@@ -367,7 +371,7 @@ func TestForceFlushKey_WantRunsUnderTheReadLock(t *testing.T) {
 			shard.mu.RUnlock()
 		}
 		return true
-	})
+	}).Result
 	if r != Forced {
 		t.Fatalf("got %v, want forced", r)
 	}
@@ -381,7 +385,8 @@ func TestForceFlushKey_WantRunsUnderTheReadLock(t *testing.T) {
 
 // I24, first half: two callers that both pass the due check cannot both send.
 // The second is held between its scan and its write lock while the first
-// forces and a new write lands; its O(1) re-check sees the new detach id.
+// forces and a new write lands; its O(1) re-check sees the new detach id and
+// answers LostRace with it (#1942).
 func TestForceFlushKey_ConcurrentCallersSendOnce(t *testing.T) {
 	f := newForceFixture(t, forceConfig(4, 8), &ForceBudget{MaxInFlight: 4})
 	f.write("m", 10)
@@ -395,20 +400,19 @@ func TestForceFlushKey_ConcurrentCallersSendOnce(t *testing.T) {
 			<-proceed
 		}
 	}
-	held := make(chan ForceResult, 1)
-	go func() {
-		r, _ := f.force("db/m", func([]interface{}) bool { return true })
-		held <- r
-	}()
+	held := make(chan ForceReply, 1)
+	go func() { held <- f.force("db/m", func([]interface{}) bool { return true }) }()
 	<-inHook
 
-	if r, _ := f.force("db/m", func([]interface{}) bool { return true }); r != Forced {
-		t.Fatalf("the free caller: got %v, want forced", r)
+	free := f.force("db/m", func([]interface{}) bool { return true })
+	if free.Result != Forced || free.TaskID == 0 {
+		t.Fatalf("the free caller: got %+v, want forced with its task id", free)
 	}
 	f.write("m", 10) // the key is buffered again, after a detach
 	close(proceed)
-	if r := <-held; r != NothingToForce {
-		t.Fatalf("the held caller: got %v, want nothing (a detach happened after its due check)", r)
+	// #1942: a lost race, carrying the winner's id, not "nothing".
+	if r := <-held; r.Result != LostRace || r.TaskID != free.TaskID {
+		t.Fatalf("the held caller: got %+v, want lost_race with the free caller's task %d (a detach happened after its due check)", r, free.TaskID)
 	}
 	if f.buffered("db/m") == 0 {
 		t.Fatal("the held caller sent the new write: two forced sends for one due check")
@@ -534,7 +538,7 @@ func TestForceFlushKey_BudgetSeesADeferralAfterTheDueCheck1943(t *testing.T) {
 	f.write("k", 10)
 
 	armed.Store(true)
-	r, _ := f.force("db/k", nil)
+	r := f.force("db/k", nil).Result
 	if !fired.Load() {
 		t.Fatal("fixture: the clock hook did not run")
 	}
@@ -662,7 +666,7 @@ func TestForceFlushKey_Closing(t *testing.T) {
 
 	// Close starting between the scan and the write lock.
 	forceAfterScanHook = func(string) { f.buf.closing.Store(true) }
-	if r, _ := f.force("db/k", nil); r != Closing {
+	if r := f.force("db/k", nil).Result; r != Closing {
 		t.Fatalf("closing set before the write lock: got %v, want closing", r)
 	}
 	forceAfterScanHook = nil
@@ -671,7 +675,7 @@ func TestForceFlushKey_Closing(t *testing.T) {
 	}
 
 	_ = f.buf.Close()
-	if r, _ := f.force("db/k", nil); r != Closing {
+	if r := f.force("db/k", nil).Result; r != Closing {
 		t.Fatalf("after Close: got %v, want closing", r)
 	}
 }
@@ -765,11 +769,17 @@ func TestForcedSlot_ReleasedWhenWantPanics(t *testing.T) {
 	if got := f.inFlight(); got != 0 {
 		t.Fatalf("a panic in want kept the slot: %d", got)
 	}
+	// Polled, not tried once: the buffer's own goroutines (the age sweep, a
+	// flush worker) hold the shard lock for moments; a lock the panic left
+	// behind is never released.
 	shard := f.buf.getShard("db/k")
-	if !shard.mu.TryLock() {
-		t.Fatal("a panic in want left the shard locked")
-	}
-	shard.mu.Unlock()
+	f.waitFor("the shard lock to be free after a panic in want", func() bool {
+		if shard.mu.TryLock() {
+			shard.mu.Unlock()
+			return true
+		}
+		return false
+	})
 }
 
 // I11 (#1944): with the ledger off, every detach and deferral site is
@@ -824,7 +834,7 @@ func TestForceFlushKey_DueAndBudgetChecksTakeNoShardLock(t *testing.T) {
 		shard.mu.Lock()
 		done := make(chan ForceResult, 1)
 		go func() {
-			r, _ := f.force(key, nil)
+			r := f.force(key, nil).Result
 			done <- r
 		}()
 		select {

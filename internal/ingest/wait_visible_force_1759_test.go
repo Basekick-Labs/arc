@@ -34,7 +34,7 @@ func newCountingForcer(next KeyForcer) *countingForcer {
 }
 
 func (c *countingForcer) ForceFlushKey(key string, interval time.Duration, src ForceSource,
-	want func([]interface{}) bool) (ForceResult, time.Time) {
+	want func([]interface{}) bool) ForceReply {
 	if c.onCall != nil {
 		c.onCall(key)
 	}
@@ -53,14 +53,14 @@ func (c *countingForcer) ForceFlushKey(key string, interval time.Duration, src F
 			return want(b)
 		}
 	}
-	r, due := NotDue, time.Now().Add(time.Hour)
+	rep := ForceReply{Result: NotDue, Due: time.Now().Add(time.Hour)}
 	if c.next != nil {
-		r, due = c.next.ForceFlushKey(key, interval, src, counted)
+		rep = c.next.ForceFlushKey(key, interval, src, counted)
 	}
 	c.mu.Lock()
-	c.results = append(c.results, r)
+	c.results = append(c.results, rep.Result)
 	c.mu.Unlock()
-	return r, due
+	return rep
 }
 
 func (c *countingForcer) callsOf(key string) int {
@@ -241,7 +241,7 @@ func TestVisibleForceSharesTheReadLimiter1759(t *testing.T) {
 		t.Fatalf("arc_ingest_forced_flushes_total{source=write,result=forced} = %d, want %d", got, before+1)
 	}
 	f.write("m", 5)
-	if r, due := f.buf.ForceFlushKey("db/m", 5*time.Second, ForceRead, nil); r != NotDue || time.Until(due) < 4*time.Second {
+	if r, due := f.buf.ForceFlushKey("db/m", 5*time.Second, ForceRead, nil).resultDue(); r != NotDue || time.Until(due) < 4*time.Second {
 		t.Fatalf("a read right after a write's force: %v (due in %v), want not_due about 5 s away", r, time.Until(due))
 	}
 }
@@ -253,7 +253,7 @@ func TestVisibleForceOverBudgetWaitsForTheAgeFlush1759(t *testing.T) {
 	cfg.MaxBufferAgeMS = 600
 	f := newVisibleForceFixture(t, cfg, ForceBudget{})
 	f.write("blocker0", 5)
-	if r, _ := f.buf.ForceFlushKey("db/blocker0", time.Second, ForceRead, nil); r != Forced {
+	if r := f.buf.ForceFlushKey("db/blocker0", time.Second, ForceRead, nil).Result; r != Forced {
 		t.Fatalf("taking the only forced slot: %v", r)
 	}
 	f.waitFor("blocker0 held in a worker", func() bool { return f.store.blocked.Load() >= 1 })
@@ -319,8 +319,8 @@ func TestVisibleForceOverBudgetEndsTheRound1759(t *testing.T) {
 // forcerFunc answers every call with what its function returns.
 type forcerFunc func() ForceResult
 
-func (f forcerFunc) ForceFlushKey(string, time.Duration, ForceSource, func([]interface{}) bool) (ForceResult, time.Time) {
-	return f(), time.Time{}
+func (f forcerFunc) ForceFlushKey(string, time.Duration, ForceSource, func([]interface{}) bool) ForceReply {
+	return ForceReply{Result: f()}
 }
 
 // B6: a wait that forces keeps all four exits and the re-check of an outcome
@@ -517,8 +517,8 @@ func TestVisibleNoForcerOrNoIntervalNeverForces1759(t *testing.T) {
 // fixedForcer answers every call with one result.
 type fixedForcer ForceResult
 
-func (r fixedForcer) ForceFlushKey(string, time.Duration, ForceSource, func([]interface{}) bool) (ForceResult, time.Time) {
-	return ForceResult(r), time.Time{}
+func (r fixedForcer) ForceFlushKey(string, time.Duration, ForceSource, func([]interface{}) bool) ForceReply {
+	return ForceReply{Result: ForceResult(r)}
 }
 
 // LedgerOff and Closing end forcing for the rest of the wait: one call.
@@ -616,11 +616,11 @@ func TestForceFlushKeyPruneBoundary1941(t *testing.T) {
 	if _, ok := l.lastDetach("db/m"); !ok {
 		t.Fatal("pruned 1 ns before the longest interval")
 	}
-	if r, due := f.buf.ForceFlushKey("db/m", interval, ForceWrite, nil); r != NotDue || !due.Equal(t0.Add(interval)) {
+	if r, due := f.buf.ForceFlushKey("db/m", interval, ForceWrite, nil).resultDue(); r != NotDue || !due.Equal(t0.Add(interval)) {
 		t.Fatalf("1 ns before the interval: got (%v, %v), want (not_due, %v)", r, due, t0.Add(interval))
 	}
 	f.clock.Advance(time.Nanosecond)
-	if r, _ := f.buf.ForceFlushKey("db/m", interval, ForceWrite, nil); r != Forced {
+	if r := f.buf.ForceFlushKey("db/m", interval, ForceWrite, nil).Result; r != Forced {
 		t.Fatalf("at the interval: got %v, want forced", r)
 	}
 }
@@ -658,7 +658,7 @@ func TestForceFlushKeyPrunedEntryIsNotADetach1759(t *testing.T) {
 			t.Errorf("hook pruned %d, want 1", n)
 		}
 	}
-	if r, _ := f.buf.ForceFlushKey("db/m", time.Second, ForceWrite, nil); r != Forced {
+	if r := f.buf.ForceFlushKey("db/m", time.Second, ForceWrite, nil).Result; r != Forced {
 		t.Fatalf("ForceFlushKey after a prune of its entry = %v, want forced: a pruned entry is not a detach", r)
 	}
 }
@@ -667,14 +667,14 @@ func TestForceFlushKeyPrunedEntryIsNotADetach1759(t *testing.T) {
 func TestForceFlushKeyCountsResults1759(t *testing.T) {
 	off := newForceFixture(t, forceConfig(2, 100), nil)
 	sum := func() (n int64) {
-		for _, r := range []string{"forced", "not_due", "over_budget", "nothing", "not_wanted", "closing"} {
+		for _, r := range []string{"forced", "not_due", "over_budget", "nothing", "not_wanted", "closing", "lost_race"} {
 			n += forcedFlushCount(t, "read", r)
 		}
 		return n
 	}
 	before := sum()
 	off.write("m", 5)
-	if r, _ := off.buf.ForceFlushKey("db/m", time.Second, ForceRead, nil); r != LedgerOff {
+	if r := off.buf.ForceFlushKey("db/m", time.Second, ForceRead, nil).Result; r != LedgerOff {
 		t.Fatal(r)
 	}
 	if sum() != before {
@@ -727,20 +727,20 @@ func (s *ownSettleForcer) settleOne(after time.Duration) {
 	}()
 }
 
-func (s *ownSettleForcer) ForceFlushKey(key string, _ time.Duration, _ ForceSource, _ func([]interface{}) bool) (ForceResult, time.Time) {
+func (s *ownSettleForcer) ForceFlushKey(key string, _ time.Duration, _ ForceSource, _ func([]interface{}) bool) ForceReply {
 	s.mu.Lock()
 	s.calls[key]++
 	n := s.calls[key]
 	s.mu.Unlock()
 	if key == "db/k1" {
 		s.settleOne(20 * time.Millisecond) // k1's forced flush settles a moment later
-		return Forced, time.Time{}
+		return ForceReply{Result: Forced}
 	}
 	if n <= 2 {
-		return OverBudget, time.Time{}
+		return ForceReply{Result: OverBudget}
 	}
 	s.settleOne(5 * time.Millisecond)
-	return Forced, time.Time{}
+	return ForceReply{Result: Forced}
 }
 
 func TestVisibleForceRetriesAfterItsOwnSettle1759(t *testing.T) {
@@ -809,12 +809,12 @@ func (s *scriptForcer) callsOf(key string) int {
 	return s.calls[key]
 }
 
-func (s *scriptForcer) ForceFlushKey(key string, _ time.Duration, _ ForceSource, _ func([]interface{}) bool) (ForceResult, time.Time) {
+func (s *scriptForcer) ForceFlushKey(key string, _ time.Duration, _ ForceSource, _ func([]interface{}) bool) ForceReply {
 	s.mu.Lock()
 	s.calls[key]++
 	if d, ok := s.due[key]; ok && time.Now().Before(d) {
 		s.mu.Unlock()
-		return NotDue, d
+		return ForceReply{Result: NotDue, Due: d}
 	}
 	sc := s.script[key]
 	r := sc[min(s.steps[key], len(sc)-1)]
@@ -826,7 +826,7 @@ func (s *scriptForcer) ForceFlushKey(key string, _ time.Duration, _ ForceSource,
 	s.mu.Unlock()
 	switch r {
 	case NotDue:
-		return NotDue, d
+		return ForceReply{Result: NotDue, Due: d}
 	case Forced:
 		go func() {
 			v := s.o.vis
@@ -835,7 +835,7 @@ func (s *scriptForcer) ForceFlushKey(key string, _ time.Duration, _ ForceSource,
 			v.signal()
 		}()
 	}
-	return r, time.Time{}
+	return ForceReply{Result: r}
 }
 
 // A not-due key after an over-budget one keeps its due timer: the round that
