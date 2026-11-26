@@ -10,7 +10,7 @@ Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1949](https:/
 
 ## New: a query can flush and wait for the measurements it reads (`x-arc-freshness: flush`) ([#1760](https://github.com/Basekick-Labs/arc/issues/1760))
 
-**Who is affected:** standalone deployments with local storage that turn on the new key **`query.fresh_flush_enabled`** (`ARC_QUERY_FRESH_FLUSH_ENABLED`, default `false`). Off, nothing changes: a query carrying the header is refused with 403, as before.
+**Who is affected:** standalone deployments with local storage that turn on the new key **`query.fresh_flush_enabled`** (`ARC_QUERY_FRESH_FLUSH_ENABLED`, default `false`). Off, a query carrying the header is refused with 403 (`disabled`) and not run. **Upgrade note:** earlier releases ignored the header and ran the query, so a client that already sends it gets 403 after the upgrade until the key is turned on or the header is removed.
 
 A write is acknowledged once its rows are buffered, and a query sees them only after their flush, up to `ingest.max_buffer_age_ms` (5 s by default) later. A reader that must see everything already acknowledged, including rows written by other clients, had to sleep or poll. With the key on, a query to `/api/v1/query` or `/api/v1/query/msgpack` can send **`x-arc-freshness: flush`**. Arc then flushes the measurements the query reads, waits until those flushes are stored, and runs the query unchanged:
 
