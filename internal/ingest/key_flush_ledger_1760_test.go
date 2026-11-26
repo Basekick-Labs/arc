@@ -769,11 +769,17 @@ func TestForcedSlot_ReleasedWhenWantPanics(t *testing.T) {
 	if got := f.inFlight(); got != 0 {
 		t.Fatalf("a panic in want kept the slot: %d", got)
 	}
+	// Polled, not tried once: the buffer's own goroutines (the age sweep, a
+	// flush worker) hold the shard lock for moments; a lock the panic left
+	// behind is never released.
 	shard := f.buf.getShard("db/k")
-	if !shard.mu.TryLock() {
-		t.Fatal("a panic in want left the shard locked")
-	}
-	shard.mu.Unlock()
+	f.waitFor("the shard lock to be free after a panic in want", func() bool {
+		if shard.mu.TryLock() {
+			shard.mu.Unlock()
+			return true
+		}
+		return false
+	})
 }
 
 // I11 (#1944): with the ledger off, every detach and deferral site is
