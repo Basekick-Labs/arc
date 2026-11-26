@@ -187,7 +187,10 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: "*",
 		AllowMethods: "GET,POST,PUT,DELETE,OPTIONS",
-		AllowHeaders: "Origin,Content-Type,Accept,Authorization,x-api-key,x-arc-database,Content-Encoding,Arcli-Installation-Id,Arc-Client-Installation-Id," + WaitVisibleHeader + "," + FreshnessHeader,
+		// The request headers a browser may send: x-arc-decimals (#1784) and
+		// the Arrow route's encoding options among them.
+		AllowHeaders: "Origin,Content-Type,Accept,Authorization,x-api-key,x-arc-database,Content-Encoding,Arcli-Installation-Id,Arc-Client-Installation-Id," + WaitVisibleHeader + "," + FreshnessHeader +
+			"," + decimalsHeader + ",x-arc-arrow-dictionary,x-arc-arrow-compression",
 		// A browser reads a visible write's answer (#1759) and a fresh
 		// query's (#1760).
 		ExposeHeaders: VisibleHeader + "," + VisibleReasonHeader + "," + FreshnessAnswerHeader + "," + FreshnessReasonHeader + "," + FreshnessWaitHeader,
