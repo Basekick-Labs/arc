@@ -763,6 +763,9 @@ func flightStatementDatabase(ctx context.Context, stored string) (string, error)
 }
 
 func (s *flightSQLService) GetFlightInfoStatement(ctx context.Context, query flightsql.StatementQuery, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
+	if err := flightFreshnessRefusal(ctx); err != nil { // #1760
+		return nil, err
+	}
 	if len(query.GetTransactionId()) != 0 {
 		return nil, status.Error(codes.Unimplemented, "Flight SQL transactions are not supported")
 	}
@@ -801,6 +804,9 @@ func flightStatementInfo(desc *flight.FlightDescriptor, sql, database string) (*
 var flightSQLBenchDirect func(ctx context.Context, s *flightSQLService, sql, database string) (schema *arrow.Schema, stream <-chan flight.StreamChunk, handled bool, err error)
 
 func (s *flightSQLService) DoGetStatement(ctx context.Context, ticket flightsql.StatementQueryTicket) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+	if err := flightFreshnessRefusal(ctx); err != nil { // #1760
+		return nil, nil, err
+	}
 	var statement flightStatement
 	if err := json.Unmarshal(ticket.GetStatementHandle(), &statement); err != nil {
 		return nil, nil, status.Error(codes.InvalidArgument, "invalid statement ticket")

@@ -602,7 +602,9 @@ func TestWaitVisibleCORS1759(t *testing.T) {
 	req.Header.Set("Origin", "https://app.example")
 	resp, err = app.Test(req, -1)
 	require.NoError(t, err)
-	require.Equal(t, VisibleHeader+","+VisibleReasonHeader, resp.Header.Get("Access-Control-Expose-Headers"))
+	exposed := resp.Header.Get("Access-Control-Expose-Headers")
+	require.Contains(t, exposed, VisibleHeader)
+	require.Contains(t, exposed, VisibleReasonHeader)
 }
 
 // countingGate is a WAL disk gate that admits everything and counts the

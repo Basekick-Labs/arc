@@ -582,7 +582,7 @@ func TestVisiblePanicLeavesTheBatchUnresolved1759(t *testing.T) {
 				t.Fatal("the flush did not panic")
 			}
 		}()
-		_ = buf.flushRecordsAsync(context.Background(), "db/mpanic", "db", "mpanic", []interface{}{batch}, 3, nil, nil, time.Now())
+		_ = buf.flushRecordsAsync(context.Background(), "db/mpanic", "db", "mpanic", []interface{}{batch}, 3, nil, nil, time.Now(), nil)
 	}()
 	o.Seal()
 	if c := countsOf(o); c.settled != 0 || c.unconfirmed != 0 || c.failedNoWAL != 0 || c.marked != 1 || o.Resolved() {

@@ -2581,6 +2581,11 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 	start := time.Now()
 	// Cache timestamp format once per request to avoid repeated formatting
 	timestamp := start.UTC().Format(time.RFC3339)
+	// x-arc-freshness is refused before anything is forwarded or run
+	// (#1760, fresh_flush.go). Also /api/v1/query/msgpack, in its wire format.
+	if status, msg := freshnessRefusal(c); status != 0 {
+		return respondError(c, status, msg, timestamp, start)
+	}
 	m := metrics.Get()
 	m.IncQueryRequests()
 
@@ -6096,6 +6101,10 @@ type EstimateResponse struct {
 // estimateQuery handles POST /api/v1/query/estimate - returns row count estimate
 func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	start := time.Now()
+	// x-arc-freshness: refused before the forward (#1760, fresh_flush.go).
+	if status, msg := freshnessRefusal(c); status != 0 {
+		return c.Status(status).JSON(EstimateResponse{Success: false, Error: msg, WarningLevel: "error"})
+	}
 
 	// A node that cannot serve queries forwards (before governance, so the
 	// request is counted once, on the node that answers it).
@@ -6674,6 +6683,10 @@ func rowCapReached(maxRows int, rowCount int64) bool {
 // queryMeasurement handles GET /api/v1/query/:measurement - query a specific measurement
 func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	start := time.Now()
+	// x-arc-freshness: refused before the forward (#1760, fresh_flush.go).
+	if status, msg := freshnessRefusal(c); status != 0 {
+		return c.Status(status).JSON(QueryResponse{Success: false, Error: msg, Timestamp: start.UTC().Format(time.RFC3339)})
+	}
 	m := metrics.Get()
 	m.IncQueryRequests()
 
