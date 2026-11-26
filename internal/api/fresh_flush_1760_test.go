@@ -265,6 +265,7 @@ func TestFreshness_CORS(t *testing.T) {
 	exposed := resp.Header.Get("Access-Control-Expose-Headers")
 	require.Contains(t, exposed, FreshnessAnswerHeader)
 	require.Contains(t, exposed, FreshnessReasonHeader)
+	require.Contains(t, exposed, FreshnessWaitHeader)
 }
 
 // On a node that forwards its reads (a compactor), the refusal comes before

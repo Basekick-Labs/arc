@@ -16,8 +16,8 @@ import (
 // after the answer (#1759), waiting at most waitVisibleBudget. With a forcer
 // set (SetForcer) the measurements it wrote are flushed early: at most once
 // per ingest.wait_visible_min_interval_ms per measurement, and only inside
-// the forced-flush budget (spare flush capacity). Otherwise it waits for its
-// rows' normal age or size flush.
+// the forced-flush budget (spare flush capacity), which fresh queries share
+// (#1760). Otherwise it waits for its rows' normal age or size flush.
 //
 //   - 204, X-Arc-Visible: true: every row is in a stored (and, with tiering,
 //     registered) file a query lists.

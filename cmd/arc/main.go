@@ -1299,14 +1299,26 @@ func main() {
 		Int("flush_queue_size", cfg.Ingest.FlushQueueSize).
 		Msg("Initializing Arrow buffer with ingestion config")
 	arrowBuffer := ingest.NewArrowBuffer(&cfg.Ingest, storageBackend, logger.Get("arrow"))
-	// x-arc-wait: visible flushes a write's measurements early (#1759): the
-	// per-key flush ledger, enabled before WAL recovery and the first
-	// flushes so its limiter sees every detach.
-	if writeForcingEnabled(cfg) {
+	// x-arc-wait: visible (#1759) and x-arc-freshness: flush (#1760) flush
+	// measurements early through the per-key flush ledger: enabled once, so
+	// the two share one forced-flush budget (the first budget would win
+	// anyway), before WAL recovery and the first flushes so its limiter sees
+	// every detach. A fresh query also needs per-task tracking, which must
+	// be on before recovery's first detach: a task detached before it is
+	// not tracked.
+	if keyFlushLedgerEnabled(cfg) {
 		arrowBuffer.EnableKeyFlushLedger(ingest.ForceBudget{})
 		log.Info().
-			Int("wait_visible_min_interval_ms", cfg.Ingest.WaitVisibleMinIntervalMS).
-			Msg("Visible writes may flush their measurements early (ingest.wait_visible_enabled): per-measurement flush ledger on")
+			Bool("visible_writes", writeForcingEnabled(cfg)).
+			Bool("fresh_queries", freshFlushEnabled(cfg)).
+			Msg("Measurements may be flushed early (ingest.wait_visible_enabled, query.fresh_flush_enabled): per-measurement flush ledger on, one budget shared")
+	}
+	if freshFlushEnabled(cfg) {
+		arrowBuffer.EnableKeyFlushTracking()
+		log.Info().
+			Int("fresh_flush_min_interval_ms", cfg.Query.FreshFlushMinIntervalMS).
+			Int("fresh_flush_max_waiters", cfg.Query.FreshFlushMaxWaiters).
+			Msg("Queries may flush and wait for the measurements they read (query.fresh_flush_enabled): flush task tracking on")
 	}
 	// Grace days 7-14 of an expired license refuse live ingestion (503,
 	// X-Arc-Ingest-Refused: license_grace); replay, CQ and compaction writes
@@ -4265,6 +4277,9 @@ func main() {
 	// created just above.
 	arrowBuffer.AddOnFilePublished(queryHandler.FilePublished)
 	queryHandler.SetCancelOnClientDisconnect(cfg.Query.CancelOnClientDisconnect)
+	// x-arc-freshness (#1760): the handler refuses the header unless
+	// freshFlushEnabled, the predicate the buffer's tracking was enabled on.
+	queryHandler.SetFreshFlush(freshFlushConfig(cfg), arrowBuffer)
 	if authManager != nil && rbacManager != nil {
 		queryHandler.SetAuthAndRBAC(authManager, rbacManager)
 	}

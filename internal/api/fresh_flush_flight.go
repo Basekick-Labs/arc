@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 
+	"github.com/basekick-labs/arc/internal/metrics"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -23,6 +24,7 @@ import (
 func flightFreshnessRefusal(ctx context.Context) error {
 	for _, v := range metadata.ValueFromIncomingContext(ctx, FreshnessHeader) {
 		if strings.TrimSpace(v) != "" {
+			metrics.Get().IncQueryFreshFlush(freshnessReasonUnsupportedRoute)
 			return status.Error(codes.InvalidArgument, "x-arc-freshness is not supported on Flight SQL; the query was not run")
 		}
 	}

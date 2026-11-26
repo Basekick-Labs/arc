@@ -40,7 +40,7 @@ func (m *Metrics) IncIngestForcedFlush(source, result int) {
 }
 
 func (m *Metrics) appendIngestForcedFlush(b []byte) []byte {
-	b = append(b, "# HELP arc_ingest_forced_flushes_total Requests to flush one measurement's buffer early, by source (write: x-arc-wait: visible; read: reserved for fresh queries) and result: forced, not_due (flushed within the interval), over_budget (no spare flush capacity: the rows wait for their age or size flush), nothing (nothing buffered), not_wanted (nothing of the caller's left to flush), closing, lost_race (another flush took the rows first)\n"...)
+	b = append(b, "# HELP arc_ingest_forced_flushes_total Requests to flush one measurement's buffer early, by source (write: x-arc-wait: visible; read: x-arc-freshness: flush; the two share one budget of early flushes) and result: forced, not_due (flushed within the interval), over_budget (no spare flush capacity: the rows wait for their age or size flush), nothing (nothing buffered), not_wanted (nothing of the caller's left to flush), closing, lost_race (another flush took the rows first)\n"...)
 	b = append(b, "# TYPE arc_ingest_forced_flushes_total counter\n"...)
 	names := []string{"source", "result"}
 	for s, source := range forcedFlushSourceLabels {

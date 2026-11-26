@@ -828,6 +828,8 @@ type QueryHandler struct {
 	// lifetime is the context read requests run on (SetLifetime); nil
 	// leaves them on Fiber's background context.
 	lifetime context.Context
+	// fresh serves x-arc-freshness (SetFreshFlush); nil: the feature off.
+	fresh *freshFlush
 	// warehouse names the Iceberg warehouse's directories in the storage
 	// root, which the listings leave out (#1626); nil with Iceberg off.
 	warehouse   WarehouseDirs
@@ -2581,13 +2583,20 @@ func (h *QueryHandler) executeQuery(c *fiber.Ctx) error {
 	start := time.Now()
 	// Cache timestamp format once per request to avoid repeated formatting
 	timestamp := start.UTC().Format(time.RFC3339)
-	// x-arc-freshness is refused before anything is forwarded or run
-	// (#1760, fresh_flush.go). Also /api/v1/query/msgpack, in its wire format.
-	if status, msg := freshnessRefusal(c); status != 0 {
-		return respondError(c, status, msg, timestamp, start)
+	// x-arc-freshness (#1760, fresh_flush.go): its refusals come before
+	// anything is forwarded, counted or run. Also /api/v1/query/msgpack, in
+	// its wire format.
+	fresh, refused, refusal := h.freshBegin(c)
+	if refused != 0 {
+		return respondError(c, refused, refusal, timestamp, start)
 	}
 	m := metrics.Get()
 	m.IncQueryRequests()
+	// flushed: the fresh wait succeeded (below, after validation and RBAC).
+	var flushed bool
+	if fresh {
+		defer freshExit(c, &flushed)
+	}
 
 	// Check if this request should be forwarded to a reader/writer node
 	// Compactor nodes cannot process queries locally, so they forward to readers/writers
@@ -2652,6 +2661,11 @@ localProcessing:
 	// comment and executes it — returning the database/table list to a caller
 	// the SHOW RBAC gate would have denied. SECURITY: RBAC bypass.
 	showNormalised := normalizeSQLForShow(req.SQL)
+	if fresh && (showDatabasesPattern.MatchString(showNormalised) || showTablesPattern.MatchString(showNormalised)) {
+		m.IncQueryErrors()
+		freshReason(c, fresh, freshnessReasonShow)
+		return respondError(c, fiber.StatusBadRequest, "x-arc-freshness is not supported on SHOW commands; the query was not run", timestamp, start)
+	}
 
 	// Handle SHOW DATABASES command. A caller with a grant covering every
 	// database sees them all; any other sees the databases it can read
@@ -2705,6 +2719,7 @@ localProcessing:
 	// Check RBAC permissions for all tables referenced in the query
 	if err := h.checkQueryPermissions(c, req.SQL, "read"); err != nil {
 		m.IncQueryErrors()
+		freshReason(c, fresh, freshnessReasonForbidden)
 		return respondError(c, fiber.StatusForbidden, err.Error(), timestamp, start)
 	}
 
@@ -2715,6 +2730,24 @@ localProcessing:
 		effectiveTimeout = governanceTimeout
 	}
 	deadline := requestDeadline(effectiveTimeout)
+
+	// x-arc-freshness: flush the measurements the query reads and wait for
+	// them, outside the read gate, before its SQL is built below.
+	if fresh {
+		if status, msg := h.freshWait(c, req.SQL, headerDB, effectiveTimeout, deadline); status != 0 {
+			return respondError(c, status, msg, timestamp, start)
+		}
+		if freshAfterWaitHook != nil {
+			freshAfterWaitHook()
+		}
+		flushed = true
+		// Every execution clock below (execution_time_ms, the latency
+		// metrics, the stream outcome, the slow-query log) starts after the
+		// wait, which X-Arc-Freshness-Wait-Ms and
+		// arc_query_fresh_flush_seconds report. The deadline does not: it
+		// bounds the whole request.
+		start = time.Now()
+	}
 
 	// A read in flight, from before its SQL is built until its statement is
 	// bound (internal/readgate): a job that swaps files waits for it.
@@ -6102,7 +6135,7 @@ type EstimateResponse struct {
 func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	start := time.Now()
 	// x-arc-freshness: refused before the forward (#1760, fresh_flush.go).
-	if status, msg := freshnessRefusal(c); status != 0 {
+	if status, msg := h.freshnessRefusal(c); status != 0 {
 		return c.Status(status).JSON(EstimateResponse{Success: false, Error: msg, WarningLevel: "error"})
 	}
 
@@ -6684,7 +6717,7 @@ func rowCapReached(maxRows int, rowCount int64) bool {
 func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	start := time.Now()
 	// x-arc-freshness: refused before the forward (#1760, fresh_flush.go).
-	if status, msg := freshnessRefusal(c); status != 0 {
+	if status, msg := h.freshnessRefusal(c); status != 0 {
 		return c.Status(status).JSON(QueryResponse{Success: false, Error: msg, Timestamp: start.UTC().Format(time.RFC3339)})
 	}
 	m := metrics.Get()
