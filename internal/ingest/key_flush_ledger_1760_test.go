@@ -777,7 +777,9 @@ func TestForcedSlot_ReleasedWhenWantPanics(t *testing.T) {
 // (blocker0 and blocker1's size-triggered sends); the deferral,
 // markDeferredLocked's noteDeferral (blocker2); and D2,
 // extractBufferLocked's recordDetach (FlushAll of m). Removing any one of
-// those nil guards panics it on the nil ledger.
+// those nil guards panics the test goroutine on the nil ledger while it holds
+// a shard lock; the fixture's Close then blocks on that lock, so the test
+// fails by -timeout with the nil-receiver frame in its stack.
 func TestKeyFlushLedger_OffSitesAreNilSafe(t *testing.T) {
 	f := newForceFixture(t, forceConfig(1, 1), nil)
 	f.occupyWorker()
