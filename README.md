@@ -1,7 +1,9 @@
 # Arc
 
+**The open-source time-series lakehouse.**
+
 [![Ingestion](https://img.shields.io/badge/ingestion-38M%2B%20rec%2Fs-brightgreen)](https://github.com/basekick-labs/arc)
-[![Query](https://img.shields.io/badge/query-8.42M%20rows%2Fs-blue)](https://github.com/basekick-labs/arc)
+[![Query](https://img.shields.io/badge/query-25.3M%20rows%2Fs-blue)](https://github.com/basekick-labs/arc)
 [![Go](https://img.shields.io/badge/go-1.26+-00ADD8?logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
@@ -12,7 +14,11 @@
 
 [![Grump found nothing to complain about](https://grump.run/badge.svg)](https://grump.run/?utm_source=github&utm_medium=readme&utm_campaign=basekick-arc)
 
-Open, SQL-native time-series database for telemetry you need to keep. Arc ingests 38M+ records/sec, stores data as standard Parquet on infrastructure you own, and lets you query recent and historical data together. InfluxDB Line Protocol and Telegraf compatible. Single binary. AGPL-3.0.
+**Keep every telemetry reading. Query the whole history.**
+
+Hot data fast for live dashboards. Cold history cheap in your own bucket. One SQL across both. Telegraf and InfluxDB Line Protocol in, Parquet out, published as Apache Iceberg tables your Snowflake, Databricks and Athena already read.
+
+Arc is a SQL-native time-series database built so you never have to downsample or delete history to afford it: 38M+ records/sec ingestion, standard Parquet on infrastructure you own, one Go binary. AGPL-3.0.
 
 > **Prefer a UI?** [**Arc Launchpad**](https://github.com/Basekick-Labs/launchpad) is a self-hosted web console for the Arc instances you run — SQL console, schema explorer, logs, monitoring, and management for tokens, retention, alerts, continuous queries, and MQTT ingestion. Deploy it alongside Arc with Docker Compose. [Docs](https://docs.basekick.net/launchpad).
 >
@@ -20,27 +26,36 @@ Open, SQL-native time-series database for telemetry you need to keep. Arc ingest
 
 ---
 
-## Telemetry is easy to collect and expensive to keep
+## Keeping telemetry is harder than collecting it
 
-Machines, services, vehicles, and devices produce data continuously. The operational problem is not only ingesting the latest readings — it is keeping the full-resolution history available for debugging, analysis, compliance, and the next question nobody has asked yet.
+Machines, services, vehicles, and devices produce data continuously. Most stacks downsample it after 30 days and delete it after 90. The rest goes to a second system nobody wanted to build.
 
-Teams evaluating a time-series database usually run into the same trade-offs:
+- **History disappears.** Retention limits force you to pick between cost and detail. The reading you need for the failure analysis is the one you deleted.
+- **Two systems for one dataset.** A time-series database for recent data, a lake for history, a pipeline between them, two copies to pay for and keep in sync.
+- **Your data is stuck.** Proprietary formats and query languages mean every analyst and every warehouse needs an export job first.
+- **Migration friction.** Existing agents, dashboards, and Line Protocol writers make changing databases risky.
 
-- **Retention cliffs**: Older data is downsampled, exported, or deleted because storage costs grow too quickly.
-- **Split hot and cold paths**: Recent data is queryable in one system while historical data waits in a warehouse or object store.
-- **Operational overhead**: A simple workload turns into a PostgreSQL extension stack or a multi-service cluster.
-- **Migration friction**: Existing agents, dashboards, and Line Protocol writers make changing databases risky.
-- **Vendor lock-in**: Proprietary storage makes it difficult to use your data elsewhere or leave later.
-
-Arc is built for teams that want to keep the data, query the whole history, and start with a small deployment. It combines high-throughput ingestion, automatic Parquet storage and compaction, analytical SQL, retention policies, and continuous queries in one binary.
+Arc is built for teams that want to keep the data, query the whole history, and start with a small deployment. It combines high-throughput ingestion, automatic Parquet storage and compaction, analytical SQL, Iceberg tables, retention policies, and continuous queries in one binary.
 
 **Built for aerospace telemetry. Useful anywhere machines never stop producing data.**
 
 ---
 
+## Hot for dashboards. Cold in your bucket. Read by your warehouse.
+
+One copy of the data, three ways to use it:
+
+- **Hot.** Recent data, flushed to Parquet within seconds (optionally behind a write-ahead log). Grafana, alerts and live SQL read it directly.
+- **Cold.** Compacted Parquet in your object storage (S3, GCS, Azure Blob, or any S3-compatible store), at object storage prices. Keep it for years, at full resolution. The same SQL reaches hot and cold.
+- **Your engines.** The same files, published as Apache Iceberg tables and registered in AWS Glue or Arc's own Iceberg REST catalog. Snowflake, Databricks, Athena, Redshift, BigQuery, Trino, Spark and DuckDB read them where they sit.
+
+No Kafka, no Flink, no compaction cron, no export job. Automated hot/cold tiering (moving older files from local disk to a cheaper store on a schedule) is an Arc Enterprise feature; see [Read your data with other engines](#read-your-data-with-other-engines-iceberg) for the Iceberg side.
+
+---
+
 ## What Arc is (and isn't)
 
-Arc is a complete time-series analytical database: ingestion pipeline, Parquet storage engine, compaction system, SQL query layer, retention policy manager, continuous query scheduler, and telemetry integrations — in one binary. It uses DuckDB as its query engine, while Arc adds the pieces needed to run a durable ingestion and analytics service: high-throughput writes with automatic Parquet flushing, background compaction, scheduled compute, data lifecycle management, authentication, backup and restore, and enterprise clustering.
+Arc is the open-source time-series lakehouse: a complete time-series database with an ingestion pipeline, Parquet storage engine, compaction system, SQL query layer, Iceberg export, retention policy manager, continuous query scheduler, and telemetry integrations, all in one binary. It uses DuckDB as its query engine, while Arc adds the pieces needed to run a durable ingestion and analytics service: high-throughput writes with automatic Parquet flushing, background compaction, scheduled compute, data lifecycle management, authentication, backup and restore, and enterprise clustering.
 
 Arc is **not a wrapper**. You don't bring your own ingestion, compaction, or retention policies. Arc provides the full stack.
 
@@ -48,7 +63,8 @@ Arc is **not a wrapper**. You don't bring your own ingestion, compaction, or ret
 
 - **Keep full-resolution history** instead of choosing between retention and cost.
 - **Use standard SQL** with window functions, CTEs, joins, and analytical aggregations.
-- **Own the files**: Arc stores data as open Apache Parquet on local disk, S3, Azure, or any S3-compatible store (SeaweedFS, R2, MinIO, ...).
+- **Own the files**: Arc stores data as open Apache Parquet on local disk, S3, Google Cloud Storage, Azure Blob, or any S3-compatible store (SeaweedFS, R2, MinIO, ...).
+- **Feed your warehouse without a pipeline**: the same Parquet files are published as Apache Iceberg tables, so Snowflake, Databricks, Athena and other engines read them in place.
 - **Start small**: run one binary on a laptop, edge box, or server before adding enterprise clustering.
 - **Migrate gradually**: use InfluxDB Line Protocol and Telegraf-compatible ingestion to dual-write and validate before cutover.
 
@@ -95,6 +111,27 @@ Arc accepts **InfluxDB Line Protocol** directly, so existing Telegraf inputs can
 4. Decommission the old database only after a full retention cycle has passed.
 
 See the [InfluxDB migration guide](https://basekick.net/migrate/influxdb), or compare Arc with [TimescaleDB](https://basekick.net/compare/timescaledb), [InfluxDB](https://basekick.net/compare/influxdb), [ClickHouse](https://basekick.net/compare/clickhouse), and [Elasticsearch](https://basekick.net/compare/elasticsearch).
+
+---
+
+## Read your data with other engines (Iceberg)
+
+Arc publishes each measurement as an Apache Iceberg table over the Parquet files it already wrote. Nothing is copied: the Iceberg metadata describes Arc's own files, and Arc keeps it current as data arrives, compacts and expires.
+
+```toml
+[iceberg]
+enabled = true
+rest_catalog_enabled = true   # read-only Iceberg REST catalog at /iceberg (Snowflake, Trino, Spark, PyIceberg, DuckDB)
+
+[iceberg.glue]                # S3 only: register every table in AWS Glue
+enabled = true                # (Athena, Redshift, EMR, Snowflake, Databricks through Glue federation)
+```
+
+- Each Arc database is a namespace (a Glue database), each measurement a table, and new rows reach the table about a minute after they're written.
+- Arc maintains the tables it writes: it merges small files, expires old snapshots and removes unreferenced metadata. Engines only read.
+- The Iceberg export has run on local storage since 26.09.1. The REST catalog and AWS Glue registration ship in 27.01.1.
+
+Walkthroughs: [Databricks through AWS Glue](https://basekick.net/blog/databricks-zero-copy-iceberg-glue) · [Power BI through OneLake](https://basekick.net/blog/power-bi-zero-copy-iceberg-onelake) · [Spark](https://basekick.net/blog/arc-apache-iceberg-export), and every engine as its guide is published on [basekick.net/integrations](https://basekick.net/integrations). Full reference: [Apache Iceberg guide](https://docs.basekick.net/arc/integrations/apache-iceberg/) and [basekick.net/iceberg](https://basekick.net/iceberg).
 
 ---
 
@@ -325,6 +362,7 @@ CMVP-certified; Arc itself is not a CMVP-listed module. See the
 | **Python SDK** | Query and ingest from Python applications | [PyPI](https://pypi.org/project/arc-tsdb-client/) |
 | **Superset Dialect (JSON)** | Apache Superset connector using JSON transport | [GitHub](https://github.com/Basekick-Labs/arc-superset-dialect) |
 | **Superset Dialect (Arrow)** | Apache Superset connector using Arrow transport | [GitHub](https://github.com/Basekick-Labs/arc-superset-arrow) |
+| **Iceberg engines** | Snowflake, Databricks, Athena, Redshift, BigQuery, Trino, Spark, DuckDB and Power BI read Arc's tables in place, through AWS Glue or Arc's REST catalog | [Guide](https://docs.basekick.net/arc/integrations/apache-iceberg/) · [All integrations](https://basekick.net/integrations) |
 
 ---
 
@@ -332,15 +370,16 @@ CMVP-certified; Arc itself is not a CMVP-listed module. See the
 
 ### Core Capabilities
 - **Columnar storage**: Parquet format with full analytical SQL engine
+- **Iceberg tables**: every measurement published as an Apache Iceberg table over the same files, with Arc-managed compaction and snapshot expiry; read-only REST catalog and AWS Glue registration (27.01.1)
 - **Workloads**: Industrial IoT, manufacturing, energy, fleet telemetry, aerospace, observability, and event analytics
 
 - **Ingestion**: MessagePack columnar (fastest), [Prometheus Remote Write 1.0](docs/integrations/prometheus-remote-write.md), InfluxDB Line Protocol, MQTT, TLE (satellite telemetry)
 - **Query**: Full analytical SQL; JSON, columnar MessagePack, and Apache Arrow IPC responses
 - **Compaction**: Tiered (hourly/daily) automatic Parquet file merging —
   10x storage reduction; see [hourly compaction tuning](docs/operations/compaction.md)
-- **Data Lifecycle**: Retention policies, continuous queries, tiered storage (hot/cold)
+- **Data Lifecycle**: Retention policies, continuous queries, tiered hot/cold storage (Arc Enterprise)
 - **Durability**: Optional write-ahead log (WAL), backup and restore; [WAL recovery monitoring](docs/operations/wal-recovery.md)
-- **Storage**: Local filesystem, S3 and S3-compatible object stores (SeaweedFS, R2, MinIO, ...), Azure Blob
+- **Storage**: Local filesystem, S3 and S3-compatible object stores (SeaweedFS, R2, MinIO, ...), Google Cloud Storage, Azure Blob
 - **Auth**: Token-based authentication with in-memory caching
 - **Data Management**: GDPR-compliant delete operations
 - **Observability**: Prometheus metrics, structured logging, graceful shutdown
@@ -361,7 +400,7 @@ host = "0.0.0.0"
 port = 8000
 
 [storage]
-backend = "local"        # local, s3, minio
+backend = "local"        # local, s3, azure, gcs
 local_path = "./data/arc"
 
 [ingest]
