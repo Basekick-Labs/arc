@@ -2,19 +2,29 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/apache/arrow-go/v18/parquet/file"
+	"github.com/basekick-labs/arc/internal/config"
 	"github.com/basekick-labs/arc/internal/database"
+	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/basekick-labs/arc/internal/wal"
+	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/klauspost/compress/snappy"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
@@ -100,6 +110,132 @@ func remoteWriteTestPost(t *testing.T, r *lpWriteRig, body []byte, headers map[s
 	return resp.StatusCode, out.String()
 }
 
+func remoteWriteParquetTags(t *testing.T, dir string) map[string][]string {
+	t.Helper()
+	tags := map[string][]string{}
+	err := filepath.WalkDir(dir, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() || !strings.HasSuffix(path, ".parquet") {
+			return err
+		}
+		rel, err := filepath.Rel(dir, path)
+		if err != nil {
+			return err
+		}
+		parts := strings.Split(rel, string(filepath.Separator))
+		if len(parts) < 2 {
+			return fmt.Errorf("unexpected parquet path %q", rel)
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		reader, err := file.NewParquetReader(f)
+		if err != nil {
+			f.Close()
+			return err
+		}
+		value := "<none>"
+		if metadata := reader.MetaData().KeyValueMetadata().FindValue("arc:tags"); metadata != nil {
+			value = *metadata
+		}
+		reader.Close()
+		f.Close()
+		tags[parts[1]] = append(tags[parts[1]], value)
+		return nil
+	})
+	require.NoError(t, err)
+	for measurement := range tags {
+		sort.Strings(tags[measurement])
+	}
+	return tags
+}
+
+func legacyRemoteWriteRecord(measurement string, batch *ingest.TypedColumnBatch) *models.ColumnarRecord {
+	record := &models.ColumnarRecord{
+		Measurement: measurement,
+		Columns:     make(map[string][]interface{}, len(batch.Data)),
+		TagColumns:  append([]string(nil), batch.TagColumns...),
+		Columnar:    true,
+	}
+	for name, data := range batch.Data {
+		validity := batch.Validity[name]
+		values := make([]interface{}, 0)
+		switch column := data.(type) {
+		case []int64:
+			for i, value := range column {
+				if len(validity) > 0 && !validity[i] {
+					values = append(values, nil)
+				} else {
+					values = append(values, value)
+				}
+			}
+		case []float64:
+			for i, value := range column {
+				if len(validity) > 0 && !validity[i] {
+					values = append(values, nil)
+				} else {
+					values = append(values, value)
+				}
+			}
+		case []string:
+			for i, value := range column {
+				if len(validity) > 0 && !validity[i] {
+					values = append(values, nil)
+				} else {
+					values = append(values, value)
+				}
+			}
+		}
+		record.Columns[name] = values
+	}
+	return record
+}
+
+func replayRemoteWriteBatch(t *testing.T, measurement string, batch *ingest.TypedColumnBatch, typed bool) (map[string]int64, map[string]map[string]string, map[string][]string) {
+	t.Helper()
+	ctx := context.Background()
+	root := t.TempDir()
+	walDir := filepath.Join(root, "wal")
+	w, err := wal.NewWriter(&wal.WriterConfig{WALDir: walDir, SyncMode: wal.SyncModeFsync, Logger: zerolog.Nop()})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	cfg := &config.IngestConfig{MaxBufferSize: 1_000_000, MaxBufferAgeMS: 600000, Compression: "snappy", ShardCount: 2, FlushWorkers: 1, FlushQueueSize: 8}
+	liveBackend, err := storage.NewLocalBackend(filepath.Join(root, "live"), zerolog.Nop())
+	require.NoError(t, err)
+	live := ingest.NewArrowBuffer(cfg, liveBackend, zerolog.Nop())
+	live.SetWAL(w)
+	t.Cleanup(func() { _ = live.Close() })
+
+	if typed {
+		require.NoError(t, lpWriteTyped(live, ctx, "d", measurement, batch, len(batch.Data["time"].([]int64))))
+	} else {
+		require.NoError(t, lpWriteRecord(live, ctx, "d", legacyRemoteWriteRecord(measurement, batch)))
+	}
+	require.NoError(t, w.Rotate())
+
+	replayDir := filepath.Join(root, "replayed")
+	replayBackend, err := storage.NewLocalBackend(replayDir, zerolog.Nop())
+	require.NoError(t, err)
+	replayed := ingest.NewArrowBuffer(cfg, replayBackend, zerolog.Nop())
+	t.Cleanup(func() { _ = replayed.Close() })
+	callback := func(ctx context.Context, rows []map[string]interface{}, identity string) error {
+		database, name, columns, err := ingest.WALRowsToColumns(rows)
+		if err != nil {
+			return err
+		}
+		return replayed.WriteColumnarDirectReplay(ctx, database, name, columns, identity)
+	}
+	_, err = wal.NewRecovery(walDir, zerolog.Nop()).RecoverWithOptions(ctx, nil, &wal.RecoveryOptions{
+		SkipActiveFile: w.CurrentFile(), TrackedRowCallback: callback,
+	})
+	require.NoError(t, err)
+
+	replayRig := &lpWriteRig{buf: replayed, dir: replayDir}
+	rows, types := replayRig.stored(t)
+	return rows, types, remoteWriteParquetTags(t, replayDir)
+}
+
 // Keep header names as constants here so the fixture makes the HTTP contract visible.
 const (
 	fiberHeaderContentEncoding = "Content-Encoding"
@@ -130,12 +266,16 @@ func TestPrometheusRemoteWriteDecodesAndMapsSamples(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, drops)
 	require.Equal(t, []string{"host", "region"}, records["cpu"].TagColumns)
-	require.Equal(t, []interface{}{int64(1_700_000_000_000_000), int64(1_700_000_001_000_000), int64(1_700_000_002_000_000)}, records["cpu"].Columns["time"])
-	require.Equal(t, []interface{}{12.5, 13.5, 7.0}, records["cpu"].Columns["value"])
-	require.Equal(t, []interface{}{"a", "a", nil}, records["cpu"].Columns["host"])
-	require.Equal(t, []interface{}{nil, nil, "eu"}, records["cpu"].Columns["region"])
+	require.Equal(t, []int64{1_700_000_000_000_000, 1_700_000_001_000_000, 1_700_000_002_000_000}, records["cpu"].Data["time"])
+	require.Equal(t, []float64{12.5, 13.5, 7.0}, records["cpu"].Data["value"])
+	require.Equal(t, []string{"a", "a", ""}, records["cpu"].Data["host"])
+	require.Equal(t, []bool{true, true, false}, records["cpu"].Validity["host"])
+	require.Equal(t, []string{"", "", "eu"}, records["cpu"].Data["region"])
+	require.Equal(t, []bool{false, false, true}, records["cpu"].Validity["region"])
 
 	trig := newLPWriteRig(t, nil)
+	typedWAL := &recordingWAL{}
+	trig.buf.SetWAL(typedWAL)
 	status, out := remoteWriteTestPost(t, trig, remoteWriteTestBody(request), remoteWriteTestHeaders())
 	require.Equal(t, http.StatusNoContent, status, out)
 	rows, types := trig.stored(t)
@@ -143,6 +283,23 @@ func TestPrometheusRemoteWriteDecodesAndMapsSamples(t *testing.T) {
 	require.Equal(t, "float64", types["cpu"]["value"])
 	require.Equal(t, "utf8", types["cpu"]["host"])
 	require.Equal(t, "utf8", types["cpu"]["region"])
+	require.Equal(t, map[string][]string{"cpu": {"host,region"}}, remoteWriteParquetTags(t, trig.dir))
+
+	legacy := newLPWriteRig(t, nil)
+	legacyWAL := &recordingWAL{}
+	legacy.buf.SetWAL(legacyWAL)
+	require.NoError(t, lpWriteRecord(legacy.buf, context.Background(), "d", legacyRemoteWriteRecord("cpu", records["cpu"])))
+	legacyRows, legacyTypes := legacy.stored(t)
+	require.Equal(t, rows, legacyRows)
+	require.Equal(t, types, legacyTypes)
+	require.Equal(t, remoteWriteParquetTags(t, trig.dir), remoteWriteParquetTags(t, legacy.dir))
+	require.Equal(t, typedWAL.appended, legacyWAL.appended)
+
+	typedReplayRows, typedReplayTypes, typedReplayTags := replayRemoteWriteBatch(t, "cpu", records["cpu"], true)
+	legacyReplayRows, legacyReplayTypes, legacyReplayTags := replayRemoteWriteBatch(t, "cpu", records["cpu"], false)
+	require.Equal(t, typedReplayRows, legacyReplayRows)
+	require.Equal(t, typedReplayTypes, legacyReplayTypes)
+	require.Equal(t, typedReplayTags, legacyReplayTags)
 
 	backend, err := storage.NewLocalBackend(trig.dir, zerolog.Nop())
 	require.NoError(t, err)

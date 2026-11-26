@@ -2,6 +2,12 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Change: Prometheus Remote Write builds typed columns directly ([#1748](https://github.com/Basekick-Labs/arc/issues/1748))
+
+The receiver now builds timestamp, sample and label columns in their native types instead of boxing each cell in an interface value. Labels keep the same null handling and tag metadata, and WAL reservations still match the bytes written. The existing Parquet output and WAL replay remain unchanged.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1949](https://github.com/Basekick-Labs/arc/pull/1949).
+
 ## New: a query can flush and wait for the measurements it reads (`x-arc-freshness: flush`) ([#1760](https://github.com/Basekick-Labs/arc/issues/1760))
 
 **Who is affected:** standalone deployments with local storage that turn on the new key **`query.fresh_flush_enabled`** (`ARC_QUERY_FRESH_FLUSH_ENABLED`, default `false`). Off, nothing changes: a query carrying the header is refused with 403, as before.
