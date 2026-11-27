@@ -620,7 +620,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		h.logger.Error().Err(err).Msg("Failed to find affected files")
 		return c.Status(fiber.StatusInternalServerError).JSON(DeleteResponse{
 			Success:         false,
-			Error:           "Failed to find affected files: " + err.Error(),
+			Error:           "Failed to find affected files: " + sqlutil.TrimErrStatement(err.Error()),
 			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 		})
 	}
@@ -754,7 +754,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{Success: false, Error: "Delete recorded, not run: " + err.Error()})
 		} else if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(DeleteResponse{
-				Success: false, Error: "Delete recorded, not run: failed to find affected files: " + err.Error(),
+				Success: false, Error: "Delete recorded, not run: failed to find affected files: " + sqlutil.TrimErrStatement(err.Error()),
 				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 			})
 		}
@@ -904,7 +904,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 			freeOSMemoryThrottled()
 			return c.Status(fiber.StatusMultiStatus).JSON(DeleteResponse{
 				Success:          false,
-				Error:            "Delete incomplete: " + err.Error() + "; the rows of the other files are deleted",
+				Error:            "Delete incomplete: " + sqlutil.TrimErrStatement(err.Error()) + "; the rows of the other files are deleted",
 				DeletedCount:     totalDeleted,
 				AffectedFiles:    len(seen),
 				RewrittenFiles:   rewrittenCount,

@@ -159,7 +159,7 @@ func executeArrowJSONQuery(
 		h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(convertedSQL)).Msg("Arrow JSON query failed")
 		c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 			Success:         false,
-			Error:           err.Error(),
+			Error:           clientErrText(h.logger, err),
 			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 			Timestamp:       timestamp,
 		})

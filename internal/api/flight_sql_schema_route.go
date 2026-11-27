@@ -210,7 +210,7 @@ func (h *QueryHandler) flightSQLBindFailure(parent, ctx context.Context, err err
 	case errors.Is(err, database.ErrSchemaParameters):
 		return metrics.FlightSQLBindInvalid, fiber.StatusBadRequest, "parameters not supported: Arc prepared statements run as written"
 	case errors.Is(err, database.ErrSchemaBind):
-		return metrics.FlightSQLBindInvalid, fiber.StatusBadRequest, err.Error()
+		return metrics.FlightSQLBindInvalid, fiber.StatusBadRequest, clientErrText(h.logger, err)
 	case errors.Is(err, database.ErrSchemaStorage):
 		// Not the statement's fault, so not 400: ADBC would tell the user
 		// their SQL is wrong. DuckDB's text names storage paths, so it is
@@ -221,7 +221,7 @@ func (h *QueryHandler) flightSQLBindFailure(parent, ctx context.Context, err err
 		h.logger.Warn().Err(err).Msg("Flight SQL prepare: out of memory during the bind")
 		return metrics.FlightSQLBindFailed, fiber.StatusServiceUnavailable, flightSQLBindMemoryMessage
 	case errors.Is(err, database.ErrSchemaUnsupported):
-		return metrics.FlightSQLBindUnimplemented, fiber.StatusNotImplemented, err.Error()
+		return metrics.FlightSQLBindUnimplemented, fiber.StatusNotImplemented, clientErrText(h.logger, err)
 	default:
 		h.logger.Error().Err(err).Msg("Flight SQL prepare: the bind failed")
 		return metrics.FlightSQLBindFailed, fiber.StatusInternalServerError, "the statement's result schema could not be read"

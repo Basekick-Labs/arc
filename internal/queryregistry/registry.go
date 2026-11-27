@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 )
@@ -195,7 +196,11 @@ func (r *Registry) Fail(queryID string, errMsg string) {
 	entry.query.Status = StatusFailed
 	entry.query.EndTime = &now
 	entry.query.DurationMs = float64(now.Sub(entry.query.StartTime).Milliseconds())
-	entry.query.Error = errMsg
+	// Sanitised here, for every caller: the history is served by the API
+	// (GET /api/v1/queries), and a raw DuckDB error carries the rewritten
+	// statement, storage paths and queried values. Idempotent, so a caller
+	// that already sanitised is unaffected.
+	entry.query.Error = sqlutil.SanitizeErrText(errMsg)
 
 	r.addToHistory(entry.query)
 	delete(r.active, queryID)
