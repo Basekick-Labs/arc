@@ -3,10 +3,10 @@ package api
 // Arc's wire-type names.
 //
 // These are the strings the "types" array of the msgpack and JSON query
-// responses carries (JSON since #1967), and they are a published contract: BI drivers and other clients switch on
-// them to decode each column. They live here, in an untagged file with no
-// Arrow dependency, because two independent code paths emit them and must
-// not drift apart:
+// responses carries (JSON since #1967), and they are a published contract:
+// BI drivers and other clients switch on them to decode each column. They
+// live here, in an untagged file with no Arrow dependency, because two
+// independent code paths emit them and must not drift apart:
 //
 //   - the streaming query path, via arrowTypeName (query_msgpack_types.go,
 //     build-tagged duckdb_arrow) — derives the name from the Arrow schema

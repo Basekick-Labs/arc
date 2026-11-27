@@ -152,7 +152,9 @@ func TestArrowTypeName_NilIsSentinelNotPanic(t *testing.T) {
 // payload is opaque. If someone adds a typed name without a matching
 // encoder case, this fails.
 func TestArrowTypeName_NoTypedNameWithoutEncoderCase(t *testing.T) {
-	// Types encodeColumn handles with a typed (non-string) encoding.
+	// Types encodeColumn handles with a typed (non-string) encoding. The
+	// JSON encoder (appendValue) must have the same set, since the names
+	// are shared: TestJSONKindPerArrowType_1967 checks that side.
 	typedOK := map[string]bool{
 		"int8": true, "int16": true, "int32": true, "int64": true,
 		"uint8": true, "uint16": true, "uint32": true, "uint64": true,
@@ -196,7 +198,7 @@ func TestArrowTypeName_NoTypedNameWithoutEncoderCase(t *testing.T) {
 	for _, dt := range all {
 		name := arrowTypeName(dt)
 		if !typedOK[name] && !opaque(name) {
-			t.Errorf("arrowTypeName(%s) = %q: a typed-looking name with no encodeColumn case — "+
+			t.Errorf("arrowTypeName(%s) = %q: a typed-looking name with no encodeColumn/appendValue case — "+
 				"values would ship as strings under a numeric-looking type. Use string_encoded, "+
 				"or add the encoder case.", dt, name)
 		}

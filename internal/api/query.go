@@ -5807,8 +5807,8 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time, visibl
 	h.logger.Debug().Msg("Handling SHOW DATABASES")
 
 	// Include tier column if tiering is enabled. The types slice is
-	// parallel to columns and feeds the msgpack envelope's "types"
-	// field — SHOW results are schema-known by construction, so we
+	// parallel to columns and feeds the "types" field of the msgpack and
+	// JSON envelopes — SHOW results are schema-known by construction, so we
 	// declare types explicitly rather than infer them from cell
 	// content (which is brittle when leading rows are nil).
 	var columns []string

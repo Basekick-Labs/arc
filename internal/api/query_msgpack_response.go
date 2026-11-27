@@ -106,6 +106,7 @@ func respondEmptySuccess(c *fiber.Ctx, timestamp string, start time.Time) error 
 		return c.JSON(QueryResponse{
 			Success:         true,
 			Columns:         []string{},
+			Types:           []string{},
 			Data:            [][]interface{}{},
 			RowCount:        0,
 			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
@@ -119,8 +120,8 @@ func respondEmptySuccess(c *fiber.Ctx, timestamp string, start time.Time) error 
 // writeMsgPackRowsColumnar writes a SHOW-style success envelope as a
 // columnar msgpack response. Transposes the row-major data slice into
 // per-column arrays so the wire shape matches the streaming hot path:
-// `data` is array-of-columns, with a parallel `types` array (inferred
-// from the first non-nil cell in each column). Bounded payload — SHOW
+// `data` is array-of-columns, with a parallel `types` array (the caller's
+// declared types; see respondSuccessRows). Bounded payload — SHOW
 // results are small (databases/measurements) — so direct in-memory
 // encode without streaming.
 func writeMsgPackRowsColumnar(c *fiber.Ctx, columns []string, types []string, data [][]interface{}, start time.Time, timestamp string) {

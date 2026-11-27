@@ -16,6 +16,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
@@ -147,10 +150,17 @@ func jsonKindOK(name string, v any) (bool, string) {
 		// decimal name on the JSON wire is itself the bug.
 		return false, "no decimal name at all (decimals are normalised)"
 	}
-	// utf8, large_utf8, binary (base64), large_binary, string_encoded,
-	// list, struct, map, unknown:…: all strings on the wire.
-	_, ok := v.(string)
-	return ok, "a string"
+	// Strings on the wire. Listed, not defaulted: a name this test does not
+	// know (a new typed name, say) must fail here until its kind is added,
+	// or the drift this test exists for passes as "a string".
+	switch {
+	case name == wireTypeUTF8, name == "large_utf8", name == wireTypeBinary, name == "large_binary",
+		name == wireTypeStringEncoded, name == wireTypeList, name == wireTypeStruct, name == wireTypeMap,
+		strings.HasPrefix(name, wireTypeUnknownPrefix):
+		_, ok := v.(string)
+		return ok, "a string"
+	}
+	return false, "a name this test knows (add its JSON kind to jsonKindOK)"
 }
 
 func TestJSONTypesMatchMsgpack_1967(t *testing.T) {
@@ -313,3 +323,56 @@ type fakeRowScanner struct{}
 func (fakeRowScanner) Next() bool             { return false }
 func (fakeRowScanner) Scan(dest ...any) error { return nil }
 func (fakeRowScanner) Err() error             { return nil }
+
+// The JSON encoder, per Arrow type, including the ones DuckDB SQL does not
+// produce (DATE64, FLOAT16, LARGE_*, FIXED_SIZE_BINARY, DURATION, …): one
+// value through jsonValueEncoder.appendValue must be the kind its shared
+// wire name promises. The route test above covers what DuckDB emits; this
+// covers the rest of the list TestArrowTypeName_NoTypedNameWithoutEncoderCase
+// walks for the msgpack side.
+func TestJSONKindPerArrowType_1967(t *testing.T) {
+	mem := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	defer mem.AssertSize(t, 0)
+	for _, tc := range []struct {
+		dt  arrow.DataType
+		val string // the JSON array FromJSON reads: one non-null value
+	}{
+		{arrow.FixedWidthTypes.Boolean, `[true]`},
+		{arrow.PrimitiveTypes.Int8, `[1]`}, {arrow.PrimitiveTypes.Int16, `[1]`},
+		{arrow.PrimitiveTypes.Int32, `[1]`}, {arrow.PrimitiveTypes.Int64, `[1]`},
+		{arrow.PrimitiveTypes.Uint8, `[1]`}, {arrow.PrimitiveTypes.Uint16, `[1]`},
+		{arrow.PrimitiveTypes.Uint32, `[1]`}, {arrow.PrimitiveTypes.Uint64, `[18446744073709551615]`},
+		{arrow.PrimitiveTypes.Float32, `[1.5]`}, {arrow.PrimitiveTypes.Float64, `[1.5]`},
+		{arrow.FixedWidthTypes.Float16, `[1.5]`},
+		{arrow.BinaryTypes.String, `["x"]`}, {arrow.BinaryTypes.LargeString, `["x"]`},
+		{arrow.BinaryTypes.Binary, `["qrs="]`}, {arrow.BinaryTypes.LargeBinary, `["qrs="]`},
+		{&arrow.FixedSizeBinaryType{ByteWidth: 2}, `["qrs="]`},
+		{arrow.FixedWidthTypes.Date32, `["2026-11-26"]`}, {arrow.FixedWidthTypes.Date64, `["2026-11-26"]`},
+		{arrow.FixedWidthTypes.Timestamp_s, `["2026-11-26T01:02:03Z"]`},
+		{arrow.FixedWidthTypes.Timestamp_ms, `["2026-11-26T01:02:03Z"]`},
+		{arrow.FixedWidthTypes.Timestamp_us, `["2026-11-26T01:02:03Z"]`},
+		{arrow.FixedWidthTypes.Timestamp_ns, `["2026-11-26T01:02:03Z"]`},
+		{arrow.FixedWidthTypes.Time32s, `["01:02:03"]`}, {arrow.FixedWidthTypes.Time64ns, `["01:02:03"]`},
+		{arrow.FixedWidthTypes.Duration_ns, `[5]`},
+		{arrow.FixedWidthTypes.MonthInterval, `[{"months": 2}]`},
+		{arrow.FixedWidthTypes.DayTimeInterval, `[{"days": 1, "milliseconds": 2}]`},
+		{arrow.FixedWidthTypes.MonthDayNanoInterval, `[{"months": 1, "days": 1, "nanoseconds": 2}]`},
+		{arrow.ListOf(arrow.PrimitiveTypes.Int32), `[[1, 2]]`},
+		{arrow.StructOf(arrow.Field{Name: "a", Type: arrow.PrimitiveTypes.Int32}), `[{"a": 1}]`},
+		{arrow.MapOf(arrow.BinaryTypes.String, arrow.PrimitiveTypes.Int32), `[[{"key": "k", "value": 1}]]`},
+	} {
+		name := arrowTypeName(tc.dt)
+		arr, _, err := array.FromJSON(mem, tc.dt, strings.NewReader(tc.val))
+		require.NoError(t, err, "%s", tc.dt)
+		require.False(t, arr.IsNull(0), "%s", tc.dt)
+		enc := &jsonValueEncoder{}
+		raw := enc.appendValue(nil, arr, 0)
+		arr.Release()
+		var v any
+		d := json.NewDecoder(bytes.NewReader(raw))
+		d.UseNumber()
+		require.NoError(t, d.Decode(&v), "%s: %s", tc.dt, raw)
+		ok, want := jsonKindOK(name, v)
+		require.True(t, ok, "%s: name %q promises %s, appendValue wrote %s", tc.dt, name, want, raw)
+	}
+}

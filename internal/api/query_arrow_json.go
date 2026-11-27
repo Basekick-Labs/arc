@@ -571,8 +571,8 @@ batchLoop:
 	w.Write(scratch)
 
 	// Governance row cap (#724): see streamTypedJSON. Same two keys, same
-	// omit-when-absent rule, so the JSON and Arrow-JSON envelopes stay
-	// identical in shape.
+	// omit-when-absent rule as that writer. (The envelopes are not identical:
+	// "types" is written only here, #1967.)
 	if rowCapReached(governanceMaxRows, int64(rowCount)) {
 		w.WriteString(`,"rows_capped":true,"row_cap":`)
 		scratch = strconv.AppendInt(scratch[:0], int64(governanceMaxRows), 10)
