@@ -690,6 +690,8 @@ func encodeColumn(ctx context.Context, enc *msgpack.Encoder, batches []arrow.Rec
 		return encodeLargeStringColumn(ctx, enc, batches, colIdx)
 	case *array.Binary:
 		return encodeBinaryColumn(ctx, enc, batches, colIdx)
+	case *array.Null:
+		return encodeNullColumn(ctx, enc, batches, colIdx)
 	default:
 		return encodeFallbackColumn(ctx, enc, batches, colIdx)
 	}
@@ -1055,6 +1057,25 @@ func encodeBinaryColumn(ctx context.Context, enc *msgpack.Encoder, batches []arr
 					return err
 				}
 			} else if err := enc.EncodeBytes(c.Value(i)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// encodeNullColumn writes a NULL-typed column: nil for every row. The array
+// has no validity bitmap, so IsNull is false for every row and the fallback
+// below would send ValueStr's "(null)" as a string under the type name
+// "null" (#1970).
+func encodeNullColumn(ctx context.Context, enc *msgpack.Encoder, batches []arrow.Record, colIdx int) error {
+	for _, batch := range batches {
+		if err := ctxCanceled(ctx); err != nil {
+			return err
+		}
+		n := batch.Column(colIdx).Len()
+		for i := 0; i < n; i++ {
+			if err := enc.EncodeNil(); err != nil {
 				return err
 			}
 		}

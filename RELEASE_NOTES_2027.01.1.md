@@ -2,6 +2,12 @@
 
 > **Status:** Planned — January 2027 release.
 
+## Fix: a column of Arrow type `null` is sent as nulls, not as the string `"(null)"` ([#1970](https://github.com/Basekick-Labs/arc/issues/1970))
+
+**Who is affected:** JSON and MessagePack query clients reading a result from an engine that emits Arrow's `null` type for a column (arcx serve can; DuckDB does not, it types a bare `NULL` as `int32`). Arrow IPC and Flight SQL were not affected.
+
+Such a column is named `null` in `types`, but its values went out as the string `"(null)"` on both wires: the column has no null bitmap, so Arc's encoders took every value for a non-null one and printed it. They now send `null` (JSON) and nil (MessagePack) for every row.
+
 ## New: JSON query responses carry column types (`types`), as MessagePack does ([#1967](https://github.com/Basekick-Labs/arc/issues/1967))
 
 **Who is affected:** JSON clients of `POST /api/v1/query` and `GET /api/v1/query/:measurement` that need to know a column's type: a `TIMESTAMP` from a string, an `INT64` from a whole `DOUBLE`. The field is additive; a client that does not read it sees no change.
@@ -12,7 +18,7 @@ The JSON envelope now has `"types"` right after `"columns"`, one name per column
 {"success":true,"columns":["time","host","usage"],"types":["timestamp[us]","utf8","float64"],"data":[...],...}
 ```
 
-- **The names describe the column, not the JSON token.** In JSON, timestamps and dates are RFC 3339 strings in UTC (a `date32` is that day at `T00:00:00Z`; a year outside 0–9999, such as DuckDB's `infinity`, is written with more digits than RFC 3339 allows), and `binary` is base64. `string_encoded`, `list`, `struct`, `map` and `unknown:…` columns are strings, as they are in MessagePack. A float NaN or ±Inf is `null` in JSON. Integers are bare numbers, so an `int64` or `uint64` above 2^53 loses precision in a client that reads every number as a double.
+- **The names describe the column, not the JSON token.** In JSON, timestamps and dates are RFC 3339 strings in UTC (a `date32` is that day at `T00:00:00Z`; a year outside 0–9999, such as DuckDB's `infinity`, is written with more digits than RFC 3339 allows), and `binary` is base64. `string_encoded`, `list`, `struct`, `map` and `unknown:…` columns are strings, as they are in MessagePack. A float NaN or ±Inf is `null` in JSON, and so is every value of a `null` column. Integers are bare numbers, so an `int64` or `uint64` above 2^53 loses precision in a client that reads every number as a double.
 - **Decimals:** the names follow the conversion Arc already applies, so a `sum()` of an integer column reads `int64` and a scaled decimal `float64`, matching the values.
 - **Empty answers:** a measurement with no data yet answers `"columns":[],"types":[]`. A query with no matching rows names its columns and their types, with `"data":[]`.
 - **SHOW DATABASES / SHOW TABLES** in JSON carry the types they already sent in MessagePack.

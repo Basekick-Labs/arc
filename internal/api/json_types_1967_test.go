@@ -105,7 +105,7 @@ func jtStrings(t *testing.T, v any, what string) []string {
 	return out
 }
 
-// jsonKindOK reports whether a non-null JSON value is what the wire type
+// jsonKindOK reports whether a JSON value is what the wire type
 // name promises. This is what catches the JSON encoder (appendValue) and the
 // msgpack one (encodeColumn) drifting apart: the names are computed once for
 // both, so only the values can disagree.
@@ -128,7 +128,7 @@ func jsonKindOK(name string, v any) (bool, string) {
 		_, ok := v.(bool)
 		return ok, "a bool"
 	case wireTypeNull:
-		return false, "null"
+		return v == nil, "null"
 	case "date32":
 		s, ok := v.(string)
 		if !ok {
@@ -335,7 +335,7 @@ func TestJSONKindPerArrowType_1967(t *testing.T) {
 	defer mem.AssertSize(t, 0)
 	for _, tc := range []struct {
 		dt  arrow.DataType
-		val string // the JSON array FromJSON reads: one non-null value
+		val string // the JSON array FromJSON reads: one non-null value (arrow.Null: its null)
 	}{
 		{arrow.FixedWidthTypes.Boolean, `[true]`},
 		{arrow.PrimitiveTypes.Int8, `[1]`}, {arrow.PrimitiveTypes.Int16, `[1]`},
@@ -360,10 +360,16 @@ func TestJSONKindPerArrowType_1967(t *testing.T) {
 		{arrow.ListOf(arrow.PrimitiveTypes.Int32), `[[1, 2]]`},
 		{arrow.StructOf(arrow.Field{Name: "a", Type: arrow.PrimitiveTypes.Int32}), `[{"a": 1}]`},
 		{arrow.MapOf(arrow.BinaryTypes.String, arrow.PrimitiveTypes.Int32), `[[{"key": "k", "value": 1}]]`},
+		// A NULL-typed array's only value is null, yet IsNull reports false
+		// for it (no validity bitmap): the case #1970 fixed.
+		{arrow.Null, `[null]`},
 	} {
 		name := arrowTypeName(tc.dt)
 		arr, _, err := array.FromJSON(mem, tc.dt, strings.NewReader(tc.val))
 		require.NoError(t, err, "%s", tc.dt)
+		// Every fixture is a non-null value except arrow.Null's, and that
+		// one also reports IsNull false (no validity bitmap), so the check
+		// holds for all of them and appendValue's own case is what runs.
 		require.False(t, arr.IsNull(0), "%s", tc.dt)
 		enc := &jsonValueEncoder{}
 		raw := enc.appendValue(nil, arr, 0)

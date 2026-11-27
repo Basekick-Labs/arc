@@ -2536,7 +2536,8 @@ func (h *QueryHandler) RegisterRoutes(app *fiber.App) {
 //	timestamp, and profile when x-arc-profile is set.
 //
 // Note "data" is COLUMNAR (an array of numCols arrays), unlike the JSON
-// envelope's row-major shape, and unlike JSON it carries "types".
+// envelope's row-major shape. Both carry the same "types" (JSON since
+// #1967).
 //
 // Requires the duckdb_arrow build tag, which every shipped artifact sets
 // and without which Arc refuses to start (#598); the 501 below is

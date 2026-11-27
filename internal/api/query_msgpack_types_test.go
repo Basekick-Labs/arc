@@ -164,7 +164,9 @@ func TestArrowTypeName_NoTypedNameWithoutEncoderCase(t *testing.T) {
 		// String-family types are genuinely strings on the wire, so a
 		// string-shaped name is honest for them.
 		"utf8": true, "large_utf8": true, "binary": true, "large_binary": true,
-		// null carries no values at all.
+		// null carries no values at all. This list checks names only: that
+		// a null column's values really go out as nil/null on both wires
+		// is pinned by TestNullTypeColumn{JSON,Msgpack}_1970.
 		"null": true,
 	}
 	// Names that self-describe as opaque.
