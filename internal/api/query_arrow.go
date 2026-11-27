@@ -958,7 +958,8 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 
 	// Normalize decimal columns in the schema — DuckDB returns SUM(integer) as
 	// decimal(38,0) which many Arrow clients (e.g. Grafana) cannot handle.
-	// castInfo is nil when there are no decimal columns (zero overhead on hot path).
+	// castInfo is nil when there is nothing to cast: no decimal columns, or
+	// x-arc-decimals: exact with only decimals it keeps (zero overhead).
 	castInfo := normalizeDecimalSchemaForMode(schema, decimalMode)
 	if castInfo != nil {
 		schema = castInfo.schema
@@ -1165,7 +1166,9 @@ func normalizeDecimalSchema(schema *arrow.Schema) *decimalCastInfo {
 
 // normalizeDecimalSchemaForMode retains wide integral decimals only when the
 // caller explicitly requested an exact Arrow result. All other decimal
-// columns keep the historical integer/float conversion.
+// columns keep the historical integer/float conversion. It returns nil when
+// no column is cast: no decimal at all, or (exact) only retained ones, so
+// their batches are streamed as DuckDB built them.
 func normalizeDecimalSchemaForMode(schema *arrow.Schema, mode string) *decimalCastInfo {
 	hasDecimal := false
 	for i := 0; i < schema.NumFields(); i++ {
@@ -1185,13 +1188,16 @@ func normalizeDecimalSchemaForMode(schema *arrow.Schema, mode string) *decimalCa
 
 	targets := make([]arrow.DataType, schema.NumFields())
 	fields := make([]arrow.Field, schema.NumFields())
+	cast := false
 	for i := 0; i < schema.NumFields(); i++ {
 		f := schema.Field(i)
 		if dt, ok := f.Type.(arrow.DecimalType); ok {
 			if mode == decimalModeExact && dt.GetScale() == 0 && dt.GetPrecision() > 18 {
 				fields[i] = f
 				continue
-			} else if dt.GetScale() == 0 {
+			}
+			cast = true
+			if dt.GetScale() == 0 {
 				targets[i] = arrow.PrimitiveTypes.Int64
 			} else {
 				targets[i] = arrow.PrimitiveTypes.Float64
@@ -1200,6 +1206,9 @@ func normalizeDecimalSchemaForMode(schema *arrow.Schema, mode string) *decimalCa
 		} else {
 			fields[i] = f
 		}
+	}
+	if !cast {
+		return nil
 	}
 
 	md := schema.Metadata()

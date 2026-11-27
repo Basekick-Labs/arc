@@ -139,6 +139,9 @@ func (s *flightSQLMetadataModeService) DoGetTables(ctx context.Context, cmd flig
 	if !schemas {
 		return s.flightSQLService.DoGetTables(ctx, cmd)
 	}
+	if err := flightTablesDecimalMode(ctx, cmd); err != nil {
+		return nil, nil, err
+	}
 	s.logger.Debug().Str("call", "GetTables").
 		Interface("catalog", cmd.GetCatalog()).Interface("schema_pattern", cmd.GetDBSchemaFilterPattern()).
 		Interface("table_pattern", cmd.GetTableNameFilterPattern()).Bool("include_schema", cmd.GetIncludeSchema()).

@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -50,6 +51,10 @@ type preparedRigOptions struct {
 	// filled in.
 	policy *governance.Policy
 	router *cluster.Router
+	// storedDecimals adds sample.dec, one row of a DECIMAL(38,0) "big", a
+	// DECIMAL(18,0) "small" and a DECIMAL(10,2) "frac", as a measurement
+	// written with ingest.decimal_columns stores them (#1784).
+	storedDecimals bool
 }
 
 type preparedRig struct {
@@ -72,13 +77,19 @@ type bridgeRecorder struct {
 type bridgeRequest struct {
 	path   string
 	detail map[string]string
+	// decimals is every x-arc-decimals value the request carried.
+	decimals []string
 }
 
 func (r *bridgeRecorder) middleware(c *fiber.Ctx) error {
 	err := c.Next()
 	detail, _ := c.Locals(audit.DetailLocalsKey).(map[string]string)
 	r.mu.Lock()
-	r.requests = append(r.requests, bridgeRequest{path: utils.CopyString(c.Path()), detail: detail})
+	var decimals []string
+	for _, v := range c.Request().Header.PeekAll(decimalsHeader) {
+		decimals = append(decimals, string(v))
+	}
+	r.requests = append(r.requests, bridgeRequest{path: utils.CopyString(c.Path()), detail: detail, decimals: decimals})
 	r.mu.Unlock()
 	return err
 }
@@ -130,6 +141,14 @@ func newPreparedRig(t *testing.T, opts preparedRigOptions) *preparedRig {
 	duck, err := database.New(&database.Config{MemoryLimit: "256MB", ThreadCount: 2, MaxConnections: maxConnections, LocalStorageRoot: storageRoot}, logger)
 	require.NoError(t, err)
 	t.Cleanup(func() { duck.Close() })
+	if opts.storedDecimals {
+		dir := filepath.Join(storageRoot, "sample", "dec", "2026", "11", "26", "10")
+		require.NoError(t, os.MkdirAll(dir, 0o700))
+		_, err := duck.Exec("COPY (SELECT TIMESTAMP '2026-11-26 10:00:00' AS time, " +
+			"100000000000000000000::DECIMAL(38,0) AS big, 5::DECIMAL(18,0) AS small, 1.5::DECIMAL(10,2) AS frac) TO '" +
+			strings.ReplaceAll(filepath.Join(dir, "dec.parquet"), "'", "''") + "' (FORMAT PARQUET)")
+		require.NoError(t, err)
+	}
 	authManager, err := auth.NewAuthManager(filepath.Join(t.TempDir(), "auth.db"), time.Minute, 100, logger)
 	require.NoError(t, err)
 	t.Cleanup(func() { authManager.Close() })
@@ -248,7 +267,7 @@ func TestFlightSQLPreparedStatementIsOneQuery(t *testing.T) {
 
 func TestFlightSQLPreparedExactDecimalModeIsStable(t *testing.T) {
 	rig := newPreparedRig(t, preparedRigOptions{})
-	ctx := metadata.AppendToOutgoingContext(rig.ctx, flightSQLDecimalsHeader, decimalModeExact)
+	ctx := metadata.AppendToOutgoingContext(rig.ctx, decimalsHeader, decimalModeExact)
 	ps, err := rig.client.Prepare(ctx, "SELECT 100000000000000000000::HUGEINT AS v")
 	require.NoError(t, err)
 	defer func() { require.NoError(t, ps.Close(ctx)) }()
@@ -267,7 +286,7 @@ func TestFlightSQLPreparedExactDecimalModeIsStable(t *testing.T) {
 	require.NoError(t, reader.Err())
 
 	_, err = ps.Execute(rig.ctx)
-	require.Error(t, err, "executing a prepared exact statement in default mode must be refused")
+	require.Equal(t, codes.InvalidArgument, status.Code(err), "executing a prepared exact statement in default mode must be refused: %v", err)
 }
 
 // The prepared schema is the schema DoGet streams: Arc's decimal

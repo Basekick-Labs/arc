@@ -42,7 +42,11 @@ type flightPreparedStatement struct {
 	SQL     string `json:"sql"`
 	// Database is the x-arc-database call header the prepare saw, as a
 	// statement ticket carries the one GetFlightInfo saw.
-	Database    string `json:"database,omitempty"`
+	Database string `json:"database,omitempty"`
+	// DecimalMode is "exact" when the prepare saw x-arc-decimals: exact, ""
+	// otherwise. Every later call (GetSchema, GetFlightInfo, DoGet) must send
+	// the same mode, so one without the header is refused for an exact
+	// statement (#1784).
 	DecimalMode string `json:"decimal_mode,omitempty"`
 }
 

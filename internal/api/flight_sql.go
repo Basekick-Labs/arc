@@ -67,13 +67,18 @@ const flightSQLPeerHeader = "X-Arc-Flight-Peer"
 // flightSQLInternalKeyHeader authenticates the gRPC side to the bridge.
 const flightSQLInternalKeyHeader = "X-Arc-Flight-Internal-Key"
 
-// flightSQLDatabaseHeader is the one client call header a statement carries
-// across the bridge: the database unqualified table names resolve in, as the
-// HTTP header of the same name. ADBC sets it with the connection option
-// adbc.flight.sql.rpc.call_header.x-arc-database. Of the client's metadata
-// only this, the bearer token and the User-Agent cross; the peer header is
-// the bridge's proxy header (the audit log's client address), and the other
-// x-arc-* headers change what the Arrow route encodes or whether it forwards.
+// flightSQLDatabaseHeader is one of the two client call headers a statement
+// carries across the bridge: the database unqualified table names resolve
+// in, as the HTTP header of the same name. ADBC sets it with the connection
+// option adbc.flight.sql.rpc.call_header.x-arc-database. The other is
+// x-arc-decimals (decimalsHeader, #1784), sent only to the Arrow route and the
+// schema route, and only after the call's value was checked: against the one
+// the ticket or prepared statement handle stored, or, for GetTables with
+// schemas, at the call's entry. Of the client's metadata
+// only these two, the bearer token and the User-Agent cross; the peer header
+// is the bridge's proxy header (the audit log's client address), and the
+// other x-arc-* headers change what the Arrow route encodes or whether it
+// forwards.
 const flightSQLDatabaseHeader = "x-arc-database"
 
 // Shutdown stages. The shutdown hooks share one deadline, their part of
@@ -141,7 +146,10 @@ type flightStatement struct {
 	SQL string `json:"sql"`
 	// Database is the x-arc-database call header GetFlightInfo saw, so a
 	// client that sends it only there still runs in that database.
-	Database    string `json:"database,omitempty"`
+	Database string `json:"database,omitempty"`
+	// DecimalMode is "exact" when GetFlightInfo saw x-arc-decimals: exact, ""
+	// otherwise; DoGet refuses a call whose header names another mode, so the
+	// stream has the types the statement was planned with (#1784).
 	DecimalMode string `json:"decimal_mode,omitempty"`
 }
 
@@ -787,13 +795,14 @@ func (s *flightSQLService) GetFlightInfoStatement(ctx context.Context, query fli
 	return flightStatementInfo(desc, canonicalSQL, database, decimalMode)
 }
 
-// flightStatementInfo answers a statement ticket for sql, to run in database.
-func flightStatementInfo(desc *flight.FlightDescriptor, sql, database string, decimalModes ...string) (*flight.FlightInfo, error) {
-	decimalMode := ""
-	if len(decimalModes) > 0 && decimalModes[0] == decimalModeExact {
-		decimalMode = decimalModeExact
+// flightStatementInfo answers a statement ticket for sql, to run in database
+// with decimalMode; the ticket stores only exact.
+func flightStatementInfo(desc *flight.FlightDescriptor, sql, database, decimalMode string) (*flight.FlightInfo, error) {
+	stored := ""
+	if decimalMode == decimalModeExact {
+		stored = decimalModeExact
 	}
-	handle, err := json.Marshal(flightStatement{SQL: sql, Database: database, DecimalMode: decimalMode})
+	handle, err := json.Marshal(flightStatement{SQL: sql, Database: database, DecimalMode: stored})
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "encode statement ticket: %v", err)
 	}
@@ -812,7 +821,8 @@ func flightStatementInfo(desc *flight.FlightDescriptor, sql, database string, de
 // flightSQLBenchDirect is set only by flight_sql_bench.go, which builds with
 // the flightbench tag and never into a release: a benchmark arm that serves a
 // statement from DuckDB in-process, without the bridge (scripts/flightbench).
-// It returns handled=false unless the caller asked for it.
+// It returns handled=false unless the caller asked for it. It ignores
+// x-arc-decimals: the arm measures the default types only.
 var flightSQLBenchDirect func(ctx context.Context, s *flightSQLService, sql, database string) (schema *arrow.Schema, stream <-chan flight.StreamChunk, handled bool, err error)
 
 func (s *flightSQLService) DoGetStatement(ctx context.Context, ticket flightsql.StatementQueryTicket) (*arrow.Schema, <-chan flight.StreamChunk, error) {
@@ -1069,7 +1079,7 @@ func (s *flightSQLService) query(ctx context.Context, path, sql, token, database
 		req.Header.Set(flightSQLDatabaseHeader, database)
 	}
 	if decimalModePresent {
-		req.Header.Set(flightSQLDecimalsHeader, decimalMode)
+		req.Header.Set(decimalsHeader, decimalMode)
 	}
 	// Who is asking, for the query registry, the audit log and forwarding.
 	if p, ok := peer.FromContext(ctx); ok && p.Addr != nil {
@@ -1328,6 +1338,9 @@ func (s *flightSQLService) GetFlightInfoTables(_ context.Context, cmd flightsql.
 }
 
 func (s *flightSQLService) DoGetTables(ctx context.Context, cmd flightsql.GetTables) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+	if err := flightTablesDecimalMode(ctx, cmd); err != nil {
+		return nil, nil, err
+	}
 	token := s.token(ctx)
 	catalogPattern := compileFlightPattern(cmd.GetCatalog())
 	dbSchemaPattern := compileFlightPattern(cmd.GetDBSchemaFilterPattern())
@@ -1382,6 +1395,19 @@ func (s *flightSQLService) DoGetTables(ctx context.Context, cmd flightsql.GetTab
 		}
 	}
 	return flightRecordStream(ctx, tableSchema, builder)
+}
+
+// flightTablesDecimalMode checks x-arc-decimals on a GetTables call that
+// includes schemas: each table's schema follows the mode (#1784), so the
+// value is checked once, before any table is listed, and refused even when
+// no table matches. Without schemas the header is ignored, as on every other
+// catalog call.
+func flightTablesDecimalMode(ctx context.Context, cmd flightsql.GetTables) error {
+	if !cmd.GetIncludeSchema() {
+		return nil
+	}
+	_, _, err := flightSQLDecimalMode(ctx)
+	return err
 }
 
 // skipFlightTableSchemaError reports whether a measurement whose schema query

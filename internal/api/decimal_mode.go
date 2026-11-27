@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -12,51 +13,85 @@ import (
 )
 
 const (
-	flightSQLDecimalsHeader = "x-arc-decimals"
-	decimalModeDefault      = "default"
-	decimalModeExact        = "exact"
+	// decimalsHeader is x-arc-decimals, the HTTP request header and the
+	// Flight SQL call header alike (#1784).
+	decimalsHeader     = "x-arc-decimals"
+	decimalModeDefault = "default"
+	decimalModeExact   = "exact"
 )
 
-func parseDecimalMode(value string) (string, error) {
-	switch value {
-	case decimalModeExact, decimalModeDefault:
-		return value, nil
+// errDecimalsRepeated is the refusal of a header sent more than once.
+var errDecimalsRepeated = errors.New("the x-arc-decimals header was sent more than once; send it once (with ADBC, set it at either the database or the connection level, not both)")
+
+// decimalModeOf is the one x-arc-decimals rule, for HTTP and Flight SQL, over
+// every value a request carried. Each value is trimmed and an empty one is
+// dropped. None left is the header absent: default, present false. More than
+// one is refused, identical values included: the mode decides the column
+// types, so a request must name it once (ADBC joins the database- and
+// connection-level call headers, so a client sets it at one level). The one
+// value left must be exactly "exact" or "default". The result is one of the
+// constants, never the request's own string, which on HTTP is a copy of
+// fasthttp's buffer.
+func decimalModeOf(values []string) (mode string, present bool, err error) {
+	value := ""
+	for _, v := range values {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		if present {
+			return "", true, errDecimalsRepeated
+		}
+		value, present = v, true
+	}
+	switch {
+	case !present:
+		return decimalModeDefault, false, nil
+	case value == decimalModeExact:
+		return decimalModeExact, true, nil
+	case value == decimalModeDefault:
+		return decimalModeDefault, true, nil
 	default:
-		return "", fmt.Errorf("invalid x-arc-decimals header %q: use %q or %q", value, decimalModeExact, decimalModeDefault)
+		return "", true, fmt.Errorf("invalid x-arc-decimals header %q: use %q or %q", value, decimalModeExact, decimalModeDefault)
 	}
 }
 
-// requestDecimalMode reads the HTTP form of x-arc-decimals. An absent or
-// empty header preserves the historical response types.
+// requestDecimalMode reads the HTTP form of x-arc-decimals (decimalModeOf).
+// Without the header it costs one Peek; the values are copied out of
+// fasthttp's scratch slice only when it is there.
 func requestDecimalMode(c *fiber.Ctx) (string, error) {
-	value := strings.TrimSpace(c.Get(flightSQLDecimalsHeader))
-	if value == "" {
+	hd := &c.Request().Header
+	// Peek returns a non-nil empty slice for a header sent with an empty value,
+	// so an empty first value still reaches PeekAll and the later values are
+	// read (pinned by the "empty then exact" test).
+	if hd.Peek(decimalsHeader) == nil {
 		return decimalModeDefault, nil
 	}
-	return parseDecimalMode(value)
+	all := hd.PeekAll(decimalsHeader)
+	values := make([]string, len(all))
+	for i, v := range all {
+		values[i] = string(v)
+	}
+	mode, _, err := decimalModeOf(values)
+	return mode, err
 }
 
-// flightSQLDecimalMode reads x-arc-decimals from an incoming Flight SQL call.
-// present distinguishes an omitted header from an explicit "default" so the
-// bridge preserves the client's request exactly.
+// flightSQLDecimalMode reads x-arc-decimals from an incoming Flight SQL call
+// (decimalModeOf). present distinguishes an omitted header from an explicit
+// "default". The bridge forwards the parsed constant, never the raw value.
 func flightSQLDecimalMode(ctx context.Context) (mode string, present bool, err error) {
 	md, _ := metadata.FromIncomingContext(ctx)
-	values := md.Get(flightSQLDecimalsHeader)
-	if len(values) == 0 {
-		return decimalModeDefault, false, nil
-	}
-	if len(values) > 1 {
-		return "", true, status.Error(codes.InvalidArgument, "the x-arc-decimals header was sent more than once")
-	}
-	mode, err = parseDecimalMode(values[0])
+	mode, present, err = decimalModeOf(md.Get(decimalsHeader))
 	if err != nil {
 		return "", true, status.Error(codes.InvalidArgument, err.Error())
 	}
-	return mode, true, nil
+	return mode, present, nil
 }
 
 // flightStatementDecimalMode checks that the mode used for a Flight SQL
-// statement is unchanged from its prepare or GetFlightInfo call.
+// statement is unchanged from its prepare or GetFlightInfo call. A call
+// without the header is default, so it is refused for a statement prepared
+// with exact.
 func flightStatementDecimalMode(ctx context.Context, stored string) (string, error) {
 	if stored == "" {
 		stored = decimalModeDefault
