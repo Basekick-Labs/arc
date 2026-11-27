@@ -49,7 +49,7 @@ func TestValidateSQLRequest_ReadStatementsOnly(t *testing.T) {
 		"CREATE MACRO m(x) AS 1;",
 	}
 	for _, q := range refused {
-		if err := ValidateSQLRequest(q); err == nil {
+		if err := validateSQLErr(q); err == nil {
 			t.Errorf("accepted: %q", q)
 		}
 	}
@@ -78,7 +78,7 @@ func TestValidateSQLRequest_ReadStatementsOnly(t *testing.T) {
 		"SELECT created_at, updated FROM db.cpu",
 	}
 	for _, q := range accepted {
-		if err := ValidateSQLRequest(q); err != nil {
+		if err := validateSQLErr(q); err != nil {
 			t.Errorf("refused %q: %v", q, err)
 		}
 	}
@@ -136,7 +136,7 @@ func TestValidateSQLRequest_ReadStatementsBypasses(t *testing.T) {
 		"SELECT * FROM enable_logging\u00a0(['QueryLog'])",
 	}
 	for _, q := range refused {
-		if err := ValidateSQLRequest(q); err == nil {
+		if err := validateSQLErr(q); err == nil {
 			t.Errorf("accepted: %q", q)
 		}
 	}
@@ -157,7 +157,7 @@ func TestValidateSQLRequest_ReadStatementsBypasses(t *testing.T) {
 		"SELECT 'a\u00a0b' AS s",
 	}
 	for _, q := range accepted {
-		if err := ValidateSQLRequest(q); err != nil {
+		if err := validateSQLErr(q); err != nil {
 			t.Errorf("refused %q: %v", q, err)
 		}
 	}
@@ -179,7 +179,7 @@ func TestValidateSQLRequest_LexerAgreesWithDuckDB(t *testing.T) {
 		"--x\r/* /* */ SELECT */ CREATE MACRO m() AS 1",
 	}
 	for _, q := range refused {
-		if err := ValidateSQLRequest(q); err == nil {
+		if err := validateSQLErr(q); err == nil {
 			t.Errorf("accepted: %q", q)
 		}
 	}
@@ -191,7 +191,7 @@ func TestValidateSQLRequest_LexerAgreesWithDuckDB(t *testing.T) {
 		"SELECT 1 AS a, $$x; CREATE$$ AS s",
 	}
 	for _, q := range accepted {
-		if err := ValidateSQLRequest(q); err != nil {
+		if err := validateSQLErr(q); err != nil {
 			t.Errorf("refused %q: %v", q, err)
 		}
 	}

@@ -335,6 +335,12 @@ func normalizeSQLForShow(sql string) string {
 // backtick (hasUnquotedBacktick).
 const errUnquotedBacktick = "backticks are not identifier quotes in DuckDB; quote identifiers with double quotes (\"name\")"
 
+// errUnicodeSpaceInCode refuses a Unicode space (a no-break space, say) left
+// outside every literal and comment after canonicalising: there DuckDB's
+// space-replacing pass and its lexer disagree, or the pass did not reach it
+// (the last two bytes). The message names the fix.
+const errUnicodeSpaceInCode = "Unicode space characters (such as a no-break space) are only allowed inside string literals and comments here; replace them with ASCII spaces"
+
 // errReservedPlaceholder refuses caller SQL that spells a placeholder the
 // SQL maskers generate, outside a string literal or quoted identifier
 // (sqlutil.HasCallerPlaceholder).
@@ -2647,10 +2653,12 @@ localProcessing:
 	}
 
 	// Validate SQL (empty, max length, dangerous patterns)
-	if err := ValidateSQLRequest(req.SQL); err != nil {
+	canonicalSQL, err := ValidateSQLRequest(req.SQL)
+	if err != nil {
 		m.IncQueryErrors()
 		return respondError(c, fiber.StatusBadRequest, err.Error(), timestamp, start)
 	}
+	req.SQL = canonicalSQL
 
 	// Extract x-arc-database header for optimized query path
 	headerDB := c.Get("x-arc-database")
@@ -3436,7 +3444,28 @@ func MaxSQLLength() int {
 	return config.DefaultMaxSQLLength
 }
 
-func ValidateSQLRequest(sql string) error {
+// ValidateSQLRequest checks a statement for the query API and returns the
+// text every later step must use: the statement with the Unicode spaces
+// DuckDB's parser replaces before parsing already replaced
+// (sqlutil.StripUnicodeSpaces). Permission checks, rewrites and execution
+// all read that text, so they read the statement DuckDB will run; reading
+// the original would let a Unicode space mean an identifier byte to Arc and
+// a separator to DuckDB. Callers must use the returned SQL, never the
+// argument, from here on.
+func ValidateSQLRequest(sql string) (string, error) {
+	// The length cap applies to what the client sent; the canonical text
+	// can only be shorter.
+	if max := MaxSQLLength(); len(sql) > max {
+		return "", &SQLValidationError{Message: fmt.Sprintf("SQL query exceeds maximum length (%d characters; query.max_sql_length)", max)}
+	}
+	canonical := sqlutil.StripUnicodeSpaces(sql)
+	if err := validateSQLRequest(canonical); err != nil {
+		return "", err
+	}
+	return canonical, nil
+}
+
+func validateSQLRequest(sql string) error {
 	if strings.TrimSpace(sql) == "" {
 		return &SQLValidationError{Message: "SQL query is required"}
 	}
@@ -3484,6 +3513,14 @@ func ValidateSQLRequest(sql string) error {
 		return &SQLValidationError{Message: "Nested block comments are not allowed"}
 	}
 	normalised = stripSQLComments(normalised, features.hasDashComment || features.hasBlockComment)
+	// The statement was canonicalised by ValidateSQLRequest, so a Unicode
+	// space DuckDB's parser would replace can only remain where DuckDB's
+	// pre-pass believed it was inside quotes. Outside every literal and
+	// comment, as Arc reads them, that belief is wrong, and a later rewrite
+	// that removes a comment can change it: refuse rather than guess.
+	if sqlutil.HasUnicodeSpace(normalised) {
+		return &SQLValidationError{Message: errUnicodeSpaceInCode}
+	}
 	// The table-position guards below read their own copy, with the FROM of
 	// EXTRACT/SUBSTRING/TRIM/OVERLAY and of `IS [NOT] DISTINCT FROM` masked, as
 	// the rewriters and the RBAC extractor already see it: without it,
@@ -6171,13 +6208,15 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 	}
 
 	// Validate SQL (empty, max length, dangerous patterns)
-	if err := ValidateSQLRequest(req.SQL); err != nil {
+	canonicalSQL, err := ValidateSQLRequest(req.SQL)
+	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(EstimateResponse{
 			Success:      false,
 			Error:        err.Error(),
 			WarningLevel: "error",
 		})
 	}
+	req.SQL = canonicalSQL
 
 	// Extract x-arc-database header for optimized query path
 	headerDB := c.Get("x-arc-database")
@@ -6824,8 +6863,11 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		})
 	}
 
-	// Validate WHERE clause if provided
+	// Validate WHERE clause if provided. Canonical first, as the assembled
+	// statement will be (ValidateSQLRequest below), so this check reads the
+	// clause DuckDB will.
 	if where != "" {
+		where = sqlutil.StripUnicodeSpaces(where)
 		if err := validateWhereClauseQuery(where); err != nil {
 			m.IncQueryErrors()
 			return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
@@ -6887,7 +6929,8 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 	// Arc's own read_parquet() and would self-trip the denylist. It is also why
 	// the bug was so clean to exploit — an injected read_parquet hits the
 	// fast-path at getTransformedSQL and is returned verbatim, untransformed.
-	if err := ValidateSQLRequest(sql); err != nil {
+	canonicalSQL, err := ValidateSQLRequest(sql)
+	if err != nil {
 		m.IncQueryErrors()
 		return c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
 			Success:   false,
@@ -6895,6 +6938,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
 		})
 	}
+	sql = canonicalSQL
 
 	// SECURITY: authorize every table the ASSEMBLED statement references, not
 	// just the one named in the path.

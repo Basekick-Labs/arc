@@ -149,7 +149,7 @@ func TestCoreTableFunctionsReviewed(t *testing.T) {
 			// A pragma is not callable as `FROM name(...)`; PRAGMA and CALL
 			// are the statements that run it.
 			for _, q := range []string{"PRAGMA " + name, "CALL " + name + "()"} {
-				if ValidateSQLRequest(q) == nil {
+				if validateSQLErr(q) == nil {
 					problems = append(problems, "pragma "+name+" accepted: "+q)
 				}
 			}
@@ -177,12 +177,12 @@ func TestCoreTableFunctionsReviewed(t *testing.T) {
 			"SELECT * FROM main." + name + "('x')",
 			"SELECT 1 FROM cpu WHERE EXISTS (FROM " + strings.ToUpper(name) + " ('x'))",
 		} {
-			if err := ValidateSQLRequest(q); err == nil || !strings.Contains(strings.ToLower(err.Error()), name) {
+			if err := validateSQLErr(q); err == nil || !strings.Contains(strings.ToLower(err.Error()), name) {
 				problems = append(problems, name+" ("+kind+") is neither refused nor reviewed: "+q+" -> "+errString(err))
 			}
 		}
 		where := "time > 0 AND EXISTS (FROM " + name + "('x'))"
-		if _, err := (&DeleteHandler{}).validateWhereClause(where); err == nil || !strings.Contains(strings.ToLower(err.Error()), name) {
+		if _, _, err := (&DeleteHandler{}).validateWhereClause(where); err == nil || !strings.Contains(strings.ToLower(err.Error()), name) {
 			problems = append(problems, name+" accepted in a DELETE predicate: "+where+" -> "+errString(err))
 		}
 	}
@@ -201,7 +201,7 @@ func TestCoreTableFunctionsReviewed(t *testing.T) {
 		require.NoError(t, views.Scan(&name, &def))
 		nViews++
 		if inner := refusedBody(def); inner != "" {
-			if err := ValidateSQLRequest("SELECT * FROM " + name); err == nil {
+			if err := validateSQLErr("SELECT * FROM " + name); err == nil {
 				problems = append(problems, "internal view "+name+" calls the refused "+inner+"() and is accepted by name")
 			}
 		}
@@ -224,7 +224,7 @@ func TestCoreTableFunctionsReviewed(t *testing.T) {
 			seen[name] = true
 			continue
 		}
-		if err := ValidateSQLRequest("SELECT " + name + "('x')"); err == nil || !strings.Contains(strings.ToLower(err.Error()), name) {
+		if err := validateSQLErr("SELECT " + name + "('x')"); err == nil || !strings.Contains(strings.ToLower(err.Error()), name) {
 			problems = append(problems, "scalar "+name+" is neither refused nor reviewed -> "+errString(err))
 		}
 	}

@@ -29,7 +29,7 @@ func TestValidateSQLRefusesUnquotedBacktick(t *testing.T) {
 		"SELECT 2 ` 3",
 		"SELECT 1 /* a */ ` 2",
 	} {
-		err := ValidateSQLRequest(sql)
+		err := validateSQLErr(sql)
 		if err == nil || !strings.Contains(err.Error(), "backticks are not identifier quotes") {
 			t.Errorf("ValidateSQLRequest(%q) = %v, want the backtick refusal", sql, err)
 		}
@@ -50,7 +50,7 @@ func TestValidateSQLAllowsBacktickInQuotedText(t *testing.T) {
 		"SHOW TABLES FROM `my--db`",
 		"SHOW MEASUREMENTS FROM `mydb`;",
 	} {
-		if err := ValidateSQLRequest(sql); err != nil {
+		if err := validateSQLErr(sql); err != nil {
 			t.Errorf("ValidateSQLRequest(%q) = %v, want nil", sql, err)
 		}
 	}
@@ -64,7 +64,7 @@ func TestValidateSQLReadsBacktickInIdentifierAsWritten(t *testing.T) {
 		`SHOW TABLES FROM "a` + "`" + `/*"; SELECT 2 --*/`,
 		`SELECT "x` + "`" + `" , 1 FROM '/data/db2/x.parquet' "` + "`" + `"`,
 	} {
-		if err := ValidateSQLRequest(sql); err == nil {
+		if err := validateSQLErr(sql); err == nil {
 			t.Errorf("ValidateSQLRequest(%q) accepted", sql)
 		}
 	}
@@ -81,10 +81,10 @@ func TestWhereValidatorsRefuseUnquotedBacktick(t *testing.T) {
 	} {
 		// The /query/:measurement path checks the fragment, then the assembled
 		// statement; either may refuse.
-		if validateWhereClauseQuery(where) == nil && ValidateSQLRequest("SELECT * FROM cpu WHERE "+where) == nil {
+		if validateWhereClauseQuery(where) == nil && validateSQLErr("SELECT * FROM cpu WHERE "+where) == nil {
 			t.Errorf("the measurement query path accepted %q", where)
 		}
-		if _, err := h.validateWhereClause(where); err == nil {
+		if _, _, err := h.validateWhereClause(where); err == nil {
 			t.Errorf("validateWhereClause(%q) accepted", where)
 		}
 	}
@@ -99,7 +99,7 @@ func TestWhereValidatorsRefuseUnquotedBacktick(t *testing.T) {
 		if err := validateWhereClauseQuery(where); err != nil {
 			t.Errorf("validateWhereClauseQuery(%q) = %v", where, err)
 		}
-		if _, err := h.validateWhereClause(where); err != nil {
+		if _, _, err := h.validateWhereClause(where); err != nil {
 			t.Errorf("validateWhereClause(%q) = %v", where, err)
 		}
 	}
@@ -130,7 +130,7 @@ func TestRewriteForRecordsRevalidates(t *testing.T) {
 	h := &DeleteHandler{db: db, storage: backend, logger: zerolog.Nop()}
 	// DuckDB evaluates this and matches every row; the validator refuses it.
 	refused := "v > 0 OR EXISTS (SELECT 1)"
-	if _, err := h.validateWhereClause(refused); err == nil {
+	if _, _, err := h.validateWhereClause(refused); err == nil {
 		t.Fatalf("validator accepts %q; pick another refused record", refused)
 	}
 	res, err := h.RewriteForRecords(context.Background(), rel, []string{refused, "host = 'h2'"})

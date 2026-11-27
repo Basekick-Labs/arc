@@ -513,6 +513,12 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
+	// Canonical first (see validateWhereClause): the qualifier rewrite below
+	// masks the clause, and it must find the literals DuckDB will find. On
+	// the raw clause, a dollar-quoted literal after a no-break space was not
+	// one to the masker, and the rewrite edited inside it.
+	req.Where = sqlutil.StripUnicodeSpaces(req.Where)
+
 	// A column qualified by the measurement's name means that column (#1451).
 	// Rewritten before validation, so what is validated is what runs. Keep
 	// this order: the rewrite masks and restores caller text, and
@@ -521,13 +527,14 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	req.Where = unqualifyMeasurement(req.Where, req.Measurement)
 
 	// Validate WHERE clause
-	isFullTableDelete, err := h.validateWhereClause(req.Where)
+	canonicalWhere, isFullTableDelete, err := h.validateWhereClause(req.Where)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{
 			Success: false,
 			Error:   err.Error(),
 		})
 	}
+	req.Where = canonicalWhere
 
 	// Check if confirmation is required for full table delete
 	if isFullTableDelete && !req.Confirm {
@@ -992,15 +999,30 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	return c.JSON(resp)
 }
 
-// validateWhereClause validates the WHERE clause and returns true if it's a full table delete
-func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
+// validateWhereClause validates the WHERE clause and returns the text to
+// use from here on, and whether it deletes the whole table. As for
+// ValidateSQLRequest, the returned clause has the Unicode spaces DuckDB's
+// parser replaces already replaced, so the checks and the DELETE statement
+// read the clause DuckDB will run; callers must use it, not the argument.
+func (h *DeleteHandler) validateWhereClause(where string) (string, bool, error) {
+	canonical := sqlutil.StripUnicodeSpaces(where)
+	full, err := h.checkWhereClause(canonical)
+	if err != nil {
+		return "", false, err
+	}
+	return canonical, full, nil
+}
+
+// checkWhereClause validates a canonical WHERE clause and returns true if
+// it's a full table delete.
+func (h *DeleteHandler) checkWhereClause(where string) (bool, error) {
 	if where == "" || strings.TrimSpace(where) == "" {
 		return false, fmt.Errorf("WHERE clause is required. To delete all data, use WHERE clause '1=1' with confirm=true")
 	}
 
 	// Validation scans run on the MASKED clause: a forbidden keyword or ';'
-	// inside a string literal is data, not SQL (#834). The raw clause is what
-	// gets interpolated into the DuckDB statement, so the unmatched-quote and
+	// inside a string literal is data, not SQL (#834). The (canonical) clause
+	// is what gets interpolated into the DuckDB statement, so the unmatched-quote and
 	// unmatched-parenthesis checks below stay on it. An unquoted backtick is
 	// refused before anything is masked: it is not a quote in DuckDB, so the
 	// masker must see the clause exactly as DuckDB will (#1480).
@@ -1014,6 +1036,12 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	// literal after the checks. Text inside a literal stays data.
 	if sqlutil.HasCallerPlaceholder(maskedWhere, masks) {
 		return false, errors.New("WHERE clause: " + errReservedPlaceholder)
+	}
+	// A Unicode space DuckDB's parser would replace that is still here sits
+	// where DuckDB's pre-pass believed it was inside quotes; outside every
+	// literal, as Arc reads them, that is wrong (see ValidateSQLRequest).
+	if sqlutil.HasUnicodeSpace(maskedWhere) {
+		return false, errors.New("WHERE clause: " + errUnicodeSpaceInCode)
 	}
 	// DuckDB reads non-ASCII spaces as token separators; the keyword and
 	// function scans below only see ASCII ones (read_statements.go).

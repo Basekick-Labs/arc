@@ -29,7 +29,7 @@ func TestDynamicSQLFunctionPattern_Family(t *testing.T) {
 			"SELECT * FROM main." + fn + "('SELECT 1')",               // schema-qualified
 			"SELECT * FROM " + fn + "/**/('SELECT 1')",                // comment before paren
 		} {
-			if err := ValidateSQLRequest(sql); err == nil {
+			if err := validateSQLErr(sql); err == nil {
 				t.Errorf("ValidateSQLRequest(%q): expected rejection for dynamic-SQL function %q, got nil", sql, fn)
 			}
 		}
@@ -46,7 +46,7 @@ func TestDynamicSQLFunction_ExploitVariantsBlocked(t *testing.T) {
 		`SELECT * FROM query('SELECT * FROM query(''SELECT 1'')')`, // nested
 	}
 	for _, sql := range exploits {
-		if err := ValidateSQLRequest(sql); err == nil {
+		if err := validateSQLErr(sql); err == nil {
 			t.Errorf("ValidateSQLRequest(%q): exploit not blocked", sql)
 		}
 	}
@@ -62,7 +62,7 @@ func TestDynamicSQLFunction_NoFalsePositives(t *testing.T) {
 		"SELECT * FROM cpu WHERE query_table > 5",
 	}
 	for _, sql := range ok {
-		if err := ValidateSQLRequest(sql); err != nil {
+		if err := validateSQLErr(sql); err != nil {
 			t.Errorf("ValidateSQLRequest(%q): false positive, got %v", sql, err)
 		}
 	}

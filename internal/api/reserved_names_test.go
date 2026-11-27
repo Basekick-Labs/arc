@@ -70,10 +70,10 @@ func TestTransformNeverBuildsAPathFromPlaceholderText(t *testing.T) {
 }
 
 func TestValidateSQLRequestRefusesQuotedPlaceholderTextInTablePosition(t *testing.T) {
-	if err := ValidateSQLRequest(`SELECT 1 FROM "x__STR_0__" WHERE a = 'b'`); err == nil {
+	if err := validateSQLErr(`SELECT 1 FROM "x__STR_0__" WHERE a = 'b'`); err == nil {
 		t.Fatal("a quoted reserved name in table position was accepted")
 	}
-	if err := ValidateSQLRequest(`SELECT '__STR_0__' AS s, "x__STR_0__" FROM t`); err != nil {
+	if err := validateSQLErr(`SELECT '__STR_0__' AS s, "x__STR_0__" FROM t`); err != nil {
 		t.Fatalf("placeholder text outside table position refused: %v", err)
 	}
 }

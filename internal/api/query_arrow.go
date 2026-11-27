@@ -575,13 +575,15 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	}
 
 	// Validate SQL (empty, max length, dangerous patterns)
-	if err := ValidateSQLRequest(req.SQL); err != nil {
+	canonicalSQL, err := ValidateSQLRequest(req.SQL)
+	if err != nil {
 		m.IncQueryErrors()
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"success": false,
 			"error":   err.Error(),
 		})
 	}
+	req.SQL = canonicalSQL
 
 	// Opt-in stream encodings. Both change the bytes the client must be able
 	// to parse, so they are strictly request-driven — no config default:

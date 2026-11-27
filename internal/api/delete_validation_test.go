@@ -18,7 +18,7 @@ func TestValidateWhereClauseAllowsDangerousTextInsideLiterals(t *testing.T) {
 			fmt.Sprintf("value = E'%s'", keyword),
 			fmt.Sprintf("value = $$%s$$", keyword),
 		} {
-			if _, err := h.validateWhereClause(where); err != nil {
+			if _, _, err := h.validateWhereClause(where); err != nil {
 				t.Errorf("validateWhereClause(%q) returned error: %v", where, err)
 			}
 		}
@@ -29,7 +29,7 @@ func TestValidateWhereClauseAllowsDangerousTextInsideLiterals(t *testing.T) {
 		`note = E'a;b--c'`,
 		`note = $$a;b--c$$`,
 	} {
-		if _, err := h.validateWhereClause(where); err != nil {
+		if _, _, err := h.validateWhereClause(where); err != nil {
 			t.Errorf("validateWhereClause(%q) returned error: %v", where, err)
 		}
 	}
@@ -44,7 +44,7 @@ func TestValidateWhereClauseRejectsDangerousTextOutsideLiterals(t *testing.T) {
 		`host = 'a' OR 1=1 --`,
 		`host = 'a' OR glob('/data/**') IS NOT NULL`,
 	} {
-		if _, err := h.validateWhereClause(where); err == nil {
+		if _, _, err := h.validateWhereClause(where); err == nil {
 			t.Errorf("validateWhereClause(%q) accepted unsafe input", where)
 		}
 	}
@@ -63,7 +63,7 @@ func TestValidateWhereClauseRejectsKeywordsGluedToNumbersOrLiterals(t *testing.T
 		`1=1.e1UNION VALUES (1)`,
 		`1=1_0UNION VALUES (1)`,
 	} {
-		if _, err := h.validateWhereClause(where); err == nil {
+		if _, _, err := h.validateWhereClause(where); err == nil {
 			t.Errorf("validateWhereClause(%q) accepted a keyword without a word boundary", where)
 		}
 	}
@@ -75,7 +75,7 @@ func TestValidateWhereClauseRejectsKeywordsGluedToNumbersOrLiterals(t *testing.T
 		`value > 1e5`,
 		`value < 1.5e-3 AND other = .25`,
 	} {
-		if _, err := h.validateWhereClause(where); err != nil {
+		if _, _, err := h.validateWhereClause(where); err != nil {
 			t.Errorf("validateWhereClause(%q) returned error: %v", where, err)
 		}
 	}
@@ -93,7 +93,7 @@ func TestValidateWhereClauseMaskingEdgeCases(t *testing.T) {
 		`msg = E'read_csv(x)'`,
 		`"offset" = 'set'`,
 	} {
-		if _, err := h.validateWhereClause(where); err != nil {
+		if _, _, err := h.validateWhereClause(where); err != nil {
 			t.Errorf("validateWhereClause(%q) returned error: %v", where, err)
 		}
 	}
@@ -105,7 +105,7 @@ func TestValidateWhereClauseMaskingEdgeCases(t *testing.T) {
 		"host = `read_csv`('/etc/passwd')",
 		"`a'` = 1 OR glob('/etc/passwd') IS NOT NULL OR `'` = 1",
 	} {
-		if _, err := h.validateWhereClause(where); err == nil {
+		if _, _, err := h.validateWhereClause(where); err == nil {
 			t.Errorf("validateWhereClause(%q) accepted unsafe input", where)
 		}
 	}
@@ -139,13 +139,13 @@ func TestValidateWhereClauseAcceptsIdentifiersContainingProcedurePrefixes(t *tes
 		`transport_mode = 'air'`,
 		`value = 'sp_who'`,
 	} {
-		if _, err := h.validateWhereClause(where); err != nil {
+		if _, _, err := h.validateWhereClause(where); err != nil {
 			t.Errorf("validateWhereClause(%q) returned error: %v", where, err)
 		}
 	}
 
 	// The keyword check, not the deleted prefix scan, is what refuses this.
-	if _, err := h.validateWhereClause(`1=1; EXEC xp_cmdshell('dir')`); err == nil {
+	if _, _, err := h.validateWhereClause(`1=1; EXEC xp_cmdshell('dir')`); err == nil {
 		t.Error("validateWhereClause accepted EXEC xp_cmdshell; the keyword check must still refuse it")
 	}
 }
@@ -162,11 +162,11 @@ func TestValidateWhereClauseRejectsSideEffectFunctions(t *testing.T) {
 		`host = "current_setting"('threads')`,
 		"EXISTS (FROM enable_logging (['QueryLog']))",
 	} {
-		if _, err := h.validateWhereClause(where); err == nil {
+		if _, _, err := h.validateWhereClause(where); err == nil {
 			t.Errorf("validateWhereClause(%q) accepted unsafe input", where)
 		}
 	}
-	if _, err := h.validateWhereClause(`host = 'enable_logging(x)'`); err != nil {
+	if _, _, err := h.validateWhereClause(`host = 'enable_logging(x)'`); err != nil {
 		t.Errorf("a function name inside a literal was refused: %v", err)
 	}
 }
@@ -192,12 +192,12 @@ func TestValidateWhereClauseRefusesQueryDeniedFunctions(t *testing.T) {
 		"time > 0 AND EXISTS (FROM histogram('/x', v))",
 		"time > 0 AND json_serialize_plan('SELECT * FROM read_parquet(''/x'')') IS NOT NULL",
 	} {
-		if _, err := h.validateWhereClause(where); err == nil {
+		if _, _, err := h.validateWhereClause(where); err == nil {
 			t.Errorf("validateWhereClause accepted %q", where)
 		}
 	}
 	// A column that shares a refused function's name is still a column.
-	if _, err := h.validateWhereClause("enable_profiling = 1 AND query > 0 AND histogram > 0"); err != nil {
+	if _, _, err := h.validateWhereClause("enable_profiling = 1 AND query > 0 AND histogram > 0"); err != nil {
 		t.Errorf("validateWhereClause refused plain columns: %v", err)
 	}
 }

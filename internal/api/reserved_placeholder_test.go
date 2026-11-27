@@ -21,7 +21,7 @@ func TestValidateSQLRequestRefusesReservedPlaceholders(t *testing.T) {
 		"SELECT v, EXTRACT(YEAR FROM time) AS y, 'a'FROM_MASK_0__ cpu",
 		"SELECT 'a'STR_1__, 'b' FROM cpu",
 	} {
-		err := ValidateSQLRequest(sql)
+		err := validateSQLErr(sql)
 		if err == nil || !strings.Contains(err.Error(), "reserved sequence") {
 			t.Errorf("%q: want reserved-sequence refusal, got %v", sql, err)
 		}
@@ -40,7 +40,7 @@ func TestValidateSQLRequestKeepsFunctionBodyFrom(t *testing.T) {
 		// Exact bytes: the restore never matches another case.
 		"SELECT EXTRACT(YEAR FROM time) AS y, __from_mask_0__ FROM cpu",
 	} {
-		if err := ValidateSQLRequest(sql); err != nil {
+		if err := validateSQLErr(sql); err != nil {
 			t.Errorf("%q: refused: %v", sql, err)
 		}
 	}
@@ -116,12 +116,12 @@ func TestPinDeleteTimeRestoresEachLiteralInPlace(t *testing.T) {
 
 func TestDeleteWhereRefusesReservedPlaceholders(t *testing.T) {
 	for _, where := range []string{"b = __STR_0__", "__IDENT_0__ = 1", "x __FROM_MASK_0__ y", "a = 'x'STR_1__ AND b = 'y'"} {
-		if _, err := (&DeleteHandler{}).validateWhereClause(where); err == nil || !strings.Contains(err.Error(), "reserved sequence") {
+		if _, _, err := (&DeleteHandler{}).validateWhereClause(where); err == nil || !strings.Contains(err.Error(), "reserved sequence") {
 			t.Errorf("%q: want reserved-sequence refusal, got %v", where, err)
 		}
 	}
 	for _, where := range []string{"b = '__STR_0__'", "m LIKE '%__FROM_MASK_%'"} {
-		if _, err := (&DeleteHandler{}).validateWhereClause(where); err != nil {
+		if _, _, err := (&DeleteHandler{}).validateWhereClause(where); err != nil {
 			t.Errorf("%q: placeholder text inside a literal refused: %v", where, err)
 		}
 	}

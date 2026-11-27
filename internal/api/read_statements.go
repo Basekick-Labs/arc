@@ -4,6 +4,8 @@ import (
 	"regexp"
 	"strings"
 	"unicode"
+
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 )
 
 // The query API runs read statements only. DuckDB serves every user from one
@@ -172,18 +174,14 @@ func hasNestedBlockComment(masked string) bool {
 				i++
 			}
 		case masked[i] == '/' && masked[i+1] == '*':
-			end := strings.Index(masked[i+2:], "*/")
-			body := masked[i+2:]
-			if end >= 0 {
-				body = body[:end]
-			}
-			if strings.Contains(body, "/*") {
+			// Byte by byte, as DuckDB scans: in `/*/*/` the second opener
+			// shares the first one's '*', and a search for the first `*/`
+			// followed by a look for `/*` in what precedes it misses it.
+			end, _, nested := sqlutil.BlockComment(masked, i)
+			if nested {
 				return true
 			}
-			if end < 0 {
-				return false
-			}
-			i += 2 + end + 1
+			i = end - 1
 		}
 	}
 	return false

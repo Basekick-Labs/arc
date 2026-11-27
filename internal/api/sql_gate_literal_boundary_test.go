@@ -95,7 +95,7 @@ func TestValidateSQLRequest_LiteralBoundariesDoNotHideTheRest(t *testing.T) {
 	}
 	for _, tc := range hidden {
 		t.Run(tc.name, func(t *testing.T) {
-			err := ValidateSQLRequest(tc.sql)
+			err := validateSQLErr(tc.sql)
 			if err == nil {
 				t.Fatalf("accepted SQL whose %s is hidden behind a backslash literal", tc.want)
 			}
@@ -108,7 +108,7 @@ func TestValidateSQLRequest_LiteralBoundariesDoNotHideTheRest(t *testing.T) {
 	// The same statements without the backslash were already refused; the fix
 	// must not have changed that, and must not start refusing a plain value
 	// that merely ends in a backslash.
-	if err := ValidateSQLRequest(`SELECT * FROM cpu WHERE host = 'a' UNION ALL SELECT * FROM read_parquet('/other/x.parquet')`); err == nil {
+	if err := validateSQLErr(`SELECT * FROM cpu WHERE host = 'a' UNION ALL SELECT * FROM read_parquet('/other/x.parquet')`); err == nil {
 		t.Error("the plain form of the file-I/O call was accepted")
 	}
 	for _, ok := range []string{
@@ -122,7 +122,7 @@ func TestValidateSQLRequest_LiteralBoundariesDoNotHideTheRest(t *testing.T) {
 		`SELECT 1 AS "a'b" FROM cpu`,
 		"SELECT 1 /* it's fine */ FROM cpu",
 	} {
-		if err := ValidateSQLRequest(ok); err != nil {
+		if err := validateSQLErr(ok); err != nil {
 			t.Errorf("FALSE POSITIVE: refused benign SQL %q: %v", ok, err)
 		}
 	}

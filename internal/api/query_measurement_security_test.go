@@ -68,7 +68,7 @@ func TestQueryMeasurementWhereRejectsCrossTenantReads(t *testing.T) {
 			}
 
 			sql := assembleMeasurementSQL("default", "cpu", p.where)
-			if err := ValidateSQLRequest(sql); err == nil {
+			if err := validateSQLErr(sql); err == nil {
 				t.Errorf("VULNERABLE: cross-tenant payload accepted\n  where: %s\n  sql:   %s", p.where, sql)
 			}
 		})
@@ -103,7 +103,7 @@ func TestQueryMeasurementWhereAllowsLegitimateFilters(t *testing.T) {
 	for _, v := range valid {
 		t.Run(v.name, func(t *testing.T) {
 			sql := assembleMeasurementSQL("mydb", "cpu", v.where)
-			if err := ValidateSQLRequest(sql); err != nil {
+			if err := validateSQLErr(sql); err != nil {
 				t.Errorf("FALSE POSITIVE: legitimate filter rejected\n  where: %s\n  err:   %v", v.where, err)
 			}
 		})
@@ -129,7 +129,7 @@ func TestValidateSQLRequestBlocksNonStandardStringLiterals(t *testing.T) {
 		`SELECT * FROM cpu WHERE x > (SELECT max(v) FROM e'/data/arc/o/d.parquet')`,
 	}
 	for _, sql := range blocked {
-		if err := ValidateSQLRequest(sql); err == nil {
+		if err := validateSQLErr(sql); err == nil {
 			t.Errorf("VULNERABLE: replacement scan accepted: %s", sql)
 		}
 	}
@@ -145,7 +145,7 @@ func TestValidateSQLRequestBlocksNonStandardStringLiterals(t *testing.T) {
 		`SELECT * FROM cpu WHERE a = 'it''s'`,
 	}
 	for _, sql := range allowed {
-		if err := ValidateSQLRequest(sql); err != nil {
+		if err := validateSQLErr(sql); err != nil {
 			t.Errorf("FALSE POSITIVE: %s -> %v", sql, err)
 		}
 	}
@@ -164,7 +164,7 @@ func TestDeleteWhereRejectsIOFunctions(t *testing.T) {
 		`time > 0 AND parquet_metadata('/data/arc/o/d.parquet') IS NOT NULL`,
 	}
 	for _, where := range payloads {
-		if _, err := h.validateWhereClause(where); err == nil {
+		if _, _, err := h.validateWhereClause(where); err == nil {
 			t.Errorf("VULNERABLE: DELETE accepted I/O function: %s", where)
 		}
 	}
@@ -177,7 +177,7 @@ func TestDeleteWhereRejectsIOFunctions(t *testing.T) {
 		`offset_ms < 5`,
 	}
 	for _, where := range valid {
-		if _, err := h.validateWhereClause(where); err != nil {
+		if _, _, err := h.validateWhereClause(where); err != nil {
 			t.Errorf("FALSE POSITIVE: DELETE rejected valid filter %q: %v", where, err)
 		}
 	}

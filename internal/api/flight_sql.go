@@ -770,7 +770,8 @@ func (s *flightSQLService) GetFlightInfoStatement(ctx context.Context, query fli
 	if len(query.GetTransactionId()) != 0 {
 		return nil, status.Error(codes.Unimplemented, "Flight SQL transactions are not supported")
 	}
-	if err := ValidateSQLRequest(query.GetQuery()); err != nil {
+	canonicalSQL, err := ValidateSQLRequest(query.GetQuery())
+	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	database, err := flightDatabase(ctx)
@@ -781,7 +782,9 @@ func (s *flightSQLService) GetFlightInfoStatement(ctx context.Context, query fli
 	if err != nil {
 		return nil, err
 	}
-	return flightStatementInfo(desc, query.GetQuery(), database, decimalMode)
+	// The ticket carries the canonical text; DoGetStatement validates it
+	// again, which leaves it unchanged.
+	return flightStatementInfo(desc, canonicalSQL, database, decimalMode)
 }
 
 // flightStatementInfo answers a statement ticket for sql, to run in database.
@@ -820,9 +823,11 @@ func (s *flightSQLService) DoGetStatement(ctx context.Context, ticket flightsql.
 	if err := json.Unmarshal(ticket.GetStatementHandle(), &statement); err != nil {
 		return nil, nil, status.Error(codes.InvalidArgument, "invalid statement ticket")
 	}
-	if err := ValidateSQLRequest(statement.SQL); err != nil {
+	canonicalSQL, err := ValidateSQLRequest(statement.SQL)
+	if err != nil {
 		return nil, nil, status.Error(codes.InvalidArgument, err.Error())
 	}
+	statement.SQL = canonicalSQL
 	// The ticket is the client's to send back, so its database is checked
 	// like the header; the route then applies the same checks to both.
 	if err := validateHeaderDatabase(statement.Database); err != nil {

@@ -14,7 +14,7 @@ func TestGeoParquetConversionCannotBeTurnedOn(t *testing.T) {
 		"PRAGMA enable_geoparquet_conversion = true",
 		"SELECT 1; SET enable_geoparquet_conversion = true",
 	} {
-		if err := ValidateSQLRequest(sql); err == nil {
+		if err := validateSQLErr(sql); err == nil {
 			t.Errorf("query: %q was accepted", sql)
 		}
 		if err := validateCQQuery(sql); err == nil {
@@ -22,7 +22,7 @@ func TestGeoParquetConversionCannotBeTurnedOn(t *testing.T) {
 		}
 	}
 	h := &DeleteHandler{}
-	if _, err := h.validateWhereClause("1=1; SET GLOBAL enable_geoparquet_conversion = true"); err == nil {
+	if _, _, err := h.validateWhereClause("1=1; SET GLOBAL enable_geoparquet_conversion = true"); err == nil {
 		t.Error("DELETE WHERE: a SET was accepted")
 	}
 }

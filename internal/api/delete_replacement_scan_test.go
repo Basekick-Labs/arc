@@ -36,7 +36,7 @@ func TestValidateWhereClause_RejectsReplacementScan(t *testing.T) {
 	}
 	for _, tt := range refused {
 		t.Run("refused/"+tt.name, func(t *testing.T) {
-			if _, err := h.validateWhereClause(tt.where); err == nil {
+			if _, _, err := h.validateWhereClause(tt.where); err == nil {
 				t.Errorf("accepted a path literal in table position: %s", tt.where)
 			}
 		})
@@ -55,7 +55,7 @@ func TestValidateWhereClause_RejectsReplacementScan(t *testing.T) {
 	}
 	for _, tt := range accepted {
 		t.Run("accepted/"+tt.name, func(t *testing.T) {
-			if _, err := h.validateWhereClause(tt.where); err != nil {
+			if _, _, err := h.validateWhereClause(tt.where); err != nil {
 				t.Errorf("false denial on an ordinary predicate: %s -> %v", tt.where, err)
 			}
 		})
