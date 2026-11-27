@@ -17,34 +17,51 @@ func CutStatementContext(s string) string {
 	return s
 }
 
-// TrimErrStatement is ClientErrText without the path redaction: the message
-// and its hint lines, without DuckDB's statement context. For routes whose
-// errors name files the caller is entitled to see (DELETE reports the
-// database-relative file it could not rewrite).
+// maxClientErrInput bounds the work spent on one error: only its start can
+// be part of the message and hint lines a client sees.
+const maxClientErrInput = 64 << 10
+
+// TrimErrStatement returns the message and its hint lines, without DuckDB's
+// statement context, capped at 1000 runes. It does not redact paths; for
+// routes whose errors name files the caller is entitled to see, after the
+// caller has made those paths relative (DELETE strips the storage root).
 func TrimErrStatement(s string) string {
-	return keepMessageLines(CutStatementContext(strings.ReplaceAll(strings.TrimSpace(s), "\r\n", "\n")))
+	if len(s) > maxClientErrInput {
+		s = s[:maxClientErrInput]
+	}
+	s = keepMessageLines(CutStatementContext(strings.ReplaceAll(strings.TrimSpace(s), "\r\n", "\n")))
+	return capRunes(s, 1000)
+}
+
+func capRunes(s string, n int) string {
+	if r := []rune(s); len(r) > n {
+		return string(r[:n]) + "…"
+	}
+	return s
 }
 
 // ClientErrText is the text of a DuckDB execution error as a client should
 // see it: DuckDB's message and its hint lines (candidate columns, "Did you
 // mean", GROUP BY advice, cast hints), without the statement context and
-// without anything that names storage. paths are what was removed, for the
-// server log: the global log sanitiser (SanitizeErrText) drops them too, and
+// without anything that names storage. paths are the storage locations it
+// removed (a URI, an absolute path, a Parquet file name; at most ten, each
+// capped), for the server log: the global log sanitiser drops them too, and
 // support needs to know which file a schema-drift or corrupt-file error was
-// about.
+// about. Anything else it redacts (a value that merely looks like a path) is
+// not returned, so the log does not get row data the sanitiser keeps out.
 //
 // SanitizeErrText is the wrong tool for a response: it keeps one line and
 // masks every quoted span, removing the column and function names a client
 // needs to fix its query.
 func ClientErrText(s string) (text string, paths []string) {
-	s = TrimErrStatement(s)
+	if len(s) > maxClientErrInput {
+		s = s[:maxClientErrInput]
+	}
+	s = keepMessageLines(CutStatementContext(strings.ReplaceAll(strings.TrimSpace(s), "\r\n", "\n")))
 	// Redact before capping: a cut inside a quoted path would leave a span
 	// with no closing quote.
 	s, paths = redactStorage(s)
-	if r := []rune(s); len(r) > 1000 {
-		s = string(r[:1000]) + "…"
-	}
-	return s, paths
+	return capRunes(s, 1000), paths
 }
 
 // keepMessageLines keeps at most five lines and drops the trailing blank
@@ -66,7 +83,24 @@ var (
 	clientDrive       = regexp.MustCompile(`^[A-Za-z]:[\\/]`)
 	clientLeadingSep  = regexp.MustCompile(`^(?:\.{0,2}[/\\])[A-Za-z0-9_.-]`)
 	clientNumericPath = regexp.MustCompile(`^[0-9]+(?:[/\\-][0-9]+)+$`)
+	clientFormatSpec  = regexp.MustCompile(`%[A-Za-z]`)
+	// The object-store schemes Arc reads from; an http(s) URL in an error is
+	// as likely a queried value as a location.
+	clientStorageScheme = regexp.MustCompile(`^(?:s3|s3a|s3n|gs|gcs|azure|az|abfs|abfss|r2|hf)://`)
+	clientBackslash     = regexp.MustCompile(`[A-Za-z0-9_.-]\\[A-Za-z0-9_.-]`)
 )
+
+// storageLocation reports whether a redacted token is certainly a storage
+// location (worth logging for support) rather than a value that only looks
+// like a path: an object-store URI, an absolute path, a Parquet file.
+func storageLocation(tok string) bool {
+	t := strings.Trim(tok, "()[]{},;:'\"`")
+	lower := strings.ToLower(t)
+	return clientStorageScheme.MatchString(lower) || strings.HasPrefix(lower, "file:") || strings.HasPrefix(t, "/") ||
+		strings.HasPrefix(t, `\\`) || clientDrive.MatchString(t) ||
+		strings.HasSuffix(lower, ".parquet") || strings.Contains(lower, ".parquet.") ||
+		strings.HasPrefix(lower, "read_parquet(")
+}
 
 // storagePathLike reports whether a token, or the inside of a quoted span,
 // names a file or a storage location. Judged by content, not by a list of
@@ -81,9 +115,12 @@ func storagePathLike(tok string) bool {
 		return false
 	case strings.Contains(t, "://"), strings.HasPrefix(lower, "file:"),
 		strings.HasPrefix(t, `\\`), strings.Contains(lower, "%2f"),
-		strings.HasSuffix(lower, ".parquet"), clientDrive.MatchString(t),
-		clientIPv4.MatchString(t), clientHostPort.MatchString(t):
+		strings.HasSuffix(lower, ".parquet"), strings.Contains(lower, ".parquet."),
+		clientDrive.MatchString(t), clientIPv4.MatchString(t), clientHostPort.MatchString(t),
+		clientBackslash.MatchString(t):
 		return true
+	case clientFormatSpec.MatchString(t):
+		return false // a strptime/strftime format, the client's own SQL
 	}
 	seps := strings.Count(t, "/") + strings.Count(t, `\`)
 	return seps >= 2 || seps >= 1 && (clientLeadingSep.MatchString(t) || strings.Contains(t, "="))
@@ -92,29 +129,42 @@ func storagePathLike(tok string) bool {
 // redactStorage replaces what names storage with <path>: read_parquet(...)
 // calls, quoted spans whose content is path-like (the quote characters are
 // kept: In file "<path>" the column ...), and unquoted path-like tokens.
-// Quoted spans are found with the same quote rules the SQL masker uses (”
-// and "" escapes), so a quote inside a path does not end the span early.
+// Quoted spans are found with the same quote rules the SQL masker uses (a
+// doubled quote escapes), so a quote inside a path does not end the span early.
 func redactStorage(s string) (string, []string) {
 	var b strings.Builder
 	var paths []string
 	b.Grow(len(s))
+	note := func(p string) {
+		if len(paths) < 10 && storageLocation(p) {
+			paths = append(paths, capRunes(p, 256))
+		}
+	}
 	word := strings.Builder{}
 	flushWord := func() {
 		w := word.String()
 		word.Reset()
-		if w != "" && storagePathLike(w) {
-			paths = append(paths, w)
+		switch {
+		case w == "":
+		case storagePathLike(w):
+			// key=/path keeps its key.
+			if k, v, ok := strings.Cut(w, "="); ok && !strings.ContainsAny(k, `/\`) && storagePathLike(v) {
+				note(v)
+				b.WriteString(k + "=<path>")
+				return
+			}
+			note(w)
 			b.WriteString("<path>")
-			return
+		default:
+			b.WriteString(w)
 		}
-		b.WriteString(w)
 	}
 	for i := 0; i < len(s); {
 		c := s[i]
 		switch {
 		case hasPrefixFold(s[i:], "read_parquet(") && word.Len() == 0:
 			end := skipCall(s, i+len("read_parquet("))
-			paths = append(paths, s[i:end])
+			note(s[i:end])
 			b.WriteString("read_parquet(<path>)")
 			i = end
 		case c == '\'' || c == '"' || c == '`':
@@ -136,12 +186,14 @@ func redactStorage(s string) (string, []string) {
 			}
 			span := s[i:end]
 			inner := strings.TrimSuffix(span[1:], string(c))
-			redact := storagePathLike(inner)
+			// Judged part by part: a path with spaces still has a part that
+			// is one, while a timestamp ('2026/11/26 10:00:00') has none.
+			redact := false
 			for _, part := range strings.Fields(inner) {
 				redact = redact || storagePathLike(part)
 			}
 			if redact {
-				paths = append(paths, inner)
+				note(inner)
 				b.WriteByte(c)
 				b.WriteString("<path>")
 				if strings.HasSuffix(span, string(c)) && len(span) > 1 {

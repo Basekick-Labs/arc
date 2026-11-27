@@ -412,7 +412,7 @@ func (h *DatabasesHandler) handleList(c *fiber.Ctx) error {
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to list databases")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to list databases: " + err.Error(),
+			"error": "Failed to list databases: " + clientErrText(h.logger, err),
 		})
 	}
 
@@ -642,7 +642,7 @@ func (h *DatabasesHandler) handleGet(c *fiber.Ctx) error {
 	if err != nil {
 		h.logger.Error().Err(err).Str("database", name).Msg("Failed to list measurements")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to list measurements: " + err.Error(),
+			"error": "Failed to list measurements: " + clientErrText(h.logger, err),
 		})
 	}
 	measurementCount := len(h.filterReadableMeasurements(c, name, measurements))
@@ -711,7 +711,7 @@ func (h *DatabasesHandler) handleListMeasurements(c *fiber.Ctx) error {
 	if err != nil {
 		h.logger.Error().Err(err).Str("database", name).Msg("Failed to list measurements")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to list measurements: " + err.Error(),
+			"error": "Failed to list measurements: " + clientErrText(h.logger, err),
 		})
 	}
 

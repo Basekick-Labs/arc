@@ -611,7 +611,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete rejected: " + err.Error() + "; retry shortly"})
 	}
 	if bindErr := (*whereBindError)(nil); errors.As(err, &bindErr) {
-		return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{Success: false, Error: "Delete rejected: " + err.Error()})
+		return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{Success: false, Error: "Delete rejected: " + h.errText(err)})
 	}
 	if errors.Is(err, errUnreachableFiles) {
 		return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete rejected: " + err.Error() + "; retry, or set allow_unreachable=true to skip them", UnreachableFiles: unreachable})
@@ -620,7 +620,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		h.logger.Error().Err(err).Msg("Failed to find affected files")
 		return c.Status(fiber.StatusInternalServerError).JSON(DeleteResponse{
 			Success:         false,
-			Error:           "Failed to find affected files: " + sqlutil.TrimErrStatement(err.Error()),
+			Error:           "Failed to find affected files: " + h.errText(err),
 			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 		})
 	}
@@ -751,10 +751,10 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		} else if errors.Is(err, errUnreachableFiles) {
 			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete recorded, not run: " + err.Error() + "; rows the cluster replays later are already filtered; retry, or set allow_unreachable=true to skip them", UnreachableFiles: unreachable})
 		} else if bindErr := (*whereBindError)(nil); errors.As(err, &bindErr) {
-			return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{Success: false, Error: "Delete recorded, not run: " + err.Error()})
+			return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{Success: false, Error: "Delete recorded, not run: " + h.errText(err)})
 		} else if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(DeleteResponse{
-				Success: false, Error: "Delete recorded, not run: failed to find affected files: " + sqlutil.TrimErrStatement(err.Error()),
+				Success: false, Error: "Delete recorded, not run: failed to find affected files: " + h.errText(err),
 				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 			})
 		}
@@ -904,7 +904,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 			freeOSMemoryThrottled()
 			return c.Status(fiber.StatusMultiStatus).JSON(DeleteResponse{
 				Success:          false,
-				Error:            "Delete incomplete: " + sqlutil.TrimErrStatement(err.Error()) + "; the rows of the other files are deleted",
+				Error:            "Delete incomplete: " + h.errText(err) + "; the rows of the other files are deleted",
 				DeletedCount:     totalDeleted,
 				AffectedFiles:    len(seen),
 				RewrittenFiles:   rewrittenCount,
@@ -916,7 +916,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 			})
 		}
 		if err != nil {
-			return incomplete(err.Error())
+			return incomplete(h.errText(err))
 		}
 	}
 
@@ -997,6 +997,23 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		return c.Status(status).JSON(resp)
 	}
 	return c.JSON(resp)
+}
+
+// errText is a DELETE error as the caller sees it: the message and its hint
+// lines without DuckDB's statement context (the read over every file the
+// scan touched), and with this node's storage root removed from file
+// names, so a file is named relative to the database, as DELETE reports
+// them elsewhere, never as the absolute path or bucket URI DuckDB used.
+func (h *DeleteHandler) errText(err error) string {
+	s := sqlutil.TrimErrStatement(err.Error())
+	if h.storage != nil {
+		if root, rerr := storage.ObjectURI(h.storage, "x"); rerr == nil {
+			if root = strings.TrimSuffix(root, "x"); root != "" {
+				s = strings.ReplaceAll(s, root, "")
+			}
+		}
+	}
+	return s
 }
 
 // validateWhereClause validates the WHERE clause and returns the text to

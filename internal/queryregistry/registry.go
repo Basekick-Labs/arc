@@ -198,9 +198,10 @@ func (r *Registry) Fail(queryID string, errMsg string) {
 	entry.query.DurationMs = float64(now.Sub(entry.query.StartTime).Milliseconds())
 	// Sanitised here, for every caller: the history is served by the API
 	// (GET /api/v1/queries), and a raw DuckDB error carries the rewritten
-	// statement, storage paths and queried values. Idempotent, so a caller
-	// that already sanitised is unaffected.
-	entry.query.Error = sqlutil.SanitizeErrText(errMsg)
+	// statement, storage paths and queried values. Both steps are idempotent,
+	// so a caller that already cleaned the text is unaffected.
+	text, _ := sqlutil.ClientErrText(errMsg) // removes unquoted paths too
+	entry.query.Error = sqlutil.SanitizeErrText(text)
 
 	r.addToHistory(entry.query)
 	delete(r.active, queryID)

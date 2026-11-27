@@ -93,7 +93,7 @@ func TestQueryRoutesReturnClientErrorText(t *testing.T) {
 func TestRegistryFailSanitises(t *testing.T) {
 	r := queryregistry.NewRegistry(&queryregistry.RegistryConfig{HistorySize: 10}, zerolog.Nop())
 	id, _ := r.Register(context.Background(), "SELECT 1", 0, "test", "")
-	r.Fail(id, "arrow query failed: Conversion Error: Could not convert string 'secret' to INT32\n\nLINE 1: SELECT ... FROM read_parquet(['/data/arc/x.parquet'])")
+	r.Fail(id, "arrow query failed: Conversion Error: Could not convert string 'secret' to INT32 reading /data/arc/y.parquet\n\nLINE 1: SELECT ... FROM read_parquet(['/data/arc/x.parquet'])")
 	q := r.GetQuery(id)
 	require.NotNil(t, q)
 	require.NotContains(t, q.Error, "LINE ")
@@ -130,6 +130,33 @@ func TestDeleteRouteDropsStatementContext(t *testing.T) {
 	msg, _ := out["error"].(string)
 	require.Contains(t, msg, "Conversion Error")
 	require.NotContains(t, msg, "LINE ")
+	require.False(t, strings.Contains(msg, r.root), "%q names the storage root", msg)
+
+	// A WHERE that does not bind (the scan's read over every file is in
+	// DuckDB's statement context) loses that context. Two files whose v
+	// columns differ in type make v + 1 fail to bind.
+	mixed := filepath.Join(r.root, leftoverHour+"cpu_20261007_200002_000000000.parquet")
+	_, err := r.db.DB().Exec(fmt.Sprintf(`COPY (SELECT 'h9' AS host, 'text' AS v) TO '%s' (FORMAT PARQUET)`, mixed))
+	require.NoError(t, err)
+	code, out = usDoJSON(t, app, "POST", "/api/v1/delete", map[string]any{
+		"database": "db", "measurement": "cpu", "where": "v + 1 > 0", "dry_run": true,
+	}, nil)
+	require.GreaterOrEqual(t, code, 400, "%v", out)
+	msg, _ = out["error"].(string)
+	require.NotContains(t, msg, "LINE ", "%q", msg)
+	require.False(t, strings.Contains(msg, r.root), "%q names the storage root", msg)
+	require.NoError(t, os.Remove(mixed))
+
+	// A damaged file is named relative to the database, never by the
+	// absolute path DuckDB read it from.
+	damaged := leftoverHour + "cpu_20261007_200001_000000000.parquet"
+	require.NoError(t, os.WriteFile(filepath.Join(r.root, damaged), []byte("not parquet"), 0o600))
+	code, out = usDoJSON(t, app, "POST", "/api/v1/delete", map[string]any{
+		"database": "db", "measurement": "cpu", "where": "host = 'h1'", "dry_run": true,
+	}, nil)
+	require.GreaterOrEqual(t, code, 400, "%v", out)
+	msg, _ = out["error"].(string)
+	require.Contains(t, msg, "cpu_20261007_200001_000000000.parquet", "%q", msg)
 	require.False(t, strings.Contains(msg, r.root), "%q names the storage root", msg)
 }
 

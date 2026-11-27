@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -109,5 +110,46 @@ func TestTrimErrStatement(t *testing.T) {
 	got := TrimErrStatement("Binder Error: column x not found in cpu/2026/10/11/10/cpu_a.parquet\n\nLINE 1: SELECT ... read_parquet(['/data/a', '/data/b'])")
 	if got != "Binder Error: column x not found in cpu/2026/10/11/10/cpu_a.parquet" {
 		t.Errorf("got %q", got)
+	}
+}
+
+// Only certain storage locations are returned for the log, never a value
+// that merely looks like a path, and never more than ten.
+func TestClientErrText_LogsOnlyStorageLocations(t *testing.T) {
+	_, paths := ClientErrText("Conversion Error: Could not convert string '2026/11/26 10:00:00' to INT; also 'https://example.com/a/b' and 'a/b/c' and 's3://bucket/db/x.parquet'")
+	if len(paths) != 1 || paths[0] != "s3://bucket/db/x.parquet" {
+		t.Errorf("paths %q", paths)
+	}
+	var many []string
+	for i := 0; i < 50; i++ {
+		many = append(many, fmt.Sprintf("'/app/data/f%d.parquet'", i))
+	}
+	_, paths = ClientErrText("Binder Error: " + strings.Join(many, " "))
+	if len(paths) != 10 {
+		t.Errorf("%d paths returned, want at most 10", len(paths))
+	}
+}
+
+func TestClientErrText_ReviewRoundShapes(t *testing.T) {
+	for raw, keep := range map[string]string{
+		"Conversion Error: Could not parse string '2026/11/26 10:00:00' according to format specifier '%d/%m/%Y'": "'2026/11/26 10:00:00'",
+		"Invalid Input Error: format '%d/%m/%Y %H:%M' does not match":                                             "'%d/%m/%Y %H:%M'",
+		"IO Error: open path=/app/data/x failed":                                                                  "path=<path>",
+	} {
+		if got := clientText(raw); !strings.Contains(got, keep) {
+			t.Errorf("%q: want %q in %q", raw, keep, got)
+		}
+	}
+	for raw, leak := range map[string]string{
+		`Binder Error: under data\tenant2\cpu`:          "tenant2",
+		"IO Error: cannot rename cpu_a.parquet.tmp now": "cpu_a.parquet.tmp",
+	} {
+		if got := clientText(raw); strings.Contains(got, leak) {
+			t.Errorf("%q leaked %q: %q", raw, leak, got)
+		}
+	}
+	long := strings.Repeat("x", 200_000) + " '/app/data/x.parquet'"
+	if got := TrimErrStatement(long); len([]rune(got)) > 1001 {
+		t.Errorf("TrimErrStatement not capped: %d runes", len([]rune(got)))
 	}
 }
