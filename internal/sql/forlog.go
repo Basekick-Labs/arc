@@ -212,9 +212,7 @@ func scanDollarQuote(sql string, i int) (int, int, bool) {
 // quoted values. Used by the global zerolog Err() hook AND by call sites that
 // PERSIST error strings (the query registry), which the log hook cannot reach.
 func SanitizeErrText(s string) string {
-	if i := strings.Index(s, "\nLINE "); i >= 0 {
-		s = s[:i]
-	}
+	s = CutStatementContext(s)
 	if i := strings.IndexByte(s, '\n'); i >= 0 {
 		s = s[:i]
 	}

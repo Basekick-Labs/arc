@@ -1596,7 +1596,7 @@ func (h *QueryHandler) getMeasurementSchema(c *fiber.Ctx) error {
 	if err != nil {
 		h.logger.Warn().Err(err).Str("database", database).Str("measurement", measurement).Msg("Field schema lookup failed")
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-			"error": "Field schema unavailable: " + err.Error(),
+			"error": "Field schema unavailable: " + clientErrText(h.logger, err),
 		})
 	}
 	if !ok {
@@ -3022,7 +3022,7 @@ localProcessing:
 		h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(req.SQL)).Msg("Query execution failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 			Success:         false,
-			Error:           err.Error(),
+			Error:           clientErrText(h.logger, err),
 			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 			Timestamp:       timestamp,
 		})
@@ -3042,7 +3042,7 @@ localProcessing:
 		h.logger.Error().Err(err).Msg("Failed to get column names")
 		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 			Success:         false,
-			Error:           err.Error(),
+			Error:           clientErrText(h.logger, err),
 			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 			Timestamp:       timestamp,
 		})
@@ -5849,7 +5849,7 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time, visibl
 
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to list databases")
-		return respondError(c, fiber.StatusInternalServerError, "Failed to read storage: "+err.Error(), time.Now().UTC().Format(time.RFC3339), start)
+		return respondError(c, fiber.StatusInternalServerError, "Failed to read storage: "+clientErrText(h.logger, err), time.Now().UTC().Format(time.RFC3339), start)
 	}
 
 	// Also get databases from tiering metadata (for cold-only databases)
@@ -5996,7 +5996,7 @@ func (h *QueryHandler) handleShowTables(c *fiber.Ctx, start time.Time, database 
 
 	if err != nil {
 		h.logger.Error().Err(err).Str("database", database).Msg("Failed to list tables")
-		return respondError(c, fiber.StatusInternalServerError, "Failed to read database: "+err.Error(), time.Now().UTC().Format(time.RFC3339), start)
+		return respondError(c, fiber.StatusInternalServerError, "Failed to read database: "+clientErrText(h.logger, err), time.Now().UTC().Format(time.RFC3339), start)
 	}
 
 	// Also get tables from tiering metadata (for cold-only tables)
@@ -6421,7 +6421,7 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 		h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(countSQL)).Msg("Estimate query failed")
 		return c.JSON(EstimateResponse{
 			Success:         false,
-			Error:           "Cannot estimate query: " + err.Error(),
+			Error:           "Cannot estimate query: " + clientErrText(h.logger, err),
 			WarningLevel:    "error",
 			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 		})
@@ -6434,7 +6434,7 @@ func (h *QueryHandler) estimateQuery(c *fiber.Ctx) error {
 			h.logger.Error().Err(err).Msg("Failed to scan count result")
 			return c.JSON(EstimateResponse{
 				Success:         false,
-				Error:           "Failed to get row count: " + err.Error(),
+				Error:           "Failed to get row count: " + clientErrText(h.logger, err),
 				WarningLevel:    "error",
 				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 			})
@@ -6598,7 +6598,7 @@ func (h *QueryHandler) listMeasurements(c *fiber.Ctx) error {
 		}
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
-			"error":   "Failed to read storage: " + err.Error(),
+			"error":   "Failed to read storage: " + clientErrText(h.logger, err),
 		})
 	}
 
@@ -7160,7 +7160,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(sql)).Msg("Measurement query failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 			Success:         false,
-			Error:           err.Error(),
+			Error:           clientErrText(h.logger, err),
 			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 			Timestamp:       timestamp,
 		})
@@ -7180,7 +7180,7 @@ func (h *QueryHandler) queryMeasurement(c *fiber.Ctx) error {
 		h.logger.Error().Err(err).Msg("Failed to get column names in measurement query")
 		return c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 			Success:         false,
-			Error:           err.Error(),
+			Error:           clientErrText(h.logger, err),
 			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 			Timestamp:       timestamp,
 		})

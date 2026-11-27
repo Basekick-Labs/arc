@@ -66,5 +66,5 @@ func (h *QueryHandler) respondArcxMsgPackDrainError(c *fiber.Ctx, derr error, ti
 		onFail(derr.Error())
 	}
 	h.logger.Error().Err(derr).Msg("arcx serve: msgpack drain error before headers; 500")
-	return respondError(c, fiber.StatusInternalServerError, derr.Error(), timestamp, start)
+	return respondError(c, fiber.StatusInternalServerError, clientErrText(h.logger, derr), timestamp, start)
 }

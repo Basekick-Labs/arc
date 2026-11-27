@@ -939,7 +939,7 @@ func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (
 		if src != nil {
 			h.ensureCQMirrored(ctx, queryID)
 		}
-		h.recordExecution(queryID, executionID, "failed", startTime, endTime, nil, 0, executionDuration, err.Error())
+		h.recordExecution(queryID, executionID, "failed", startTime, endTime, nil, 0, executionDuration, clientErrText(h.logger, err))
 
 		h.logger.Error().Err(err).Str("query_name", cq.Name).Msg("Scheduled continuous query execution failed")
 		return nil, fmt.Errorf("execution failed: %w", err)
@@ -1164,7 +1164,8 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 		if src != nil {
 			h.ensureCQMirrored(c.Context(), int64(queryID))
 		}
-		h.recordExecution(int64(queryID), executionID, "failed", startTime, endTime, nil, 0, executionDuration, err.Error())
+		errText := clientErrText(h.logger, err)
+		h.recordExecution(int64(queryID), executionID, "failed", startTime, endTime, nil, 0, executionDuration, errText)
 
 		if ingest.IsWriteRefusal(err) {
 			// Refused, not failed: 503 and retryable, logged by reason (#676).
@@ -1172,7 +1173,7 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 		}
 		h.logger.Error().Err(err).Str("query_name", cq.Name).Msg("Continuous query execution failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Execution failed: " + err.Error(),
+			"error": "Execution failed: " + errText,
 		})
 	}
 

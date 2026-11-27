@@ -917,7 +917,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(req.SQL)).Msg("Arrow query execution failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
-			"error":   err.Error(),
+			"error":   clientErrText(h.logger, err),
 		})
 	}
 
