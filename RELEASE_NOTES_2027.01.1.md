@@ -4,7 +4,7 @@
 
 ## Fix: a column of Arrow type `null` is sent as nulls, not as the string `"(null)"` ([#1970](https://github.com/Basekick-Labs/arc/issues/1970))
 
-**Who is affected:** JSON and MessagePack query clients reading a result from an engine that emits Arrow's `null` type for a column (arcx serve can; DuckDB does not, it types a bare `NULL` as `int32`). Arrow IPC and Flight SQL were not affected.
+**Who is affected:** JSON and MessagePack query clients reading a result from an engine that emits Arrow's `null` type for a column (arcx serve could, for example from a Parquet column of the null logical type; DuckDB does not, it types a bare `NULL` as `int32`). Arrow IPC and Flight SQL were not affected.
 
 Such a column is named `null` in `types`, but its values went out as the string `"(null)"` on both wires: the column has no null bitmap, so Arc's encoders took every value for a non-null one and printed it. They now send `null` (JSON) and nil (MessagePack) for every row.
 

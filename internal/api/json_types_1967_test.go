@@ -367,10 +367,13 @@ func TestJSONKindPerArrowType_1967(t *testing.T) {
 		name := arrowTypeName(tc.dt)
 		arr, _, err := array.FromJSON(mem, tc.dt, strings.NewReader(tc.val))
 		require.NoError(t, err, "%s", tc.dt)
-		// Every fixture is a non-null value except arrow.Null's, and that
-		// one also reports IsNull false (no validity bitmap), so the check
-		// holds for all of them and appendValue's own case is what runs.
-		require.False(t, arr.IsNull(0), "%s", tc.dt)
+		// Every fixture is a non-null value except arrow.Null's. Its array
+		// reports IsNull false in arrow-go v18 (no validity bitmap), which
+		// is what #1970 was about; Arrow C++ says true, so the fixture check
+		// skips it rather than pin an arrow-go detail.
+		if tc.dt.ID() != arrow.NULL {
+			require.False(t, arr.IsNull(0), "%s", tc.dt)
+		}
 		enc := &jsonValueEncoder{}
 		raw := enc.appendValue(nil, arr, 0)
 		arr.Release()

@@ -3,7 +3,6 @@
 package api
 
 import (
-	"bytes"
 	"encoding/json"
 	"testing"
 
@@ -76,16 +75,27 @@ func TestNullTypeColumnMsgpack_1970(t *testing.T) {
 			require.Nil(t, v, "batches=%d row %d: a null-typed value must be msgpack nil", nBatches, i)
 		}
 		require.Len(t, cols[1], 2*nBatches)
+		for i, v := range cols[1] {
+			require.EqualValues(t, i+1, v, "batches=%d row %d", nBatches, i)
+		}
 	}
 }
 
-// One value, straight through the JSON value encoder: the case itself.
-func TestNullTypeAppendValue_1970(t *testing.T) {
+// The governance cap slices the last kept batch; a sliced null column still
+// matches the array header and its neighbour.
+func TestNullTypeColumnMsgpackCapped_1970(t *testing.T) {
 	alloc := memory.NewCheckedAllocator(memory.NewGoAllocator())
-	defer alloc.AssertSize(t, 0)
-	schema, recs := nullColumnBatches(t, alloc, 1)
-	_ = schema
-	defer recs[0].Release()
-	got := (&jsonValueEncoder{}).appendValue(nil, recs[0].Column(0), 0)
-	require.True(t, bytes.Equal(got, []byte("null")), "got %s", got)
+	schema, recs := nullColumnBatches(t, alloc, 4)
+	reader := newSimpleRecordReader(schema, recs)
+	raw, _ := msgpackStreamToBytes(reader, 3)
+	reader.Release()
+	alloc.AssertSize(t, 0)
+
+	out := decodeMsgpack(t, raw)
+	cols := colsOf(t, out)
+	require.Len(t, cols[0], 3)
+	require.Len(t, cols[1], 3)
+	for i, v := range cols[0] {
+		require.Nil(t, v, "row %d", i)
+	}
 }
