@@ -7,8 +7,9 @@ import "strings"
 // ASCII space.
 //
 // DuckDB does not lex those characters. Before parsing, Parser::ParseQuery
-// runs Parser::StripUnicodeSpaces (src/parser/parser.cpp, the same in
-// v1.4.3 and v1.5.0) over the statement and parses the result. That pass is
+// runs Parser::StripUnicodeSpaces (src/parser/parser.cpp; ported from
+// v1.5.0, identical in v1.4.3, and checked byte for byte against that C++
+// compiled on its own; Arc links v1.5.6) over the statement and parses the result. That pass is
 // a small state machine of its own: it skips '…' and "…" spans (a doubled
 // quote escapes), $tag$…$tag$ spans (opened at any $ followed by $ or a tag
 // byte, wherever it stands) and -- comments ending at CR or LF, and replaces
@@ -35,8 +36,8 @@ func StripUnicodeSpaces(sql string) string {
 	}
 }
 
-// unicodeSpaceLeadBytes are the first bytes of every UTF-8 sequence the
-// pass replaces. A byte loop, not strings.ContainsAny: that decodes its set
+// hasUnicodeSpaceLeadByte reports whether s contains the first byte of any
+// UTF-8 sequence the pass replaces. A byte loop, not strings.ContainsAny: that decodes its set
 // as runes and would never match a lone lead byte.
 func hasUnicodeSpaceLeadByte(s string) bool {
 	for i := 0; i < len(s); i++ {

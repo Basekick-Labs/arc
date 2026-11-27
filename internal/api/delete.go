@@ -513,6 +513,12 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
+	// Canonical first (see validateWhereClause): the qualifier rewrite below
+	// masks the clause, and it must find the literals DuckDB will find. On
+	// the raw clause, a dollar-quoted literal after a no-break space was not
+	// one to the masker, and the rewrite edited inside it.
+	req.Where = sqlutil.StripUnicodeSpaces(req.Where)
+
 	// A column qualified by the measurement's name means that column (#1451).
 	// Rewritten before validation, so what is validated is what runs. Keep
 	// this order: the rewrite masks and restores caller text, and
@@ -1015,8 +1021,8 @@ func (h *DeleteHandler) checkWhereClause(where string) (bool, error) {
 	}
 
 	// Validation scans run on the MASKED clause: a forbidden keyword or ';'
-	// inside a string literal is data, not SQL (#834). The raw clause is what
-	// gets interpolated into the DuckDB statement, so the unmatched-quote and
+	// inside a string literal is data, not SQL (#834). The (canonical) clause
+	// is what gets interpolated into the DuckDB statement, so the unmatched-quote and
 	// unmatched-parenthesis checks below stay on it. An unquoted backtick is
 	// refused before anything is masked: it is not a quote in DuckDB, so the
 	// masker must see the clause exactly as DuckDB will (#1480).

@@ -333,12 +333,13 @@ func normalizeSQLForShow(sql string) string {
 
 // errUnquotedBacktick is the reason the validators give for an unquoted
 // backtick (hasUnquotedBacktick).
-// errUnicodeSpaceInCode refuses a Unicode space (a no-break space, say)
-// that DuckDB's parser would not read as a separator where Arc does, or the
-// reverse. It names the fix; a trailing U+00A0 is the common harmless case.
-const errUnicodeSpaceInCode = "Unicode space characters (such as a no-break space) are only allowed inside string literals and comments here; replace them with ASCII spaces"
-
 const errUnquotedBacktick = "backticks are not identifier quotes in DuckDB; quote identifiers with double quotes (\"name\")"
+
+// errUnicodeSpaceInCode refuses a Unicode space (a no-break space, say) left
+// outside every literal and comment after canonicalising: there DuckDB's
+// space-replacing pass and its lexer disagree, or the pass did not reach it
+// (the last two bytes). The message names the fix.
+const errUnicodeSpaceInCode = "Unicode space characters (such as a no-break space) are only allowed inside string literals and comments here; replace them with ASCII spaces"
 
 // errReservedPlaceholder refuses caller SQL that spells a placeholder the
 // SQL maskers generate, outside a string literal or quoted identifier
@@ -3452,6 +3453,11 @@ func MaxSQLLength() int {
 // a separator to DuckDB. Callers must use the returned SQL, never the
 // argument, from here on.
 func ValidateSQLRequest(sql string) (string, error) {
+	// The length cap applies to what the client sent; the canonical text
+	// can only be shorter.
+	if max := MaxSQLLength(); len(sql) > max {
+		return "", &SQLValidationError{Message: fmt.Sprintf("SQL query exceeds maximum length (%d characters; query.max_sql_length)", max)}
+	}
 	canonical := sqlutil.StripUnicodeSpaces(sql)
 	if err := validateSQLRequest(canonical); err != nil {
 		return "", err

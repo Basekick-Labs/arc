@@ -100,7 +100,9 @@ func (s *flightSQLService) CreatePreparedStatement(ctx context.Context, req flig
 	if decimalMode == decimalModeExact {
 		storedDecimalMode = decimalModeExact
 	}
-	handle, err := json.Marshal(flightPreparedStatement{Version: flightPreparedStatementVersion, SQL: req.GetQuery(), Database: database, DecimalMode: storedDecimalMode})
+	// The handle stores the canonical text preparedSchema validated (every
+	// reader validates it again, which leaves it unchanged).
+	handle, err := json.Marshal(flightPreparedStatement{Version: flightPreparedStatementVersion, SQL: sqlutil.StripUnicodeSpaces(req.GetQuery()), Database: database, DecimalMode: storedDecimalMode})
 	if err != nil {
 		return flightsql.ActionCreatePreparedStatementResult{}, status.Errorf(codes.Internal, "encode prepared statement handle: %v", err)
 	}
