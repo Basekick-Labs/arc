@@ -96,6 +96,11 @@ func (e *jsonValueEncoder) appendValue(dst []byte, col arrow.Array, row int) []b
 		dst = append(dst, '"')
 		dst = base64.StdEncoding.AppendEncode(dst, c.Value(row))
 		return append(dst, '"')
+	case *array.Null:
+		// Every value of a NULL-typed column is null, but the array has no
+		// validity bitmap, so IsNull above is false and the default branch
+		// would write ValueStr's "(null)" as a string (#1970).
+		return append(dst, "null"...)
 	default:
 		return appendJSONString(dst, col.ValueStr(row))
 	}
