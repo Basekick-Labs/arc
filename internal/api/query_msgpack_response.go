@@ -77,15 +77,16 @@ func respondError(c *fiber.Ctx, status int, errMsg, timestamp string, start time
 //  2. First-non-nil-cell inference is fragile when leading rows are
 //     nil for a column that later carries data.
 //
-// types may be nil, in which case the JSON path doesn't emit a types
-// field (the JSON envelope shape never had one) and the msgpack path
-// falls back to empty strings — a deliberate signal to the client that
-// the schema is unknown.
+// Both wires carry types (JSON since #1967, as the streaming query path
+// does). types may be nil, in which case the JSON path omits the field
+// and the msgpack path falls back to empty strings — a deliberate signal
+// to the client that the schema is unknown.
 func respondSuccessRows(c *fiber.Ctx, columns []string, types []string, data [][]interface{}, timestamp string, start time.Time) error {
 	if !isMsgPackWire(c) {
 		return c.JSON(QueryResponse{
 			Success:         true,
 			Columns:         columns,
+			Types:           types,
 			Data:            data,
 			RowCount:        len(data),
 			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
@@ -105,6 +106,7 @@ func respondEmptySuccess(c *fiber.Ctx, timestamp string, start time.Time) error 
 		return c.JSON(QueryResponse{
 			Success:         true,
 			Columns:         []string{},
+			Types:           []string{},
 			Data:            [][]interface{}{},
 			RowCount:        0,
 			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
@@ -118,8 +120,8 @@ func respondEmptySuccess(c *fiber.Ctx, timestamp string, start time.Time) error 
 // writeMsgPackRowsColumnar writes a SHOW-style success envelope as a
 // columnar msgpack response. Transposes the row-major data slice into
 // per-column arrays so the wire shape matches the streaming hot path:
-// `data` is array-of-columns, with a parallel `types` array (inferred
-// from the first non-nil cell in each column). Bounded payload — SHOW
+// `data` is array-of-columns, with a parallel `types` array (the caller's
+// declared types; see respondSuccessRows). Bounded payload — SHOW
 // results are small (databases/measurements) — so direct in-memory
 // encode without streaming.
 func writeMsgPackRowsColumnar(c *fiber.Ctx, columns []string, types []string, data [][]interface{}, start time.Time, timestamp string) {

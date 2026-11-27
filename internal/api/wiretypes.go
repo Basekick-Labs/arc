@@ -1,12 +1,12 @@
 package api
 
-// Arc's msgpack wire-type names.
+// Arc's wire-type names.
 //
-// These are the strings the msgpack response's "types" array carries, and
-// they are a published contract: BI drivers and other clients switch on
-// them to decode each column. They live here, in an untagged file with no
-// Arrow dependency, because two independent code paths emit them and must
-// not drift apart:
+// These are the strings the "types" array of the msgpack and JSON query
+// responses carries (JSON since #1967), and they are a published contract:
+// BI drivers and other clients switch on them to decode each column. They
+// live here, in an untagged file with no Arrow dependency, because two
+// independent code paths emit them and must not drift apart:
 //
 //   - the streaming query path, via arrowTypeName (query_msgpack_types.go,
 //     build-tagged duckdb_arrow) — derives the name from the Arrow schema
@@ -39,10 +39,11 @@ const (
 	wireTypeNull    = "null"
 
 	// wireTypeStringEncoded is the honest name for a column whose Arrow
-	// type Arc recognizes but whose values the msgpack encoder has no
-	// typed case for, so they are rendered with ValueStr and transmitted
-	// as msgpack strings (DATE64, TIME32/64, DURATION, the INTERVALs,
-	// FLOAT16, FIXED_SIZE_BINARY). Naming these by their logical Arrow
+	// type Arc recognizes but whose values neither encoder has a typed
+	// case for (msgpack encodeColumn, JSON jsonValueEncoder.appendValue),
+	// so they are rendered with ValueStr and transmitted as strings on
+	// both wires (DATE64, TIME32/64, DURATION, the INTERVALs, FLOAT16,
+	// FIXED_SIZE_BINARY). Naming these by their logical Arrow
 	// type would advertise a numeric payload over a string one — the
 	// exact defect this contract was introduced to eliminate.
 	wireTypeStringEncoded = "string_encoded"

@@ -929,10 +929,16 @@ type QueryRequest struct {
 	SQL string `json:"sql"`
 }
 
-// QueryResponse represents a SQL query response
+// QueryResponse represents a SQL query response.
+//
+// Types is Arc's wire type name per column, parallel to Columns: the names
+// the msgpack response carries (#1967). omitzero, not omitempty: an empty
+// answer sends "types":[], and a response without them (an error, or the
+// database/sql fallback) has no key at all.
 type QueryResponse struct {
 	Success         bool                   `json:"success"`
 	Columns         []string               `json:"columns"`
+	Types           []string               `json:"types,omitzero"`
 	Data            [][]interface{}        `json:"data"`
 	RowCount        int                    `json:"row_count"`
 	ExecutionTimeMs float64                `json:"execution_time_ms"`
@@ -5801,8 +5807,8 @@ func (h *QueryHandler) handleShowDatabases(c *fiber.Ctx, start time.Time, visibl
 	h.logger.Debug().Msg("Handling SHOW DATABASES")
 
 	// Include tier column if tiering is enabled. The types slice is
-	// parallel to columns and feeds the msgpack envelope's "types"
-	// field — SHOW results are schema-known by construction, so we
+	// parallel to columns and feeds the "types" field of the msgpack and
+	// JSON envelopes — SHOW results are schema-known by construction, so we
 	// declare types explicitly rather than infer them from cell
 	// content (which is brittle when leading rows are nil).
 	var columns []string

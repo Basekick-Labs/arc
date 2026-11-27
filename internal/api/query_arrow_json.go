@@ -96,6 +96,7 @@ func executeArrowJSONQuery(
 			c.JSON(QueryResponse{
 				Success:         true,
 				Columns:         []string{},
+				Types:           []string{},
 				Data:            [][]interface{}{},
 				RowCount:        0,
 				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
@@ -357,7 +358,19 @@ func streamArrowJSON(
 	// --- Write envelope open ---
 	w.WriteString(`{"success":true,"columns":`)
 	writeJSONStringArray(w, columns)
-	w.WriteString(`,"data":[`)
+	// "types": Arc's wire type name per column, the same names the msgpack
+	// response carries (#1967). From the post-normalisation schema, so a
+	// decimal SUM reads int64, matching the values below. writeJSONString,
+	// not WriteString: an unknown: name carries Arrow debug text, which can
+	// include field names.
+	w.WriteString(`,"types":[`)
+	for i, f := range fields {
+		if i > 0 {
+			w.WriteByte(',')
+		}
+		writeJSONString(w, scratch, arrowTypeName(f.Type))
+	}
+	w.WriteString(`],"data":[`)
 
 	// rowCount is the rows on the wire (row_count); dispatched also counts
 	// rows handed to encoder workers and not written yet, and decides the
@@ -558,8 +571,8 @@ batchLoop:
 	w.Write(scratch)
 
 	// Governance row cap (#724): see streamTypedJSON. Same two keys, same
-	// omit-when-absent rule, so the JSON and Arrow-JSON envelopes stay
-	// identical in shape.
+	// omit-when-absent rule as that writer. (The envelopes are not identical:
+	// "types" is written only here, #1967.)
 	if rowCapReached(governanceMaxRows, int64(rowCount)) {
 		w.WriteString(`,"rows_capped":true,"row_cap":`)
 		scratch = strconv.AppendInt(scratch[:0], int64(governanceMaxRows), 10)
