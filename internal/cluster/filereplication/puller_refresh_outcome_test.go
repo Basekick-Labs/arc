@@ -5,7 +5,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -213,5 +215,48 @@ func TestVerifyLocalCopyFailsClosed(t *testing.T) {
 	}
 	if p.verifyLocalCopy(zerolog.Nop(), entry) == localCopyMatched {
 		t.Fatal("a hash read on a stopped puller was treated as matching")
+	}
+}
+
+// failAfterReader yields its bytes, then fails like a dropped transfer.
+type failAfterReader struct{ r io.Reader }
+
+func (f *failAfterReader) Read(b []byte) (int, error) {
+	n, err := f.r.Read(b)
+	if err == io.EOF {
+		return n, errors.New("transfer interrupted")
+	}
+	return n, err
+}
+
+// The resume path on the real LocalBackend: an interrupted WriteReader leaves
+// a staged partial that ReadToAt no longer returns (#1199), and
+// tryResumeFromPartial still finds it through StagingInspector and hashes
+// exactly its bytes. The fake backend stood in for this before; this pins it
+// on the backend production runs.
+func TestTryResumeFromPartialOnLocalBackend(t *testing.T) {
+	body := bytes.Repeat([]byte("0123456789"), 100)
+	p, local, _ := newVerifyPuller(t, body)
+	ctx := context.Background()
+	const path = "db/m/2026/11/02/10/resume.parquet"
+	prefix := body[:400]
+
+	if err := local.WriteReader(ctx, path, &failAfterReader{r: bytes.NewReader(prefix)}, int64(len(body))); err == nil {
+		t.Fatal("WriteReader succeeded over an interrupted reader")
+	}
+	if exists, err := local.Exists(ctx, path); err != nil || exists {
+		t.Fatalf("Exists after an interrupted write = %v, %v; want false", exists, err)
+	}
+	if err := local.ReadToAt(ctx, path, io.Discard, 0); !errors.Is(err, storage.ErrObjectNotFound) {
+		t.Fatalf("ReadToAt of a staged-only path = %v, want ErrObjectNotFound", err)
+	}
+
+	offset, h := p.tryResumeFromPartial(zerolog.Nop(), entryFor(path, body))
+	if offset != int64(len(prefix)) || h == nil {
+		t.Fatalf("tryResumeFromPartial = offset %d, hasher %v; want a resume at %d", offset, h, len(prefix))
+	}
+	want := sha256.Sum256(prefix)
+	if got := h.Sum(nil); !bytes.Equal(got, want[:]) {
+		t.Fatalf("resume hash covers the wrong bytes: got %x, want %x", got, want[:])
 	}
 }

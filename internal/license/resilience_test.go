@@ -171,10 +171,11 @@ func TestCacheGrid(t *testing.T) {
 
 	t.Run("expired rejected", func(t *testing.T) {
 		c := mk(t)
-		lf, sig := signedPairFor(t, c, -time.Minute)
+		// Past the paid cutoff (signed expiry + up to 15 days of grace).
+		lf, sig := signedPairFor(t, c, -20*24*time.Hour)
 		c.saveCache(lf, sig)
 		if _, err := c.LoadCachedLicense(); err == nil {
-			t.Fatal("expired cache must be rejected — no grace beyond expires_at")
+			t.Fatal("expired cache must be rejected past the grace cutoff")
 		}
 	})
 

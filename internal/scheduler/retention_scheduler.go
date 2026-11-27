@@ -2,7 +2,6 @@ package scheduler
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"time"
 
@@ -25,10 +24,6 @@ type WriterGate interface {
 // RetentionClusterGate is an alias for WriterGate kept for backwards compatibility.
 // Deprecated: use WriterGate directly.
 type RetentionClusterGate = WriterGate
-
-// ErrRetentionRoleGated is returned by TriggerNow when the node's role does
-// not permit running retention (e.g. it is a reader, not the primary writer).
-var ErrRetentionRoleGated = fmt.Errorf("retention: node role is not primary writer")
 
 // RetentionScheduler manages automatic execution of retention policies on a schedule
 type RetentionScheduler struct {
@@ -243,20 +238,24 @@ func (s *RetentionScheduler) TriggerNow(ctx context.Context) error {
 		s.logger.Warn().
 			Str("role", s.clusterGate.Role()).
 			Msg("Manual retention trigger rejected: node is not primary writer")
-		return ErrRetentionRoleGated
+		return api.ErrRetentionTriggerRoleGated
 	}
 
-	// Check license - require valid license for retention scheduler
+	// Check license - require valid license for retention scheduler. This
+	// returned nil, which the API answered 200 "Retention triggered
+	// successfully" without running anything (#1433). The scheduler is only
+	// created with a license, so this is one that expired or was revoked
+	// since.
 	if s.licenseClient == nil || !s.licenseClient.CanUseRetentionScheduler() {
 		s.logger.Warn().Msg("Valid enterprise license required for retention trigger")
-		return nil
+		return api.ErrRetentionTriggerUnlicensed
 	}
 
 	s.mu.Lock()
 	if s.runningJob {
 		s.mu.Unlock()
 		s.logger.Warn().Msg("Manual retention trigger rejected: a cycle is already running")
-		return fmt.Errorf("retention cycle already in progress")
+		return api.ErrRetentionTriggerRunning
 	}
 	s.runningJob = true
 	s.mu.Unlock()

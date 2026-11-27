@@ -72,51 +72,116 @@ func NewMigrator(cfg *MigratorConfig) *Migrator {
 // MigrateTier migrates eligible files from one tier to another
 // Returns the number of files migrated and the number of errors
 func (m *Migrator) MigrateTier(ctx context.Context, fromTier, toTier Tier) (int, int) {
+	return m.MigrateTierFiltered(ctx, fromTier, toTier, "", "")
+}
+
+// MigrateTierFiltered migrates eligible files, optionally restricted to a
+// database and/or measurement. The automatic scheduler uses MigrateTier with
+// empty filters, while manual API requests can safely target a subset.
+func (m *Migrator) MigrateTierFiltered(ctx context.Context, fromTier, toTier Tier, database, measurement string) (int, int) {
+	r := m.MigrateTierFilteredResult(ctx, fromTier, toTier, database, measurement)
+	return r.Migrated, r.Failed
+}
+
+// MigrationResult is what one migration run did (#1830).
+type MigrationResult struct {
+	// Candidates is how many files were eligible.
+	Candidates int
+	// Migrated files have a cold copy and a cold row.
+	Migrated int
+	// Failed counts files that could not be migrated, plus one for a
+	// release that failed.
+	Failed int
+	// NotAttempted files were left hot, with nothing in cold: the run ended
+	// (budget, shutdown) before their copy started or finished, this node
+	// stopped being the writer, a DELETE held them, or a release failure
+	// stopped the run. A later run moves them.
+	NotAttempted int
+	// Gone files were removed since the scan listed them (a compaction, a
+	// DELETE, a re-home job, #1848): nothing to copy; the next scan retires
+	// their rows.
+	Gone int
+	// Kept files are migrated but their hot copy was not released (a
+	// manifest update or a hot delete failed). Until they are reconciled,
+	// a node reading both tiers reads them twice.
+	Kept int
+	// TimedOut: tiered_storage.migration_timeout ended the run before every
+	// candidate was tried.
+	TimedOut bool
+	// ReleaseErr is the release failure that stopped the run, if any.
+	ReleaseErr error
+}
+
+// MigrateTierFilteredResult is MigrateTierFiltered reporting the whole result.
+func (m *Migrator) MigrateTierFilteredResult(ctx context.Context, fromTier, toTier Tier, database, measurement string) MigrationResult {
+	var r MigrationResult
 	m.logger.Info().
 		Str("from_tier", string(fromTier)).
 		Str("to_tier", string(toTier)).
+		Str("database", database).
+		Str("measurement", measurement).
 		Msg("Starting tier migration")
 
 	// Find candidates for migration
-	candidates, err := m.FindCandidates(ctx, fromTier, toTier)
+	candidates, err := m.FindCandidatesFiltered(ctx, fromTier, toTier, database, measurement)
 	if err != nil {
 		m.logger.Error().Err(err).Msg("Failed to find migration candidates")
-		return 0, 1
+		r.Failed = 1
+		return r
 	}
 
 	if len(candidates) == 0 {
 		m.logger.Info().Msg("No candidates for migration")
-		return 0, 0
+		return r
 	}
+	r.Candidates = len(candidates)
 
 	m.logger.Info().Int("candidates", len(candidates)).Msg("Found migration candidates")
 
-	// Process in batches
-	migrated := 0
-	failed := 0
-
 	for i := 0; i < len(candidates); i += m.batchSize {
+		if ctx.Err() != nil || m.manager.stopping() || m.manager.roleGated() {
+			// Out of budget, stopping, or no longer the writer: a batch
+			// started now would mark its sync receipts and copy nothing.
+			r.NotAttempted += len(candidates) - i
+			break
+		}
 		end := i + m.batchSize
 		if end > len(candidates) {
 			end = len(candidates)
 		}
 
-		batch := candidates[i:end]
-		batchMigrated, batchFailed, releaseErr := m.migrateBatch(ctx, batch)
-		migrated += batchMigrated
-		failed += batchFailed
-		if releaseErr != nil {
+		b := m.migrateBatch(ctx, candidates[i:end])
+		r.Migrated += b.migrated
+		r.Failed += b.failed
+		r.NotAttempted += b.notAttempted
+		r.Gone += b.gone
+		r.Kept += b.kept
+		if b.releaseErr != nil {
 			// A manifest failure is not transient (Cluster Operations
 			// Checklist item 3): no further batch is copied this cycle.
+			r.ReleaseErr = b.releaseErr
+			r.NotAttempted += len(candidates) - end
 			break
 		}
 	}
-
-	return migrated, failed
+	r.TimedOut = errors.Is(ctx.Err(), context.DeadlineExceeded) && r.NotAttempted > 0
+	if r.NotAttempted > 0 && r.ReleaseErr == nil {
+		m.logger.Warn().
+			Int("migrated", r.Migrated).
+			Int("not_attempted", r.NotAttempted).
+			Msg("Migration stopped at its budget (tiered_storage.migration_timeout); the files not attempted stay hot and move on the next run")
+	}
+	return r
 }
 
 // FindCandidates finds files eligible for migration from one tier to another
 func (m *Migrator) FindCandidates(ctx context.Context, fromTier, toTier Tier) ([]MigrationCandidate, error) {
+	return m.FindCandidatesFiltered(ctx, fromTier, toTier, "", "")
+}
+
+// FindCandidatesFiltered finds eligible migration candidates, optionally
+// restricted to a database and/or measurement.
+func (m *Migrator) FindCandidatesFiltered(ctx context.Context, fromTier, toTier Tier, database, measurement string) ([]MigrationCandidate, error) {
 	// Only support Hot -> Cold migration in 2-tier system
 	if fromTier != TierHot || toTier != TierCold {
 		return nil, fmt.Errorf("unsupported migration: %s -> %s (only hot -> cold supported)", fromTier, toTier)
@@ -126,7 +191,7 @@ func (m *Migrator) FindCandidates(ctx context.Context, fromTier, toTier Tier) ([
 	maxAge := time.Duration(m.manager.config.DefaultHotMaxAgeDays) * 24 * time.Hour
 
 	// Get files older than max age in the source tier
-	files, err := m.manager.metadata.GetFilesOlderThan(ctx, fromTier, maxAge)
+	files, err := m.manager.metadata.GetFilesOlderThanFiltered(ctx, fromTier, maxAge, database, measurement)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get old files: %w", err)
 	}
@@ -195,7 +260,9 @@ func (m *Migrator) FindCandidates(ctx context.Context, fromTier, toTier Tier) ([
 			continue
 		}
 
-		if m.manager.heldByCompaction(file.Path) {
+		if m.manager.heldElsewhere(file.Path) {
+			m.logger.Debug().Str("path", file.Path).
+				Msg("Skipping a file a compaction or a re-home job owns for cold migration")
 			continue
 		}
 		if m.supersededByDelete(file.Path, retired[file.Path]) {
@@ -219,31 +286,58 @@ func (m *Migrator) FindCandidates(ctx context.Context, fromTier, toTier Tier) ([
 	return candidates, nil
 }
 
-// dropTakenOver removes from files those a compaction committed over since
-// their copy (#1207 d2a2b): their rows are in the compaction's output, so the
-// cold copy goes and the hot copy is the finisher's to delete.
+// dropTakenOver removes from files those another operation took over since
+// their copy, and makes them hot again: the cold copy goes and the row is set
+// back.
+//
+//   - A compaction that committed over the file (#1207 d2a2b): its rows are
+//     in the compaction's output, and the hot copy is the finisher's to
+//     delete.
+//   - A re-home job that owns the file (#1825). On a standalone node this is
+//     reached only for a file the job does not end up taking: the job's
+//     check of its source (CheckRehomeSource) is refused while the move
+//     claim is held, which is until after this. On a cluster the job, staged
+//     by another node, may go on to take it once this node's check passes
+//     (#1869). Either way the hot copy stays, as a hot file.
 func (m *Migrator) dropTakenOver(ctx context.Context, files []MigrationCandidate) []MigrationCandidate {
 	kept := files[:0:0]
+	var removed []string
+	defer func() { m.manager.reportColdRemoved(removed) }() // once for the chunk
 	for _, c := range files {
-		if !m.manager.heldByCompaction(c.Path) {
+		if !m.manager.heldElsewhere(c.Path) {
 			kept = append(kept, c)
 			continue
 		}
+		// The cold copy goes while the row is still cold: keep the
+		// missing-object check off it until the row is hot again (#1551).
+		m.manager.BeginColdRemoval()
 		if dst := m.manager.GetBackendForTier(c.TargetTier); dst != nil {
 			if err := dst.Delete(ctx, c.Path); err != nil && !storage.IsNotFound(err) {
-				m.logger.Warn().Err(err).Str("path", c.Path).Msg("Could not remove the cold copy of a file a compaction took over")
+				m.logger.Warn().Err(err).Str("path", c.Path).Msg("Could not remove the cold copy of a file a compaction or a re-home job took over")
+			} else {
+				removed = append(removed, c.Path)
 			}
 		}
 		if err := m.manager.metadata.UpdateTier(ctx, c.Path, c.CurrentTier); err != nil {
-			m.logger.Warn().Err(err).Str("path", c.Path).Msg("Could not record a file a compaction took over as hot again")
+			m.logger.Warn().Err(err).Str("path", c.Path).Msg("Could not record a file a compaction or a re-home job took over as hot again")
 		}
-		m.logger.Info().Str("path", c.Path).Msg("A compaction took over a file during its migration; its cold copy was removed")
+		m.manager.EndColdRemoval()
+		m.logger.Info().Str("path", c.Path).Msg("A compaction or a re-home job took over a file during its migration; it stays on the hot tier")
 	}
 	return kept
 }
 
-// errHeldByCompaction: a compaction took the file over during its migration.
-var errHeldByCompaction = errors.New("a compaction took the file over during its migration")
+// errSourceGone: the hot file was removed after the scan listed it; its row
+// is stale and the next scan retires it. Not a failure of the migration.
+var errSourceGone = errors.New("the file was removed after the tiering scan listed it")
+
+// errHeldByCompaction: a compaction or a re-home job took the file over
+// during its migration.
+var errHeldByCompaction = errors.New("a compaction or a re-home job took the file over during its migration")
+
+// errHeldBeforeCopy: a compaction or a re-home job owns the file; nothing was
+// copied, and it migrates on a later cycle.
+var errHeldBeforeCopy = errors.New("a compaction or a re-home job owns the file; it migrates on a later cycle")
 
 // dropSupersededCopy deletes the cold copy of a file whose rows a DELETE took
 // out. If it stays, the next cold sync records it as a cold file and the
@@ -254,6 +348,7 @@ func (m *Migrator) dropSupersededCopy(ctx context.Context, cold storage.Backend,
 			Msg("Could not remove the cold copy of a file whose rows a DELETE removed; the next cold sync will record it and those rows will be read again until it is deleted by hand")
 		return
 	}
+	m.manager.reportColdRemoved([]string{path})
 	m.logger.Warn().Str("path", path).Str("why", why).Msg("Removed the cold copy of a file whose rows a DELETE removed")
 }
 
@@ -313,15 +408,69 @@ func (m *Migrator) supersededNow(ctx context.Context, path string) (bool, error)
 
 // MigrateBatch migrates a batch of files concurrently
 func (m *Migrator) MigrateBatch(ctx context.Context, candidates []MigrationCandidate) (int, int) {
-	migrated, failed, _ := m.migrateBatch(ctx, candidates)
-	return migrated, failed
+	b := m.migrateBatch(ctx, candidates)
+	return b.migrated, b.failed
 }
 
-// migrateBatch is MigrateBatch, also returning the release's manifest
-// failure, which stops the cycle.
-func (m *Migrator) migrateBatch(ctx context.Context, candidates []MigrationCandidate) (int, int, error) {
+// batchResult is migrateBatch's account of one batch.
+type batchResult struct {
+	migrated, failed, notAttempted, kept, gone int
+	// releaseErr is the release's manifest failure, which stops the cycle.
+	releaseErr error
+}
+
+// releaseDrain is how long the release of already-migrated files may run on
+// after the migration's own context ends (#1830). A variable for tests.
+var releaseDrain = 2 * time.Minute
+
+// releaseContext is the context the hot-copy release runs on: not cancelled
+// with ctx, because a file that flipped to cold must lose its hot copy or be
+// read twice until something reconciles it, and an API migrate reaching
+// tiered_storage.migration_timeout used to leave exactly those (#1830). It
+// ends releaseDrain after ctx does, when the manager stops, or when the
+// returned cancel is called. A writer demoted mid-run keeps releasing, as it
+// did within the budget before: each chunk leaves the manifest first, so
+// releasing is safe, and stopping would leave double reads behind.
+func (m *Migrator) releaseContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	relCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	var stopCh <-chan struct{}
+	if m.manager != nil {
+		stopCh = m.manager.stopCh
+	}
+	drain := releaseDrain
+	go func() {
+		select {
+		case <-relCtx.Done():
+			return
+		case <-stopCh:
+			cancel()
+			return
+		case <-ctx.Done():
+		}
+		if relCtx.Err() != nil {
+			return
+		}
+		t := time.NewTimer(drain)
+		defer t.Stop()
+		select {
+		case <-relCtx.Done():
+		case <-stopCh:
+		case <-t.C:
+		}
+		cancel()
+	}()
+	return relCtx, cancel
+}
+
+// errCopyCutOff marks a copy the run's end cut off: the file stays hot, with
+// no cold row and no cold object, and is not a failure (#1830).
+var errCopyCutOff = errors.New("copy cut off by the end of the migration run")
+
+// migrateBatch migrates one batch: copies on ctx, releases on a release
+// context that outlives it by releaseDrain.
+func (m *Migrator) migrateBatch(ctx context.Context, candidates []MigrationCandidate) batchResult {
 	if len(candidates) == 0 {
-		return 0, 0, nil
+		return batchResult{}
 	}
 	// Mark sync receipts for the WHOLE batch before any file work (#687):
 	// one chunked UPDATE on the shared sync DB instead of per-file calls
@@ -337,11 +486,7 @@ func (m *Migrator) migrateBatch(ctx context.Context, candidates []MigrationCandi
 	if err := m.manager.notifyHotFilesRemoved(paths); err != nil {
 		m.logger.Warn().Err(err).Int("candidates", len(candidates)).
 			Msg("Could not mark sync receipts; aborting migration batch")
-		return 0, len(candidates), nil
-	}
-
-	if len(candidates) == 0 {
-		return 0, 0, nil
+		return batchResult{failed: len(candidates)}
 	}
 
 	// Each file is claimed before its copy so a DELETE cannot rewrite it
@@ -358,38 +503,60 @@ func (m *Migrator) migrateBatch(ctx context.Context, candidates []MigrationCandi
 	// Copy and flip concurrently, and release the hot copies as files flip,
 	// a chunk at a time, rather than after the whole batch: between a flip
 	// and its release both copies are read. A manifest failure, or this
-	// node losing the writer role, stops new copies; the ones in flight
-	// still finish and flip.
+	// node losing the writer role, stops new copies. A copy in flight when
+	// ctx ends stops with it; one already past its copy still flips. Every
+	// flipped file is released on relCtx, which outlives ctx (#1830).
 	sem := semaphore.NewWeighted(int64(m.maxConcurrent))
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	migrated, failed := 0, 0
+	migrated, failed, notAttempted, gone := 0, 0, 0, 0
+	var moved []string // hot paths migrated, for the export (#1727)
 	var stop atomic.Bool
 	flippedCh := make(chan MigrationCandidate, len(candidates))
-	releaseErr := make(chan error, 1)
+	relCtx, cancelRelease := m.releaseContext(ctx)
+	defer cancelRelease()
+	type released struct {
+		kept int
+		err  error
+	}
+	releaseDone := make(chan released, 1)
 	go func() {
-		releaseErr <- m.streamRelease(ctx, flippedCh, &stop)
+		kept, err := m.streamRelease(relCtx, flippedCh, &stop)
+		releaseDone <- released{kept, err}
 	}()
 
-	for _, candidate := range candidates {
+	for i, candidate := range candidates {
 		if err := sem.Acquire(ctx, 1); err != nil {
-			m.logger.Error().Err(err).Msg("Failed to acquire semaphore")
+			// Acquire fails only when ctx has ended: the budget ran out.
+			mu.Lock()
+			notAttempted += len(candidates) - i
+			mu.Unlock()
 			break
 		}
 		// Asked once a slot is free: the wait for it can outlast a manifest
-		// failure or the writer role.
-		if stop.Load() {
+		// failure or the writer role. What is left is not attempted, so the
+		// answer does not read "completed" (#1830).
+		if stop.Load() || m.manager.stopping() {
 			sem.Release(1)
+			mu.Lock()
+			notAttempted += len(candidates) - i
+			mu.Unlock()
 			break
 		}
 		if m.manager.roleGated() {
 			sem.Release(1)
 			m.logger.Warn().Msg("This node is no longer the primary writer; no further files are copied this cycle")
+			mu.Lock()
+			notAttempted += len(candidates) - i
+			mu.Unlock()
 			break
 		}
 		if !m.manager.claims.claimMove(candidate.Path) {
 			// A DELETE is rewriting it; the next cycle sees the result.
 			sem.Release(1)
+			mu.Lock()
+			notAttempted++
+			mu.Unlock()
 			continue
 		}
 		claimed = append(claimed, candidate.Path)
@@ -400,6 +567,32 @@ func (m *Migrator) migrateBatch(ctx context.Context, candidates []MigrationCandi
 			defer sem.Release(1)
 
 			if err := m.copyAndFlip(ctx, c); err != nil {
+				if errors.Is(err, errHeldBeforeCopy) {
+					// Not a failure, and not a file the run's budget left
+					// behind (which is what not-attempted reports): another
+					// operation owns it. Its claim goes now, not with the
+					// batch's: the owner may be about to ask about this very
+					// file (CheckRehomeSource), and nothing of it is moving.
+					m.manager.claims.releaseMove(c.Path)
+					m.logger.Debug().Str("path", c.Path).Msg("A compaction or a re-home job owns the file; it stays hot this cycle")
+					return
+				}
+				if errors.Is(err, errSourceGone) {
+					m.logger.Info().Str("path", c.Path).Msg("A file listed for migration was removed since the tiering scan listed it (a compaction, a DELETE or a re-home job); nothing to copy, and the next scan retires its row")
+					mu.Lock()
+					gone++
+					mu.Unlock()
+					return
+				}
+				if errors.Is(err, errCopyCutOff) {
+					// Not a failure of the file: the run ran out of time
+					// while copying it. It stays hot, with no cold row.
+					m.logger.Debug().Err(err).Str("path", c.Path).Msg("Copy stopped at the migration budget; the file stays hot")
+					mu.Lock()
+					notAttempted++
+					mu.Unlock()
+					return
+				}
 				// A quarantined candidate already logged its own, definitive
 				// line at Error; repeating it here would read as a second
 				// failure of the same file. It still counts as failed for this
@@ -407,7 +600,7 @@ func (m *Migrator) migrateBatch(ctx context.Context, candidates []MigrationCandi
 				// say so the one time it happens.
 				// Not-primary, replaced and changed-row outcomes logged their
 				// own Warn; they are not failures of the copy.
-				if errors.Is(err, errNotPrimary) || errors.Is(err, errReplacedByDelete) || errors.Is(err, errTierChanged) {
+				if errors.Is(err, errNotPrimary) || errors.Is(err, errReplacedByDelete) || errors.Is(err, errTierChanged) || errors.Is(err, errHeldByCompaction) {
 					mu.Lock()
 					failed++
 					mu.Unlock()
@@ -429,6 +622,7 @@ func (m *Migrator) migrateBatch(ctx context.Context, candidates []MigrationCandi
 			}
 			mu.Lock()
 			migrated++
+			moved = append(moved, c.Path)
 			mu.Unlock()
 			flippedCh <- c
 		}(candidate)
@@ -438,11 +632,14 @@ func (m *Migrator) migrateBatch(ctx context.Context, candidates []MigrationCandi
 	close(flippedCh)
 	// A manifest failure counts once for the cycle; the files are migrated
 	// regardless and reconciliation finishes the hot cleanup.
-	err := <-releaseErr
-	if err != nil {
+	rel := <-releaseDone
+	if rel.err != nil {
 		failed++
 	}
-	return migrated, failed, err
+	// The hot copies are released by now: the export can name the cold ones
+	// (#1727).
+	m.manager.notifyPathsChanged(moved)
+	return batchResult{migrated: migrated, failed: failed, notAttempted: notAttempted, kept: rel.kept, gone: gone, releaseErr: rel.err}
 }
 
 // releaseWindow bounds how long a flipped file waits for its chunk to start
@@ -459,8 +656,9 @@ var onReleaseStopped = func() {}
 // streamRelease releases hot copies as files arrive on flipped, in chunks of
 // manifestChunk or every releaseWindow, whichever comes first. A manifest
 // failure sets stop, so no further copies start, and keeps every later
-// hot copy for reconciliation.
-func (m *Migrator) streamRelease(ctx context.Context, flipped <-chan MigrationCandidate, stop *atomic.Bool) error {
+// hot copy for reconciliation. It returns how many migrated files kept their
+// hot copy, and the manifest failure if one stopped it.
+func (m *Migrator) streamRelease(ctx context.Context, flipped <-chan MigrationCandidate, stop *atomic.Bool) (int, error) {
 	var pending []MigrationCandidate
 	var failure error
 	kept := 0
@@ -479,7 +677,9 @@ func (m *Migrator) streamRelease(ctx context.Context, flipped <-chan MigrationCa
 			kept += len(m.dropTakenOver(ctx, chunk))
 			return
 		}
-		if err := m.releaseHotCopies(ctx, chunk, manifestReasonMigrated); err != nil {
+		k, err := m.releaseHotCopies(ctx, chunk, manifestReasonMigrated)
+		kept += k
+		if err != nil {
 			failure = err
 			stop.Store(true)
 			onReleaseStopped()
@@ -492,9 +692,9 @@ func (m *Migrator) streamRelease(ctx context.Context, flipped <-chan MigrationCa
 				flush()
 				if kept > 0 {
 					m.logger.Warn().Err(failure).Int("kept_hot_copies", kept).
-						Msg("Files that flipped after the manifest failure keep their hot copies for reconciliation")
+						Msg(keptHotCopiesMsg)
 				}
-				return failure
+				return kept, failure
 			}
 			pending = append(pending, c)
 			if len(pending) >= manifestChunk {
@@ -520,8 +720,23 @@ func (m *Migrator) MigrateFile(ctx context.Context, candidate MigrationCandidate
 	if err := m.copyAndFlip(ctx, candidate); err != nil {
 		return err
 	}
-	return m.releaseHotCopies(ctx, []MigrationCandidate{candidate}, manifestReasonMigrated)
+	relCtx, cancel := m.releaseContext(ctx)
+	defer cancel()
+	_, err := m.releaseHotCopies(relCtx, []MigrationCandidate{candidate}, manifestReasonMigrated)
+	return err
 }
+
+// keptHotCopiesMsg is logged when migrated files keep their hot copy (#1830).
+const keptHotCopiesMsg = "Migrated files kept their hot copies: they are in cold already, and a node reading both tiers reads them twice until they are reconciled. POST /api/v1/tiering/reconcile, or the scheduled migration cycle, finishes them"
+
+// ErrManifestChanged: a manifest proposal was refused because one of its
+// files was taken by a compaction or a re-home job since it was checked.
+var ErrManifestChanged = errors.New("a file of the batch was taken over")
+
+const (
+	manifestChangedRetries = 3
+	manifestChangedPause   = 500 * time.Millisecond
+)
 
 // releaseHotCopies removes migrated files' hot copies in chunks: each chunk
 // leaves the cluster manifest first (one proposal, paced by the manager so
@@ -531,9 +746,11 @@ func (m *Migrator) MigrateFile(ctx context.Context, candidate MigrationCandidate
 // bookkeeping and the delete here removes the object. A manifest failure
 // returns with the remaining hot copies in place — their rows
 // already say cold, and reconciliation finishes them, manifest-first,
-// within its window.
-func (m *Migrator) releaseHotCopies(ctx context.Context, files []MigrationCandidate, reason string) error {
+// within its window. It returns how many hot copies were kept: those of a
+// failed manifest chunk and after it, and those whose delete failed.
+func (m *Migrator) releaseHotCopies(ctx context.Context, files []MigrationCandidate, reason string) (int, error) {
 	files = m.dropTakenOver(ctx, files)
+	kept := 0
 	for i := 0; i < len(files); i += manifestChunk {
 		chunk := files[i:min(i+manifestChunk, len(files))]
 		paths := make([]string, len(chunk))
@@ -544,11 +761,32 @@ func (m *Migrator) releaseHotCopies(ctx context.Context, files []MigrationCandid
 		// (no file that day) must not answer for them: that read would find
 		// neither copy. After, a cached hot glob naming them must not either.
 		m.manager.notifyReadCachesStale()
-		// The adapter logged the cause at Error; this is the consequence.
-		if err := m.manager.deleteFromManifest(ctx, paths, reason); err != nil {
+		err := m.manager.deleteFromManifest(ctx, paths, reason)
+		// One file of the chunk taken by a compaction or a re-home job since
+		// the check refuses the whole proposal (#1869): drop the taken ones
+		// (once this node has seen the take) and propose the rest again.
+		for retry := 0; retry < manifestChangedRetries && errors.Is(err, ErrManifestChanged); retry++ {
+			if serr := sleepCtx(ctx, manifestChangedPause); serr != nil {
+				err = serr
+				break
+			}
+			chunk = m.dropTakenOver(ctx, chunk)
+			paths = paths[:0]
+			for _, c := range chunk {
+				paths = append(paths, c.Path)
+			}
+			if len(paths) == 0 {
+				err = nil
+				break
+			}
+			err = m.manager.deleteFromManifest(ctx, paths, reason)
+		}
+		// The adapter logged the cause at Error (a take-over refusal that
+		// outlasted the retries is logged only here); this is the consequence.
+		if err != nil {
 			m.logger.Warn().Err(err).Int("kept_hot_copies", len(files)-i).
-				Msg("Manifest update failed; keeping the remaining hot copies for reconciliation")
-			return err
+				Msg("Manifest update failed; the remaining hot copies of this release are kept")
+			return kept + len(files) - i, err
 		}
 		for _, c := range chunk {
 			// Always the HOT backend in the only production caller
@@ -571,7 +809,10 @@ func (m *Migrator) releaseHotCopies(ctx context.Context, files []MigrationCandid
 			}
 			if err := src.Delete(ctx, c.Path); err != nil {
 				m.logger.Warn().Err(err).Str("path", c.Path).Msg("Failed to delete source file after migration")
-				// Don't fail the migration - file is in destination, just source cleanup failed
+				// Don't fail the migration - file is in destination, just
+				// source cleanup failed. It is kept: the orphan sweep removes
+				// it within its window.
+				kept++
 				continue
 			}
 			// Clean up empty parent directories after successful delete
@@ -579,7 +820,7 @@ func (m *Migrator) releaseHotCopies(ctx context.Context, files []MigrationCandid
 		}
 		m.manager.notifyReadCachesStale()
 	}
-	return nil
+	return kept, nil
 }
 
 // copyAndFlip streams the candidate to its target tier and flips its row.
@@ -602,16 +843,23 @@ func (m *Migrator) copyAndFlip(ctx context.Context, candidate MigrationCandidate
 	if dstBackend == nil {
 		return fmt.Errorf("destination backend not available for tier: %s", candidate.TargetTier)
 	}
-	if m.manager.heldByCompaction(candidate.Path) {
-		return fmt.Errorf("%s is being compacted; it migrates on a later cycle", candidate.Path)
+	if m.manager.heldElsewhere(candidate.Path) {
+		return fmt.Errorf("%s: %w", candidate.Path, errHeldBeforeCopy)
 	}
 
-	// The row's size is what the last scan recorded; a file rewritten in
-	// place since (the delete API does that) is longer or shorter, and an
+	// The row's size is what the last scan recorded; a file rewritten at
+	// its own path since (a restore, an edge-sync promote; the delete API
+	// did that before #1073) is longer or shorter, and an
 	// object-store destination now enforces the declared length. Ask the
 	// source, falling back to the row when it cannot say.
 	size := candidate.SizeBytes
-	if n, err := srcBackend.StatFile(ctx, candidate.Path); err == nil && n > 0 {
+	n, statErr := srcBackend.StatFile(ctx, candidate.Path)
+	if statErr == nil && n < 0 {
+		// Gone since the scan listed it (a compaction, a DELETE, a re-home
+		// job removed it, #1848): nothing to copy. The scan retires its row.
+		return fmt.Errorf("%s: %w", candidate.Path, errSourceGone)
+	}
+	if statErr == nil && n > 0 {
 		size = n
 	}
 
@@ -630,15 +878,57 @@ func (m *Migrator) copyAndFlip(ctx context.Context, candidate MigrationCandidate
 	}
 
 	// Perform the migration using streaming to avoid loading entire files into memory
-	migrationErr := m.copyFileStreaming(ctx, srcBackend, dstBackend, candidate.Path, size)
+	copyFile := func() error {
+		return m.copyFileStreaming(ctx, srcBackend, dstBackend, candidate.Path, size)
+	}
+	var migrationErr error
+	if candidate.TargetTier == TierCold {
+		// The cluster's cold mark is raised before the object exists, so a
+		// reader that cannot list cold never rules this file's day out
+		// (#1552). When the mark cannot be raised the copy does not start.
+		migrationErr = m.manager.GuardColdWrite(ctx, []string{candidate.Path}, copyFile)
+	} else {
+		migrationErr = copyFile()
+	}
 
 	if migrationErr != nil {
+		// Bookkeeping after a failed copy runs even if the run's context
+		// ended: that is when a copy is most often cut off.
+		cctx, ccancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer ccancel()
+		// Removed between the stat and the copy: the same as gone before it,
+		// and recorded as such.
+		if storage.IsNotFound(migrationErr) {
+			if n, err := srcBackend.StatFile(cctx, candidate.Path); err == nil && n < 0 {
+				if migrationID > 0 {
+					m.manager.metadata.CompleteMigration(cctx, migrationID, errSourceGone)
+				}
+				return fmt.Errorf("%s: %w", candidate.Path, errSourceGone)
+			}
+		}
 		// Record failure
 		if migrationID > 0 {
-			m.manager.metadata.CompleteMigration(ctx, migrationID, migrationErr)
+			m.manager.metadata.CompleteMigration(cctx, migrationID, migrationErr)
 		}
 		if errors.Is(migrationErr, storage.ErrInvalidPath) {
 			return m.quarantineCandidate(ctx, candidate, migrationErr)
+		}
+		if ctx.Err() != nil && (errors.Is(migrationErr, context.DeadlineExceeded) || errors.Is(migrationErr, context.Canceled)) {
+			// Cut off by the run's end, not refused. The upload can still
+			// have completed on the object store while this side saw the
+			// cancellation, leaving a cold object under a row that says hot;
+			// a read globs the cold partition and would count its rows next
+			// to the hot copy's. The row is hot and the hot copy is intact,
+			// so the cold object is unaccounted for: remove it (#1830).
+			if candidate.TargetTier == TierCold {
+				if err := dstBackend.Delete(cctx, candidate.Path); err != nil && !storage.IsNotFound(err) {
+					m.logger.Warn().Err(err).Str("path", candidate.Path).
+						Msg("Could not remove a cold object left by a copy the migration budget cut off; until the file migrates again its rows may be read from both tiers")
+				} else {
+					m.manager.reportColdRemoved([]string{candidate.Path})
+				}
+			}
+			return fmt.Errorf("%w: %w", errCopyCutOff, migrationErr)
 		}
 		return migrationErr
 	}
@@ -650,12 +940,17 @@ func (m *Migrator) copyAndFlip(ctx context.Context, candidate MigrationCandidate
 	// A compaction may have committed over the file during the copy: its
 	// rows are in the compaction's output now, and a cold copy would hold
 	// them twice (#1207 d2a2b).
-	if m.manager.heldByCompaction(candidate.Path) {
+	if m.manager.heldElsewhere(candidate.Path) {
 		if migrationID > 0 {
 			m.manager.metadata.CompleteMigration(ctx, migrationID, errHeldByCompaction)
 		}
-		if err := dstBackend.Delete(ctx, candidate.Path); err != nil && !storage.IsNotFound(err) {
-			m.logger.Warn().Err(err).Str("path", candidate.Path).Msg("Could not remove the cold copy of a file a compaction took over")
+		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer dcancel()
+		if err := dstBackend.Delete(dctx, candidate.Path); err != nil && !storage.IsNotFound(err) {
+			m.logger.Warn().Err(err).Str("path", candidate.Path).Msg("Could not remove the cold copy of a file a compaction or a re-home job took over")
+		} else {
+			m.manager.reportColdRemoved([]string{candidate.Path})
+			m.logger.Warn().Str("path", candidate.Path).Msg("A compaction or a re-home job took over a file while it was copied to cold storage; the copy was removed and the file stays hot")
 		}
 		return fmt.Errorf("%s: %w", candidate.Path, errHeldByCompaction)
 	}
@@ -687,9 +982,11 @@ func (m *Migrator) copyAndFlip(ctx context.Context, candidate MigrationCandidate
 		return fail(fmt.Errorf("%s: %w", candidate.Path, errReplacedByDelete))
 	}
 	// Standalone, nothing but this node's DELETE (or its retention) removes
-	// a hot file, so a source gone during the copy means its rows were
+	// a hot file during its copy, so a source gone then means its rows were
 	// deleted: a leftover whose journal record was cleared mid-copy, or a
-	// file retention removed. Clusters cannot tell that from another node's
+	// file retention removed. (A re-home job removes hot files too, but not
+	// one being copied: it checks its source against the move claim held
+	// here, CheckRehomeSource.) Clusters cannot tell that from another node's
 	// move, so there only the evidence above counts.
 	if m.manager.manifest == nil && m.manager.clusterGate == nil {
 		size, err := m.manager.hotBackend.StatFile(bctx, candidate.Path)
@@ -860,12 +1157,19 @@ func (m *Migrator) copyFileStreaming(ctx context.Context, src, dst StreamingBack
 	return nil
 }
 
+// orphanReconcileWindow is how far back the scheduled orphan sweep looks.
+const orphanReconcileWindow = 48 * time.Hour
+
 // ReconcileOrphanedFiles finds and deletes files that exist in hot storage
 // but are tracked as cold in metadata (orphaned after failed hot deletion during migration).
 // Only checks files migrated within the last 48 hours to limit I/O.
 func (m *Migrator) ReconcileOrphanedFiles(ctx context.Context) (orphansFound, deleted, failed int) {
-	const reconcileWindow = 48 * time.Hour
+	return m.reconcileOrphanedFiles(ctx, orphanReconcileWindow)
+}
 
+// reconcileOrphanedFiles is ReconcileOrphanedFiles over files migrated within
+// window; POST /api/v1/tiering/reconcile may ask for a wider one (#1830).
+func (m *Migrator) reconcileOrphanedFiles(ctx context.Context, reconcileWindow time.Duration) (orphansFound, deleted, failed int) {
 	coldFiles, err := m.manager.metadata.GetRecentlyMigratedFiles(ctx, TierCold, reconcileWindow)
 	if err != nil {
 		m.logger.Error().Err(err).Msg("Failed to get recently migrated files for reconciliation")

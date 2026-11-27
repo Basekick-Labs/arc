@@ -477,7 +477,7 @@ func TestManager_StartSubscriber_RejectsInvalidPersistedTargets(t *testing.T) {
 		return sub
 	}
 	badMapping := base("bad-mapping")
-	badMapping.TopicMapping = map[string]string{"sensors/a": "../other-db"}
+	badMapping.TopicMapping = TopicMapping{"sensors/a": {Database: "../other-db"}}
 	badDatabase := base("bad-db")
 	badDatabase.Database = "a/b"
 	for _, sub := range []*Subscription{badMapping, badDatabase} {

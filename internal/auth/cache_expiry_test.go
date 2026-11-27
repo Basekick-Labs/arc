@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -195,49 +196,52 @@ func TestVerifyToken_CacheDeadlineCappedAtTokenExpiry(t *testing.T) {
 // TestVerifyToken_ExpiresWhileCached_EndToEnd is the real-path proof: no
 // planted state, a token that genuinely expires between two verifications.
 //
-// The window is seconds rather than milliseconds because CreateToken and the
-// first VerifyToken each run PBKDF2 at pbkdf2Iterations, which is materially
-// slower under the race detector used in CI.
+// The virtual clock advances only when the bubble is durably blocked, so
+// CreateToken and VerifyToken can run real PBKDF2 and SQLite operations without
+// consuming the token lifetime on a slow race-enabled CI runner. The sleep
+// below then advances past expiry without changing the token or cache state.
 func TestVerifyToken_ExpiresWhileCached_EndToEnd(t *testing.T) {
-	am, cleanup := setupTestAuthManager(t)
-	defer cleanup()
+	synctest.Test(t, func(t *testing.T) {
+		am, cleanup := setupTestAuthManager(t)
+		defer cleanup()
 
-	expiresAt := time.Now().Add(4 * time.Second)
-	token, err := am.CreateToken(context.Background(), "expiring", "Expires mid-test", "admin", &expiresAt)
-	if err != nil {
-		t.Fatalf("CreateToken: %v", err)
-	}
+		expiresAt := time.Now().Add(4 * time.Second)
+		token, err := am.CreateToken(context.Background(), "expiring", "Expires mid-test", "admin", &expiresAt)
+		if err != nil {
+			t.Fatalf("CreateToken: %v", err)
+		}
 
-	info := am.VerifyToken(token)
-	if info == nil {
-		t.Fatal("VerifyToken returned nil before expiry; the token window was too short for this machine")
-	}
+		info := am.VerifyToken(token)
+		if info == nil {
+			t.Fatal("VerifyToken returned nil before expiry")
+		}
 
-	missesBefore := am.cacheMisses.Load()
+		missesBefore := am.cacheMisses.Load()
 
-	// Wait for the credential to expire.
-	//
-	// Note which half of the fix this exercises: because cache entries are
-	// capped at the token's expiry, the entry is still in the map but its
-	// deadline has passed, so this second call takes a natural cache miss and
-	// is rejected by the database path. That makes this an end-to-end proof of
-	// the CAP, not of the cache-hit expiry check — the deterministic
-	// TestVerifyToken_CachedTokenRejectedAfterExpiry and
-	// TestMiddleware_CachedExpiredToken cover that branch, where the entry's
-	// own deadline is still live.
-	time.Sleep(time.Until(expiresAt) + 250*time.Millisecond)
+		// Wait for the credential to expire.
+		//
+		// Note which half of the fix this exercises: because cache entries are
+		// capped at the token's expiry, the entry is still in the map but its
+		// deadline has passed, so this second call takes a natural cache miss and
+		// is rejected by the database path. That makes this an end-to-end proof of
+		// the CAP, not of the cache-hit expiry check — the deterministic
+		// TestVerifyToken_CachedTokenRejectedAfterExpiry and
+		// TestMiddleware_CachedExpiredToken cover that branch, where the entry's
+		// own deadline is still live.
+		time.Sleep(time.Until(expiresAt) + 250*time.Millisecond)
 
-	if info := am.VerifyToken(token); info != nil {
-		t.Error("VerifyToken accepted the token after it expired")
-	}
-	if am.cacheMisses.Load() <= missesBefore {
-		t.Error("expected the expired token to fall through to the database path")
-	}
+		if info := am.VerifyToken(token); info != nil {
+			t.Error("VerifyToken accepted the token after it expired")
+		}
+		if am.cacheMisses.Load() <= missesBefore {
+			t.Error("expected the expired token to fall through to the database path")
+		}
 
-	am.InvalidateCache()
-	if info := am.VerifyToken(token); info != nil {
-		t.Error("VerifyToken accepted the expired token after cache invalidation")
-	}
+		am.InvalidateCache()
+		if info := am.VerifyToken(token); info != nil {
+			t.Error("VerifyToken accepted the expired token after cache invalidation")
+		}
+	})
 }
 
 // TestCreateToken_ExpiresAtStoredInUTC pins the storage timezone for

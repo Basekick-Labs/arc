@@ -38,12 +38,14 @@ type fsmCoordinator struct {
 	onBatch func(n int) // before batch n (1-based) applies
 	batches int
 	missing []string
-	syncs   int
-	syncErr error
-	onSync  func()
-	db      *database.DuckDB
-	root    string
-	ops     []raft.BatchFileOp
+	// arriving: files FileArriving reports on their way (#1426).
+	arriving map[string]bool
+	syncs    int
+	syncErr  error
+	onSync   func()
+	db       *database.DuckDB
+	root     string
+	ops      []raft.BatchFileOp
 }
 
 // expectSHA returns the checksum the DELETE expected of path in its ops.
@@ -108,6 +110,9 @@ func (c *fsmCoordinator) ManifestHotFiles(database, measurement string) []raft.F
 }
 
 var _ compactionCommitter = (*fsmCoordinator)(nil)
+
+// FileArriving: arriving lists the files something is delivering here.
+func (c *fsmCoordinator) FileArriving(path string) bool { return c.arriving[path] }
 
 func (c *fsmCoordinator) WaitLocalFiles(context.Context, string, string, time.Duration, func(string) bool) ([]string, error) {
 	c.waits++

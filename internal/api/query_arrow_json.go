@@ -70,7 +70,7 @@ func executeArrowJSONQuery(
 			if cancel != nil {
 				cancel()
 			}
-			m.IncQueryErrors()
+			m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			if onFail != nil {
 				onFail(vanishedPartitionMessage)
 			}
@@ -91,6 +91,8 @@ func executeArrowJSONQuery(
 			if onComplete != nil {
 				onComplete(0)
 			}
+			m.IncQuerySuccess()
+			m.RecordQueryLatencyForEngine(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			c.JSON(QueryResponse{
 				Success:         true,
 				Columns:         []string{},
@@ -107,7 +109,7 @@ func executeArrowJSONQuery(
 			if cancel != nil {
 				cancel()
 			}
-			m.IncQueryErrors()
+			m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			m.IncQueryTimeouts()
 			if onTimeout != nil {
 				onTimeout()
@@ -133,19 +135,69 @@ func executeArrowJSONQuery(
 		if cancel != nil {
 			cancel()
 		}
-		m.IncQueryErrors()
+		if errors.Is(err, context.Canceled) && h.shuttingDown() {
+			// Shutdown cancelled it (#1644); onFail records it as cancelled
+			// in the registry. The metrics count a failed execution, as on
+			// every query route (#1292), so success + errors = requests holds.
+			m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
+			if onFail != nil {
+				onFail("server shutting down")
+			}
+			h.logger.Warn().Str("sql", sqlutil.ForLog(convertedSQL)).Msg("Arrow JSON query cancelled at shutdown")
+			c.Status(fiber.StatusServiceUnavailable).JSON(QueryResponse{
+				Success:         false,
+				Error:           "Server shutting down",
+				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+				Timestamp:       timestamp,
+			})
+			return -1, true
+		}
+		m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 		if onFail != nil {
 			onFail(err.Error())
 		}
 		h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(convertedSQL)).Msg("Arrow JSON query failed")
 		c.Status(fiber.StatusInternalServerError).JSON(QueryResponse{
 			Success:         false,
-			Error:           err.Error(),
+			Error:           clientErrText(h.logger, err),
 			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 			Timestamp:       timestamp,
 		})
 		return -1, true
 	}
+
+	// A value the response cannot carry in the first batch is answered as a
+	// 400 here, before any header is set (#1784).
+	releaseResult := func() {
+		reader.Release()
+		if conn != nil {
+			conn.Close()
+		}
+		if cancel != nil {
+			cancel()
+		}
+	}
+	peeked, overflow := peekDecimalOverflowGuarded(reader, governanceMaxRows, releaseResult, func() {
+		if onFail != nil {
+			onFail("handler panicked")
+		}
+	})
+	if overflow != nil {
+		releaseResult()
+		m.IncQueryErrors()
+		if onFail != nil {
+			onFail(overflow.Error())
+		}
+		h.logger.Warn().Err(overflow).Str("sql", sqlutil.ForLog(convertedSQL)).Msg("Arrow JSON query refused: a decimal value does not fit int64")
+		c.Status(fiber.StatusBadRequest).JSON(QueryResponse{
+			Success:         false,
+			Error:           overflow.Error(),
+			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
+			Timestamp:       timestamp,
+		})
+		return -1, true
+	}
+	reader = peeked
 
 	// Capture token name before async callback (Fiber context not safe in callbacks)
 	tokenName := getTokenName(c)
@@ -165,6 +217,7 @@ func executeArrowJSONQuery(
 	if respEncoding != "" {
 		c.Set(fiber.HeaderContentEncoding, respEncoding)
 	}
+	outcome := newQueryStreamOutcome(metrics.QueryEngineDuckDB, start)
 	h.setDirectBodyStream(c.Context(), cancel, nil, "query_arrow_json", func() {
 		// A panic skips the onComplete/onFail/onTimeout dispositions below,
 		// which would leave the query registered as running forever (#717).
@@ -194,15 +247,13 @@ func executeArrowJSONQuery(
 			isWrapped = true
 		}
 		rc, streamErr := streamArrowJSON(streamCtx, bw, reader, governanceMaxRows, profile, start, timestamp)
-		bw.Flush()
+		streamErr = firstStreamWriteError(streamErr, bw.Flush())
 		if isWrapped {
-			if err := finishCompression(); err != nil && streamErr == nil {
-				streamErr = err
-			}
+			streamErr = firstStreamWriteError(streamErr, finishCompression())
 			bw.Reset(nil)
 			compressBufPool.Put(bw)
 		}
-		w.Flush()
+		streamErr = firstStreamWriteError(streamErr, w.Flush())
 
 		// Reported before the error branch below: a stream can reach the cap
 		// and then fail on the way out, and the marker is emitted either way,
@@ -212,7 +263,7 @@ func executeArrowJSONQuery(
 		h.logGovernanceRowCap("arrow_json", convertedSQL, tokenID, tokenName, governanceMaxRows, int64(rc))
 
 		if streamErr != nil {
-			m.IncQueryErrors()
+			outcome.fail()
 			if errors.Is(streamErr, context.DeadlineExceeded) {
 				m.IncQueryTimeouts()
 				if onTimeout != nil {
@@ -238,9 +289,7 @@ func executeArrowJSONQuery(
 			return
 		}
 
-		m.IncQuerySuccess()
-		m.IncQueryRows(int64(rc))
-		m.RecordQueryLatency(time.Since(start).Microseconds())
+		outcome.succeed(int64(rc))
 
 		if onComplete != nil {
 			onComplete(rc)
@@ -251,7 +300,7 @@ func executeArrowJSONQuery(
 			Float64("execution_time_ms", float64(time.Since(start).Milliseconds())).
 			Msg("Arrow JSON query completed")
 		h.logSlowQuery(convertedSQL, start, rc, tokenName)
-	})
+	}, outcome.fail)
 
 	// Return 0 — actual row count is only known after async streaming completes.
 	// Metrics are recorded in the callback above.
@@ -372,35 +421,42 @@ batchLoop:
 			break
 		}
 
+		// The governance cap is decided here, for the batch as a whole: the
+		// rows to encode, and whether the cap stops the stream after them.
+		// A cap reached exactly at the end of a batch is only noticed at the
+		// next batch, as before (one more Next). It is decided before the
+		// decimal cast, so the cast only sees rows that will be sent, as on
+		// the Arrow and msgpack paths: a value that does not fit int64 past
+		// the cap no longer cuts a capped result short (#1784).
+		nRows := int(batch.NumRows())
+		if governanceMaxRows > 0 && dispatched >= governanceMaxRows && nRows > 0 {
+			capped = true
+			break
+		}
+		n := nRows
+		if governanceMaxRows > 0 && dispatched+n > governanceMaxRows {
+			n = governanceMaxRows - dispatched
+		}
+
 		var casted arrow.Record
 		if castInfo != nil {
+			toCast := batch
+			if n < nRows {
+				toCast = batch.NewSlice(0, int64(n))
+			}
 			var err error
-			casted, err = castDecimalBatch(batch, castInfo)
+			casted, err = castDecimalBatchAt(toCast, castInfo, int64(dispatched))
+			if toCast != batch {
+				toCast.Release()
+			}
 			if err != nil {
-				streamErr = fmt.Errorf("decimal cast failed at row %d: %w", rowCount, err)
+				streamErr = wrapDecimalCastError(err, "decimal cast failed at row %d", rowCount)
 				break batchLoop
 			}
 		}
 		encoded := batch
 		if casted != nil {
 			encoded = casted
-		}
-
-		// The governance cap is decided here, for the batch as a whole: the
-		// rows to encode, and whether the cap stops the stream after them.
-		// A cap reached exactly at the end of a batch is only noticed at the
-		// next batch, as before (one more Next).
-		nRows := int(encoded.NumRows())
-		if governanceMaxRows > 0 && dispatched >= governanceMaxRows && nRows > 0 {
-			capped = true
-			if casted != nil {
-				casted.Release()
-			}
-			break
-		}
-		n := nRows
-		if governanceMaxRows > 0 && dispatched+n > governanceMaxRows {
-			n = governanceMaxRows - dispatched
 		}
 		cols := make([]arrow.Array, numCols)
 		for c := 0; c < numCols; c++ {

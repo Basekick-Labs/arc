@@ -49,6 +49,29 @@ type deleteColdTier interface {
 	ColdFilesForMeasurement(ctx context.Context, database, measurement string) ([]tiering.FileMetadata, error)
 	RetireColdRows(ctx context.Context, paths []string) (int, error)
 	RevertColdRowToHot(ctx context.Context, path string) error
+	// NotifyColdFilesRemoved tells tiering's listeners (query caches, the Iceberg export's
+	// cold listing, #939) that cold objects are gone.
+	NotifyColdFilesRemoved(paths []string)
+}
+
+// coldRemovalGuard is implemented by *tiering.Manager: a run that deletes
+// cold objects before retiring their rows brackets itself, so the cold
+// sync's missing-object check does not count rows it is about to retire
+// (#1551).
+type coldRemovalGuard interface {
+	BeginColdRemoval()
+	EndColdRemoval()
+}
+
+// beginColdRemoval begins a bracket on tier when it supports one and returns
+// its end.
+func beginColdRemoval(tier any) func() {
+	g, ok := tier.(coldRemovalGuard)
+	if !ok {
+		return func() {}
+	}
+	g.BeginColdRemoval()
+	return g.EndColdRemoval
 }
 
 // coldFile is one cold object a DELETE counted.
@@ -86,6 +109,8 @@ type coldPass struct {
 	// After run:
 	deleted     []string
 	deletedRows int64
+	// rehomed counts the failed files a re-home job in flight owns (#1825).
+	rehomed int
 }
 
 // liveDonor is the donor less the files this run deleted.
@@ -225,8 +250,9 @@ func (h *DeleteHandler) scanCold(ctx context.Context, database, measurement, whe
 		}
 	}
 
-	// Rows whose object is gone (#1350 review M2): cold sync never retires
-	// them, so a DELETE that looked would otherwise stat them on every run.
+	// Rows whose object is gone (#1350 review M2): on the primary the cold
+	// sync never retires them (only a reader's does, #1563), so a DELETE that
+	// looked would otherwise stat them on every run.
 	rows, err := tier.ColdFilesForMeasurement(ctx, database, measurement)
 	if err != nil {
 		h.logger.Debug().Err(err).Msg("Could not read cold rows to find ones whose object is gone")
@@ -365,10 +391,20 @@ func (h *DeleteHandler) runCold(ctx context.Context, c *coldPass, where string) 
 	if c == nil || c.backend == nil {
 		return
 	}
+	defer beginColdRemoval(h.coldTier)()
 	var retire []string
 	for _, f := range c.whole {
 		if ctx.Err() != nil {
 			c.failed = append(c.failed, f.path)
+			continue
+		}
+		// Asked now, under the rewrite lock this runs in, not at the scan:
+		// a re-home job (#1825) takes ownership first and then checks its
+		// file under the same lock, so one of the two sees the other.
+		if h.rehomeOwns != nil && h.rehomeOwns(f.path) {
+			h.logger.Info().Str("file", f.path).Msg("DELETE leaves a cold file a re-home job in flight owns; retry once the job has ended (GET /api/v1/rehome)")
+			c.failed = append(c.failed, f.path)
+			c.rehomed++
 			continue
 		}
 		size, err := c.backend.StatFile(ctx, f.path)
@@ -411,6 +447,13 @@ func (h *DeleteHandler) runCold(ctx context.Context, c *coldPass, where string) 
 			}
 			continue
 		}
+		// Receipt first (#1666): a cold copy of a spoke file was marked
+		// compacted when it migrated; with every row deleted nothing survives.
+		if err := h.markReceipt(ctx, f.path, true); err != nil {
+			h.logger.Error().Err(err).Str("file", f.path).Msg("Could not mark the edge-sync receipt of a cold file; left as it is")
+			c.failed = append(c.failed, f.path)
+			continue
+		}
 		if err := c.backend.Delete(ctx, f.path); err != nil {
 			// A delete can fail after the object went (a timed-out response).
 			if after, serr := c.backend.StatFile(ctx, f.path); serr != nil || after >= 0 {
@@ -428,9 +471,13 @@ func (h *DeleteHandler) runCold(ctx context.Context, c *coldPass, where string) 
 	// retention checks at the moment it acts (#1350 review H1). A migration
 	// may have copied the object since the listing; its row must stay. Then
 	// pointed back at a hot copy that still exists, or retired.
+	var reverted []string
 	for _, p := range c.missingRows {
 		if ctx.Err() != nil {
 			break
+		}
+		if h.rehomeOwns != nil && h.rehomeOwns(p) {
+			continue // the job retires or keeps its own file's row
 		}
 		coldSize, err := c.backend.StatFile(ctx, p)
 		if err != nil || coldSize >= 0 {
@@ -443,6 +490,8 @@ func (h *DeleteHandler) runCold(ctx context.Context, c *coldPass, where string) 
 		case hotSize >= 0:
 			if err := h.coldTier.RevertColdRowToHot(context.WithoutCancel(ctx), p); err != nil {
 				h.logger.Warn().Err(err).Str("file", p).Msg("Could not point a cold row whose object is gone back at its hot copy")
+			} else {
+				reverted = append(reverted, p)
 			}
 		default:
 			retire = append(retire, p)
@@ -454,6 +503,13 @@ func (h *DeleteHandler) runCold(ctx context.Context, c *coldPass, where string) 
 			h.logger.Warn().Err(err).Int("removed", n).Int("rows", len(retire)).
 				Msg("Failed to retire cold tier rows; the next DELETE or retention run retires them")
 		}
+	}
+	// Every cold object now gone: deleted, already missing (retired), or
+	// missing under a row pointed back at hot. A cached cold listing, here
+	// or on a cluster's Iceberg exporter, can still name any of them (#1728).
+	// retire holds the deleted ones too.
+	if gone := append(append([]string(nil), retire...), reverted...); len(gone) > 0 {
+		h.coldTier.NotifyColdFilesRemoved(gone)
 	}
 }
 
@@ -505,8 +561,11 @@ func (c *coldPass) applyCold(resp *DeleteResponse, dryRun bool) bool {
 	if n := len(c.hotCopy); n > 0 {
 		why = append(why, fmt.Sprintf("%d cold files %s", n, coldHotCopyWhy))
 	}
-	if n := len(c.failed); n > 0 {
+	if n := len(c.failed) - c.rehomed; n > 0 {
 		why = append(why, fmt.Sprintf("%d cold files could not be read or deleted and were left as they are", n))
+	}
+	if c.rehomed > 0 {
+		why = append(why, fmt.Sprintf("%d cold files are being re-homed and were left as they are; retry for those once the job has ended, GET /api/v1/rehome", c.rehomed))
 	}
 	if c.notExamined != "" {
 		why = append(why, "cold storage was not examined: "+c.notExamined+"; rows in it may still match")

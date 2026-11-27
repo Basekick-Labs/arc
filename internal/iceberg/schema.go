@@ -1,16 +1,23 @@
 package iceberg
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet"
 	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	iceberg "github.com/apache/iceberg-go"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/basekick-labs/arc/internal/storage"
 )
 
 // SchemaFromParquet derives an ArcSchema (typed Iceberg columns) by reading a Parquet file's
@@ -34,20 +41,196 @@ func SchemaFromParquet(localPath string) (ArcSchema, error) {
 		return ArcSchema{}, fmt.Errorf("open parquet %q: %w", localPath, err)
 	}
 	defer f.Close()
-
-	rdr, err := file.NewParquetReader(f)
+	st, err := f.Stat()
 	if err != nil {
-		return ArcSchema{}, fmt.Errorf("parquet reader %q: %w", localPath, err)
+		return ArcSchema{}, fmt.Errorf("stat parquet %q: %w", localPath, err)
+	}
+	n, err := footerLen(f, st.Size(), localPath)
+	if err != nil {
+		return ArcSchema{}, err
+	}
+	if err := checkFooterLen(n, localPath); err != nil {
+		return ArcSchema{}, err
+	}
+	return schemaFromReader(f, localPath)
+}
+
+// footerWindow is how much of a remote file's tail SchemaFromBackend reads
+// first: Arc's footers are a few KiB, so one read normally holds the whole
+// footer; a larger one costs a second read.
+var footerWindow int64 = 64 << 10
+
+// SchemaFromBackend derives a remote Parquet file's schema from its footer,
+// reading only the file's tail through the backend (a ranged GET from the
+// footer to the end of the object, ReadToAt), never the whole object. size
+// is the file's size from the listing; a tail that does not match it (the
+// file was replaced or truncated since) is an error, not a guess.
+func SchemaFromBackend(ctx context.Context, backend storage.Backend, key string, size int64) (ArcSchema, error) {
+	sc, _, err := schemaAndTailFromBackend(ctx, backend, key, size)
+	return sc, err
+}
+
+// schemaAndTailFromBackend is SchemaFromBackend, also returning the tail it
+// read: the footer and trailer, checked to end at size. The export hands it
+// to iceberg-go so the file is not fetched again (export_reads.go, #1778).
+func schemaAndTailFromBackend(ctx context.Context, backend storage.Backend, key string, size int64) (ArcSchema, fileTail, error) {
+	if size < parquetTrailerLen+int64(len(parquetMagic)) {
+		return ArcSchema{}, fileTail{}, fmt.Errorf("parquet %q: %d bytes is too small for a Parquet file", key, size)
+	}
+	off := size - footerWindow
+	if off < 0 {
+		off = 0
+	}
+	tail, err := readTail(ctx, backend, key, size, off)
+	if err != nil {
+		return ArcSchema{}, fileTail{}, err
+	}
+	trailer := tail[len(tail)-parquetTrailerLen:]
+	if string(trailer[4:]) != parquetMagic {
+		return ArcSchema{}, fileTail{}, fmt.Errorf("parquet %q: no Parquet magic at the end of the file", key)
+	}
+	need := int64(binary.LittleEndian.Uint32(trailer[:4])) + parquetTrailerLen
+	if err := checkFooterLen(need-parquetTrailerLen, key); err != nil {
+		return ArcSchema{}, fileTail{}, err
+	}
+	if need > size-int64(len(parquetMagic)) {
+		return ArcSchema{}, fileTail{}, fmt.Errorf("parquet %q: footer length %d does not fit a %d-byte file", key, need-parquetTrailerLen, size)
+	}
+	if need > int64(len(tail)) {
+		off = size - need
+		if tail, err = readTail(ctx, backend, key, size, off); err != nil {
+			return ArcSchema{}, fileTail{}, err
+		}
+	}
+	sc, err := schemaFromReader(&tailReader{base: off, data: tail, size: size}, key)
+	if err != nil {
+		return ArcSchema{}, fileTail{}, err
+	}
+	return sc, fileTail{base: off, size: size, data: tail}, nil
+}
+
+const (
+	parquetMagic      = "PAR1"
+	parquetTrailerLen = 8 // footer length (uint32 LE) + magic
+)
+
+// readTail reads key from off to its end and checks the result ends where
+// the listing said the file does.
+func readTail(ctx context.Context, backend storage.Backend, key string, size, off int64) ([]byte, error) {
+	var buf bytes.Buffer
+	buf.Grow(int(size - off))
+	if err := backend.ReadToAt(ctx, key, &buf, off); err != nil {
+		return nil, fmt.Errorf("read footer of %q: %w", key, err)
+	}
+	if got := int64(buf.Len()); got != size-off {
+		return nil, fmt.Errorf("read footer of %q: read %d bytes from offset %d, want %d (the file changed since it was listed)", key, got, off, size-off)
+	}
+	return buf.Bytes(), nil
+}
+
+// tailReader serves reads within a file's tail [base, size) for the Parquet
+// footer parser; a read before base is an error (the parser asked for more
+// than the footer, which a schema read never needs).
+type tailReader struct {
+	base int64
+	data []byte
+	size int64
+	pos  int64
+}
+
+func (r *tailReader) ReadAt(p []byte, off int64) (int, error) {
+	if off < r.base {
+		return 0, fmt.Errorf("parquet footer read at offset %d, before the %d bytes read from the tail", off, r.base)
+	}
+	if off >= r.size {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[off-r.base:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (r *tailReader) Seek(offset int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekStart:
+	case io.SeekCurrent:
+		offset += r.pos
+	case io.SeekEnd:
+		offset += r.size
+	default:
+		return 0, fmt.Errorf("tailReader: bad whence %d", whence)
+	}
+	if offset < 0 {
+		return 0, fmt.Errorf("tailReader: negative position %d", offset)
+	}
+	r.pos = offset
+	return offset, nil
+}
+
+// newParquetReader opens a Parquet file's footer; a test seam.
+var newParquetReader = file.NewParquetReader
+
+// maxFooterBytes bounds the footer schemaFromReader hands the Parquet
+// library. Arc's footers are a few KiB and a file with thousands of row
+// groups a few MiB; the bound keeps a malformed footer's nesting from
+// recursing the library's schema builder past the stack limit, a fatal error
+// no recover reaches.
+var maxFooterBytes int64 = 16 << 20
+
+// footerLen reads the footer length from a Parquet file's trailer.
+func footerLen(f io.ReaderAt, size int64, name string) (int64, error) {
+	if size < parquetTrailerLen+int64(len(parquetMagic)) {
+		return 0, fmt.Errorf("parquet %q: %d bytes is too small for a Parquet file", name, size)
+	}
+	var trailer [parquetTrailerLen]byte
+	if _, err := f.ReadAt(trailer[:], size-parquetTrailerLen); err != nil {
+		return 0, fmt.Errorf("parquet %q: read trailer: %w", name, err)
+	}
+	if string(trailer[4:]) != parquetMagic {
+		return 0, fmt.Errorf("parquet %q: no Parquet magic at the end of the file", name)
+	}
+	return int64(binary.LittleEndian.Uint32(trailer[:4])), nil
+}
+
+// checkFooterLen refuses a footer over maxFooterBytes.
+func checkFooterLen(n int64, name string) error {
+	if n > maxFooterBytes {
+		return fmt.Errorf("parquet %q: footer of %d bytes is over the %d-byte limit", name, n, maxFooterBytes)
+	}
+	return nil
+}
+
+// schemaFromReader derives the ArcSchema from a Parquet file's footer. name
+// labels errors.
+//
+// A malformed footer can panic inside the Parquet library rather than return
+// an error (a length field it trusts for an allocation, for one). The files
+// read here include ones Arc did not write itself, EdgeSync spokes' among
+// them, and the reads run on the reconcile goroutine and on footer-reading
+// worker goroutines, where a panic ends the process; and the file stays in
+// storage, so every restart would reach it again. The panic is returned as
+// this file's error instead, and the measurement fails its pass.
+func schemaFromReader(f parquet.ReaderAtSeeker, name string) (sc ArcSchema, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			sc, err = ArcSchema{}, fmt.Errorf("parquet %q: reading its footer panicked (%v); the file is malformed, and this measurement's export stays blocked until it is removed", name, r)
+		}
+	}()
+	rdr, err := newParquetReader(f)
+	if err != nil {
+		return ArcSchema{}, fmt.Errorf("parquet reader %q: %w", name, err)
 	}
 	defer rdr.Close()
 
 	fr, err := pqarrow.NewFileReader(rdr, pqarrow.ArrowReadProperties{}, memory.DefaultAllocator)
 	if err != nil {
-		return ArcSchema{}, fmt.Errorf("pqarrow reader %q: %w", localPath, err)
+		return ArcSchema{}, fmt.Errorf("pqarrow reader %q: %w", name, err)
 	}
 	arrowSchema, err := fr.Schema()
 	if err != nil {
-		return ArcSchema{}, fmt.Errorf("arrow schema %q: %w", localPath, err)
+		return ArcSchema{}, fmt.Errorf("arrow schema %q: %w", name, err)
 	}
 
 	fields := make([]ArcField, 0, len(arrowSchema.Fields()))
@@ -110,16 +293,19 @@ func UnionSchema(ctx context.Context, localPaths []string) (ArcSchema, error) {
 	}
 
 	seen := make(map[string]iceberg.Type)
+	seenIn := make(map[string]string)
 	var order []string
 	for i := range localPaths {
 		for _, f := range schemas[i].Fields {
 			if prev, ok := seen[f.Name]; ok {
 				if !prev.Equals(f.Type) {
-					return ArcSchema{}, fmt.Errorf("column %q has conflicting types across files: %s vs %s", f.Name, prev, f.Type)
+					return ArcSchema{}, &SchemaConflictError{Column: f.Name, First: prev.String(), Then: f.Type.String(),
+						With: conflictWithFiles, FirstFile: seenIn[f.Name], File: localPaths[i]}
 				}
 				continue
 			}
 			seen[f.Name] = f.Type
+			seenIn[f.Name] = localPaths[i]
 			order = append(order, f.Name)
 		}
 	}
@@ -130,33 +316,87 @@ func UnionSchema(ctx context.Context, localPaths []string) (ArcSchema, error) {
 	return ArcSchema{Fields: fields}, nil
 }
 
+// Where a schema conflict was found (SchemaConflictError.With).
+const (
+	conflictWithFiles = "files" // two files of the measurement disagree
+	conflictWithTable = "table" // new files disagree with the table's existing column
+)
+
+// SchemaConflictError is a column whose type differs between files, or between new files and
+// the table (#1744). Its text is what the export always logged, and that text goes through the
+// process-wide error sanitizer, which masks every quoted span, the column name included. The
+// scheduler therefore also logs the fields as structured values (logSchemaConflict): a column
+// name and a storage key are identifiers, logged as plain fields across Arc, not the data
+// values the sanitizer exists to keep out of logs.
+type SchemaConflictError struct {
+	Column string
+	// First is the type seen first (the table's, for With == conflictWithTable); Then the other.
+	First, Then string
+	With        string
+	// FirstFile and File are storage keys holding each type, when known.
+	FirstFile, File string
+}
+
+func (e *SchemaConflictError) Error() string {
+	if e.With == conflictWithTable {
+		return fmt.Sprintf("column %q type mismatch: Iceberg table has %s, new Parquet files have %s "+
+			"(the measurement's column type changed; Iceberg cannot represent both in one column)",
+			e.Column, e.First, e.Then)
+	}
+	return fmt.Sprintf("column %q has conflicting types across files: %s vs %s", e.Column, e.First, e.Then)
+}
+
 // MergeSchemas unions two already-derived ArcSchemas, preserving `base`'s column order and
 // appending any names that appear only in `add`. A name present in both must carry the same
 // type — a genuine conflict is an error (matching UnionSchema's semantics). This lets the
 // reconciler extend a cached schema with only the newly-added files' schemas, avoiding an O(N)
 // re-read of every footer when a measurement's file set grows.
+//
+// A conflict is a *SchemaConflictError naming the files on each side when the schemas know
+// them (sources), with With left empty: only the caller knows whether base came from files or
+// from the table.
 func MergeSchemas(base, add ArcSchema) (ArcSchema, error) {
 	seen := make(map[string]iceberg.Type, len(base.Fields)+len(add.Fields))
 	order := make([]string, 0, len(base.Fields)+len(add.Fields))
+	var sources map[string]string
+	if base.sources != nil || add.sources != nil {
+		sources = make(map[string]string, len(base.Fields)+len(add.Fields))
+	}
 	for _, f := range base.Fields {
 		seen[f.Name] = f.Type
 		order = append(order, f.Name)
+		if src, ok := base.sources[f.Name]; ok {
+			sources[f.Name] = src
+		}
 	}
 	for _, f := range add.Fields {
 		if prev, ok := seen[f.Name]; ok {
 			if !prev.Equals(f.Type) {
-				return ArcSchema{}, fmt.Errorf("column %q has conflicting types across files: %s vs %s", f.Name, prev, f.Type)
+				return ArcSchema{}, &SchemaConflictError{Column: f.Name, First: prev.String(), Then: f.Type.String(),
+					FirstFile: base.sources[f.Name], File: add.sources[f.Name]}
 			}
 			continue
 		}
 		seen[f.Name] = f.Type
 		order = append(order, f.Name)
+		if src, ok := add.sources[f.Name]; ok {
+			sources[f.Name] = src
+		}
 	}
 	fields := make([]ArcField, len(order))
 	for i, name := range order {
 		fields[i] = ArcField{Name: name, Type: seen[name]}
 	}
-	return ArcSchema{Fields: fields}, nil
+	return ArcSchema{Fields: fields, sources: sources}, nil
+}
+
+// markConflict sets where a conflict was found when MergeSchemas left it to the caller.
+func markConflict(err error, with string) error {
+	var c *SchemaConflictError
+	if errors.As(err, &c) && c.With == "" {
+		c.With = with
+	}
+	return err
 }
 
 // arrowToIceberg maps one Arrow type to its Iceberg type per the table above.

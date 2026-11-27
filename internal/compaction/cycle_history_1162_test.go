@@ -187,7 +187,11 @@ func TestCycleHistorySourceDistinguishesCallersIssue1162(t *testing.T) {
 		{
 			name: "scheduler",
 			run: func(m *Manager) (int64, error) {
-				return m.runCycleInternal(context.Background(), cycleSourceScheduler, nil, []string{"hourly"})
+				// The scheduler's own path (#220): it claims and runs the
+				// cycle itself.
+				s := &Scheduler{manager: m, tierNames: []string{"hourly"}, logger: zerolog.Nop()}
+				err := s.runScheduledCycle()
+				return m.cycleID.Load(), err
 			},
 			want: cycleSourceScheduler,
 		},

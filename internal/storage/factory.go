@@ -1,7 +1,7 @@
 package storage
 
 import (
-	"fmt"
+	"errors"
 	"strings"
 
 	"github.com/rs/zerolog"
@@ -95,6 +95,6 @@ func NewBackend(spec BackendSpec, logger zerolog.Logger) (Backend, error) {
 		return b, nil
 
 	default:
-		return nil, fmt.Errorf("unsupported storage backend %q (use local, s3, minio, azure, azblob or gcs)", spec.Type)
+		return nil, errors.New("storage backend type is not supported (use local, s3, minio, azure, azblob or gcs)")
 	}
 }

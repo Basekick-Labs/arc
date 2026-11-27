@@ -3,6 +3,7 @@ package compaction
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sort"
 	"testing"
 	"time"
@@ -239,5 +240,77 @@ func TestOpenJobsOnOutputSeenOnce(t *testing.T) {
 	o.ExcludedFor(ctx, "db/m/")
 	if calls != 1 {
 		t.Fatalf("hook ran %d times, want once", calls)
+	}
+}
+
+type flakyBackend struct {
+	storage.Backend
+	statErr, readErr error
+}
+
+func (f *flakyBackend) StatFile(ctx context.Context, p string) (int64, error) {
+	if f.statErr != nil {
+		return 0, f.statErr
+	}
+	return f.Backend.StatFile(ctx, p)
+}
+
+func (f *flakyBackend) Read(ctx context.Context, p string) ([]byte, error) {
+	if f.readErr != nil {
+		return nil, f.readErr
+	}
+	return f.Backend.Read(ctx, p)
+}
+
+// The strict variant (the Iceberg export, #939 A0) fails where a read
+// guesses: an output it cannot stat, a manifest it cannot read. An
+// unparsable manifest is not retried into an error: it falls back to the
+// candidates, as reads do.
+func TestOpenJobsStrict(t *testing.T) {
+	ctx := context.Background()
+	o, b := openJobsRig(t)
+	out := "db/m/2026/10/20/10/m_x_b1_compacted.parquet"
+	man := "_compaction_state/hourly/db/job1.json"
+	in1, in2 := "db/m/2026/10/20/10/a.parquet", "db/m/2026/10/20/10/b.parquet"
+	data, _ := json.Marshal(&Manifest{OutputPath: out, InputFiles: []string{in1, in2}})
+	if err := b.Write(ctx, man, data); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Write(ctx, out, []byte("parquet")); err != nil {
+		t.Fatal(err)
+	}
+	fb := &flakyBackend{Backend: b}
+	o.backend = fb
+	o.register(out, man, []string{in1, in2})
+
+	fb.statErr = errors.New("throttled")
+	if got := o.ExcludedFor(ctx, "db/m/"); len(got) != 0 {
+		t.Fatalf("lenient, stat failing: excluded %v, want none", got)
+	}
+	if _, err := o.ExcludedForStrict(ctx, "db/m/"); err == nil {
+		t.Fatal("strict, stat failing: no error")
+	}
+	fb.statErr = nil
+	fb.readErr = errors.New("connection reset")
+	if _, err := o.ExcludedForStrict(ctx, "db/m/"); err == nil {
+		t.Fatal("strict, manifest unreadable: no error")
+	}
+	fb.readErr = nil
+	got, err := o.ExcludedForStrict(ctx, "db/m/")
+	sort.Strings(got)
+	if err != nil || len(got) != 2 || got[0] != in1 || got[1] != in2 {
+		t.Fatalf("strict, healthy: excluded %v (%v), want both inputs", got, err)
+	}
+
+	o2, b2 := openJobsRig(t)
+	if err := b2.Write(ctx, man, []byte("{not json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := b2.Write(ctx, out, []byte("parquet")); err != nil {
+		t.Fatal(err)
+	}
+	o2.register(out, man, []string{in1})
+	if got, err := o2.ExcludedForStrict(ctx, "db/m/"); err != nil || len(got) != 1 || got[0] != in1 {
+		t.Fatalf("strict, manifest unparsable: excluded %v (%v), want the candidates", got, err)
 	}
 }

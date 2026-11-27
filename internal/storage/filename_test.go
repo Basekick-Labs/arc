@@ -23,13 +23,24 @@ func TestStripRewriteSuffix(t *testing.T) {
 // A repeated clock value must still yield increasing stamps, and a stamp that
 // crosses a second carries the second, not just the nanos (#1282).
 func TestNameTimeIsStrictlyIncreasing(t *testing.T) {
-	base := time.Date(2099, 1, 2, 3, 4, 5, 999_999_999, time.UTC)
+	// The last nanosecond of a second past both the clock and every stamp
+	// this process has issued: NameTime keeps one process-wide high-water
+	// mark, so a fixed base is already behind it on a second run (-count).
+	last := time.Unix(0, lastNameStamp.Load()).UTC()
+	base := time.Now().UTC()
+	if last.After(base) {
+		base = last
+	}
+	base = base.Truncate(time.Second).Add(2*time.Second - time.Nanosecond)
 	first := NameTime(base)
+	if !first.Equal(base) {
+		t.Fatalf("first stamp %v, want the clock value %v", first, base)
+	}
 	second := NameTime(base)
 	if !second.After(first) {
 		t.Fatalf("second stamp %v not after first %v", second, first)
 	}
-	if got, want := second.Format("20060102_150405"), "20990102_030406"; got != want {
+	if got, want := second.Format("20060102_150405"), base.Add(time.Nanosecond).Format("20060102_150405"); got != want {
 		t.Fatalf("stamp past .999999999 formats as %s, want %s", got, want)
 	}
 	if second.Nanosecond() != 0 {

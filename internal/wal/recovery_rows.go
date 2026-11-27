@@ -20,8 +20,41 @@ func trackedRowIdentity(identity string) bool {
 	return err == nil && strings.ToLower(identity) == identity
 }
 
+// RecoveryRowIdentity is the checkpoint identity of rows [start, end) of the
+// tracked entry parent. Recovery writes it for the ranges it replays; a flush
+// that spans several hours writes it for the rows of each hour file it has
+// stored (#1492, ingest.walRowSpans).
+func RecoveryRowIdentity(parent string, start, end int) string {
+	return recoveryRowIdentity(parent, start, end)
+}
+
 func recoveryRowIdentity(parent string, start, end int) string {
 	return recoveryRowPrefix + parent + ":" + strconv.Itoa(start) + ":" + strconv.Itoa(end)
+}
+
+// columnarRowCount is the row count of a columnar entry, by its time column
+// (the column every live decoder writes), and whether every column has that
+// many rows. (0, true) for a nil entry.
+func columnarRowCount(e *ColumnarEntry) (int, bool) {
+	if e == nil {
+		return 0, true
+	}
+	n := len(e.Columns["time"])
+	for _, col := range e.Columns {
+		if len(col) != n {
+			return n, false
+		}
+	}
+	return n, true
+}
+
+// sliceColumnarRange is rows [start, end) of every column.
+func sliceColumnarRange(columns map[string][]interface{}, start, end int) map[string][]interface{} {
+	out := make(map[string][]interface{}, len(columns))
+	for name, col := range columns {
+		out[name] = col[start:end:end]
+	}
+	return out
 }
 
 // ParseRecoveryRowIdentity recognizes a checkpoint for the half-open row range

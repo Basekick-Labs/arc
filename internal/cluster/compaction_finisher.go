@@ -228,6 +228,9 @@ func (c *Coordinator) finishObjectJob(ctx context.Context, job string) error {
 		return nil
 	}
 	staged := raft.StagedCompactionKey(s.Job, s.Output.Path)
+	if s.Acked {
+		return c.finishFencedJob(ctx, copier, job, staged)
+	}
 	if s.Finalized {
 		return c.endObjectJob(ctx, s, staged, false)
 	}

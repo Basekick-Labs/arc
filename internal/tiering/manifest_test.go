@@ -216,7 +216,7 @@ func TestReleaseHotCopies_ChunksAndPaces(t *testing.T) {
 	fake := &fakeManifest{hot: hot, entries: map[string]int64{}, probe: files[0].Path}
 	m.manifest = fake
 
-	if err := m.migrator.releaseHotCopies(ctx, files, manifestReasonMigrated); err != nil {
+	if _, err := m.migrator.releaseHotCopies(ctx, files, manifestReasonMigrated); err != nil {
 		t.Fatalf("releaseHotCopies: %v", err)
 	}
 	if len(fake.calls) != 3 {
@@ -255,7 +255,7 @@ func TestReleaseHotCopies_PartialFailureKeepsLaterChunks(t *testing.T) {
 	fake := &fakeManifest{hot: hot, entries: map[string]int64{}, failOnCall: 2}
 	m.manifest = fake
 
-	if err := m.migrator.releaseHotCopies(ctx, files, manifestReasonMigrated); err == nil {
+	if _, err := m.migrator.releaseHotCopies(ctx, files, manifestReasonMigrated); err == nil {
 		t.Fatal("releaseHotCopies succeeded although the second proposal failed")
 	}
 	if len(fake.calls) != 2 {
@@ -588,5 +588,46 @@ func TestMigrateBatch_DropsAFileACompactionTookOver(t *testing.T) {
 func TestMigratedReasonIsTheAccountedOne(t *testing.T) {
 	if manifestReasonMigrated != "tiering:migrated" {
 		t.Fatalf("reason %q: update raft.OutputGoneAccounted too", manifestReasonMigrated)
+	}
+}
+
+// takenManifest refuses its first proposal as a compaction or a re-home job
+// taking missA would, and from then on reports missA owned.
+type takenManifest struct {
+	*fakeManifest
+	taken bool
+}
+
+func (t *takenManifest) DeleteFilesFromManifest(ctx context.Context, paths []string, reason string) error {
+	if !t.taken {
+		t.taken = true
+		return fmt.Errorf("%w: manifest changed under the operation: paths %s", ErrManifestChanged, missA)
+	}
+	return t.fakeManifest.DeleteFilesFromManifest(ctx, paths, reason)
+}
+
+func (t *takenManifest) CompactionOwns(p string) bool { return t.taken && p == missA }
+
+// #1869: a release refused because one of its files was taken since the check
+// drops that file and proposes the rest again.
+func TestReleaseHotCopiesProposesTheRestAfterATakeOver(t *testing.T) {
+	m, hot, _, cleanup := setupIntegrationTest(t, true)
+	t.Cleanup(cleanup)
+	ctx := context.Background()
+	for _, p := range []string{missA, missB} {
+		if err := hot.Write(ctx, p, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fake := &fakeManifest{hot: hot, entries: map[string]int64{}}
+	m.manifest = &takenManifest{fakeManifest: fake}
+	if _, err := m.migrator.releaseHotCopies(ctx, []MigrationCandidate{candidateFor(missA), candidateFor(missB)}, "tiering:migrated"); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if len(fake.calls) != 1 || len(fake.calls[0].paths) != 1 || fake.calls[0].paths[0] != missB {
+		t.Fatalf("proposals after the refusal %+v, want one naming %s only", fake.calls, missB)
+	}
+	if ok, _ := hot.Exists(ctx, missA); !ok {
+		t.Fatal("the taken file's hot copy was deleted")
 	}
 }

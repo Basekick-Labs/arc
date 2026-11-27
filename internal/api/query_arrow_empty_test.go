@@ -85,6 +85,13 @@ func TestExecuteQueryArrow_EmptyResultReleasesContext(t *testing.T) {
 
 func TestExecuteQueryArrow_MissingAnchorStillFailsAndRecovers(t *testing.T) {
 	e := newFieldSchemaEnv(t, fieldschema.Options{}, true)
+	// The failure this pins comes from a cached transform still naming the
+	// removed anchor. A local volume that folds names (macOS by default) does
+	// not cache transforms (#1509), so there the query after the removal is
+	// planned afresh and succeeds: nothing to pin.
+	if storageFoldsNames(e.backend) {
+		t.Skip("the storage volume folds names, so transforms are not cached (#1509)")
+	}
 	seedCustomerScenario(e)
 	reg := queryregistry.NewRegistry(&queryregistry.RegistryConfig{HistorySize: 16}, zerolog.Nop())
 	e.h.SetQueryRegistry(reg)

@@ -662,7 +662,7 @@ func TestBackup_ClusterSyncsBeforeEverySnapshot(t *testing.T) {
 func TestBackup_ClusterSkipsReconciledAgainstTheManifest(t *testing.T) {
 	ctx := context.Background()
 	const ghost = "db/cpu/2026/09/17/00/compacted-away.parquet"
-	seed := func(t *testing.T, ghostLeaves bool) (string, string, *fakeClusterManifest) {
+	seed := func(t *testing.T, ghostLeaves bool) (string, string, *Manager) {
 		t.Helper()
 		data := mustLocalBackend(t, t.TempDir(), zerolog.Nop())
 		cm := &fakeClusterManifest{}
@@ -690,7 +690,20 @@ func TestBackup_ClusterSkipsReconciledAgainstTheManifest(t *testing.T) {
 		if mf.SkippedFiles != 1 || strings.Join(mf.SkippedSample, ",") != ghost || mf.TotalFiles != 21 {
 			t.Fatalf("skipped=%d sample=%v total=%d, want 1 [%s] 21", mf.SkippedFiles, mf.SkippedSample, mf.TotalFiles, ghost)
 		}
-		return backupDir, mf.BackupID, cm
+		return backupDir, mf.BackupID, m
+	}
+	// The listing entry says what GET /:id says (#1555): the same skip, the
+	// same reconciled count, and that the cluster manifest was checked.
+	listed := func(t *testing.T, m *Manager, wantReconciled int64) {
+		t.Helper()
+		summaries, err := m.ListBackups(ctx)
+		if err != nil || len(summaries) != 1 {
+			t.Fatalf("ListBackups = %v, %v", summaries, err)
+		}
+		s := summaries[0]
+		if s.SkippedFiles != 1 || s.SkippedReconciled != wantReconciled || !s.ClusterManifestChecked {
+			t.Errorf("listing skipped=%d reconciled=%d checked=%v, want 1, %d, true", s.SkippedFiles, s.SkippedReconciled, s.ClusterManifestChecked, wantReconciled)
+		}
 	}
 	replaceInto := func(t *testing.T, backupDir, backupID string) error {
 		t.Helper()
@@ -700,7 +713,8 @@ func TestBackup_ClusterSkipsReconciledAgainstTheManifest(t *testing.T) {
 		return err
 	}
 	t.Run("ghost left the manifest", func(t *testing.T) {
-		backupDir, backupID, _ := seed(t, true)
+		backupDir, backupID, m := seed(t, true)
+		listed(t, m, 1)
 		mf, err := (&Manager{backupStorage: mustLocalBackend(t, backupDir, zerolog.Nop())}).GetBackup(ctx, backupID)
 		if err != nil {
 			t.Fatal(err)
@@ -713,7 +727,8 @@ func TestBackup_ClusterSkipsReconciledAgainstTheManifest(t *testing.T) {
 		}
 	})
 	t.Run("ghost still in the manifest", func(t *testing.T) {
-		backupDir, backupID, _ := seed(t, false)
+		backupDir, backupID, m := seed(t, false)
+		listed(t, m, 0)
 		mf, err := (&Manager{backupStorage: mustLocalBackend(t, backupDir, zerolog.Nop())}).GetBackup(ctx, backupID)
 		if err != nil {
 			t.Fatal(err)

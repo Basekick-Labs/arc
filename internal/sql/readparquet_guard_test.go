@@ -38,6 +38,11 @@ var readParquetAllowedFiles = map[string]string{
 	// the DuckDB shadow oracle gets it through the normal query path.
 	// See TestArcxGeneratedSQLCarriesNoReadParquetOptions in internal/arcxrouter.
 	"internal/arcxrouter/router.go": "arcx rejects option arguments and does no Hive inference — must NOT be patched",
+
+	// Recognises Arc's own read_parquet calls inside DuckDB error TEXT, to
+	// redact the storage paths they carry before the text reaches a client.
+	// It never builds or runs a read.
+	"internal/sql/clienterr.go": "matches read_parquet( in error text to redact it; never builds a read",
 }
 
 // readParquetCall matches any spelling DuckDB accepts. Case-insensitive with

@@ -56,12 +56,13 @@ type License struct {
 	DaysRemaining int       `json:"days_remaining"`
 }
 
-// IsValid returns true if the license is valid and not expired
+// IsValid returns true if the license is valid: before its cutoff on the
+// grace schedule (grace.go) at the license clock.
 func (l *License) IsValid() bool {
 	if l == nil {
 		return false
 	}
-	return l.Status == "active" || l.Status == "grace_period"
+	return validAt(l.ExpiresAt, l.IsTrial(), licenseNow())
 }
 
 // IsExpired returns true if the license has expired
@@ -69,7 +70,7 @@ func (l *License) IsExpired() bool {
 	if l == nil {
 		return true
 	}
-	return l.Status == "expired" || l.Status == "read_only"
+	return !l.IsValid()
 }
 
 // HasFeature checks if the license includes a specific feature

@@ -178,7 +178,8 @@ func (c *recordingCoordinator) WaitLocalFiles(_ context.Context, db, m string, _
 
 type recordingFlusher struct {
 	events  *[]string
-	failure bool
+	failure bool // the latch's flush-failure reason
+	pending bool // the latch's recovery-pending reason
 	err     error
 }
 
@@ -186,9 +187,15 @@ func (f *recordingFlusher) FlushScopeAndWait(_ context.Context, db, m string) (m
 	*f.events = append(*f.events, "flush "+db+"/"+m)
 	return map[string]uint64{db + "/" + m: 4}, f.err
 }
-func (f *recordingFlusher) HasFlushFailure() bool { return f.failure }
+func (f *recordingFlusher) FlushFailureState() (bool, bool, uint64) {
+	return f.failure, f.pending, 0
+}
+func (f *recordingFlusher) FlushScopeAndWaitSince(ctx context.Context, db, m string, _ uint64) (map[string]uint64, error) {
+	return f.FlushScopeAndWait(ctx, db, m)
+}
 
 func TestDeleteRecordsTheDeleteBeforeRewriting(t *testing.T) {
+	shortGiveUp(t, 100*time.Millisecond)
 	root, backend, db := recordsDuckDB(t)
 	const rel = "db/cpu/2026/10/11/10/cpu_a.parquet"
 	send := func(h *DeleteHandler, body string) (int, DeleteResponse) {
@@ -353,7 +360,7 @@ func TestDatabaseDeletionFlushesRecordsAndWithdraws(t *testing.T) {
 		t.Fatal(err)
 	}
 	events := &[]string{}
-	handler.SetCoordinator(&recordingDatabaseCoordinator{databaseDeleteCoordinatorFake: databaseDeleteCoordinatorFake{primary: true, role: "writer"}, events: events}, true)
+	handler.SetCoordinator(&recordingDatabaseCoordinator{databaseDeleteCoordinatorFake: databaseDeleteCoordinatorFake{primary: true, role: "writer"}, events: events})
 	handler.SetFlusher(&recordingFlusher{events: events})
 	handler.SetPendingRegistrations(recordingPending{events: events})
 	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/db?confirm=true", nil), testRequestTimeoutMS)

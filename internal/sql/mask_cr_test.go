@@ -13,8 +13,8 @@ func TestLineCommentEndsAtCarriageReturn(t *testing.T) {
 		t.Errorf("findKeywordFunctionCall(%q) = %d, want 0", q, got)
 	}
 	q = "x --a\rEXTRACT (YEAR FROM t)"
-	if !isFromKeywordFuncBeforeParen(q, strings.Index(q, "(")) {
-		t.Errorf("isFromKeywordFuncBeforeParen(%q) = false: the comment ended at the carriage return", q)
+	if _, masks := MaskFromKeywordsInFunctionBodies(q); len(masks) != 1 {
+		t.Errorf("MaskFromKeywordsInFunctionBodies(%q) masked %d FROMs, want 1: the comment ended at the carriage return", q, len(masks))
 	}
 	masked, _ := MaskStringLiterals("SELECT 1 --x\r, 'a;b' AS s", true)
 	if strings.Contains(masked, "a;b") {

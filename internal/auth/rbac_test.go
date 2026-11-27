@@ -12,7 +12,7 @@ import (
 )
 
 // setupTestRBACManager creates a test RBACManager with a temporary database
-func setupTestRBACManager(t *testing.T) (*RBACManager, *AuthManager, func()) {
+func setupTestRBACManager(t testing.TB) (*RBACManager, *AuthManager, func()) {
 	t.Helper()
 
 	tmpDir, err := os.MkdirTemp("", "arc-rbac-test-*")
@@ -37,6 +37,11 @@ func setupTestRBACManager(t *testing.T) (*RBACManager, *AuthManager, func()) {
 	})
 
 	cleanup := func() {
+		// Stop the cache-cleanup goroutine NewRBACManager starts. Left
+		// running past its test, it calls time.Now on every tick and races
+		// TestOSS_RBACWrites_StampUTC, which swaps time.Local (seen under
+		// -race in CI once more tests used this helper).
+		rm.Close()
 		am.Close()
 		os.RemoveAll(tmpDir)
 	}

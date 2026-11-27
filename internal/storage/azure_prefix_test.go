@@ -76,8 +76,10 @@ func TestAzureBackendPrefixedKeyValidatesTheCompleteObjectName(t *testing.T) {
 	}
 	if _, err := backend.prefixedKey(keyOverLimit); err == nil {
 		t.Fatal("prefixedKey accepted an object name over the limit")
-	} else if !strings.Contains(err.Error(), backend.prefix+keyOverLimit) {
-		t.Errorf("error %q does not identify the complete object name", err)
+	} else if !strings.Contains(err.Error(), "under the configured prefix") || !strings.Contains(err.Error(), "over the") {
+		// The object name is not repeated (#1113): the caller knows its key,
+		// and the message says the prefixed name is what failed (#1121).
+		t.Errorf("error %q does not say the prefixed object name is over the limit", err)
 	}
 }
 

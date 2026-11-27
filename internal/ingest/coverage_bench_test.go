@@ -7,7 +7,7 @@ import (
 
 // The covered write path enqueues the WAL entry under the shard lock (#1207).
 // Same-key concurrent writers are the case that lock serialises.
-func benchmarkCoveredWrite(b *testing.B, covered bool, rows int) {
+func benchmarkCoveredWrite(b *testing.B, covered bool, rows int, keyFlush ...bool) {
 	t := &testing.T{}
 	var reg *coverageRegistrar
 	if covered {
@@ -17,6 +17,10 @@ func benchmarkCoveredWrite(b *testing.B, covered bool, rows int) {
 	}
 	buf, _ := newCoverageBuffer(t, 50000, reg)
 	defer buf.Close()
+	if len(keyFlush) > 0 && keyFlush[0] { // query.fresh_flush_enabled: ledger and task tracking on (#1760)
+		buf.EnableKeyFlushLedger(ForceBudget{})
+		buf.EnableKeyFlushTracking()
+	}
 	rec := coverageRecord("cpu", 1)
 	if rows > 1 {
 		ts, vs := make([]interface{}, rows), make([]interface{}, rows)
@@ -41,3 +45,10 @@ func BenchmarkWriteSameKeyCoverageOff(b *testing.B)        { benchmarkCoveredWri
 func BenchmarkWriteSameKeyCoverageOn(b *testing.B)         { benchmarkCoveredWrite(b, true, 1) }
 func BenchmarkWriteSameKey500RowsCoverageOff(b *testing.B) { benchmarkCoveredWrite(b, false, 500) }
 func BenchmarkWriteSameKey500RowsCoverageOn(b *testing.B)  { benchmarkCoveredWrite(b, true, 500) }
+
+// With fresh queries enabled and no query asking (#1760): every detach records and resolves its
+// task.
+func BenchmarkWriteSameKeyFreshFlushOn(b *testing.B) { benchmarkCoveredWrite(b, false, 1, true) }
+func BenchmarkWriteSameKey500RowsFreshFlushOn(b *testing.B) {
+	benchmarkCoveredWrite(b, false, 500, true)
+}

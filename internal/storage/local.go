@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,9 +14,14 @@ import (
 
 	"github.com/basekick-labs/arc/internal/metrics"
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/singleflight"
 )
 
-const maxDirCacheEntries = 1024
+// maxDirCacheEntries bounds the directory cache. It holds every level of a
+// partition path (database, measurement, year, month, day, hour), and a miss
+// costs a directory fsync per uncached level (ensureDir), so it is sized for
+// a few thousand active measurements rather than one entry each.
+const maxDirCacheEntries = 8192
 
 // LocalBackend implements the Backend interface for local filesystem storage
 type LocalBackend struct {
@@ -31,6 +37,19 @@ type LocalBackend struct {
 	// causing filesystem lock contention. This cache eliminates that.
 	dirCache map[string]bool
 	dirMu    sync.RWMutex
+	// dirGen counts cache invalidations (forgetDir, RemoveAll,
+	// RemoveDirectory), so a creation that ran outside dirMu does not cache
+	// a chain a removal may have taken meanwhile. Guarded by dirMu.
+	dirGen uint64
+	// dirFlight shares one durable creation among concurrent writers that
+	// miss the cache for the same directory (ensureDir).
+	dirFlight singleflight.Group
+	// dirSyncWarn logs once that the volume refuses directory fsync.
+	dirSyncWarn sync.Once
+
+	// spelling refuses database and measurement names that exist on disk
+	// in another spelling, armed only when the root folds names (#1509).
+	spelling nameSpelling
 }
 
 // NewLocalBackend creates a new local filesystem storage backend
@@ -52,44 +71,25 @@ func NewLocalBackend(basePath string, logger zerolog.Logger) (*LocalBackend, err
 		prefix += storagePathSeparator
 	}
 
-	return &LocalBackend{
+	b := &LocalBackend{
 		basePath:   absPath,
 		pathPrefix: prefix,
 		logger:     logger.With().Str("component", "local-storage").Logger(),
 		dirCache:   make(map[string]bool),
-	}, nil
-}
-
-// ensureDir creates the directory if it doesn't exist, using a cache to avoid
-// redundant os.MkdirAll calls under sustained load.
-func (b *LocalBackend) ensureDir(dir string) error {
-	// Fast path: check if directory already exists in cache (RLock)
-	b.dirMu.RLock()
-	exists := b.dirCache[dir]
-	b.dirMu.RUnlock()
-
-	if exists {
-		return nil
 	}
-
-	// Slow path: create directory and update cache (Lock)
-	b.dirMu.Lock()
-	defer b.dirMu.Unlock()
-	// Double-check after acquiring write lock
-	if !b.dirCache[dir] {
-		// Use 0700 for owner-only access (security best practice)
-		if err := os.MkdirAll(dir, 0700); err != nil {
-			return fmt.Errorf("failed to create directory: %w", err)
-		}
-		if len(b.dirCache) >= maxDirCacheEntries {
-			for cachedDir := range b.dirCache {
-				delete(b.dirCache, cachedDir)
-				break
-			}
-		}
-		b.dirCache[dir] = true
+	folds, err := probeNamesFold(absPath)
+	b.spelling = nameSpelling{armed: folds.Case || folds.Normalization, folds: folds, listings: make(map[string]dirListing)}
+	switch {
+	case err != nil:
+		b.logger.Warn().Err(err).Msg("Could not tell whether the storage volume distinguishes names by case; database and measurement names are only accepted in the spelling they have on disk")
+	case folds.Case:
+		b.logger.Warn().Str("path", absPath).Msg("The storage volume does not distinguish names that differ only in case (for example macOS APFS by default); database and measurement names are only accepted in the spelling they have on disk. Use a case-sensitive volume if names may differ only by case")
+	case folds.Normalization:
+		// Case-sensitive APFS: ingest names are ASCII, so only an existing
+		// non-ASCII name can meet this fold.
+		b.logger.Debug().Str("path", absPath).Msg("The storage volume folds Unicode normalization; names are only accepted in the spelling they have on disk")
 	}
-	return nil
+	return b, nil
 }
 
 // Write writes data to the specified path with atomic write (write to temp, then rename)
@@ -106,17 +106,15 @@ func (b *LocalBackend) Write(ctx context.Context, path string, data []byte) erro
 	}
 
 	// Write to temporary file with cryptographically random name (prevents TOCTOU attacks)
-	tmpFile, err := os.CreateTemp(dir, ".arc-*.tmp")
+	tmpFile, err := createTempFn(dir, ".arc-*.tmp")
 	if err != nil {
 		// Directory might have been deleted externally — invalidate cache and retry
-		if os.IsNotExist(err) {
-			b.dirMu.Lock()
-			delete(b.dirCache, dir)
-			b.dirMu.Unlock()
+		if dirGone(err) {
+			b.forgetDir(dir)
 			if err := b.ensureDir(dir); err != nil {
 				return err
 			}
-			tmpFile, err = os.CreateTemp(dir, ".arc-*.tmp")
+			tmpFile, err = createTempFn(dir, ".arc-*.tmp")
 			if err != nil {
 				return fmt.Errorf("failed to create temp file: %w", err)
 			}
@@ -126,23 +124,38 @@ func (b *LocalBackend) Write(ctx context.Context, path string, data []byte) erro
 	}
 	tmpPath := tmpFile.Name()
 
-	// Write data and close the file
+	// Write the data, make it durable, and close the file
 	_, writeErr := tmpFile.Write(data)
+	var syncErr error
+	if writeErr == nil {
+		syncErr = syncFileFn(tmpFile)
+	}
 	closeErr := tmpFile.Close()
 	if writeErr != nil {
 		os.Remove(tmpPath) // Clean up temp file on error
 		return fmt.Errorf("failed to write temp file: %w", writeErr)
+	}
+	if syncErr != nil {
+		os.Remove(tmpPath)
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to sync temp file: %w", syncErr)
 	}
 	if closeErr != nil {
 		os.Remove(tmpPath) // Clean up temp file on error
 		return fmt.Errorf("failed to close temp file: %w", closeErr)
 	}
 
-	// Atomic rename
+	// Atomic rename, then make the name durable (local_durable.go)
 	if err := os.Rename(tmpPath, fullPath); err != nil {
 		os.Remove(tmpPath) // Clean up temp file on error
 		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to rename temp file: %w", err)
+	}
+	if err := b.syncDir(dir); err != nil {
+		// Kept in place: see local_durable.go for why Write never unpublishes.
+		b.notDurable(fullPath, err)
+		metrics.Get().IncStorageErrors()
+		return err
 	}
 
 	// Record metrics
@@ -157,11 +170,82 @@ func (b *LocalBackend) Write(ctx context.Context, path string, data []byte) erro
 	return nil
 }
 
+// WriteIfAbsent writes data at path unless a file is already there
+// (ConditionalWriter). The bytes go to a temporary file first and are linked
+// into place: link fails when the target exists and never exposes a partial
+// file, which a plain O_EXCL create of the target would.
+//
+// Unlike Write it does not recreate a directory removed under it (#1804).
+// Directory removers take only empty directories, and its callers write into
+// one that is not: the Iceberg publish puts vN.metadata.json beside the
+// metadata file it just read, and the link cannot be struck because the
+// temporary file is already in the directory. The edgesync relay falls back
+// to Write on any error. A backup restore writes a table's discovery files
+// with it (#1813) after the table's 000NN-<uuid>.metadata.json, which sort
+// first, so the directory is not empty either. A new caller writing into a directory that can be
+// empty needs the retry Write has.
+func (b *LocalBackend) WriteIfAbsent(ctx context.Context, path string, data []byte) (bool, error) {
+	fullPath, err := b.validatePath(path)
+	if err != nil {
+		return false, fmt.Errorf("invalid path: %w", err)
+	}
+	dir := filepath.Dir(fullPath)
+	if err := b.ensureDir(dir); err != nil {
+		return false, err
+	}
+	tmpFile, err := os.CreateTemp(dir, ".arc-*.tmp")
+	if err != nil {
+		return false, fmt.Errorf("failed to create temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+	_, writeErr := tmpFile.Write(data)
+	var syncErr error
+	if writeErr == nil {
+		syncErr = syncFileFn(tmpFile)
+	}
+	closeErr := tmpFile.Close()
+	if writeErr != nil {
+		return false, fmt.Errorf("failed to write temp file: %w", writeErr)
+	}
+	if syncErr != nil {
+		metrics.Get().IncStorageErrors()
+		return false, fmt.Errorf("failed to sync temp file: %w", syncErr)
+	}
+	if closeErr != nil {
+		return false, fmt.Errorf("failed to close temp file: %w", closeErr)
+	}
+	if err := os.Link(tmpPath, fullPath); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			// The file in place may be this caller's own, linked by an
+			// attempt whose directory sync failed: sync it now, so the
+			// retry that lands here returns only once the name is durable.
+			if err := b.syncDir(dir); err != nil {
+				metrics.Get().IncStorageErrors()
+				return false, err
+			}
+			return false, nil
+		}
+		metrics.Get().IncStorageErrors()
+		return false, fmt.Errorf("failed to link file into place: %w", err)
+	}
+	// Unlike the other writes, a failure here does not unpublish: this is the
+	// Iceberg publish fence, and a reader may already have adopted the
+	// version. The caller's retry finds the file in place.
+	if err := b.syncDir(dir); err != nil {
+		metrics.Get().IncStorageErrors()
+		return false, err
+	}
+	metrics.Get().IncStorageWrites()
+	metrics.Get().IncStorageWriteBytes(int64(len(data)))
+	return true, nil
+}
+
 // partPath returns the persistent in-progress path for a file being written by
 // WriteReader or AppendReader. Using a deterministic name (rather than a
 // random .tmp) means a partial write that survives a crash or transport error
-// is discoverable through StagingInspector and ReadToAt, enabling the puller
-// to resume from the last committed byte on the next attempt.
+// is discoverable through StagingInspector, enabling the puller to resume from
+// the last staged byte on the next attempt.
 func partPath(fullPath string) string {
 	return fullPath + PartSuffix
 }
@@ -170,8 +254,10 @@ func partPath(fullPath string) string {
 //
 // Writes proceed to a deterministic "<path>.part" staging file so that a
 // partial transfer interrupted by a transport error leaves recoverable bytes
-// on disk. On success the staging file is atomically renamed to the final path.
-// On error the staging file is left in place so the puller can resume from it.
+// on disk. On success the staging file is fsynced and atomically renamed to the
+// final path, and the directory is fsynced (local_durable.go). On a copy error
+// the staging file is left in place so the puller can resume from it; on an
+// fsync error it is removed (see below).
 func (b *LocalBackend) WriteReader(ctx context.Context, path string, reader io.Reader, size int64) error {
 	fullPath, err := b.validatePath(path)
 	if err != nil {
@@ -184,16 +270,14 @@ func (b *LocalBackend) WriteReader(ctx context.Context, path string, reader io.R
 	}
 
 	stagingPath := partPath(fullPath)
-	stagingFile, err := os.OpenFile(stagingPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	stagingFile, err := createStagingFn(stagingPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			b.dirMu.Lock()
-			delete(b.dirCache, dir)
-			b.dirMu.Unlock()
+		if dirGone(err) {
+			b.forgetDir(dir)
 			if err := b.ensureDir(dir); err != nil {
 				return err
 			}
-			stagingFile, err = os.OpenFile(stagingPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+			stagingFile, err = createStagingFn(stagingPath)
 			if err != nil {
 				return fmt.Errorf("failed to create staging file: %w", err)
 			}
@@ -203,6 +287,10 @@ func (b *LocalBackend) WriteReader(ctx context.Context, path string, reader io.R
 	}
 
 	written, copyErr := io.Copy(stagingFile, reader)
+	var syncErr error
+	if copyErr == nil {
+		syncErr = syncFileFn(stagingFile)
+	}
 	closeErr := stagingFile.Close()
 
 	if copyErr != nil {
@@ -210,15 +298,30 @@ func (b *LocalBackend) WriteReader(ctx context.Context, path string, reader io.R
 		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to write data: %w", copyErr)
 	}
+	if syncErr != nil {
+		// Unlike a copy error, remove the staging file: after a failed fsync
+		// the page cache can still hold bytes the disk does not, so a resume
+		// that hashes them back proves nothing. The puller restarts a missing
+		// .part from offset zero.
+		os.Remove(stagingPath)
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to sync staging file: %w", syncErr)
+	}
 	if closeErr != nil {
 		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to close staging file: %w", closeErr)
 	}
 
-	// Atomic promotion: rename staging → final.
+	// Atomic promotion: rename staging → final, then make the name durable.
+	existed := keyExists(fullPath)
 	if err := os.Rename(stagingPath, fullPath); err != nil {
 		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to promote staging file: %w", err)
+	}
+	if err := b.syncDir(dir); err != nil {
+		b.unpublish(fullPath, existed, err)
+		metrics.Get().IncStorageErrors()
+		return err
 	}
 
 	metrics.Get().IncStorageWrites()
@@ -243,11 +346,24 @@ var renameFile = os.Rename
 // same reason: a filesystem that refuses chmod is hard to arrange in a test.
 var chmodFile = os.Chmod
 
+// createTempFn and createStagingFn create the temporary file Write and the
+// staging file WriteReader write into. Variables so a test can return the
+// error a directory removed under the call produces on another platform
+// (#1767: EINVAL on macOS), which CI cannot arrange on Linux.
+var (
+	createTempFn    = os.CreateTemp
+	createStagingFn = func(path string) (*os.File, error) {
+		return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	}
+)
+
 // AdoptFile implements FileAdopter: it moves an already-written local file into
 // the backend instead of copying it, which is what makes compaction output cost
 // one pass over the bytes instead of two.
 //
-// The source file is CONSUMED on success. On ErrAdoptUnsupported it is still
+// The source file is CONSUMED on success, and also when the directory sync
+// after the rename fails (the adopted file is then removed, see
+// local_durable.go). On ErrAdoptUnsupported it is still
 // there with its contents intact -- though possibly with its mode set to 0600,
 // see below -- and the caller must copy it through WriteReader instead. That is
 // the normal outcome when compaction.temp_directory sits on a different
@@ -297,26 +413,49 @@ func (b *LocalBackend) AdoptFile(ctx context.Context, path, localPath string) er
 		return fmt.Errorf("%w: cannot set mode 0600 on %s: %w", ErrAdoptUnsupported, localPath, err)
 	}
 
+	// The source was written by DuckDB, which does not fsync it. Make the
+	// bytes durable before the rename publishes them, or a power loss after
+	// the job deletes its inputs could leave neither (#1618). A hard error,
+	// not ErrAdoptUnsupported: after a failed fsync the page cache can hold
+	// bytes the disk does not, and copying them out through WriteReader would
+	// publish whatever the cache says, the reason WriteReader drops its .part
+	// on a failed sync. The sync is wasted when the rename below turns out
+	// to be cross-filesystem (compaction.temp_directory on another mount);
+	// the copy then syncs its own destination.
+	if err := syncFileAt(localPath); err != nil {
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to sync %s before adopting it: %w", localPath, err)
+	}
+
+	existed := keyExists(fullPath)
 	if err := renameFile(localPath, fullPath); err != nil {
-		// ENOENT first, and it is the only errno worth retrying: it is also the
-		// only one WriteReader retries, for the same cause -- a cached
-		// directory an operator removed under us. Note ENOENT from rename is
-		// ambiguous in a way it is not from OpenFile, because the SOURCE may be
-		// the missing path, so the message below asserts only what is known.
-		if os.IsNotExist(err) {
-			b.dirMu.Lock()
-			delete(b.dirCache, dir)
-			b.dirMu.Unlock()
+		// A directory removed under us first, the one cause worth retrying,
+		// and the one WriteReader retries too: a cached directory an operator,
+		// retention or a database delete removed. dirGone is ENOENT, and on
+		// macOS also EINVAL, which APFS returns for the same race (#1767).
+		// ENOENT from rename is ambiguous in a way it is not from OpenFile,
+		// because the SOURCE may be the missing path, so the message below
+		// asserts only what is known.
+		if dirGone(err) {
+			b.forgetDir(dir)
 			if mkErr := b.ensureDir(dir); mkErr != nil {
 				metrics.Get().IncStorageErrors()
 				return mkErr
 			}
 			if retryErr := renameFile(localPath, fullPath); retryErr != nil {
+				if !errors.Is(err, fs.ErrNotExist) {
+					// The first refusal was EINVAL, which is also a plain
+					// refusal from a filesystem that will not take this
+					// rename. That one still means "copy instead" (below),
+					// as before the retry existed.
+					return fmt.Errorf("%w: cannot rename %s to %s (refused with %v, then again after re-creating its directory): %w",
+						ErrAdoptUnsupported, localPath, fullPath, err, retryErr)
+				}
 				metrics.Get().IncStorageErrors()
 				return fmt.Errorf("failed to adopt local file into %s after re-creating its parent directory: %w",
 					fullPath, retryErr)
 			}
-			// fall through to the success accounting below
+			// fall through to the directory sync below
 		} else {
 			// Every other refusal means "copy instead", not "fail". EXDEV is
 			// the common one -- Linux rename returns it for any cross-MOUNT
@@ -331,6 +470,15 @@ func (b *LocalBackend) AdoptFile(ctx context.Context, path, localPath string) er
 			return fmt.Errorf("%w: cannot rename %s to %s: %w",
 				ErrAdoptUnsupported, localPath, fullPath, err)
 		}
+	}
+
+	// The rename is a new name in dir; make it durable too. A failure removes
+	// a newly adopted file, consuming the source: the caller fails the job and
+	// the next cycle compacts again from the inputs, which are untouched.
+	if err := b.syncDir(dir); err != nil {
+		b.unpublish(fullPath, existed, err)
+		metrics.Get().IncStorageErrors()
+		return err
 	}
 
 	// Accounting parity with WriteReader. These bytes were committed to the
@@ -422,10 +570,8 @@ func (b *LocalBackend) ReadTo(ctx context.Context, path string, writer io.Writer
 	return nil
 }
 
-// ReadToAt reads data from path starting at the given byte offset and writes
-// to writer. offset=0 starts at the beginning. Falls back to the ".part"
-// staging file if the final file does not exist (allows the puller to hash a
-// partial prefix before resuming a transfer).
+// ReadToAt reads the committed file at path starting at the given byte offset
+// and writes to writer. offset=0 starts at the beginning.
 func (b *LocalBackend) ReadToAt(ctx context.Context, path string, writer io.Writer, offset int64) error {
 	fullPath, err := b.validatePath(path)
 	if err != nil {
@@ -435,12 +581,7 @@ func (b *LocalBackend) ReadToAt(ctx context.Context, path string, writer io.Writ
 		return fmt.Errorf("negative offset: %d", offset)
 	}
 
-	// Prefer the final file; fall back to the staging file so tryResumeFromPartial
-	// can hash a prefix even before the transfer completes.
 	file, err := os.Open(fullPath)
-	if os.IsNotExist(err) {
-		file, err = os.Open(partPath(fullPath))
-	}
 	if err != nil {
 		metrics.Get().IncStorageErrors()
 		if os.IsNotExist(err) {
@@ -516,21 +657,43 @@ func (b *LocalBackend) AppendReader(ctx context.Context, path string, reader io.
 	// Close exactly once on every path, including a failed copy. Closing
 	// before promotion also makes close errors visible to the caller.
 	written, copyErr := io.Copy(file, reader)
+	promote := copyErr == nil && written == appendSize
+	var syncErr error
+	if promote {
+		// fsync is per inode, so this also covers the bytes earlier
+		// WriteReader/AppendReader calls wrote through other descriptors.
+		// Appends that do not promote are resumable staging, not data, and
+		// are not synced.
+		syncErr = syncFileFn(file)
+	}
 	closeErr := file.Close()
 	if copyErr != nil {
 		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to append file data: %w", copyErr)
+	}
+	if syncErr != nil {
+		// Removed for the reason WriteReader removes it on a failed fsync.
+		os.Remove(stagingPath)
+		metrics.Get().IncStorageErrors()
+		return fmt.Errorf("failed to sync staging file: %w", syncErr)
 	}
 	if closeErr != nil {
 		metrics.Get().IncStorageErrors()
 		return fmt.Errorf("failed to close staging file: %w", closeErr)
 	}
 
-	// Promote only after a successful copy and close.
-	if written == appendSize {
+	// Promote only after a successful copy, sync and close, then make the
+	// name durable.
+	if promote {
+		existed := keyExists(fullPath)
 		if err := os.Rename(stagingPath, fullPath); err != nil {
 			metrics.Get().IncStorageErrors()
 			return fmt.Errorf("failed to promote staging file after append: %w", err)
+		}
+		if err := b.syncDir(filepath.Dir(fullPath)); err != nil {
+			b.unpublish(fullPath, existed, err)
+			metrics.Get().IncStorageErrors()
+			return err
 		}
 	}
 
@@ -675,36 +838,47 @@ func (b *LocalBackend) ConfigJSON() string {
 // ListDirectories lists immediate subdirectories at a prefix.
 // Implements the DirectoryLister interface.
 func (b *LocalBackend) ListDirectories(ctx context.Context, prefix string) ([]string, error) {
+	dirs, _, err := b.ListLevel(ctx, prefix)
+	return dirs, err
+}
+
+var _ LevelLister = (*LocalBackend)(nil)
+
+// ListLevel implements LevelLister: one directory read, returning the
+// directories directly under prefix and the files directly in it.
+func (b *LocalBackend) ListLevel(ctx context.Context, prefix string) ([]string, []string, error) {
 	// Reject the prefix unless it names something inside the root
 	searchPath, err := b.validateListPath(prefix)
 	if err != nil {
-		return nil, fmt.Errorf("invalid prefix: %w", err)
+		return nil, nil, fmt.Errorf("invalid prefix: %w", err)
 	}
 
 	entries, err := os.ReadDir(searchPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return []string{}, nil
+			return []string{}, nil, nil
 		}
-		return nil, fmt.Errorf("failed to read directory: %w", err)
+		return nil, nil, fmt.Errorf("failed to read directory: %w", err)
 	}
 
-	var dirs []string
+	var dirs, files []string
 	for _, entry := range entries {
+		// Callers join this name into a key, so a name the contract would
+		// refuse produces an unusable key. Same rule as List (#743), and
+		// the same function, so the listings cannot drift apart about
+		// what they drop (#756). A name here is one segment, so it is
+		// both the base name and the relative path.
+		if omittedFromListing(entry.Name(), entry.Name()) != nil {
+			continue
+		}
 		if entry.IsDir() {
-			// Callers join this name into a key, so a name the contract would
-			// refuse produces an unusable key. Same rule as List (#743), and
-			// the same function, so the four listings cannot drift apart about
-			// what they drop (#756). A directory name is one segment, so it is
-			// both the base name and the relative path here.
-			if omittedFromListing(entry.Name(), entry.Name()) != nil {
-				continue
-			}
 			dirs = append(dirs, entry.Name())
+		} else {
+			files = append(files, entry.Name())
 		}
 	}
 
-	return dirs, nil
+	return dirs, files, nil
 }
 
 // DeleteBatch deletes multiple objects at the specified paths.
@@ -739,6 +913,7 @@ func (b *LocalBackend) RemoveDirectory(ctx context.Context, path string) error {
 	// Invalidate from directory cache
 	b.dirMu.Lock()
 	delete(b.dirCache, fullPath)
+	b.dirGen++
 	b.dirMu.Unlock()
 
 	b.logger.Debug().
@@ -1017,7 +1192,7 @@ func ValidateKey(key string) error {
 		return fmt.Errorf("%w: key is empty", ErrInvalidPath)
 	}
 	if key[len(key)-1] == '/' {
-		return fmt.Errorf("%w: %q ends in a separator, which names the same object as %q", ErrInvalidPath, key, key[:len(key)-1])
+		return fmt.Errorf("%w: key ends in a separator, which names the same object as the key without it", ErrInvalidPath)
 	}
 	// PartSuffix is reserved because LocalBackend stages every write at
 	// key+PartSuffix. Without this the staging file of key "x" IS the
@@ -1031,7 +1206,7 @@ func ValidateKey(key string) error {
 	// key remains portable between backends, which is the property #743
 	// established.
 	if strings.HasSuffix(key, PartSuffix) {
-		return fmt.Errorf("%w: %q ends in %q, which is reserved for write staging", ErrInvalidPath, key, PartSuffix)
+		return fmt.Errorf("%w: key ends in %s, which is reserved for write staging", ErrInvalidPath, PartSuffix)
 	}
 	return validateKeyBody(key)
 }
@@ -1057,7 +1232,7 @@ func ValidateListPrefix(prefix string) error {
 		return nil
 	}
 	if prefix == "/" {
-		return fmt.Errorf("%w: %q is not a relative prefix; use \"\" for everything", ErrInvalidPath, prefix)
+		return fmt.Errorf("%w: root separator is not a relative prefix; use an empty prefix for everything", ErrInvalidPath)
 	}
 	if prefix[len(prefix)-1] == '/' {
 		prefix = prefix[:len(prefix)-1]
@@ -1076,7 +1251,7 @@ func validateKeyBody(p string) error {
 		return fmt.Errorf("%w: key is %d bytes, over the %d-byte limit", ErrInvalidPath, len(p), MaxUsableKeyLen)
 	}
 	if p[0] == '/' {
-		return fmt.Errorf("%w: %q must be relative to the backend root", ErrInvalidPath, p)
+		return fmt.Errorf("%w: path must be relative to the backend root", ErrInvalidPath)
 	}
 	start := 0
 	for i := 0; i <= len(p); i++ {
@@ -1086,14 +1261,14 @@ func validateKeyBody(p string) error {
 				return fmt.Errorf("%w: contains a NUL byte", ErrInvalidPath)
 			}
 			if c == '\\' {
-				return fmt.Errorf("%w: %q contains a backslash, which Azure treats as a separator", ErrInvalidPath, p)
+				return fmt.Errorf("%w: path contains a backslash, which Azure treats as a separator", ErrInvalidPath)
 			}
 			if c != '/' {
 				continue
 			}
 		}
 		if err := checkSegment(p[start:i]); err != nil {
-			return fmt.Errorf("%w (in %q)", err, p)
+			return err
 		}
 		start = i + 1
 	}
@@ -1108,8 +1283,10 @@ func checkSegment(seg string) error {
 	switch seg {
 	case "":
 		return fmt.Errorf("%w: contains an empty segment", ErrInvalidPath)
-	case ".", "..":
-		return fmt.Errorf("%w: contains a %q segment", ErrInvalidPath, seg)
+	case ".":
+		return fmt.Errorf("%w: contains a single-dot segment", ErrInvalidPath)
+	case "..":
+		return fmt.Errorf("%w: contains a double-dot segment", ErrInvalidPath)
 	}
 	if len(seg) > MaxUsableKeySegmentLen {
 		return fmt.Errorf("%w: has a %d-byte segment, over the %d-byte limit", ErrInvalidPath, len(seg), MaxUsableKeySegmentLen)
@@ -1142,9 +1319,9 @@ func ValidateKeySegment(seg string) error {
 		case 0:
 			return fmt.Errorf("%w: segment contains a NUL byte", ErrInvalidPath)
 		case '\\':
-			return fmt.Errorf("%w: segment %q contains a backslash, which Azure treats as a separator", ErrInvalidPath, seg)
+			return fmt.Errorf("%w: segment contains a backslash, which Azure treats as a separator", ErrInvalidPath)
 		case '/':
-			return fmt.Errorf("%w: segment %q contains a separator, so it names more than one path component", ErrInvalidPath, seg)
+			return fmt.Errorf("%w: segment contains a separator, so it names more than one path component", ErrInvalidPath)
 		}
 	}
 	return checkSegment(seg)
@@ -1172,7 +1349,7 @@ const globMetacharacters = `*?[]{}`
 // segment of everything that spoke writes into the hub's storage root.
 func ValidateGlobSafe(s string) error {
 	if i := strings.IndexAny(s, globMetacharacters); i >= 0 {
-		return fmt.Errorf("%w: %q contains the glob metacharacter %q, which would match more than one path", ErrInvalidPath, s, s[i])
+		return fmt.Errorf("%w: contains the glob metacharacter %U, which would match more than one path", ErrInvalidPath, rune(s[i]))
 	}
 	return nil
 }
@@ -1191,7 +1368,7 @@ func (b *LocalBackend) stagedPath(key string) (string, error) {
 		return "", fmt.Errorf("%w: key is empty", ErrInvalidPath)
 	}
 	if key[len(key)-1] == '/' {
-		return "", fmt.Errorf("%w: %q ends in a separator", ErrInvalidPath, key)
+		return "", fmt.Errorf("%w: key ends in a separator", ErrInvalidPath)
 	}
 	if err := validateKeyBody(key); err != nil {
 		return "", err
@@ -1451,6 +1628,18 @@ func (b *LocalBackend) validateListPath(prefix string) (string, error) {
 	}
 	if prefix[len(prefix)-1] == '/' {
 		prefix = prefix[:len(prefix)-1]
+	}
+	// The prefix names a directory; its database and measurement segments
+	// must have their on-disk spelling on a volume that folds names, or
+	// a delete or retention pass under `CPU` would act on `cpu` (#1509).
+	if b.spelling.armed {
+		segs := strings.SplitN(prefix, "/", 3)
+		if len(segs) > 2 {
+			segs = segs[:2]
+		}
+		if _, err := b.checkSpelling(segs); err != nil {
+			return "", err
+		}
 	}
 	return b.pathPrefix + prefix, nil
 }

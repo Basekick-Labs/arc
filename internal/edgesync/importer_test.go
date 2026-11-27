@@ -249,6 +249,35 @@ func TestImporter_RefusesUnknownAndDisabledSpokes(t *testing.T) {
 	}
 }
 
+// A spoke whose ID shares a directory with another enabled registration on a
+// folding hub is refused as an invalid bundle (422), like an unknown or
+// disabled one, not as a server failure (#740).
+func TestImporter_RefusesACollidingSpoke(t *testing.T) {
+	ctx := context.Background()
+	rig := newImportRig(t, false)
+	dir := exportBundle(t, rig.secret, 1, testHubID)
+
+	// A legacy row written before collisions were refused.
+	encrypted, err := rig.registry.cipher.Encrypt("other-secret")
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	if _, err := rig.registry.db.ExecContext(ctx,
+		`INSERT INTO sync_spokes (spoke_id, name, secret_encrypted, enabled, registered_at)
+		 VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)`, "ROCKET-01", "alias", encrypted); err != nil {
+		t.Fatalf("insert alias: %v", err)
+	}
+	rig.registry.mu.Lock()
+	addSpokeID(rig.registry.spokeIDsByKey, "ROCKET-01")
+	rig.registry.mu.Unlock()
+	rig.registry.SetNameFolding(AllNameFolds)
+
+	_, err = rig.importer.Import(ctx, dir)
+	if !errors.Is(err, ErrBundleInvalid) || !errors.Is(err, ErrSpokeIDCollision) {
+		t.Fatalf("a colliding spoke's bundle: err = %v, want ErrBundleInvalid wrapping ErrSpokeIDCollision", err)
+	}
+}
+
 // The Cluster Operations Checklist caps Raft batches at 1000. An import is a
 // tight loop, unlike the online path where HTTP rate-limits one proposal per
 // request — so a 2500-file bundle must be three proposals, not 2500.

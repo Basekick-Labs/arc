@@ -74,13 +74,14 @@ the chart does not generate certificates. Enforced only when TLS is on.
 {{- end }}
 
 {{/*
-Arc refuses a bootstrap token shorter than 32 characters, logs one error and
-starts with no admin token, so the install looks healthy and nobody can log
-in. Checked only when the chart creates the Secret from the value.
+Arc refuses to start with a bootstrap token shorter than 32 characters
+(#1915); failing at render time says so before any pod crash-loops. Checked
+only when the chart creates the Secret from the value: a short value in an
+existingSecret stops Arc at startup instead.
 */}}
 {{- define "arc-enterprise.validate.bootstrapToken" -}}
 {{- if and (not .Values.auth.bootstrapToken.existingSecret) .Values.auth.bootstrapToken.value -}}
-{{- if lt (len .Values.auth.bootstrapToken.value) 32 -}}
+{{- if lt (len (trim .Values.auth.bootstrapToken.value)) 32 -}}
 {{- fail "auth.bootstrapToken.value must be at least 32 characters long" -}}
 {{- end -}}
 {{- end -}}

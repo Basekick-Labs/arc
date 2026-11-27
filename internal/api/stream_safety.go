@@ -41,14 +41,20 @@ import (
 // under the arcx_engine tag, which no CI or release build uses, so the grep is
 // the only automated check they get; they are compile-checked by hand against
 // the arcx library before changes there merge.
-func (h *QueryHandler) safeStream(stream string, onPanic func(), sw func(*bufio.Writer)) func(*bufio.Writer) {
+// panicMetric optionally replaces default aggregate-only panic accounting.
+// Query streams pass a once-guarded engine outcome recorder.
+func (h *QueryHandler) safeStream(stream string, onPanic func(), sw func(*bufio.Writer), panicMetric ...func()) func(*bufio.Writer) {
 	return func(w *bufio.Writer) {
 		defer func() {
 			r := recover()
 			if r == nil {
 				return
 			}
-			metrics.Get().IncQueryErrors()
+			if len(panicMetric) > 0 && panicMetric[0] != nil {
+				panicMetric[0]()
+			} else {
+				metrics.Get().IncQueryErrors()
+			}
 			h.logger.Error().Interface("panic", r).Str("stream", stream).
 				Msg("Response stream writer panicked; the client receives a truncated response")
 			if onPanic == nil {

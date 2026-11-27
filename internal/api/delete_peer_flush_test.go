@@ -157,7 +157,7 @@ func TestDeletePeerFlushNotAskedForDryRunOrOutsideSharedStorage(t *testing.T) {
 func TestDatabaseDeleteFlushesOtherNodesFirst(t *testing.T) {
 	c, _, root := peerFlushCluster(t, casA)
 	h := newDatabasesTestHandler(t, root)
-	h.SetCoordinator(c, true)
+	h.SetCoordinator(c)
 	c.unflushed = []string{"node writer-2 (state dead): no answer"}
 	code, body := sendDatabaseDelete(t, h, "db", "")
 	if code != 503 || !strings.Contains(body, "writer-2") {
@@ -203,7 +203,7 @@ func (o *heldOutbox) WithdrawDatabase(context.Context, string, uint64) error {
 func TestDatabaseDeleteRemovesItsOwnFreshFiles(t *testing.T) {
 	c, _, root := peerFlushCluster(t, casA)
 	h := newDatabasesTestHandler(t, root)
-	h.SetCoordinator(c, true)
+	h.SetCoordinator(c)
 	writeRecordsParquet(t, c.db, root, casB)
 	h.SetPendingRegistrations(&heldOutbox{held: map[string]bool{casB: true}})
 	if code, body := sendDatabaseDelete(t, h, "db", ""); code != 200 {
@@ -220,7 +220,7 @@ func TestDatabaseDeleteRemovesItsOwnFreshFiles(t *testing.T) {
 func TestDatabaseDeleteLeavesAFlushThatLandsWhileItRuns(t *testing.T) {
 	c, _, root := peerFlushCluster(t, casA)
 	h := newDatabasesTestHandler(t, root)
-	h.SetCoordinator(c, true)
+	h.SetCoordinator(c)
 	h.SetPendingRegistrations(&landingOutbox{land: func() { writeRecordsParquet(t, c.db, root, casO) }})
 	if code, body := sendDatabaseDelete(t, h, "db", ""); code != 200 {
 		t.Fatalf("%d %s", code, body)
@@ -269,7 +269,7 @@ func TestDatabaseDeleteOutsideSharedStorageDoesNotWait(t *testing.T) {
 	c, _, root := peerFlushCluster(t, casA)
 	c.inactive = true
 	h := newDatabasesTestHandler(t, root)
-	h.SetCoordinator(c, true)
+	h.SetCoordinator(c)
 	writeRecordsParquet(t, c.db, root, casB)
 	if code, body := sendDatabaseDelete(t, h, "db", ""); code != 200 {
 		t.Fatalf("%d %s", code, body)
@@ -280,7 +280,7 @@ func TestDatabaseDeleteOutsideSharedStorageDoesNotWait(t *testing.T) {
 func TestDatabaseDeleteDoesNotWaitOnACompactionOutput(t *testing.T) {
 	c, _, root := peerFlushCluster(t, casA)
 	h := newDatabasesTestHandler(t, root)
-	h.SetCoordinator(c, true)
+	h.SetCoordinator(c)
 	writeRecordsParquet(t, c.db, root, casO)
 	c.owned[casO] = true
 	if code, body := sendDatabaseDelete(t, h, "db", ""); code != 200 {

@@ -47,18 +47,89 @@ const (
 // only: the live hour that feature targets exists only on the hot tier, and
 // the feature is documented for the local backend.
 //
+// allowFileTime is also how this function knows the tier is the one ingest
+// writes to: only then are its listings cached under the measurement's
+// publish generation, and dropped when ingest publishes a file outside the
+// current hour (publish.go, #1757). A caller MUST pass true for that tier:
+// with false, a late row's hour stays out of queries until the cached
+// listing expires. Pass false for any other tier, whose files ingest never
+// writes.
+//
 // Results are NOT cached at this layer (unlike OptimizeTablePath's
 // partitionCache): the SQL transform cache already dedupes repeated queries,
 // and the remote directory/file listings below are individually cached in
 // globCache, so a re-prune costs no extra backend calls within the TTL.
 func (p *PartitionPruner) PruneTierPaths(ctx context.Context, tierGlob, database, measurement string, timeRange *TimeRange, backend storage.Backend, allowFileTime bool) ([]string, TierPruneOutcome) {
+	d := p.PruneTierPathsDetail(ctx, tierGlob, database, measurement, timeRange, backend, allowFileTime, false)
+	return d.Paths, d.Outcome
+}
+
+// TierPruneDetail is PruneTierPaths' result with the paths it could not
+// verify told apart (#1550).
+type TierPruneDetail struct {
+	Paths   []string
+	Outcome TierPruneOutcome
+	// Unverified is the subset of Paths kept only because the tier's listing
+	// failed (an unreachable store, credentials it rejected, a timeout): the
+	// store neither confirmed nor ruled out data there. Paths a listing
+	// confirmed, and paths kept for a layout the filter does not recognise,
+	// are never in it. Empty whenever every listing answered.
+	Unverified []string
+}
+
+// PruneTierPathsDetail is PruneTierPaths, also reporting which kept paths
+// rest only on a failed listing. The outcome and paths are exactly
+// PruneTierPaths': a failed listing still fails open. What a caller does
+// with the unverified subset is its own decision (the query path asks tier
+// metadata on a node whose metadata is authoritative, #1550).
+//
+// With stopAfterFailure, once one listing of the tier fails the rest of this
+// call does not list again: they would wait out the same timeout against the
+// same store, once per covered day, and a multi-day range against an
+// unreachable endpoint would spend the request's deadline in the pruner.
+// Their paths are kept unverified instead, exactly as if their own listing
+// had failed. The query path asks for it on the cold tier only, and only
+// where the unverified paths may then be left out (trusted tier metadata on a
+// standalone node, or a trusted cluster cold mark that rules the read's range
+// out); elsewhere one transient failure
+// would only turn the rest of the range into unverified globs that match
+// nothing, and the read into a "no files" failure.
+func (p *PartitionPruner) PruneTierPathsDetail(ctx context.Context, tierGlob, database, measurement string, timeRange *TimeRange, backend storage.Backend, allowFileTime, stopAfterFailure bool) TierPruneDetail {
+	paths, outcome, unverified := p.pruneTierPaths(ctx, tierGlob, database, measurement, timeRange, backend, allowFileTime, stopAfterFailure)
+	if len(unverified) > 0 {
+		// Only what survived to the result: file-time pruning (hot only) may
+		// have narrowed it.
+		kept := make(map[string]struct{}, len(paths))
+		for _, path := range paths {
+			kept[path] = struct{}{}
+		}
+		filtered := unverified[:0]
+		for _, path := range unverified {
+			if _, ok := kept[path]; ok {
+				filtered = append(filtered, path)
+			}
+		}
+		unverified = filtered
+	}
+	return TierPruneDetail{Paths: paths, Outcome: outcome, Unverified: unverified}
+}
+
+func (p *PartitionPruner) pruneTierPaths(ctx context.Context, tierGlob, database, measurement string, timeRange *TimeRange, backend storage.Backend, allowFileTime, stopAfterFailure bool) ([]string, TierPruneOutcome, []string) {
 	if !p.enabled || timeRange == nil {
-		return nil, TierPruneFallback
+		return nil, TierPruneFallback, nil
+	}
+	// Before anything is listed: every listing below is stored under the
+	// measurement's generation as it is now (publish.go). Only for the tier
+	// ingest writes to, which is the one allowFileTime is set for: a file
+	// ingest publishes cannot change what another tier holds, and a tier
+	// migration invalidates every cache when it finishes.
+	if allowFileTime {
+		ctx = withListScope(ctx, p.scopeFor(database, measurement))
 	}
 	suffix := database + "/" + measurement + "/**/*.parquet"
 	if !strings.HasSuffix(tierGlob, suffix) {
 		p.logger.Debug().Str("glob", tierGlob).Msg("Tier glob shape not recognized; not pruning")
-		return nil, TierPruneFallback
+		return nil, TierPruneFallback, nil
 	}
 	// rootURL keeps its trailing separator so TrimPrefix yields clean
 	// backend-relative keys; basePath drops it for path generation.
@@ -68,34 +139,36 @@ func (p *PartitionPruner) PruneTierPaths(ctx context.Context, tierGlob, database
 	paths := p.GeneratePartitionPaths(ctx, basePath, database, measurement, timeRange)
 	if len(paths) == 0 {
 		// Range too wide for the path cap, or generation cancelled.
-		return nil, TierPruneFallback
+		return nil, TierPruneFallback, nil
 	}
 
 	// A start-only range: add the partitions that exist past the assumed
 	// end on this tier (open_end.go). timeRange is shared by the tiers and
 	// is not changed.
+	listing := &tierListing{stopAfterFailure: stopAfterFailure}
 	if timeRange.EndAssumed {
 		var lister dirLister
 		if storage.IsObjectURL(tierGlob) {
-			lister = p.tierDirLister(backend, rootURL)
+			lister = p.tierDirLister(backend, rootURL, listing)
 		} else {
 			lister = localDirLister(basePath)
 		}
 		beyond, _, err := discoverOpenEnd(ctx, lister, database, measurement, timeRange.End)
 		switch {
 		case errors.Is(err, errTooManyBeyond):
-			return nil, TierPruneFallback
+			return nil, TierPruneFallback, nil
 		case err == nil:
 			paths = appendBeyond(paths, beyond, basePath, database, measurement)
 		}
 	}
 
 	verified := true
+	var unverified []string
 	generated := paths
 	if storage.IsObjectURL(tierGlob) {
-		paths, verified = p.filterTierRemotePaths(ctx, paths, backend, rootURL)
+		paths, unverified, verified = p.filterTierRemotePaths(ctx, paths, backend, rootURL, listing)
 	} else {
-		paths = p.filterExistingLocalPaths(paths)
+		paths, _, _ = p.filterExistingLocalPathsOpts(ctx, paths, 0)
 	}
 	// A live partition left out because it has no files yet: the SQL
 	// transform cache must not keep a result made without it.
@@ -105,19 +178,30 @@ func (p *PartitionPruner) PruneTierPaths(ctx context.Context, tierGlob, database
 
 	if len(paths) == 0 {
 		if verified {
-			return nil, TierPruneEmpty
+			return nil, TierPruneEmpty, nil
 		}
-		return nil, TierPruneFallback
+		return nil, TierPruneFallback, nil
 	}
 
 	if allowFileTime {
 		paths, _ = p.applyFileTimePruning(ctx, paths, timeRange)
 		if len(paths) == 0 {
-			return nil, TierPruneFallback
+			return nil, TierPruneFallback, nil
 		}
 	}
-	return paths, TierPrunePruned
+	return paths, TierPrunePruned, unverified
 }
+
+// tierListing is one prune call's view of whether the tier's store answers.
+// failed is set by the first failed listing; with stopAfterFailure the call
+// then lists no more.
+type tierListing struct {
+	stopAfterFailure bool
+	failed           bool
+}
+
+// skip reports whether a listing should not be issued.
+func (l *tierListing) skip() bool { return l.stopAfterFailure && l.failed }
 
 // filterTierRemotePaths existence-filters remote partition paths against the
 // given backend, using keys relative to rootURL (the tier glob's base,
@@ -128,22 +212,25 @@ func (p *PartitionPruner) PruneTierPaths(ctx context.Context, tierGlob, database
 // returned false, so the caller can never mistake "could not check" for
 // "verified absent". (The single-tier filter fails closed on day-level List
 // errors; that is tolerable there because a dropped path still has the
-// unpruned-glob fallback, which a dropped TIER would not.)
-func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []string, backend storage.Backend, rootURL string) ([]string, bool) {
+// unpruned-glob fallback, which a dropped TIER would not.) The paths kept
+// for that reason alone are also returned as unverified; paths kept for a
+// layout this filter does not recognise are not (#1550).
+func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []string, backend storage.Backend, rootURL string, listing *tierListing) (existing, unverified []string, verified bool) {
 	lister, canList := backend.(storage.DirectoryLister)
 	if backend == nil || !canList {
 		p.logger.Debug().Msg("Tier backend cannot list directories; keeping all paths unverified")
-		return paths, false
+		return paths, nil, false
 	}
 
-	verified := true
+	verified = true
 	live := p.liveWindow()
+	scope := scopeFrom(ctx)
 	// hourDirs groups hour-level paths by their backend-relative parent (day)
 	// directory, listed once each.
 	hourDirs := make(map[string][]hourEntry)
 	var dayPaths []string // day-level compacted-file globs, checked individually
 
-	existing := make([]string, 0, len(paths))
+	existing = make([]string, 0, len(paths))
 	for _, path := range paths {
 		rel := strings.TrimPrefix(path, rootURL)
 		if rel == path {
@@ -177,13 +264,30 @@ func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []str
 		if cached, ok := p.globCache.get(cacheKey); ok && !listingMissesLive(cached, entries, live) {
 			children = cached
 		} else {
-			listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			subdirs, err := lister.ListDirectories(listCtx, parent+"/")
-			cancel()
+			var subdirs []string
+			err := errTierListingFailed
+			if !listing.skip() {
+				listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				if level, ok := lister.(storage.LevelLister); ok {
+					// The day's level listing also says whether the day
+					// holds daily files: kept for the day-level check
+					// below, which then makes no request of its own.
+					var files []string
+					subdirs, files, err = level.ListLevel(listCtx, parent+"/")
+					if err == nil {
+						p.globCache.setScoped("tier:dayfiles:"+rootURL+parent+"/", parquetNames(files), scope)
+					}
+				} else {
+					subdirs, err = lister.ListDirectories(listCtx, parent+"/")
+				}
+				cancel()
+			}
 			if err != nil {
+				listing.failed = true
 				p.logger.Debug().Err(err).Str("prefix", parent).Msg("Tier directory listing failed; keeping paths unverified")
 				for _, e := range entries {
 					existing = append(existing, e.path)
+					unverified = append(unverified, e.path)
 				}
 				verified = false
 				continue
@@ -196,7 +300,7 @@ func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []str
 				}
 				children = append(children, subdir)
 			}
-			p.globCache.set(cacheKey, children)
+			p.globCache.setScoped(cacheKey, children, scope)
 		}
 		childSet := make(map[string]bool, len(children))
 		for _, c := range children {
@@ -219,24 +323,21 @@ func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []str
 		if cached, ok := p.globCache.get(cacheKey); ok {
 			hasFiles = len(cached) > 0
 		} else {
-			listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			files, err := backend.List(listCtx, prefix)
-			cancel()
+			var files []string
+			err := errTierListingFailed
+			if !listing.skip() {
+				files, err = listDirectParquet(ctx, backend, prefix)
+			}
 			if err != nil {
+				listing.failed = true
 				p.logger.Debug().Err(err).Str("prefix", prefix).Msg("Tier day-level listing failed; keeping path unverified")
 				existing = append(existing, path)
+				unverified = append(unverified, path)
 				verified = false
 				continue
 			}
-			var directFiles []string
-			for _, f := range files {
-				remaining := strings.TrimPrefix(f, prefix)
-				if remaining != "" && !strings.Contains(remaining, "/") && strings.HasSuffix(remaining, ".parquet") {
-					directFiles = append(directFiles, remaining)
-				}
-			}
-			p.globCache.set(cacheKey, directFiles)
-			hasFiles = len(directFiles) > 0
+			p.globCache.setScoped(cacheKey, files, scope)
+			hasFiles = len(files) > 0
 		}
 		if hasFiles {
 			existing = append(existing, path)
@@ -246,10 +347,15 @@ func (p *PartitionPruner) filterTierRemotePaths(ctx context.Context, paths []str
 	p.logger.Debug().
 		Int("original_count", len(paths)).
 		Int("existing_count", len(existing)).
+		Int("unverified_count", len(unverified)).
 		Bool("verified", verified).
 		Msg("Filtered tier remote paths")
-	return existing, verified
+	return existing, unverified, verified
 }
+
+// errTierListingFailed stands for a listing this call skipped because an
+// earlier listing of the same tier already failed.
+var errTierListingFailed = errors.New("an earlier listing of this tier failed in the same prune; not listed again")
 
 // hourEntry is an hour-level partition path and its hour segment ("14").
 type hourEntry struct {

@@ -191,12 +191,25 @@ func (m fakeMessage) Ack()              {}
 // so a decode failure cannot be what stops it.
 func TestOnMessage_DropsMessageForInvalidDatabase(t *testing.T) {
 	payload := []byte(`{"m":"cpu","v":1}`)
-	cases := map[string]*Subscription{
-		"mapped_traversal": {ID: "s", Name: "s", Database: "iot", TopicMapping: map[string]string{"sensors/a": "../other-db"}},
-		"mapped_slash":     {ID: "s", Name: "s", Database: "iot", TopicMapping: map[string]string{"sensors/a": "a/b"}},
-		"default_invalid":  {ID: "s", Name: "s", Database: "../x"},
+	cases := map[string]struct {
+		config *Subscription
+		rules  compiledTopicMapping
+	}{
+		"mapped_traversal": {
+			config: &Subscription{ID: "s", Name: "s", Database: "iot"},
+			rules: compiledTopicMapping{exact: map[string]TopicMappingRule{
+				"sensors/a": {Database: "../other-db"},
+			}},
+		},
+		"mapped_slash": {
+			config: &Subscription{ID: "s", Name: "s", Database: "iot"},
+			rules: compiledTopicMapping{exact: map[string]TopicMappingRule{
+				"sensors/a": {Database: "a/b"},
+			}},
+		},
+		"default_invalid": {config: &Subscription{ID: "s", Name: "s", Database: "../x"}},
 	}
-	for name, cfg := range cases {
+	for name, test := range cases {
 		t.Run(name, func(t *testing.T) {
 			defer func() {
 				if r := recover(); r != nil {
@@ -205,7 +218,7 @@ func TestOnMessage_DropsMessageForInvalidDatabase(t *testing.T) {
 			}()
 			// No buffer and no ctx on purpose: the guard must return before
 			// either is touched.
-			s := &Subscriber{id: "s", config: cfg, logger: zerolog.Nop()}
+			s := &Subscriber{id: "s", config: test.config, topicMappingRules: test.rules, logger: zerolog.Nop()}
 			s.onMessage(nil, fakeMessage{topic: "sensors/a", payload: payload})
 			s.onMessage(nil, fakeMessage{topic: "sensors/a", payload: payload})
 			if got := s.messagesFailed.Load(); got != 2 {

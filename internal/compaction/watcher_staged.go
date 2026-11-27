@@ -342,6 +342,12 @@ func (w *CompletionWatcher) commitStagedObject(ctx context.Context, path string,
 			w.logger.Warn().Err(err).Str("job_id", job.JobID).Msg("Compaction committed; its observers failed, retrying")
 			return
 		}
+		if w.cfg.OnCommittedInto != nil {
+			if err := w.cfg.OnCommittedInto(inputs, job.Output.Path); err != nil {
+				w.logger.Warn().Err(err).Str("job_id", job.JobID).Msg("Compaction committed; its observers failed, retrying")
+				return
+			}
+		}
 	}
 	st.consumed = true
 	if status.Finalizing {
@@ -363,6 +369,7 @@ func (w *CompletionWatcher) dropStagedObjectManifest(path string, job StagedJob,
 	if w.cfg.OnFinished != nil {
 		w.cfg.OnFinished()
 	}
+	w.settled(job)
 	w.logger.Info().Str("job_id", job.JobID).Str("output", job.Output.Path).Str("end", why).
 		Msg("Compaction committed")
 }
@@ -462,6 +469,12 @@ func (w *CompletionWatcher) commitStaged(ctx context.Context, path string, job S
 			return
 		}
 	}
+	if w.cfg.OnCommittedInto != nil {
+		if err := w.cfg.OnCommittedInto(consumed, job.Output.Path); err != nil {
+			w.logger.Warn().Err(err).Str("job_id", job.JobID).Msg("Compaction committed; its observers failed, retrying")
+			return
+		}
+	}
 	if mover, ok := w.cfg.Storage.(storage.ObjectMover); ok {
 		if err := mover.RemoveAll(ctx, StagedJobDir(job.JobID)); err != nil {
 			w.logger.Warn().Err(err).Str("job_id", job.JobID).Msg("Could not remove the staged directory; retrying")
@@ -475,6 +488,7 @@ func (w *CompletionWatcher) commitStaged(ctx context.Context, path string, job S
 	delete(w.stagedJobs, job.JobID)
 	w.setCommitting(job.JobID, false)
 	w.manifestsApplied.Add(1)
+	w.settled(job)
 	w.logger.Info().Str("job_id", job.JobID).Str("output", job.Output.Path).Int("inputs", len(job.Inputs)).
 		Msg("Compaction committed")
 }
@@ -543,6 +557,11 @@ func errText(err error) string {
 	return err.Error()
 }
 
+// SetStagedIntoObserver sets OnCommittedInto (#1683). Call before Start.
+func (w *CompletionWatcher) SetStagedIntoObserver(fn func(inputs []string, output string) error) {
+	w.cfg.OnCommittedInto = fn
+}
+
 // SetStagedObservers sets BeforeCommit and OnCommitted (the manager's
 // observers, which exist once the watcher does). Call before Start.
 func (w *CompletionWatcher) SetStagedObservers(before func(output string), committed func(inputs []string) error) {
@@ -552,4 +571,16 @@ func (w *CompletionWatcher) SetStagedObservers(before func(output string), commi
 // SetStagedFinished sets OnFinished. Call before Start.
 func (w *CompletionWatcher) SetStagedFinished(finished func()) {
 	w.cfg.OnFinished = finished
+}
+
+// SetStagedSettled sets OnSettled (the manager's MeasurementCompacted).
+func (w *CompletionWatcher) SetStagedSettled(settled func(database, measurement string)) {
+	w.cfg.OnSettled = settled
+}
+
+// settled reports a staged job whose inputs are gone and output in place.
+func (w *CompletionWatcher) settled(job StagedJob) {
+	if w.cfg.OnSettled != nil {
+		w.cfg.OnSettled(job.Output.Database, job.Output.Measurement)
+	}
 }

@@ -32,6 +32,11 @@ func TestForLogMasksLiterals(t *testing.T) {
 		{`WHERE a = 'never closed and secret`, `WHERE a = '...'`},
 		// Identifier ending in E is not an E-string prefix.
 		{`SELECT CASE WHEN mode='x' THEN 1 END`, `SELECT CASE WHEN mode='...' THEN 1 END`},
+		// Nor is one whose `$` run is preceded by an identifier byte: the
+		// first literal ends at its second quote, and the next is masked.
+		{`SELECT a$e'x\' , 'secret123'`, `SELECT a$e'...' , '...'`},
+		// A non-ASCII dollar-quote tag opens a string.
+		{`WHERE a = $é$raw ' secret$é$ AND b='v'`, `WHERE a = $$...$$ AND b='...'`},
 	}
 	for _, c := range cases {
 		if got := ForLog(c.in); got != c.want {

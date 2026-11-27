@@ -158,6 +158,16 @@ func (j *Job) runStaged(ctx context.Context, compactedFile, compactedKey, output
 	return j.complete()
 }
 
+// SetOutputRetractor wires the step crash recovery runs before it removes a
+// legacy job's output from storage, or gives up on one whose output is
+// missing: un-register it from the cluster (#1811). Only a node with a
+// completion watcher sets it.
+func (m *Manager) SetOutputRetractor(retract func(ctx context.Context, jobID, outputPath string) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.outputRetractor = retract
+}
+
 // SetStagedCommit wires the staged compaction commit (#1207 d2a2a). mode
 // reports whether a job launched now is staged; lookup describes a candidate
 // file as the cluster manifest lists it; locallyStaged reports an input of a
@@ -205,6 +215,12 @@ func (m *Manager) stagedCandidate(ctx context.Context, candidate Candidate) (boo
 // about to commit, before its output can appear at its final path (#610).
 func (m *Manager) BeforeStagedCommit(output string) {
 	m.notifyCompactedOutput(output)
+}
+
+// FinishStagedInto is the output-aware half of FinishStaged (#1683): the
+// watcher calls it right after FinishStaged succeeded, with the job's output.
+func (m *Manager) FinishStagedInto(inputs []string, output string) error {
+	return m.notifyConsumedInto(inputs, output)
 }
 
 // FinishStaged runs, for a committed staged job, what a legacy job runs when

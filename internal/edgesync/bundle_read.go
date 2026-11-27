@@ -103,27 +103,9 @@ func (r *BundleReader) Manifest() *Manifest { return r.manifest }
 // it covers the whole directory, not just data/, because that is the whole of
 // what a human is handed.
 func (r *BundleReader) Verify(ctx context.Context, secret string) error {
-	entries, digest, fileSHA, err := r.readEntries(ctx)
+	entries, err := r.VerifyManifest(ctx, secret)
 	if err != nil {
 		return err
-	}
-
-	if fileSHA != r.manifest.EntriesSHA256 {
-		return fmt.Errorf("%w: %s hashes to %s, manifest says %s",
-			ErrBundleInvalid, entriesName, fileSHA, r.manifest.EntriesSHA256)
-	}
-	if digest != r.manifest.EntriesDigest {
-		return fmt.Errorf("%w: entries digest is %s, manifest says %s",
-			ErrBundleInvalid, digest, r.manifest.EntriesDigest)
-	}
-	if int64(len(entries)) != r.manifest.EntryCount {
-		return fmt.Errorf("%w: %d entries, manifest declares %d",
-			ErrBundleInvalid, len(entries), r.manifest.EntryCount)
-	}
-
-	if err := security.ValidateSyncBundleHMAC(secret, r.manifest.BundleID, r.manifest.SpokeID,
-		r.manifest.HubID, r.manifest.CreatedAt, r.manifest.EntriesDigest, r.manifest.MAC); err != nil {
-		return fmt.Errorf("%w: %v", ErrBundleInvalid, err)
 	}
 
 	declared := make(map[string]struct{}, len(entries))
@@ -138,6 +120,39 @@ func (r *BundleReader) Verify(ctx context.Context, secret string) error {
 	}
 
 	return r.rejectUndeclared(declared)
+}
+
+// VerifyManifest checks the signed metadata only: entries.jsonl's own hash,
+// the canonical entries digest, the entry count and the MAC. It reads no
+// data file, so a relay hub can authenticate a bundle before downloading a
+// byte of it (#1685), and returns the entries it verified.
+//
+// Not a substitute for Verify: it proves what the spoke signed, not that the
+// data files match it.
+func (r *BundleReader) VerifyManifest(ctx context.Context, secret string) ([]BundleEntry, error) {
+	entries, digest, fileSHA, err := r.readEntries(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if fileSHA != r.manifest.EntriesSHA256 {
+		return nil, fmt.Errorf("%w: %s hashes to %s, manifest says %s",
+			ErrBundleInvalid, entriesName, fileSHA, r.manifest.EntriesSHA256)
+	}
+	if digest != r.manifest.EntriesDigest {
+		return nil, fmt.Errorf("%w: entries digest is %s, manifest says %s",
+			ErrBundleInvalid, digest, r.manifest.EntriesDigest)
+	}
+	if int64(len(entries)) != r.manifest.EntryCount {
+		return nil, fmt.Errorf("%w: %d entries, manifest declares %d",
+			ErrBundleInvalid, len(entries), r.manifest.EntryCount)
+	}
+
+	if err := security.ValidateSyncBundleHMAC(secret, r.manifest.BundleID, r.manifest.SpokeID,
+		r.manifest.HubID, r.manifest.CreatedAt, r.manifest.EntriesDigest, r.manifest.MAC); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrBundleInvalid, err)
+	}
+	return entries, nil
 }
 
 // verifyOne checks one entry's file against its declared size and digest.

@@ -219,12 +219,10 @@ type coldWalk struct {
 // object even though the tiering cold sync does exactly that, because a backup
 // must not mutate the state it is reporting on.
 //
-// And note when an unrecorded object is NOT a transient lag: the tiering cold
-// sync only runs on a cluster with shared storage or replication, so on a
-// standalone node and on a local-storage cluster without replication there is
-// nothing that will ever record the row. There the count is a permanent
-// condition and the operator needs to know, rather than being told to wait for
-// a sync that does not run.
+// An unrecorded object can be a transient lag: the tiering cold sync runs on
+// every node with a usable cold tier, including standalone nodes, and can
+// record the row on the next successful scan. Until that scan succeeds, the
+// mismatch remains useful for the operator to know about.
 func (m *Manager) walkColdTier(ctx context.Context, sc *scope, hot map[string]struct{}) (*coldWalk, error) {
 	w := &coldWalk{dedupPaths: map[string]struct{}{}, carried: map[string]struct{}{}}
 	if m.coldSource == nil {

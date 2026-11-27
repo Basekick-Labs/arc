@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -116,11 +117,13 @@ func (c *Client) saveCache(licenseFile, licenseSignature string) {
 	c.logger.Debug().Str("path", path).Msg("license cache updated")
 }
 
-// deleteCache removes the cache (best-effort), used when its contents cannot
-// belong to the configured key.
+// deleteCache removes an unusable or definitively rejected cache. Failure does
+// not reopen in-memory gates, but can leave stale entitlements on disk.
 func (c *Client) deleteCache() {
 	if path := c.cachePath(); path != "" {
-		_ = os.Remove(path)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			c.logger.Warn().Err(err).Msg("License cache removal failed; a restart during an outage may reuse the rejected cache")
+		}
 	}
 }
 
@@ -133,8 +136,9 @@ func (c *Client) deleteCache() {
 //     replaced/downgraded license must not resurrect old entitlements;
 //  3. the signed fingerprint is NON-EMPTY and equals this machine's — see the
 //     file comment; empty-accepting bindFingerprint is NOT sufficient here;
-//  4. not expired (the cache is honored until the license's OWN expires_at,
-//     never longer — no new grace is introduced).
+//  4. not past its cutoff on the grace schedule (grace.go): a paid license's
+//     cache is honored through its fourteen grace days, a trial's until its
+//     signed expiry.
 func (c *Client) LoadCachedLicense() (*License, error) {
 	path := c.cachePath()
 	if path == "" {
@@ -159,9 +163,13 @@ func (c *Client) LoadCachedLicense() (*License, error) {
 	if signed.MachineFingerprint == "" || signed.MachineFingerprint != c.fingerprint {
 		return nil, fmt.Errorf("license cache is not bound to this machine")
 	}
+	AdvanceClock(signed.IssuedAt) // signed server time: a floor for the license clock
 	now := time.Now().UTC()
-	if !now.Before(signed.ExpiresAt) {
-		return nil, fmt.Errorf("cached license expired at %s", signed.ExpiresAt.UTC().Format(time.RFC3339))
+	// Usable until the cutoff, grace included (grace.go): v1 refuses
+	// activation past the term but verifies during grace, so a restart in
+	// grace must boot from the cache and verify.
+	if !validAt(signed.ExpiresAt, strings.HasPrefix(signed.CustomerID, TrialCustomerPrefix), licenseNow()) {
+		return nil, fmt.Errorf("cached license expired (signed expiry %s, grace included)", signed.ExpiresAt.UTC().Format(time.RFC3339))
 	}
 
 	lic := signed.ToRuntimeLicense(now)
@@ -189,8 +197,8 @@ const (
 //   - A DEFINITIVE rejection (the server spoke the protocol and said no)
 //     returns immediately and never consults the cache: revocation stays
 //     effective whenever the server is reachable.
-//   - Cache fallback proceeds FULLY LICENSED until the license's own
-//     expires_at; the caller logs it loudly and the periodic re-verify keeps
+//   - Cache fallback proceeds FULLY LICENSED until the license's cutoff
+//     (signed expiry plus grace, grace.go); the caller logs it loudly and the periodic re-verify keeps
 //     trying the server (first success rewrites the cache).
 func (c *Client) ActivateOrVerifyResilient(ctx context.Context) (*License, LicenseSource, error) {
 	phaseCtx, cancel := context.WithTimeout(ctx, bootRetryPhaseBudget)
@@ -209,7 +217,15 @@ func (c *Client) ActivateOrVerifyResilient(ctx context.Context) (*License, Licen
 		}
 		lic, err := c.ActivateOrVerify(phaseCtx)
 		if err == nil {
-			return lic, SourceServer, nil
+			// A paid license kept through its grace after a refused
+			// re-activation came from the cache, not the server.
+			c.mu.RLock()
+			src := c.source
+			c.mu.RUnlock()
+			if src != SourceCache {
+				src = SourceServer
+			}
+			return lic, src, nil
 		}
 		lastErr = err
 		if FailureClassOf(err) == ClassDefinitive {
@@ -241,13 +257,16 @@ type LicenseHealth struct {
 	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
 	DaysRemaining int        `json:"days_remaining,omitempty"`
 	SiteLicense   bool       `json:"site_license,omitempty"`
+	// Set once a paid license is past its signed expiry: the grace day
+	// (0 on the expiry day), when ingestion stops and when the license
+	// expires. DaysRemaining then counts to Cutoff.
+	GraceDay     *int       `json:"grace_day,omitempty"`
+	WritesStopAt *time.Time `json:"writes_stop_at,omitempty"`
+	Cutoff       *time.Time `json:"cutoff,omitempty"`
 }
 
-// HealthStatus reports the current license for /health. Status is derived at
-// READ time against the clock (the #603 lesson): enforcement stays boot-time,
-// but health tells the truth — a license that expires mid-process shows
-// "expired" here within a probe interval, even though features remain enabled
-// until the next restart rejects it.
+// HealthStatus reports the current license for /health using the signed expiry
+// at read time, matching feature gates without mutating their shared snapshot.
 func (c *Client) HealthStatus() LicenseHealth {
 	c.mu.RLock()
 	lic := c.license
@@ -256,18 +275,10 @@ func (c *Client) HealthStatus() LicenseHealth {
 	if lic == nil {
 		return LicenseHealth{Tier: "oss", Status: "unlicensed", Source: string(src)}
 	}
-	status := lic.Status
-	now := time.Now().UTC()
-	days := 0
-	if !lic.ExpiresAt.IsZero() {
-		if !now.Before(lic.ExpiresAt) {
-			status = "expired"
-		} else {
-			days = int(time.Until(lic.ExpiresAt).Hours() / 24)
-		}
-	}
+	now := licenseNow()
+	status, days := expiryStatus(lic.ExpiresAt, lic.IsTrial(), now)
 	exp := lic.ExpiresAt.UTC()
-	return LicenseHealth{
+	h := LicenseHealth{
 		Tier:          string(lic.Tier),
 		Status:        status,
 		Source:        string(src),
@@ -275,4 +286,9 @@ func (c *Client) HealthStatus() LicenseHealth {
 		DaysRemaining: days,
 		SiteLicense:   c.offline && c.fingerprint == "",
 	}
+	if p, day := lic.PhaseAt(now); p != PhaseActive && p != PhaseExpired {
+		s := lic.Schedule()
+		h.GraceDay, h.WritesStopAt, h.Cutoff = &day, &s.WritesStopAt, &s.Cutoff
+	}
+	return h
 }

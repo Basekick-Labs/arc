@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -70,6 +71,123 @@ func setupTestRetentionHandler(t *testing.T) (*RetentionHandler, string) {
 	})
 
 	return handler, tmpDir
+}
+
+func TestGetExecutionsIncludesRunningExecutions(t *testing.T) {
+	handler, _ := setupTestRetentionHandler(t)
+
+	result, err := handler.db.Exec(`
+		INSERT INTO retention_policies (name, database, retention_days, buffer_days, is_active)
+		VALUES (?, ?, ?, ?, ?)
+	`, "p", "testdb", 30, 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runningID := handler.recordExecutionStart(policyID, time.Now())
+	if runningID == 0 {
+		t.Fatal("recordExecutionStart() returned 0")
+	}
+	completedID := handler.recordExecutionStart(policyID, time.Now())
+	handler.recordExecutionComplete(completedID, "completed", 5, 12.5, "")
+	failedID := handler.recordExecutionStart(policyID, time.Now())
+	handler.recordExecutionComplete(failedID, "failed", 2, 24.75, "cold store unavailable")
+	// Runs started in the same second tie on execution_time; the newest run
+	// must still come first, as it does for last_execution_status (MAX(id)).
+	if _, err := handler.db.Exec(`UPDATE retention_executions SET execution_time = '2026-01-01 00:00:00' WHERE policy_id = ?`, policyID); err != nil {
+		t.Fatal(err)
+	}
+
+	app := fiber.New()
+	app.Get("/api/v1/retention/:id/executions", handler.handleGetExecutions)
+	resp, err := app.Test(httptest.NewRequest("GET", "/api/v1/retention/"+strconv.FormatInt(policyID, 10)+"/executions", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, fiber.StatusOK)
+	}
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body struct {
+		PolicyID   int64                `json:"policy_id"`
+		Executions []RetentionExecution `json:"executions"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatal(err)
+	}
+	// Decoding into the struct turns a JSON null into 0, so the response
+	// contract (a number, never null) is checked on the raw document.
+	var rawBody struct {
+		Executions []map[string]any `json:"executions"`
+	}
+	if err := json.Unmarshal(raw, &rawBody); err != nil {
+		t.Fatal(err)
+	}
+	if body.PolicyID != policyID {
+		t.Fatalf("policy_id = %d, want %d", body.PolicyID, policyID)
+	}
+	if len(body.Executions) != 3 {
+		t.Fatalf("got %d executions, want 3: %+v", len(body.Executions), body.Executions)
+	}
+	wantOrder := []int64{failedID, completedID, runningID}
+	for i, id := range wantOrder {
+		if body.Executions[i].ID != id {
+			t.Fatalf("executions[%d].id = %d, want %d (newest first)", i, body.Executions[i].ID, id)
+		}
+	}
+	running := rawBody.Executions[2]
+	if d, ok := running["execution_duration_ms"].(float64); !ok || d != 0 {
+		t.Errorf("running execution_duration_ms = %#v, want the number 0", running["execution_duration_ms"])
+	}
+	if running["status"] != "running" {
+		t.Errorf("running status = %#v, want running", running["status"])
+	}
+	if running["cutoff_date"] == nil {
+		t.Error("running cutoff_date is null, want the run's cutoff")
+	}
+	if running["error_message"] != nil {
+		t.Errorf("running error_message = %#v, want null", running["error_message"])
+	}
+	if running["deleted_count"] != float64(0) {
+		t.Errorf("running deleted_count = %#v, want 0", running["deleted_count"])
+	}
+	if running["execution_time"] == "" || running["execution_time"] == nil {
+		t.Error("running execution_time is empty")
+	}
+
+	byStatus := make(map[string]RetentionExecution, len(body.Executions))
+	for _, execution := range body.Executions {
+		byStatus[execution.Status] = execution
+	}
+	if execution, ok := byStatus["running"]; !ok {
+		t.Fatal("running execution is missing from history")
+	} else if execution.ExecutionDurationMs != 0 {
+		t.Errorf("running execution duration = %v, want 0", execution.ExecutionDurationMs)
+	}
+	if execution, ok := byStatus["completed"]; !ok {
+		t.Fatal("completed execution is missing from history")
+	} else if execution.ExecutionDurationMs != 12.5 {
+		t.Errorf("completed execution duration = %v, want 12.5", execution.ExecutionDurationMs)
+	}
+	if execution, ok := byStatus["failed"]; !ok {
+		t.Fatal("failed execution is missing from history")
+	} else {
+		if execution.ExecutionDurationMs != 24.75 {
+			t.Errorf("failed execution duration = %v, want 24.75", execution.ExecutionDurationMs)
+		}
+		if execution.ErrorMessage == nil || *execution.ErrorMessage != "cold store unavailable" {
+			t.Errorf("failed execution error = %v, want cold store unavailable", execution.ErrorMessage)
+		}
+	}
 }
 
 // Retention resolves a listed key to the location the backend actually wrote

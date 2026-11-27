@@ -2,6 +2,7 @@ package storage
 
 import (
 	"errors"
+	"github.com/rs/zerolog"
 	"strings"
 	"testing"
 )
@@ -30,7 +31,7 @@ func TestPartitionValidKeysGuardsAzureBatchDeletes(t *testing.T) {
 	} {
 		// Bad key in the middle, so a bug that stops at the first rejection
 		// still loses good2.
-		usable, rejected := partitionValidKeys("", []string{good1, bad, good2})
+		usable, rejected := partitionValidKeys("", []string{good1, bad, good2}, zerolog.Nop(), "test")
 
 		if len(rejected) != 1 {
 			t.Errorf("key %q: rejected %d keys, want 1", bad, len(rejected))
@@ -57,7 +58,7 @@ func TestPartitionValidKeysGuardsAzureBatchDeletes(t *testing.T) {
 // delete of its own.
 func TestPartitionValidKeysPassesACleanBatchThrough(t *testing.T) {
 	in := []string{"a/b.parquet", "a/c.parquet", "d/e..f.parquet"}
-	usable, rejected := partitionValidKeys("", in)
+	usable, rejected := partitionValidKeys("", in, zerolog.Nop(), "test")
 	if len(rejected) != 0 {
 		t.Fatalf("rejected %v from a clean batch", rejected)
 	}
@@ -78,7 +79,7 @@ func TestPartitionValidKeysPassesACleanBatchThrough(t *testing.T) {
 // something it was not (#1102).
 func TestPartitionValidKeysPrefixesTheBlobNames(t *testing.T) {
 	in := []string{"a/b.parquet", "a/c.parquet"}
-	usable, rejected := partitionValidKeys("arc/", in)
+	usable, rejected := partitionValidKeys("arc/", in, zerolog.Nop(), "test")
 	if len(rejected) != 0 {
 		t.Fatalf("rejected %v from a clean batch", rejected)
 	}
@@ -94,7 +95,7 @@ func TestPartitionValidKeysPrefixesTheBlobNames(t *testing.T) {
 
 	// A rejected key is rejected on its UNPREFIXED spelling, so the error the
 	// caller sees names the key the caller passed.
-	_, rejected = partitionValidKeys("arc/", []string{`a\b.parquet`})
+	_, rejected = partitionValidKeys("arc/", []string{`a\b.parquet`}, zerolog.Nop(), "test")
 	if len(rejected) != 1 {
 		t.Fatalf("rejected %d keys, want 1", len(rejected))
 	}
@@ -103,6 +104,9 @@ func TestPartitionValidKeysPrefixesTheBlobNames(t *testing.T) {
 	}
 	if strings.Contains(rejected[0].Error(), "arc/") {
 		t.Errorf("rejection %v names the prefixed blob name; it must name the key the caller passed", rejected[0])
+	}
+	if !strings.HasPrefix(rejected[0].Error(), `a\b.parquet: `) {
+		t.Errorf("rejection %v does not start with the key the caller passed", rejected[0])
 	}
 }
 
@@ -117,7 +121,7 @@ func TestPartitionValidKeysRejectsAnOverlongPrefixedBlobName(t *testing.T) {
 		t.Fatalf("fixture object name is %d bytes, want %d", got, MaxUsableKeyLen+1)
 	}
 
-	usable, rejected := partitionValidKeys(prefix, []string{"safe/file", keyAtLimit, keyOverLimit})
+	usable, rejected := partitionValidKeys(prefix, []string{"safe/file", keyAtLimit, keyOverLimit}, zerolog.Nop(), "test")
 	if len(usable) != 2 || usable[0] != prefix+"safe/file" || usable[1] != prefix+keyAtLimit {
 		t.Errorf("usable = %v, want the two names that fit", usable)
 	}
@@ -127,7 +131,9 @@ func TestPartitionValidKeysRejectsAnOverlongPrefixedBlobName(t *testing.T) {
 	if !errors.Is(rejected[0], ErrInvalidPath) {
 		t.Errorf("rejection %v does not match ErrInvalidPath", rejected[0])
 	}
-	if !strings.Contains(rejected[0].Error(), prefix+keyOverLimit) {
-		t.Errorf("rejection %q does not identify the complete object name", rejected[0])
+	// The rejection names the caller's key and says the prefixed name is
+	// what failed (#1121, #1113).
+	if msg := rejected[0].Error(); !strings.HasPrefix(msg, keyOverLimit+": ") || !strings.Contains(msg, "under the configured prefix") {
+		t.Errorf("rejection %q does not name the key and the prefixed-name failure", msg)
 	}
 }

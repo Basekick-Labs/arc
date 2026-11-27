@@ -84,7 +84,8 @@ func TestCommaJoinRewrite_Issue978(t *testing.T) {
 		{
 			name: "comma table inside a WHERE subquery",
 			sql:  "SELECT * FROM cpu WHERE host IN (SELECT host FROM a, b)",
-			want: []string{"FROM " + rp("default", "a"), ", " + rp("default", "b") + ", union_by_name=true))"},
+			// Two tables in one FROM are named after themselves (#1483).
+			want: []string{"FROM " + rp("default", "a"), ", " + rp("default", "b") + `, union_by_name=true) AS "b")`},
 		},
 		{
 			name:    "comma tables inside a CTE body and after the CTE",
@@ -116,7 +117,7 @@ func TestCommaJoinRewrite_Issue978(t *testing.T) {
 		{
 			name: "FROM-first form with a comma table before SELECT",
 			sql:  "FROM a, b SELECT *",
-			want: []string{"FROM " + rp("default", "a"), ", " + rp("default", "b") + ", union_by_name=true) SELECT *"},
+			want: []string{"FROM " + rp("default", "a"), ", " + rp("default", "b") + `, union_by_name=true) AS "b" SELECT *`},
 		},
 
 		// --- negative: a comma that is not a cross-join must not rewrite ---
@@ -604,10 +605,10 @@ func TestHasCrossDatabaseSyntax_CommaJoin_Issue978(t *testing.T) {
 // so a projection literal after it is a value, not a replacement scan — while
 // a string that really continues the table list is still rejected.
 func TestValidateSQLRequest_FromFirstForm_Issue978(t *testing.T) {
-	if err := ValidateSQLRequest("FROM cpu SELECT a, '/x'"); err != nil {
+	if err := validateSQLErr("FROM cpu SELECT a, '/x'"); err != nil {
 		t.Errorf("FROM-first projection literal rejected: %v", err)
 	}
-	if err := ValidateSQLRequest("FROM cpu, '/data/arc/db2/x.parquet' SELECT 1"); err == nil {
+	if err := validateSQLErr("FROM cpu, '/data/arc/db2/x.parquet' SELECT 1"); err == nil {
 		t.Errorf("replacement scan in FROM-first form was accepted")
 	}
 }
@@ -630,7 +631,7 @@ func TestStringLiteralAsQualifiedTablePart_Issue978(t *testing.T) {
 		"SELECT * FROM mydb.$$" + literal[1:len(literal)-1] + "$$",
 	}
 	for _, sql := range rejected {
-		if err := ValidateSQLRequest(sql); err == nil {
+		if err := validateSQLErr(sql); err == nil {
 			t.Errorf("%q accepted by validation", sql)
 		}
 		got := h.convertSQLToStoragePaths(context.Background(), sql)
@@ -654,7 +655,7 @@ func TestStringLiteralAsQualifiedTablePart_Issue978(t *testing.T) {
 		`SELECT * FROM cpu c JOIN mydb."rocket-01" r ON c.id = r.id`,
 	}
 	for _, sql := range accepted {
-		if err := ValidateSQLRequest(sql); err != nil {
+		if err := validateSQLErr(sql); err != nil {
 			t.Errorf("%q rejected: %v", sql, err)
 		}
 	}
@@ -676,7 +677,7 @@ func TestValidateSQLRequest_QuotedKeywordAlias_Issue978(t *testing.T) {
 		`SELECT * FROM cpu "where" JOIN mem "limit" ON 1=1, '/data/arc/db2/x.parquet'`,
 	}
 	for _, sql := range rejected {
-		if err := ValidateSQLRequest(sql); err == nil {
+		if err := validateSQLErr(sql); err == nil {
 			t.Errorf("%q accepted: quoted keyword alias hid the replacement scan", sql)
 		}
 	}
@@ -687,7 +688,7 @@ func TestValidateSQLRequest_QuotedKeywordAlias_Issue978(t *testing.T) {
 		`SELECT * FROM cpu "where", mem "group" WHERE 1=1`,
 	}
 	for _, sql := range accepted {
-		if err := ValidateSQLRequest(sql); err != nil {
+		if err := validateSQLErr(sql); err != nil {
 			t.Errorf("%q rejected: %v", sql, err)
 		}
 	}
@@ -704,7 +705,7 @@ func TestValidateSQLRequest_BracketLiterals_Issue978(t *testing.T) {
 		"SELECT * FROM t JOIN u ON u.ids = [1, 2] AND u.x = 1",
 	}
 	for _, sql := range accepted {
-		if err := ValidateSQLRequest(sql); err != nil {
+		if err := validateSQLErr(sql); err != nil {
 			t.Errorf("%q rejected: %v", sql, err)
 		}
 	}
@@ -720,7 +721,7 @@ func TestValidateSQLRequest_BracketLiterals_Issue978(t *testing.T) {
 		"SELECT * FROM cpu } JOIN '/data/arc/db2/x.parquet' x ON 1=1",
 	}
 	for _, sql := range rejected {
-		if err := ValidateSQLRequest(sql); err == nil {
+		if err := validateSQLErr(sql); err == nil {
 			t.Errorf("%q accepted: a string after a bracket in table position must stay flagged", sql)
 		}
 	}

@@ -162,6 +162,52 @@ type Coordinator struct {
 	streamClaimsBlockers atomic.Pointer[[]string]
 	// compactionCommit: the #1207 d2 flag's join gate and blockers.
 	compactionCommit compactionCommitGate
+	// Re-home (#1825): the flag's join gate, and whether this node's
+	// configuration is in a job's scope (SetRehomeInScope).
+	rehomeGate    rehomeGate
+	rehomeInScope atomic.Bool
+	// icebergOn: this node runs the Iceberg export when it holds the
+	// compactor lease (SetIcebergOn, #1870).
+	icebergOn atomic.Bool
+	// Re-home participant (rehome_job.go): this node's part of a job's
+	// states, a nudge from the FSM callbacks, and what it has done.
+	rehomePart   atomic.Pointer[RehomeParticipantFunc]
+	rehomeNotify chan struct{}
+	rehomeSteps  rehomeSteps
+	// filePublished tells this node's query caches about a file it gained
+	// (SetFilePublished, #1763).
+	filePublished atomic.Pointer[func(database, measurement string, partitionTime time.Time)]
+	// icebergArrived asks the Iceberg export for a table a file reached this
+	// node of (SetIcebergFileArrived, #1756).
+	icebergArrived atomic.Pointer[func(database, measurement, path string, sizeBytes int64)]
+	// rehomeLocalExclusions: re-home exclusions come from this node's own
+	// records only (SetRehomeLocalExclusions, #1860).
+	rehomeLocalExclusions atomic.Bool
+	// rehomeLocalRecords: jobs this node records (SetRehomeLocalRecords).
+	rehomeLocalRecords atomic.Pointer[func(string) bool]
+	// rehomeLocalSources: sources of jobs this node records (SetRehomeLocalSources).
+	rehomeLocalSources atomic.Pointer[func(string) bool]
+	// rehomeLocalRecorder: records a job on this node (SetRehomeLocalRecorder).
+	rehomeLocalRecorder atomic.Pointer[func(context.Context, raft.RehomeJob) error]
+	// Compaction read fences (#1852, compaction_fences.go): the flag's join
+	// gate and this node's part of a fence.
+	fencesGate compactionFencesGate
+	fenceFn    atomic.Pointer[ReadFenceFunc]
+	// Read lease hooks (SetReadLeaseHooks).
+	onReadLeaseLost atomic.Pointer[func()]
+	onReadSynced    atomic.Pointer[func()]
+	syncedHookMu    sync.Mutex
+	syncedHookDone  chan struct{}
+	// coldMarkGate / coldWriteMu: the #1552 cold mark's join gate and write
+	// fence (cold_mark.go).
+	coldMarkGate coldMarkGate
+	coldWriteMu  sync.RWMutex
+	// coldMarkSeenEnabled: this node has seen Enable applied (sticky);
+	// coldMarkDrained: its one fence drain is done; coldMarkIdentity: its
+	// cold store identity getter.
+	coldMarkSeenEnabled atomic.Bool
+	coldMarkDrained     atomic.Bool
+	coldMarkIdentity    atomic.Pointer[func() string]
 	// clusterPolicies: the #1324 flag's join gate and blockers;
 	// policyListers read this node's own rows of each kind for adoption.
 	clusterPolicies clusterPoliciesGate
@@ -169,6 +215,8 @@ type Coordinator struct {
 	retentionPolicies clusterPoliciesGate
 	// cqPolicies: the same for the continuous query flag (#1324 stage 3).
 	cqPolicies clusterPoliciesGate
+	// governancePolicies: the same for the governance flag (#1627).
+	governancePolicies clusterPoliciesGate
 	// adoptMu serializes adoption passes: the loop's and an admin's nudge.
 	adoptMu         sync.Mutex
 	policyListersMu sync.Mutex
@@ -199,8 +247,9 @@ type Coordinator struct {
 	// puller is the background worker pool that downloads files from peers.
 	// Nil when peer replication is disabled or the license forbids it.
 	puller *filereplication.Puller
-	// fetcher is the puller's fetch client: the stream claimant probes peers
-	// for a file with it (#1207 S4b1c2b).
+	// fetcher is a peer fetch client with the puller's settings but without
+	// its bandwidth cap (#397): the stream claimant probes peers for a file
+	// with it (#1207 S4b1c2b), and the staged compaction commit pulls outputs.
 	fetcher filereplication.Fetcher
 	// pendingRegistration reports whether a path waits for registration in
 	// this writer's outbox (nil on other nodes).
@@ -230,7 +279,10 @@ type Coordinator struct {
 	// on disk, not just what is still untaken.
 	deletePending   []deleteRequest
 	deletePendingMu sync.Mutex
-	deleteInFlight  atomic.Int64
+	// iceberg holds the Iceberg export's path callbacks (#1728,
+	// iceberg_paths.go).
+	iceberg        icebergNotifier
+	deleteInFlight atomic.Int64
 	// deferred: unlinks of a DELETE rewrite's old file waiting for the
 	// rewrite to arrive (rewrite_unlink.go), under deletePendingMu.
 	deferred deferredUnlinks
@@ -337,7 +389,10 @@ type Coordinator struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	stopCh   chan struct{}
-	mu       sync.RWMutex
+	// readLease decides whether this node may serve reads, on a cluster
+	// whose nodes share one object store (read_lease.go); nil elsewhere.
+	readLease *readLease
+	mu        sync.RWMutex
 
 	logger zerolog.Logger
 }
@@ -440,14 +495,18 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	// Warn when cluster TLS is enabled but no CA is configured
 	// (GHSA-wwfh-qrfq-6f8g defense-in-depth). Without a CA, client-cert
 	// verification is off (RequireAndVerifyClientCert is only set when
-	// tls_ca_file is non-empty), so TLS provides encryption but not peer
-	// identity — inter-node connections are not mutually authenticated at the
-	// TLS layer. Peer identity in that mode rests on the shared-secret HMAC
-	// (the Raft handshake and the coordinator channels). This is a warning, not
-	// a hard error: TLS-for-encryption + HMAC-for-identity is a supported
-	// posture, but operators should know mTLS is not in effect.
+	// tls_ca_file is non-empty), so inter-node connections are not mutually
+	// authenticated at the TLS layer; servers are still verified, against the
+	// system roots (see the next warning for the same condition).
+	// Cluster membership in that mode rests on the shared-secret HMAC (the
+	// Raft handshake and the coordinator channels). With a CA, mTLS proves a
+	// peer holds a certificate from the cluster CA, which is membership too:
+	// certificates are not bound to node IDs, so in either mode which node a
+	// message comes from is a claim (SECURITY.md, #1510). This is a warning,
+	// not a hard error: TLS for encryption plus HMAC for membership is a
+	// supported posture, but operators should know mTLS is not in effect.
 	if cfg.Config.TLSEnabled && cfg.Config.TLSCAFile == "" {
-		logger.Warn().Msg("Cluster TLS enabled without tls_ca_file — peer certificates are NOT verified (no mTLS); inter-node identity rests on the shared-secret HMAC. Set cluster.tls_ca_file to enable mutual TLS authentication.")
+		logger.Warn().Msg("Cluster TLS enabled without tls_ca_file — client certificates are NOT verified (no mTLS); cluster membership rests on the shared-secret HMAC. Set cluster.tls_ca_file to enable mutual TLS authentication.")
 	}
 
 	// Warn when the public Fiber listener serves HTTPS but cluster TLS
@@ -472,6 +531,7 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	}
 
 	c := &Coordinator{
+		rehomeNotify:  make(chan struct{}, 1),
 		cfg:           cfg.Config,
 		licenseClient: cfg.LicenseClient,
 		registry:      registry,
@@ -520,6 +580,11 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		c.raftFSM.SetCompactionPauseCallback(func(paused bool, generation uint64) {
 			c.onCompactionPauseChanged(paused, generation)
 		})
+		// Cold-removal notices for the Iceberg export (#1728), on every
+		// topology. Same lock rule: an atomic load and a non-blocking request.
+		c.raftFSM.SetIcebergPathsCallback(c.onIcebergNotice)
+		// Database-drop notices (#1731): map updates and a non-blocking request.
+		c.raftFSM.SetIcebergDatabaseDroppedCallback(c.onIcebergDatabaseDropped)
 
 		raftCfg := &raft.NodeConfig{
 			NodeID:            nodeID,
@@ -589,6 +654,8 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 		SharedSecret:        cfg.Config.SharedSecret,
 		ClusterName:         cfg.Config.ClusterName,
 		PeerForwardIdentity: c.peerForwardIdentity,
+		PeerReadQueries:     c.peerReadQueries,
+		PeerDatabaseCreate:  c.peerDatabaseCreate,
 	})
 
 	// Initialize writer failover manager (Phase 3) — requires license and Raft.
@@ -599,7 +666,9 @@ func NewCoordinator(cfg *CoordinatorConfig) (*Coordinator, error) {
 	// retry handles writer-crash failover instead. See
 	// docs/progress/2026-05-26-multi-writer-pattern2.md.
 	if c.raftNode != nil && !cfg.Config.SharedStorageMode {
-		// Built whenever local storage has Raft, not only when failover is
+		// Built whenever Raft runs without shared_storage_mode (local
+		// storage, or a single-writer shared bucket, #1603), not only when
+		// failover is
 		// enabled and licensed. It is a goroutine on every node whose loop
 		// returns unless this node is the Raft leader, so there is no cost to
 		// having it — and without it nothing ever issues CommandPromoteWriter,
@@ -773,18 +842,24 @@ func (c *Coordinator) Start() error {
 		}
 		c.logger.Info().Msg("Raft consensus started")
 
-		// Re-announce ourselves in cluster state if we take leadership at
-		// startup. Not only when bootstrapping: a node that restarts and wins
-		// its own election never runs peer discovery — a leader has nobody to
-		// join — so this is the only thing that puts it back in every peer's
+		// Keep our own record in cluster state current whenever we lead. Not
+		// only when bootstrapping: a node that restarts and wins its own
+		// election never runs peer discovery — a leader has nobody to join —
+		// so this is the only thing that puts it back in every peer's
 		// registry. That is #858's worst case, and it is deterministic in a
-		// cluster whose only voter is the node being restarted.
-		go c.registerSelfInFSMWhenLeader()
+		// cluster whose only voter is the node being restarted. For the
+		// coordinator's life, not a startup window: a leader elected late
+		// kept its previous process's record (#1829).
+		go c.maintainSelfRecord()
 
 		// A compaction pause restored from the local snapshot at startup
 		// fires no callback (#1087); quiesce and ack it once a leader is
 		// known. Idempotent with the callback path.
 		go c.ackCompactionPauseIfActive()
+
+		// On a shared object store, no reads until this node has synced
+		// with the leader, and none while it is cut off from it.
+		c.startReadLease(c.ctx)
 	}
 
 	// Wire what this node does on manifest changes: the peer file
@@ -830,6 +905,10 @@ func (c *Coordinator) Start() error {
 	if c.raftNode != nil {
 		go c.compactionCommitEnableLoop(c.ctx)
 		go c.clusterPoliciesEnableLoop(c.ctx)
+		go c.coldMarkLoop(c.ctx)
+		go c.rehomeEnableLoop(c.ctx)
+		c.startRehomeParticipant(c.ctx)
+		c.startCompactionFences(c.ctx)
 	}
 	// The staged compaction commit on an object store (#1207 d2a2b): the
 	// leader aborts jobs of a compactor that is gone, and committed jobs are
@@ -1046,6 +1125,7 @@ func (c *Coordinator) Stop() error {
 		if fsm := raftNode.FSM(); fsm != nil {
 			fsm.SetFileCallbacks(nil, nil)
 			fsm.SetFileContentChangedCallback(nil)
+			fsm.SetIcebergPathsCallback(nil)
 		}
 	}
 
@@ -1092,6 +1172,9 @@ func (c *Coordinator) Stop() error {
 func (c *Coordinator) enqueueLocalDelete(path, reason string) {
 	c.deletePendingMu.Lock()
 	c.deletePending = append(c.deletePending, deleteRequest{path: path, reason: reason})
+	if reason == databaseDeleteReason {
+		c.noteDatabaseDeleteQueued(path) // #1731: a drop notice waits for these
+	}
 	n := len(c.deletePending)
 	wake := c.deleteWake
 	c.publishDeleteDepthLocked()
@@ -1237,7 +1320,11 @@ func (c *Coordinator) unlinkBatch(batch []deleteRequest, relisted func(string) (
 	for _, item := range batch {
 		c.unlinkOne(item, relisted)
 		c.deleteDone()
+		if item.reason == databaseDeleteReason {
+			c.noteDatabaseDeleteDone(item.path) // whatever the outcome (#1731)
+		}
 	}
+	c.flushUnlinked()
 }
 
 // SetTierRecorder wires this node's tier metadata. Safe to call on a running
@@ -1267,8 +1354,21 @@ func (c *Coordinator) tierRecorderSnapshot() TierRecorder {
 // tiering, so this return value is what distinguishes the two.
 func (c *Coordinator) recordPulledFileInTiering(path string, sizeBytes int64) bool {
 	c.noteLocalRegistered(path)
+	// A file that landed here, readable from now: this node's query caches
+	// must not keep an answer made without it (#1763), whether or not this
+	// node keeps tier metadata.
+	c.reportFilePublished(path)
 	// A DELETE rewrite landing lets its old file's unlink go ahead.
 	c.wakeDeferredFamily(path)
+	// And lets the export drop the original in favour of it (#1728). Asked
+	// after a short delay, not now: the pulls of one DELETE's rewrites arrive
+	// one by one and would each commit a snapshot, and without local-copy
+	// tracking an original not yet unlinked (its deleteGrace) would still be
+	// listed next to its rewrite. By the delay the original is unlinked or
+	// excluded.
+	if rewriteStamp(path) > 0 {
+		c.icebergLater([]string{path})
+	}
 	r := c.tierRecorderSnapshot()
 	if r == nil {
 		return false
@@ -1303,7 +1403,12 @@ const tierReasonAbandonedPull = "replication:abandoned"
 // delete-only callbacks every such node needs. Split out of Start so a test
 // drives the same decision Start makes.
 func (c *Coordinator) startManifestCallbacksLocked() {
-	if c.cfg.ReplicationEnabled && c.raftNode != nil {
+	// cmd/arc turns replication off on a shared object store (#1605); a
+	// coordinator that still sees it on was configured some other way.
+	if c.cfg.ReplicationEnabled && c.raftNode != nil && IsSharedObjectStore(c.storage) {
+		c.logger.Error().Str("backend", c.storage.Type()).
+			Msg("Peer file replication is configured on a shared object store; not starting the puller (every node already reads the bucket)")
+	} else if c.cfg.ReplicationEnabled && c.raftNode != nil {
 		if err := c.startFilePullerLocked(); err != nil {
 			// Do not fail cluster startup if the puller can't start —
 			// replication is best-effort and the rest of the cluster can
@@ -1314,8 +1419,8 @@ func (c *Coordinator) startManifestCallbacksLocked() {
 			return
 		}
 	}
-	// A shared object store needs no puller (shared-storage deployments run
-	// with replication off: the Helm chart sets it), but every node still has
+	// A shared object store needs no puller (cmd/arc turns replication off
+	// there, #1605, as the Helm chart's shared mode does), but every node still has
 	// to hear the manifest's deletes: tiering's cold rows (#1349) and a DELETE
 	// rewrite's old file left out of reads (#1348) are per-node state. Both
 	// used to live only in the puller's callback, so they never ran there.
@@ -1338,8 +1443,11 @@ func (c *Coordinator) startSharedManifestCallbacks() {
 		return
 	}
 	// A path the manifest lists again is no longer a pending delete here.
+	// And a registered file is readable here at once (the writer stored it
+	// before registering): this node's query caches learn of it (#1763).
 	fsm.SetFileCallbacks(func(entry *raft.FileEntry) {
 		c.forgetLocalDeleted(entry.Path)
+		c.reportFilePublishedEntry(entry)
 	}, c.observeSharedManifestDelete)
 	c.logger.Info().Str("backend", c.storage.Type()).
 		Msg("Shared-storage manifest delete callback registered (no peer puller)")
@@ -1364,6 +1472,7 @@ func (c *Coordinator) observeSharedManifestDelete(path, reason string) {
 	if reason == deleteRewriteReason {
 		c.noteLocalDeleted(path, reason)
 	}
+	c.icebergSharedDelete(path, reason)
 	c.logger.Debug().
 		Str("path", path).
 		Str("reason", reason).
@@ -1452,6 +1561,11 @@ func (c *Coordinator) unlinkOne(item deleteRequest, relisted func(string) (bool,
 	if c.deferRewriteUnlink(context.Background(), item) {
 		return
 	}
+	// A re-home job's source: unlinked by this node's part of the job,
+	// after its reads (rehome_local.go, #1860).
+	if c.deferRehomeUnlink(item) {
+		return
+	}
 	// A compaction input stays readable until this node's staged copy of
 	// the output is in place (#1207 d2a2a; bounded).
 	// The wait can last seconds: a path registered again meanwhile keeps its
@@ -1538,6 +1652,18 @@ func (c *Coordinator) unlinkOne(item deleteRequest, relisted func(string) (bool,
 			Str("reason", item.reason).
 			Msg("Phase 4 local delete worker: removed local copy")
 		c.forgetLocal(item.path)
+		// The export can drop it now (#1728). Not for a database delete:
+		// that drop removes the database's tables itself (on node-local
+		// warehouses, each node on the writer's notice once these unlinks
+		// are done, #1731), and a reconcile racing it could recreate one. A DELETE rewrite's original only
+		// once its rewrite is here: unlinked before (the unlink is not
+		// deferred without compaction commit and the journal), a reconcile
+		// would publish neither file; recordPulledFileInTiering asks when
+		// the rewrite lands.
+		if c.iceberg.now.Load() != nil && item.reason != databaseDeleteReason &&
+			(item.reason != deleteRewriteReason || c.rewriteArrived(c.ctxOrBackground(), item.path)) {
+			c.noteUnlinked(item.path)
+		}
 		switch {
 		case wasLocal && recorder != nil:
 			// Only for a file this node actually held: the tier row for a
@@ -1695,7 +1821,7 @@ func (c *Coordinator) discoveryLoop() {
 //     node with seeds from dialling peers to be redirected to itself. Not
 //     latched, so a node that loses leadership resumes trying. A node that
 //     TAKES leadership re-announces itself through
-//     registerSelfInFSMWhenLeader instead, which is the other half of #858.
+//     maintainSelfRecord instead, which is the other half of #858.
 //
 // Note what is NOT a condition: whether Raft currently knows a leader. That
 // used to be the whole check, and it is #858. LeaderAddr is in-memory and
@@ -1996,6 +2122,9 @@ func (c *Coordinator) handleJoinResponse(msg *protocol.Message, seedAddr string,
 			// else take the FSM's. Losing it made a later Raft leader see no
 			// primary and fail over the designated one (#1267).
 			node.SetWriterState(c.knownWriterState(nodeInfo.ID))
+			// Nor a version: without this every peer showed a blank one
+			// until the next cluster-state write about it (#1829).
+			node.SetVersion(c.knownVersion(nodeInfo.ID))
 			if err := c.registry.Register(node); err != nil {
 				c.logger.Warn().Err(err).Str("node_id", nodeInfo.ID).Msg("Failed to register peer node")
 			}
@@ -2311,10 +2440,46 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 			c.sendJoinError(conn, req, cpWhy)
 			return
 		}
+		cmWhy, cmRelease := c.coldMarkJoinGate(req)
+		if cmWhy != "" {
+			cpRelease()
+			ccRelease()
+			release()
+			c.logger.Error().Str("node_id", req.NodeID).Str("role", req.Role).Str("reason", cmWhy).
+				Msg("Join refused: the node does not support the cold mark")
+			c.sendJoinError(conn, req, cmWhy)
+			return
+		}
+		rhWhy, rhRelease := c.rehomeJoinGate(req)
+		if rhWhy != "" {
+			cmRelease()
+			cpRelease()
+			ccRelease()
+			release()
+			c.logger.Error().Str("node_id", req.NodeID).Str("role", req.Role).Str("reason", rhWhy).
+				Msg("Join refused: the node does not support re-home")
+			c.sendJoinError(conn, req, rhWhy)
+			return
+		}
+		cfWhy, cfRelease := c.compactionFencesJoinGate(req)
+		if cfWhy != "" {
+			rhRelease()
+			cmRelease()
+			cpRelease()
+			ccRelease()
+			release()
+			c.logger.Error().Str("node_id", req.NodeID).Str("role", req.Role).Str("reason", cfWhy).
+				Msg("Join refused: the node does not support compaction read fences")
+			c.sendJoinError(conn, req, cfWhy)
+			return
+		}
 		joinGateReleased := false
 		releaseGate := func() {
 			if !joinGateReleased {
 				joinGateReleased = true
+				cfRelease()
+				rhRelease()
+				cmRelease()
 				cpRelease()
 				ccRelease()
 				release()
@@ -2373,8 +2538,16 @@ func (c *Coordinator) handleJoinRequest(conn net.Conn, req *protocol.JoinRequest
 			Capabilities: req.Capabilities,
 		}
 		if err := c.raftNode.AddNode(nodeInfo, 5*time.Second); err != nil {
-			c.logger.Error().Err(err).Str("node_id", req.NodeID).Msg("Failed to add node to FSM")
-			// Node was added to Raft but not FSM - this is ok, FSM will sync eventually
+			// Refuse the join rather than answer success: the joiner latches
+			// "joined" on success and stops discovery, and nothing else
+			// writes its record, so it would keep its previous process's
+			// address and version in every peer's view for the rest of its
+			// life (#1829). Refused, it tries again on its next discovery
+			// tick; the Raft membership added above is idempotent on retry.
+			c.logger.Error().Err(err).Str("node_id", req.NodeID).Msg("Failed to add node to FSM; refusing the join so the node retries")
+			releaseGate()
+			c.sendJoinError(conn, req, fmt.Sprintf("failed to record the node in cluster state: %v", err))
+			return
 		}
 		// Not across the network reply below.
 		releaseGate()
@@ -2719,6 +2892,23 @@ func (c *Coordinator) handleFetchFile(conn net.Conn, req *protocol.FetchFileRequ
 		if st, staged := fsm.StagedCompactionByKey(sanitized); staged {
 			sanitized = raft.StagedCompactionKey(st.Job, st.Output.Path)
 			entry, ok = &raft.FileEntry{Path: sanitized, SHA256: st.Output.SHA256, SizeBytes: st.Output.SizeBytes}, true
+		} else if out, rehomed := fsm.RehomeStagedOutput(sanitized); rehomed {
+			// A re-home job's staged output on local storage (#1860), while
+			// its job is committed or published, with its checksum and size.
+			// A node that already moved its copy into place (published)
+			// serves it from there: the output is not registered yet.
+			sanitized = out.StagedKey
+			c.mu.RLock()
+			b := c.storage
+			c.mu.RUnlock()
+			if b != nil {
+				sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				if n, err := b.StatFile(sctx, out.StagedKey); err == nil && n < 0 {
+					sanitized = out.Key
+				}
+				cancel()
+			}
+			entry, ok = &raft.FileEntry{Path: sanitized, SHA256: out.SHA256, SizeBytes: out.SizeBytes}, true
 		}
 	}
 	if !ok {
@@ -3160,6 +3350,15 @@ func (c *Coordinator) Status() map[string]interface{} {
 		"readers":       summary["readers"],
 		"compactors":    summary["compactors"],
 	}
+	// On a shared object store: whether this node serves reads now
+	// (read_lease.go).
+	if c.readLease != nil {
+		ready, why := c.readLease.Ready()
+		status["read_ready"] = ready
+		if !ready {
+			status["read_not_ready_reason"] = why
+		}
+	}
 	if puller != nil {
 		status["replication_catchup_status"] = puller.CatchUpStatus()
 		// How the walks judge a same-size local copy (#1182): by what this
@@ -3203,7 +3402,11 @@ func (c *Coordinator) Status() map[string]interface{} {
 	if c.raftNode != nil {
 		status["stream_claims"] = c.StreamClaimsStatus()
 		status["compaction_commit"] = c.CompactionCommitStatus()
+		cm, blocking := c.ColdMarkStatus()
+		trusted, why := c.ColdMarkTrusted(time.Now(), raft.ColdMarkAliveMaxAge, c.ColdMarkIdentity())
+		status["cold_mark"] = map[string]any{"state": cm, "blocking_nodes": blocking, "trusted": trusted, "untrusted_reason": why}
 		status["cluster_policies"] = c.ClusterPoliciesStatus()
+		status["rehome"] = c.RehomeStatus()
 	}
 	// The stale-local sweep's last pass (#1071), where it runs.
 	if st := c.StaleLocalStatus(); st != nil {
@@ -3245,11 +3448,13 @@ func (c *Coordinator) Status() map[string]interface{} {
 		totalCores := c.raftFSM.TotalCores()
 		status["total_cores"] = totalCores
 
-		if c.licenseClient != nil && c.licenseClient.GetLicense() != nil {
-			maxCores := c.licenseClient.GetLicense().MaxCores
-			status["max_cores"] = maxCores
-			if maxCores > 0 {
-				status["cores_remaining"] = maxCores - totalCores
+		if c.licenseClient != nil {
+			if lic := c.licenseClient.GetLicense(); lic != nil {
+				maxCores := lic.MaxCores
+				status["max_cores"] = maxCores
+				if maxCores > 0 {
+					status["cores_remaining"] = maxCores - totalCores
+				}
 			}
 		}
 	}
@@ -4046,45 +4251,137 @@ func (c *Coordinator) checkCoreLimit(maxCores int, nodeID string, coreCount int)
 
 // Phase 3: Raft and routing methods
 
-// onRaftNodeAdded is called when a node is added via Raft consensus.
-// It syncs the Raft FSM state to the local registry.
-// registerSelfInFSMWhenLeader waits for this node to become Raft leader,
-// then registers itself in the FSM so that joining nodes will receive the leader's info.
-func (c *Coordinator) registerSelfInFSMWhenLeader() {
-	// Wait for leader election (check every 100ms for up to 30 seconds)
-	for i := 0; i < 300; i++ {
+// selfRecordInterval is how often the self-record loop checks leadership and
+// this node's record in cluster state (#1829). A variable for tests.
+var selfRecordInterval = time.Second
+
+// selfRecordMaxBackoff caps the wait after a failed write of the record, and
+// is how long a difference that a successful write did not clear is left
+// alone before it is written again.
+const selfRecordMaxBackoff = 30 * time.Second
+
+// selfRecordState is maintainSelfRecord's memory between checks.
+type selfRecordState struct {
+	// announced: this process has written its record while leader. The
+	// first write is unconditional; later ones only fix a difference.
+	announced bool
+	// failures counts consecutive failed writes, for the backoff.
+	failures int
+	// writtenDiff/writtenAt: the last difference a write fixed, to notice
+	// one that does not stay fixed instead of rewriting it every second.
+	writtenDiff string
+	writtenAt   time.Time
+	warnedDiff  string
+}
+
+// maintainSelfRecord keeps this node's own record in cluster state current
+// while it is the Raft leader, for the life of the coordinator (#1829).
+//
+// A follower's record is written by the leader when the follower joins, and
+// peer discovery keeps trying until a join succeeds. A leader joins nobody
+// (discoveryShouldRun), so it has to write its own. That used to happen once,
+// and only if this node won an election within 30 s of starting: a node
+// elected later — its peers not yet resolvable after a full cold start, or a
+// failover hours in — kept the record of its previous process, with that
+// process's version and addresses. The api_address in it feeds the write
+// router, standby forwarding and peer cache invalidation; after a cold start
+// that reshuffled pod IPs it pointed at a reader for 85 minutes.
+func (c *Coordinator) maintainSelfRecord() {
+	var s selfRecordState
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
 		select {
 		case <-c.stopCh:
 			return
-		default:
+		case <-timer.C:
 		}
+		timer.Reset(c.syncSelfRecord(&s))
+	}
+}
 
-		if c.raftNode.IsLeader() {
-			break
+// syncSelfRecord runs one check and returns how long to wait for the next.
+//
+// The first write this process makes while leader is unconditional, as the
+// startup re-announcement always was, and deliberately not short-circuited on
+// "already in the FSM": a restarting leader's own record survives because the
+// peer that would have removed it was never leader, and only an applied
+// AddNode repairs the other nodes' registries, through the onNodeAdded
+// callback (#858). After that, a write happens only when the record differs
+// from this node in an identity field (selfRecordDiff). Later leadership gains
+// in the same process do not rewrite an identical record: for a voting
+// non-writer, applyAddNode's takeoverNodeBackLocked treats a write as the node
+// coming back and releases its stream claims.
+//
+// An absent record is written only by that first write. A leader's own record
+// is not absent otherwise (the remove-node API refuses self,
+// internal/api/cluster.go); if it is, the next process's first write
+// restores it, as before.
+func (c *Coordinator) syncSelfRecord(s *selfRecordState) time.Duration {
+	if c.raftNode == nil || c.leaving.Load() || !c.raftNode.IsLeader() {
+		return selfRecordInterval
+	}
+	want := c.selfNodeInfo()
+	diff := ""
+	if s.announced {
+		if c.raftFSM == nil {
+			return selfRecordInterval
 		}
-		time.Sleep(100 * time.Millisecond)
+		cur, ok := c.raftFSM.GetNode(want.ID)
+		if !ok {
+			return selfRecordInterval
+		}
+		if diff = selfRecordDiff(cur, want); diff == "" {
+			s.warnedDiff = ""
+			return selfRecordInterval
+		}
+		if diff == s.writtenDiff && time.Since(s.writtenAt) < selfRecordMaxBackoff {
+			if s.warnedDiff != diff {
+				s.warnedDiff = diff
+				c.logger.Warn().
+					Str("node_id", want.ID).
+					Str("difference", diff).
+					Msg("This node's record in cluster state still differs after it was rewritten; retrying later")
+			}
+			return selfRecordInterval
+		}
 	}
-
-	if !c.raftNode.IsLeader() {
-		c.logger.Debug().Msg("Not leader after bootstrap, skipping self-registration in FSM")
-		return
+	if err := c.raftNode.AddNode(want, 5*time.Second); err != nil {
+		s.failures++
+		wait := selfRecordInterval << min(s.failures, 5)
+		if wait > selfRecordMaxBackoff {
+			wait = selfRecordMaxBackoff
+		}
+		c.logger.Warn().Err(err).
+			Str("node_id", want.ID).
+			Dur("retry_in", wait).
+			Msg("Could not write this node's record to cluster state; peers keep the old one until it is written")
+		return wait
 	}
+	s.failures = 0
+	if !s.announced {
+		s.announced = true
+		c.logger.Info().
+			Str("node_id", want.ID).
+			Msg("Leader registered self in FSM")
+		return selfRecordInterval
+	}
+	s.writtenDiff, s.writtenAt = diff, time.Now()
+	c.logger.Info().
+		Str("node_id", want.ID).
+		Str("difference", diff).
+		Msg("Refreshed this node's record in cluster state")
+	return selfRecordInterval
+}
 
-	// Deliberately NOT short-circuited on "already in the FSM".
-	//
-	// That check used to skip the re-announcement whenever the FSM already
-	// held this node, which is precisely the state a restarting leader is in:
-	// its own record survived because the peer that would have removed it was
-	// never leader. Being in the FSM was never the question — #858 is a
-	// divergence between the FSM and every OTHER node's registry, and only an
-	// applied AddNode repairs that, through the onNodeAdded callback.
-	//
-	// The cost is one Raft entry per process start on whichever node takes
-	// leadership, and applyAddNode is idempotent in effect (it replaces the
-	// record, preserving a live primary designation, #850).
-
-	// Register ourselves in the FSM
-	nodeInfo := &raft.NodeInfo{
+// selfNodeInfo is this node's record as it should stand in cluster state.
+// WriterState is left empty, as on every join and as the startup write always
+// sent: applyAddNode derives "primary" from primaryWriterID atomically at
+// apply time (#850), which a value read here beforehand could not. A
+// "standby" mark is therefore cleared by the write, as a join clears it; that
+// only changes which standby selectPrimary prefers, never whether one exists.
+func (c *Coordinator) selfNodeInfo() *raft.NodeInfo {
+	return &raft.NodeInfo{
 		ID:           c.localNode.ID,
 		Name:         c.localNode.Name,
 		Role:         string(c.localNode.Role),
@@ -4093,18 +4390,55 @@ func (c *Coordinator) registerSelfInFSMWhenLeader() {
 		APIAddress:   c.localNode.APIAddress,
 		State:        string(StateHealthy),
 		Version:      c.localNode.Version,
-		CoreCount:    runtime.GOMAXPROCS(0), // Leader's core count
+		CoreCount:    runtime.GOMAXPROCS(0),
 		Capabilities: c.localCapabilities(),
 	}
+}
 
-	if err := c.raftNode.AddNode(nodeInfo, 5*time.Second); err != nil {
-		c.logger.Error().Err(err).Msg("Failed to register self in FSM")
-		return
+// selfRecordDiff names the identity fields in which cur differs from want,
+// "" when none does. Not compared: State and WriterState (not identity, and
+// owned by other paths) and CoreCount (GOMAXPROCS follows the cgroup at run
+// time; a resize is not worth a Raft entry, and the next restart writes it).
+func selfRecordDiff(cur, want *raft.NodeInfo) string {
+	var d []string
+	if cur.Name != want.Name {
+		d = append(d, "name")
 	}
+	if cur.Role != want.Role {
+		d = append(d, "role")
+	}
+	if cur.ClusterName != want.ClusterName {
+		d = append(d, "cluster_name")
+	}
+	if cur.Address != want.Address {
+		d = append(d, "address")
+	}
+	if cur.APIAddress != want.APIAddress {
+		d = append(d, "api_address")
+	}
+	if cur.Version != want.Version {
+		d = append(d, "version")
+	}
+	if !sameStringSet(cur.Capabilities, want.Capabilities) {
+		d = append(d, "capabilities")
+	}
+	return strings.Join(d, ",")
+}
 
-	c.logger.Info().
-		Str("node_id", c.localNode.ID).
-		Msg("Bootstrap leader registered self in FSM")
+func sameStringSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	as := append([]string(nil), a...)
+	bs := append([]string(nil), b...)
+	sort.Strings(as)
+	sort.Strings(bs)
+	for i := range as {
+		if as[i] != bs[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // nodeFromRaftInfo builds the registry's view of a node from its FSM record.
@@ -4127,6 +4461,8 @@ func nodeFromRaftInfo(n *raft.NodeInfo) *Node {
 	return node
 }
 
+// onRaftNodeAdded is called when a node is added via Raft consensus.
+// It syncs the Raft FSM state to the local registry.
 func (c *Coordinator) onRaftNodeAdded(n *raft.NodeInfo) {
 	// Roles are validated at join now, but a cluster formed before #848 can
 	// still carry an unrecognised one in the FSM, and this is where it
@@ -4224,6 +4560,25 @@ func (c *Coordinator) knownWriterState(id string) WriterState {
 		return existing.GetWriterState()
 	}
 	return WriterStateNone
+}
+
+// knownVersion is the version this node knows for id: its own when id is this
+// node (its FSM may still hold its previous process's record), else the FSM's
+// record, which the registry is derived from, else the registry entry's. The
+// join response carries none (#1829).
+func (c *Coordinator) knownVersion(id string) string {
+	if c.localNode != nil && id == c.localNode.ID {
+		return c.localNode.Version
+	}
+	if c.raftFSM != nil {
+		if n, ok := c.raftFSM.GetNode(id); ok && n != nil && n.Version != "" {
+			return n.Version
+		}
+	}
+	if existing, ok := c.registry.Get(id); ok {
+		return existing.Version
+	}
+	return ""
 }
 
 // onWriterPromoted is called when the FSM promotes a new primary writer.
@@ -4387,14 +4742,28 @@ func (c *Coordinator) startFilePullerLocked() error {
 
 	// Build the fetch client. Reuses cluster TLS (PR #382) so peer transfers
 	// run under the cluster PKI, not the public API cert.
-	fetchClient, err := filereplication.NewFetchClient(filereplication.FetchClient{
+	fetchSpec := filereplication.FetchClient{
 		SelfNodeID:            c.localNode.ID,
 		ClusterName:           c.cfg.ClusterName,
 		SharedSecret:          c.cfg.SharedSecret,
 		TLSConfig:             c.tlsConfig,
 		DialTimeout:           10 * time.Second,
 		ResponseHeaderTimeout: fetchTimeout,
-	})
+	}
+	// cluster.replication_pull_bytes_per_second (#397) caps the puller only,
+	// through one client its workers share. The staged compaction commit and
+	// the claimant's probes use an uncapped client: a staged fetch starts from
+	// byte zero every time and the origin ends any body at
+	// replication_serve_timeout_ms, so a capped one could never deliver an
+	// output above serve timeout x cap, and the partition would be compacted
+	// again and aborted again on every cycle.
+	directFetchClient, err := filereplication.NewFetchClient(fetchSpec)
+	if err != nil {
+		return fmt.Errorf("build fetch client: %w", err)
+	}
+	pullSpec := fetchSpec
+	pullSpec.BytesPerSecond = c.cfg.ReplicationPullBytesPerSecond
+	fetchClient, err := filereplication.NewFetchClient(pullSpec)
 	if err != nil {
 		return fmt.Errorf("build fetch client: %w", err)
 	}
@@ -4467,6 +4836,7 @@ func (c *Coordinator) startFilePullerLocked() error {
 		// A committed compaction output this node holds staged is moved
 		// into place instead of pulled (#1207 d2a2a).
 		AdoptStaged: c.adoptStagedForPull,
+		BeforePull:  c.rehomeBeforePull,
 		// Lets the puller stop pulling, and stop counting against the query
 		// gate, an entry that left the manifest while its pull was queued or
 		// in flight (#759, #795), while also identifying superseding versions.
@@ -4611,7 +4981,7 @@ func (c *Coordinator) startFilePullerLocked() error {
 	// Start the puller workers.
 	puller.Start(context.Background())
 	c.puller = puller
-	c.fetcher = fetchClient
+	c.fetcher = directFetchClient
 	// The staged compaction commit (#1207 d2a2a), once the puller and the
 	// fetch client it uses are in place: pull staged outputs, move committed
 	// ones into place, sweep leftovers; abort orphans as leader. This node
@@ -5191,6 +5561,11 @@ func (c *Coordinator) AddNodeViaRaft(node *Node) error {
 // It removes the node from both the Raft voting configuration and the
 // cluster FSM state, then unregisters it from the local registry.
 // Must be called on the leader.
+//
+// An ID that is not a member returns an error wrapping ErrNodeNotFound, and
+// nothing is proposed (#1619). Membership is deliberately wide; see
+// isRemovableMember. Without Raft the call only unregisters locally and
+// still succeeds for an unknown ID, as before.
 func (c *Coordinator) RemoveNodeViaRaft(nodeID string) error {
 	if c.raftNode == nil {
 		// No Raft, just unregister locally
@@ -5198,8 +5573,15 @@ func (c *Coordinator) RemoveNodeViaRaft(nodeID string) error {
 		return nil
 	}
 
+	// The leader check comes first: a follower's view of membership can lag
+	// the leader's, so it must not answer "not a member" from it. arcli
+	// matches the "not the leader" text, so it stays as it is.
 	if !c.raftNode.IsLeader() {
 		return fmt.Errorf("not the leader")
+	}
+
+	if !c.isRemovableMember(nodeID) {
+		return fmt.Errorf("%w: %q", ErrNodeNotFound, nodeID)
 	}
 
 	// Remove from Raft voting configuration. Warn on failure (node may
@@ -5219,6 +5601,42 @@ func (c *Coordinator) RemoveNodeViaRaft(nodeID string) error {
 
 	c.logger.Info().Str("node_id", nodeID).Msg("Node removed from cluster")
 	return nil
+}
+
+// isRemovableMember reports whether a removal of id would act on anything:
+// id is in the registry, in the Raft configuration, or named by the cluster
+// state (raft.ClusterFSM.ReferencesNode, which covers the node table, a
+// departed writer, its stream instances and claims, staged compactions and
+// the cold mark). Only an ID in none of them is unknown (#1619).
+//
+// The Raft configuration is read last because it is the only source that can
+// fail. If it cannot be read, id counts as a member and the removal goes
+// ahead as it always did: the check exists to refuse a typo, and must not
+// turn a removal the operator needs into a failure.
+//
+// Known limitation: the registry read is the leader's own. A stale entry only
+// a follower's registry holds (an old leader's registration whose FSM AddNode
+// failed, then a leadership change) used to be cleared cluster-wide by any
+// removal; it now gets 404 here and "not the leader" on that follower.
+func (c *Coordinator) isRemovableMember(id string) bool {
+	if _, ok := c.registry.Get(id); ok {
+		return true
+	}
+	if fsm := c.raftNode.FSM(); fsm != nil && fsm.ReferencesNode(id) {
+		return true
+	}
+	ids, err := c.raftNode.ConfigurationServerIDs()
+	if err != nil {
+		c.logger.Warn().Err(err).Str("node_id", id).
+			Msg("Could not read the Raft configuration to check the node is a member; removing it anyway")
+		return true
+	}
+	for _, s := range ids {
+		if s == id {
+			return true
+		}
+	}
+	return false
 }
 
 // UpdateNodeStateViaRaft updates a node's state via Raft consensus.
@@ -5550,4 +5968,64 @@ func (c *Coordinator) GetFileManifestByDatabase(database string) []*raft.FileEnt
 		return nil
 	}
 	return fsm.GetFilesByDatabase(database)
+}
+
+// SetFilePublished sets what tells this node's query caches about a file it
+// gained from another node (QueryHandler.FilePublished, #1763): one a peer
+// registered on a shared store, one this node's puller landed on local
+// storage. The writer's own flush reports its files itself (#1757). Called
+// on the Raft apply goroutine and from snapshot restore: fn must be O(1) and
+// never block.
+func (c *Coordinator) SetFilePublished(fn func(database, measurement string, partitionTime time.Time)) {
+	if c != nil && fn != nil {
+		c.filePublished.Store(&fn)
+	}
+}
+
+// SetIcebergFileArrived sets what asks this node's Iceberg export for an
+// export of a table when a file of it reaches this node from another (#1756):
+// with the reports of SetFilePublished, from the same two places. O(1), never
+// blocks.
+func (c *Coordinator) SetIcebergFileArrived(fn func(database, measurement, path string, sizeBytes int64)) {
+	if c != nil && fn != nil {
+		c.icebergArrived.Store(&fn)
+	}
+}
+
+// reportFilePublished reports the file at path, named by its manifest entry.
+func (c *Coordinator) reportFilePublished(path string) {
+	if (c.filePublished.Load() == nil && c.icebergArrived.Load() == nil) || c.raftNode == nil {
+		return
+	}
+	fsm := c.raftNode.FSM()
+	if fsm == nil {
+		return
+	}
+	if e, ok := fsm.GetFile(path); ok {
+		c.reportFilePublishedEntry(e)
+	}
+}
+
+func (c *Coordinator) reportFilePublishedEntry(e *raft.FileEntry) {
+	p := c.filePublished.Load()
+	a := c.icebergArrived.Load()
+	if (p == nil && a == nil) || e == nil || e.Database == "" || e.Measurement == "" {
+		return
+	}
+	// A compaction output or a DELETE rewrite replaces files of an hour that
+	// already had some: no cached "this hour is empty" answer can be wrong
+	// for it, and reporting it would cost every node its cached answers for
+	// the measurement on every compaction.
+	if e.CompactionJob != "" || rewriteStamp(e.Path) > 0 {
+		return
+	}
+	if p != nil {
+		(*p)(e.Database, e.Measurement, e.PartitionTime)
+	}
+	if a != nil && !c.rehomeOwnsLocal(e.Path) {
+		// Not a re-home job's file: its outputs reach the table in the
+		// commit that removes its source (#1870), never appended on their
+		// own beside it.
+		(*a)(e.Database, e.Measurement, e.Path, e.SizeBytes)
+	}
 }

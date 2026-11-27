@@ -223,8 +223,28 @@ func (n *Node) Start() error {
 		}
 		baseStream = stream
 	}
-	authStream := security.NewAuthenticatedStreamLayer(baseStream, n.cfg.SharedSecret, n.cfg.ClusterName)
+	authStream := security.NewAuthenticatedStreamLayer(baseStream, n.cfg.SharedSecret, n.cfg.ClusterName).
+		WithLogger(n.logger.With().Str("subcomponent", "raft-auth").Logger())
 	n.transport = raft.NewNetworkTransport(authStream, 3, 10*time.Second, os.Stderr)
+	// Until NewRaft takes ownership of them, a failed Start must release the
+	// transport (its listener and accept goroutines) and the stores it opened,
+	// or the Raft port stays bound for the life of the process.
+	// Stores left from an earlier Start/Stop were closed by Stop; forget them
+	// so the cleanup below only closes what this call opened.
+	n.logStore, n.stableStore = nil, nil
+	raftCreated := false
+	defer func() {
+		if raftCreated {
+			return
+		}
+		n.transport.Close()
+		if n.logStore != nil {
+			n.logStore.Close()
+		}
+		if n.stableStore != nil {
+			n.stableStore.Close()
+		}
+	}()
 
 	// Create log store
 	logStorePath := filepath.Join(n.cfg.DataDir, "raft-log.db")
@@ -263,6 +283,7 @@ func (n *Node) Start() error {
 	if err != nil {
 		return fmt.Errorf("failed to create raft instance: %w", err)
 	}
+	raftCreated = true
 	if count := n.fsm.RejectedPathsCount(); count > 0 {
 		// Only fires for snapshot Restore rejections (synchronous
 		// inside NewRaft). Log-replay rejections happen on runFSM
@@ -935,4 +956,50 @@ func (n *Node) ConfigurationServerIDs() ([]string, error) {
 		ids = append(ids, string(s.ID))
 	}
 	return ids, nil
+}
+
+// HeartbeatFailures registers fn for the leader's heartbeat observations:
+// failed (with the peer's last contact) and resumed (#1852). fn runs on its
+// own goroutine; it must not block for long. A nil Raft registers nothing
+// and returns a no-op stop.
+// A peer added or removed from the configuration is reported as resumed: a
+// record of its failures from before does not apply to it.
+func (n *Node) HeartbeatFailures(fn func(peer string, failed bool, lastContact time.Time)) (stop func()) {
+	n.mu.RLock()
+	r := n.raft
+	n.mu.RUnlock()
+	if r == nil {
+		return func() {}
+	}
+	ch := make(chan raft.Observation, 64)
+	obs := raft.NewObserver(ch, false, func(o *raft.Observation) bool {
+		switch o.Data.(type) {
+		case raft.FailedHeartbeatObservation, raft.ResumedHeartbeatObservation, raft.PeerObservation:
+			return true
+		}
+		return false
+	})
+	r.RegisterObserver(obs)
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case o := <-ch:
+				switch d := o.Data.(type) {
+				case raft.FailedHeartbeatObservation:
+					fn(string(d.PeerID), true, d.LastContact)
+				case raft.ResumedHeartbeatObservation:
+					fn(string(d.PeerID), false, time.Time{})
+				case raft.PeerObservation:
+					fn(string(d.Peer.ID), false, time.Time{})
+				}
+			}
+		}
+	}()
+	return func() {
+		r.DeregisterObserver(obs)
+		close(done)
+	}
 }

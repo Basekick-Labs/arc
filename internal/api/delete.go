@@ -135,6 +135,13 @@ func sharedManifest(coord any) bool {
 // apostrophe because the log masker truncates a line at the first quote.
 var errSourceRetired = errors.New("source file was retired by a concurrent delete, retry the request")
 
+// errFileBeingRehomed reports a file a re-home job in flight owns (#1825):
+// the file being moved, or one its rows are moved into. A rewrite here would
+// publish a replacement the job knows nothing of, beside the files the job
+// writes. The file is left as it is and the response says so; the DELETE can
+// be sent again once the job has ended.
+var errFileBeingRehomed = errors.New("the file is being re-homed or compacted; retry once that job has ended")
+
 // parquetRowGroupSize is the row group size used for Parquet rewrites during delete operations.
 // Matches compaction's row group size to limit DuckDB's internal write buffer per group.
 const parquetRowGroupSize = 122880
@@ -170,11 +177,19 @@ type DeleteHandler struct {
 	// onFilesRemoved invalidates the query caches (and the cluster's) after
 	// files were removed or rewritten: see SetOnFilesRemoved.
 	onFilesRemoved func()
-	db             *database.DuckDB
-	storage        storage.Backend
-	config         *config.DeleteConfig
-	authManager    *auth.AuthManager
-	coordinator    DeleteCoordinator // nil in standalone mode
+	// onPathsChanged, when set, is told the storage prefixes a DELETE changed
+	// (SetOnPathsChanged).
+	onPathsChanged func(keys []string)
+	// receiptRemoved and receiptRewritten mark edge-sync receipts before a
+	// DELETE changes a spoke file (#1666); nil unless this node is a hub.
+	// See SetReceiptMarkers.
+	receiptRemoved   func(ctx context.Context, paths []string) error
+	receiptRewritten func(paths []string) error
+	db               *database.DuckDB
+	storage          storage.Backend
+	config           *config.DeleteConfig
+	authManager      *auth.AuthManager
+	coordinator      DeleteCoordinator // nil in standalone mode
 	// pending is this node's file registration outbox (#1209): a file it
 	// flushed may not be in the manifest yet. nil off ingest nodes.
 	pending        PendingRegistrations
@@ -185,6 +200,8 @@ type DeleteHandler struct {
 	// moveClaims keeps the tiering migrator off a file this DELETE rewrites
 	// (the tiering manager, when tiering is on).
 	moveClaims moveClaimer
+	// rehomeOwns reports a file a re-home job in flight owns (SetRehomeOwns).
+	rehomeOwns func(path string) bool
 	// tempDir is the absolute, sandbox-allowlisted directory used by
 	// rewriteS3File to stage the COPY-rewritten parquet locally before
 	// uploading. MUST match one of the prefixes added to DuckDB's
@@ -283,30 +300,6 @@ var dangerousPunctuationPatterns = []string{
 // Uses \b word boundaries to avoid false positives on column names like "offset", "payload", "dataset"
 var dangerousKeywordPattern = regexp.MustCompile(`(?i)\b(DROP|DELETE|INSERT|UPDATE|EXEC|EXECUTE|UNION|SELECT|CREATE|ALTER|COPY|ATTACH|DETACH|LOAD|INSTALL|PRAGMA|CALL|SET)\b`)
 
-// dangerousIOFunctionPattern rejects DuckDB's filesystem-I/O table-function
-// family in a DELETE WHERE clause.
-//
-// The keyword list above blocks SELECT, which kills the scalar-subquery vector
-// that made GHSA-wmjj-g8xc-6hwr exploitable on the query endpoint — but these
-// readers do not need a subquery to run. The WHERE clause is interpolated into
-// `SELECT ... FROM read_parquet(...) WHERE <where>`, so a scalar expression like
-// `1=1 OR list_contains(glob('/data/**'), 'x')` reaches DuckDB with no SELECT of
-// its own and turns the row count into a cross-tenant existence oracle. DELETE is
-// admin-gated, but an admin token is not meant to be a filesystem read primitive.
-//
-// Matches the function NAME anywhere in the clause, not anchored to a FROM/JOIN
-// position — these can sit in any scalar expression. Kept as a separate pattern
-// from the keyword list so the error message can name the offending function.
-var dangerousIOFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join(append([]string{
-	"read_parquet", "parquet_scan", "read_csv", "read_csv_auto",
-	"read_json", "read_json_auto", "read_ndjson", "read_ndjson_auto",
-	"read_text", "read_blob", "read_xlsx", "glob",
-	"parquet_metadata", "parquet_schema", "parquet_file_metadata",
-	"parquet_kv_metadata", "parquet_bloom_probe",
-	"delta_scan", "iceberg_scan", "iceberg_metadata", "iceberg_snapshots",
-	"arc_partition_agg",
-}, database.DeniedExtensionFunctions()...), "|") + `)\s*\(`)
-
 // NewDeleteHandler creates a new delete handler. tempDir MUST be the same
 // path cmd/arc/main.go added to the DuckDB sandbox's allowed_directories,
 // otherwise the COPY ... TO inside rewriteS3File fails on S3-backed
@@ -331,6 +324,45 @@ func NewDeleteHandler(db *database.DuckDB, storage storage.Backend, cfg *config.
 // SetRetiredReads wires the standalone read source for replaced files.
 func (h *DeleteHandler) SetRetiredReads(r *RetiredReads) { h.reads = r }
 
+// SetReceiptMarkers wires the edge-sync hub's receipt marking into DELETE
+// (#1666). removed marks the receipt of a file whose rows all match (nothing
+// of it survives; reason row_delete); rewritten marks the receipt of a file
+// rewritten without the matching rows COMPACTED, because its surviving rows
+// live on in the new file. Either way the spoke does not re-send the
+// original, which would bring the deleted rows back and duplicate the rest.
+// Paths outside a spoke namespace match no receipt.
+func (h *DeleteHandler) SetReceiptMarkers(removed func(ctx context.Context, paths []string) error, rewritten func(paths []string) error) {
+	h.receiptRemoved, h.receiptRewritten = removed, rewritten
+}
+
+// markReceipt marks relativePath's edge-sync receipt for a DELETE about to
+// remove it (whole) or rewrite it. Called before anything changes: a failed
+// mark then leaves the file as it was, and a failure after the mark leaves a
+// vouched receipt over a file that still exists, which reconcile and receive
+// treat as present either way. Marking after the rewrite instead left a window
+// in which the leftover sweep removes the old file unmarked.
+// receiptMarkTimeout bounds one receipt mark, as cmd/arc's compacted marker
+// bounds its own.
+const receiptMarkTimeout = 60 * time.Second
+
+func (h *DeleteHandler) markReceipt(ctx context.Context, relativePath string, whole bool) error {
+	var err error
+	switch {
+	case whole && h.receiptRemoved != nil:
+		// Not cut short by a client disconnect, but bounded: it runs under
+		// rewriteMu. A mark cut off part way is harmless (see above).
+		mctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), receiptMarkTimeout)
+		err = h.receiptRemoved(mctx, []string{relativePath})
+		cancel()
+	case !whole && h.receiptRewritten != nil:
+		err = h.receiptRewritten([]string{relativePath})
+	}
+	if err != nil {
+		return fmt.Errorf("mark edge-sync receipt of %s: %w", filepath.Base(relativePath), err)
+	}
+	return nil
+}
+
 // SetCoordinator wires the cluster coordinator for manifest updates and role
 // gating. Called after construction when cluster mode is enabled.
 func (h *DeleteHandler) SetCoordinator(c DeleteCoordinator) {
@@ -351,6 +383,20 @@ func (h *DeleteHandler) SetPendingRegistrations(p PendingRegistrations) {
 }
 
 // SetTieringManager wires rewrite/delete metadata updates into tiering.
+// SetRehomeOwns gives the handler the test for a file a re-home job in
+// flight owns (#1825). nil: no such jobs.
+func (h *DeleteHandler) SetRehomeOwns(fn func(path string) bool) { h.rehomeOwns = fn }
+
+// WithRewriteLock runs fn while no DELETE rewrites a file: under the mutex
+// the whole rewrite phase of a DELETE, the removal of leftovers and the
+// drainer hold. A re-home job, having registered its ownership, checks its
+// file inside it: a DELETE that was rewriting the file has finished.
+func (h *DeleteHandler) WithRewriteLock(fn func()) {
+	h.rewriteMu.Lock()
+	defer h.rewriteMu.Unlock()
+	fn()
+}
+
 func (h *DeleteHandler) SetTieringManager(tm *tiering.Manager) {
 	h.tieringManager = tm
 	h.coldTier = nil
@@ -467,14 +513,28 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		})
 	}
 
+	// Canonical first (see validateWhereClause): the qualifier rewrite below
+	// masks the clause, and it must find the literals DuckDB will find. On
+	// the raw clause, a dollar-quoted literal after a no-break space was not
+	// one to the masker, and the rewrite edited inside it.
+	req.Where = sqlutil.StripUnicodeSpaces(req.Where)
+
+	// A column qualified by the measurement's name means that column (#1451).
+	// Rewritten before validation, so what is validated is what runs. Keep
+	// this order: the rewrite masks and restores caller text, and
+	// validateWhereClause (including its placeholder check) must see its
+	// output, which is also what pinDeleteTime later re-masks.
+	req.Where = unqualifyMeasurement(req.Where, req.Measurement)
+
 	// Validate WHERE clause
-	isFullTableDelete, err := h.validateWhereClause(req.Where)
+	canonicalWhere, isFullTableDelete, err := h.validateWhereClause(req.Where)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{
 			Success: false,
 			Error:   err.Error(),
 		})
 	}
+	req.Where = canonicalWhere
 
 	// Check if confirmation is required for full table delete
 	if isFullTableDelete && !req.Confirm {
@@ -510,6 +570,10 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	// The time range the scans read only the files of (delete_window.go):
 	// from the WHERE as written, with now() pinned as the record pins it.
 	scan := scanOpts{wait: !req.DryRun, allowUnreachable: req.AllowUnreachable, windowWhere: req.Where}
+	if req.AllowUnreachable {
+		// Shared by every wait of this request (#1426).
+		scan.track = newMissingTracker(h.coordinator)
+	}
 	if !req.DryRun {
 		if rec = recorderOf(h.coordinator); rec != nil {
 			scan.windowNow = deleteNow().UTC()
@@ -529,7 +593,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	// a file it lists that is not here yet (a compaction output on its way)
 	// is waited for.
 	if rec != nil {
-		if unreachable, err = h.waitLocalFiles(ctx, rec, req.Database, req.Measurement, req.AllowUnreachable, h.windowFor(req.Database, req.Measurement, scan.whereForWindow(where), scan.nowForWindow())); err != nil {
+		if unreachable, err = h.waitLocalFiles(ctx, rec, req.Database, req.Measurement, req.AllowUnreachable, h.windowFor(req.Database, req.Measurement, scan.whereForWindow(where), scan.nowForWindow()), scan.track); err != nil {
 			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete rejected: " + err.Error() + "; retry, or set allow_unreachable=true to skip them", UnreachableFiles: unreachable})
 		}
 	}
@@ -547,7 +611,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete rejected: " + err.Error() + "; retry shortly"})
 	}
 	if bindErr := (*whereBindError)(nil); errors.As(err, &bindErr) {
-		return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{Success: false, Error: "Delete rejected: " + err.Error()})
+		return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{Success: false, Error: "Delete rejected: " + h.errText(err)})
 	}
 	if errors.Is(err, errUnreachableFiles) {
 		return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete rejected: " + err.Error() + "; retry, or set allow_unreachable=true to skip them", UnreachableFiles: unreachable})
@@ -556,7 +620,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		h.logger.Error().Err(err).Msg("Failed to find affected files")
 		return c.Status(fiber.StatusInternalServerError).JSON(DeleteResponse{
 			Success:         false,
-			Error:           "Failed to find affected files: " + err.Error(),
+			Error:           "Failed to find affected files: " + h.errText(err),
 			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 		})
 	}
@@ -571,7 +635,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 			// hold the only rows that matched) is still removed.
 			h.rewriteMu.Lock()
 			if h.removeLeftovers(ctx, req.Database, req.Measurement) > 0 {
-				h.filesRemoved()
+				h.filesRemovedIn(req.Database, req.Measurement)
 			}
 			h.rewriteMu.Unlock()
 		}
@@ -675,7 +739,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete not run: recording it in the cluster failed or could not be confirmed (" + err.Error() + "); it may already apply to rows replayed later; retry to run it"})
 		}
 		h.recordID = id
-		if unreachable, err = h.waitLocalFiles(ctx, rec, req.Database, req.Measurement, req.AllowUnreachable, h.windowFor(req.Database, req.Measurement, scan.whereForWindow(where), scan.nowForWindow())); err != nil {
+		if unreachable, err = h.waitLocalFiles(ctx, rec, req.Database, req.Measurement, req.AllowUnreachable, h.windowFor(req.Database, req.Measurement, scan.whereForWindow(where), scan.nowForWindow()), scan.track); err != nil {
 			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete recorded, not run: " + err.Error() + "; rows the cluster replays later are already filtered; retry, or set allow_unreachable=true to skip them", UnreachableFiles: unreachable})
 		}
 		affected, unlisted, err = h.findAffectedFiles(ctx, req.Database, req.Measurement, where, scan)
@@ -687,10 +751,10 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		} else if errors.Is(err, errUnreachableFiles) {
 			return respondDeleteUnavailable(c, DeleteResponse{Error: "Delete recorded, not run: " + err.Error() + "; rows the cluster replays later are already filtered; retry, or set allow_unreachable=true to skip them", UnreachableFiles: unreachable})
 		} else if bindErr := (*whereBindError)(nil); errors.As(err, &bindErr) {
-			return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{Success: false, Error: "Delete recorded, not run: " + err.Error()})
+			return c.Status(fiber.StatusBadRequest).JSON(DeleteResponse{Success: false, Error: "Delete recorded, not run: " + h.errText(err)})
 		} else if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(DeleteResponse{
-				Success: false, Error: "Delete recorded, not run: failed to find affected files: " + err.Error(),
+				Success: false, Error: "Delete recorded, not run: failed to find affected files: " + h.errText(err),
 				ExecutionTimeMs: float64(time.Since(start).Milliseconds()),
 			})
 		}
@@ -723,6 +787,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	// retryable, so the answer is 503 rather than 207.
 	var notRegistered []string
 	var moving []string
+	rehoming := 0 // files a re-home job in flight owns, left as they are
 	var coldUnchecked []string
 
 	for round := 0; ; round++ {
@@ -748,6 +813,8 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 				if errors.Is(err, tiering.ErrFileMoving) || errors.Is(err, tiering.ErrColdCheckFailed) {
 					// Expected while a migration runs; the response says so.
 					h.logger.Warn().Err(err).Str("file", f.path).Msg("File left as it is: it is being moved to cold storage")
+				} else if errors.Is(err, errFileBeingRehomed) {
+					h.logger.Warn().Str("file", f.path).Msg("File left as it is: a re-home job in flight owns it")
 				} else {
 					h.logger.Error().Err(err).Str("file", f.path).Msg("Failed to rewrite file")
 				}
@@ -756,7 +823,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 				// corresponding manifest record.
 				if errors.Is(err, errManifestFailure) {
 					h.db.ClearHTTPCache()
-					h.filesRemoved()
+					h.filesRemovedIn(req.Database, req.Measurement)
 					freeOSMemoryThrottled()
 					return c.Status(fiber.StatusInternalServerError).JSON(DeleteResponse{
 						Success:         false,
@@ -776,6 +843,9 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 				}
 				if errors.Is(err, tiering.ErrFileMoving) {
 					moving = append(moving, f.relativePath)
+				}
+				if errors.Is(err, errFileBeingRehomed) {
+					rehoming++
 				}
 				if errors.Is(err, tiering.ErrColdCheckFailed) {
 					coldUnchecked = append(coldUnchecked, f.relativePath)
@@ -797,7 +867,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		}
 		incomplete := func(why string) error {
 			h.db.ClearHTTPCache()
-			h.filesRemoved()
+			h.filesRemovedIn(req.Database, req.Measurement)
 			freeOSMemoryThrottled()
 			return respondDeleteUnavailable(c, DeleteResponse{
 				Error:            "Delete incomplete: " + why + "; the rows of the other files are deleted; retry to finish",
@@ -830,11 +900,11 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 				failedPath = bindErr.path
 			}
 			h.db.ClearHTTPCache()
-			h.filesRemoved()
+			h.filesRemovedIn(req.Database, req.Measurement)
 			freeOSMemoryThrottled()
 			return c.Status(fiber.StatusMultiStatus).JSON(DeleteResponse{
 				Success:          false,
-				Error:            "Delete incomplete: " + err.Error() + "; the rows of the other files are deleted",
+				Error:            "Delete incomplete: " + h.errText(err) + "; the rows of the other files are deleted",
 				DeletedCount:     totalDeleted,
 				AffectedFiles:    len(seen),
 				RewrittenFiles:   rewrittenCount,
@@ -846,7 +916,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 			})
 		}
 		if err != nil {
-			return incomplete(err.Error())
+			return incomplete(h.errText(err))
 		}
 	}
 
@@ -857,7 +927,7 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	// Clear cache_httpfs and release memory back to the OS. DuckDB's Parquet metadata
 	// cache cannot be emptied (#1372); entries for removed files leave under memory_limit.
 	h.db.ClearHTTPCache()
-	h.filesRemoved()
+	h.filesRemovedIn(req.Database, req.Measurement)
 	freeOSMemoryThrottled()
 
 	executionTime := float64(time.Since(start).Milliseconds())
@@ -896,6 +966,9 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 		if len(moving) > 0 {
 			resp.Error += fmt.Sprintf(" (%d of them %s)", len(moving), movingWhy)
 		}
+		if rehoming > 0 {
+			resp.Error += fmt.Sprintf(" (%d of them are being re-homed and were left as they are; retry for those once the job has ended, GET /api/v1/rehome)", rehoming)
+		}
 		if len(coldUnchecked) > 0 {
 			resp.Error += fmt.Sprintf(" (%d of them %s; retry for those)", len(coldUnchecked), coldUncheckedWhy)
 		}
@@ -926,21 +999,67 @@ func (h *DeleteHandler) handleDelete(c *fiber.Ctx) error {
 	return c.JSON(resp)
 }
 
-// validateWhereClause validates the WHERE clause and returns true if it's a full table delete
-func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
+// errText is a DELETE error as the caller sees it: the message and its hint
+// lines without DuckDB's statement context (the read over every file the
+// scan touched), and with this node's storage root removed from file
+// names, so a file is named relative to the database, as DELETE reports
+// them elsewhere, never as the absolute path or bucket URI DuckDB used.
+func (h *DeleteHandler) errText(err error) string {
+	s := sqlutil.TrimErrStatement(err.Error())
+	if h.storage != nil {
+		if root, rerr := storage.ObjectURI(h.storage, "x"); rerr == nil {
+			if root = strings.TrimSuffix(root, "x"); root != "" {
+				s = strings.ReplaceAll(s, root, "")
+			}
+		}
+	}
+	return s
+}
+
+// validateWhereClause validates the WHERE clause and returns the text to
+// use from here on, and whether it deletes the whole table. As for
+// ValidateSQLRequest, the returned clause has the Unicode spaces DuckDB's
+// parser replaces already replaced, so the checks and the DELETE statement
+// read the clause DuckDB will run; callers must use it, not the argument.
+func (h *DeleteHandler) validateWhereClause(where string) (string, bool, error) {
+	canonical := sqlutil.StripUnicodeSpaces(where)
+	full, err := h.checkWhereClause(canonical)
+	if err != nil {
+		return "", false, err
+	}
+	return canonical, full, nil
+}
+
+// checkWhereClause validates a canonical WHERE clause and returns true if
+// it's a full table delete.
+func (h *DeleteHandler) checkWhereClause(where string) (bool, error) {
 	if where == "" || strings.TrimSpace(where) == "" {
 		return false, fmt.Errorf("WHERE clause is required. To delete all data, use WHERE clause '1=1' with confirm=true")
 	}
 
 	// Validation scans run on the MASKED clause: a forbidden keyword or ';'
-	// inside a string literal is data, not SQL (#834). The raw clause is what
-	// gets interpolated into the DuckDB statement, so the unmatched-quote and
-	// unmatched-parenthesis checks below stay on it. Backtick identifiers are
-	// normalised to double quotes first, as the query path's validator does:
-	// the masker does not know backticks, so a quote inside one would
-	// otherwise open a spurious literal that hides whatever follows it.
-	maskInput := backticksToDoubleQuotes(where)
-	maskedWhere, masks := sqlutil.MaskStringLiterals(maskInput, sqlutil.HasQuotes(maskInput))
+	// inside a string literal is data, not SQL (#834). The (canonical) clause
+	// is what gets interpolated into the DuckDB statement, so the unmatched-quote and
+	// unmatched-parenthesis checks below stay on it. An unquoted backtick is
+	// refused before anything is masked: it is not a quote in DuckDB, so the
+	// masker must see the clause exactly as DuckDB will (#1480).
+	if hasUnquotedBacktick(where) {
+		return false, errors.New("WHERE clause: " + errUnquotedBacktick)
+	}
+	maskedWhere, masks := sqlutil.MaskStringLiterals(where, sqlutil.HasQuotes(where))
+	// Placeholder text outside a literal or quoted identifier is reserved:
+	// the clause is masked, checked, and its literals restored by
+	// placeholder (pinDeleteTime), so a copy the caller wrote would move a
+	// literal after the checks. Text inside a literal stays data.
+	if sqlutil.HasCallerPlaceholder(maskedWhere, masks) {
+		return false, errors.New("WHERE clause: " + errReservedPlaceholder)
+	}
+	// A Unicode space DuckDB's parser would replace that is still here sits
+	// where DuckDB's pre-pass believed it was inside quotes; outside every
+	// literal, as Arc reads them, that is wrong (see ValidateSQLRequest).
+	if sqlutil.HasUnicodeSpace(maskedWhere) {
+		return false, errors.New("WHERE clause: " + errUnicodeSpaceInCode)
+	}
 	// DuckDB reads non-ASCII spaces as token separators; the keyword and
 	// function scans below only see ASCII ones (read_statements.go).
 	maskedWhere = foldUnicodeSpace(maskedWhere)
@@ -968,9 +1087,20 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 		return false, fmt.Errorf("WHERE clause contains forbidden keyword: %s", strings.ToUpper(match))
 	}
 
-	// Reject filesystem-I/O table functions (see dangerousIOFunctionPattern).
-	// Matched against the identifier-quote-stripped form so the quoted spelling
-	// `"glob"(...)`, which DuckDB executes identically, cannot slip past.
+	// Reject the functions the query validator refuses: filesystem readers,
+	// dynamic SQL and side effects. The keyword list blocks SELECT, but the
+	// fragment is interpolated into `SELECT ... FROM read_parquet(...) WHERE
+	// <where>`, so a reader in a scalar expression (`1=1 OR
+	// list_contains(glob('/data/**'), 'x')`, GHSA-wmjj-g8xc-6hwr) or under
+	// `EXISTS (FROM name(...))` runs with no SELECT of its own and turns the
+	// row count into a cross-tenant oracle; DELETE is admin-gated, but an
+	// admin token is not meant to be a filesystem read primitive. These are
+	// the SAME patterns as
+	// ValidateSQLRequest: this path kept its own copy, which missed every
+	// reader added after it was written and never checked dynamic SQL
+	// (GHSA-r7vm-9hcg-xgf7). Matched against the identifier-quote-stripped
+	// form so the quoted spelling `"glob"(...)`, which DuckDB executes
+	// identically, cannot slip past.
 	ioCheck := maskedWhere
 	for _, mask := range masks {
 		if mask.Identifier {
@@ -979,15 +1109,21 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 			ioCheck = strings.ReplaceAll(ioCheck, mask.Placeholder, mask.Original)
 		}
 	}
-	ioCheck = strings.NewReplacer(`"`, "", "`", "").Replace(ioCheck)
+	ioCheck = strings.ReplaceAll(ioCheck, `"`, "")
 	if unicodeEscapePattern.MatchString(maskedWhere) {
 		return false, fmt.Errorf(`WHERE clause contains a unicode-escaped identifier or string (U&"...")`)
 	}
-	if m := dangerousIOFunctionPattern.FindStringSubmatch(ioCheck); m != nil {
+	if m := ioTableFunctionPattern.FindStringSubmatch(ioCheck); m != nil {
 		return false, fmt.Errorf("WHERE clause contains forbidden file I/O function: %s()", m[1])
+	}
+	if m := dynamicSQLFunctionPattern.FindStringSubmatch(ioCheck); m != nil {
+		return false, fmt.Errorf("WHERE clause contains forbidden dynamic SQL function: %s()", m[1])
 	}
 	if name := sideEffectFunction(ioCheck); name != "" {
 		return false, fmt.Errorf("WHERE clause contains forbidden function: %s", name)
+	}
+	if name := queryTableMacroInTablePosition(maskedWhere, sqlutil.IdentifierNames(masks)); name != "" {
+		return false, fmt.Errorf("WHERE clause contains forbidden table function: %s()", name)
 	}
 
 	// SECURITY: reject a path literal standing in table position inside the
@@ -1007,7 +1143,8 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	// Reuses the query path's guard rather than growing a third keyword list
 	// in this file: that guard is fed by the same normalisation and already
 	// knows every relation-introducing keyword DuckDB has (FROM, JOIN, TABLE,
-	// SUMMARIZE, DESCRIBE, PIVOT, UNPIVOT), so this inherits additions to it
+	// SUMMARIZE, DESCRIBE, DESC, SHOW, PIVOT, PIVOT_WIDER, UNPIVOT, PIVOT_LONGER,
+	// and ONLY after one), so this inherits additions to it
 	// instead of drifting from them.
 	//
 	// It is applied to the FRAGMENT, not to the assembled statement: by the
@@ -1016,9 +1153,14 @@ func (h *DeleteHandler) validateWhereClause(where string) (bool, error) {
 	// ordering constraint queryMeasurement documents. A fragment that
 	// introduces a relation carries its own keyword, so the scanner arms
 	// without needing a synthetic FROM clause around it.
-	features := scanSQLFeatures(maskInput)
-	normalised, _ := sqlutil.MaskStringLiterals(maskInput, features.hasQuotes)
+	features := scanSQLFeatures(where)
+	normalised, _ := sqlutil.MaskStringLiterals(where, features.hasQuotes)
 	normalised = stripSQLComments(normalised, features.hasDashComment || features.hasBlockComment)
+	// As in ValidateSQLRequest, and in the same order (after the comments are
+	// gone, so a comment cannot open a masking frame): the FROM of
+	// `IS [NOT] DISTINCT FROM` and of EXTRACT/TRIM/… is not a table position,
+	// so `host IS DISTINCT FROM 'a'` is a valid predicate (#1472).
+	normalised, _ = sqlutil.MaskFromKeywordsInFunctionBodies(normalised)
 	if stringLiteralInTablePosition(normalised) {
 		return false, fmt.Errorf("WHERE clause may not put a string literal in table position (replacement scans are disabled)")
 	}
@@ -1256,6 +1398,13 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 	if size, statErr := h.storage.StatFile(ctx, relativePath); statErr == nil && size < 0 {
 		return 0, fmt.Errorf("%w: %s", errSourceRetired, filepath.Base(relativePath))
 	}
+	// A re-home job registers its ownership and then takes the rewrite
+	// mutex once, to check its file: a rewrite that began before that has
+	// finished by the time the job looks, and one that begins after sees
+	// the ownership here.
+	if h.rehomeOwns != nil && h.rehomeOwns(relativePath) {
+		return 0, fmt.Errorf("%w: %s", errFileBeingRehomed, filepath.Base(relativePath))
+	}
 	// Kept off a file the tiering migrator is copying, or one with a cold
 	// copy already: a rewrite here would leave that copy holding the rows
 	// this DELETE removes, and the cold sync would serve them again for
@@ -1298,6 +1447,9 @@ func (h *DeleteHandler) rewriteFileWithoutDeletedRows(ctx context.Context, query
 		// Nothing matches now (a clause on now() that matched at the scan):
 		// a rewrite would be the same rows under another name.
 		return 0, nil
+	}
+	if err := h.markReceipt(ctx, relativePath, rowsAfter == 0); err != nil {
+		return 0, err
 	}
 
 	// If all rows would be deleted, remove the file entirely.
@@ -1463,6 +1615,20 @@ func (h *DeleteHandler) rewriteLocalFile(ctx context.Context, filePath, relative
 
 	// Try to clean up temp directory if empty
 	os.Remove(tempDir) // Ignore error, directory might not be empty
+
+	// DuckDB does not fsync what it COPYs, and the caller removes the old file
+	// next: make the rewrite durable first, or a power loss could leave
+	// neither (#1618). Fails closed on a backend that cannot: only the local
+	// backend reaches here, and it can.
+	mover, ok := h.storage.(storage.ObjectMover)
+	if !ok {
+		os.Remove(newFilePath)
+		return 0, "", fmt.Errorf("cannot make the rewritten file durable: %T does not support sync", h.storage)
+	}
+	if err := mover.Sync(ctx, newRelativePath); err != nil {
+		os.Remove(newFilePath)
+		return 0, "", fmt.Errorf("failed to make rewritten file durable: %w", err)
+	}
 
 	h.logger.Info().
 		Str("file", filepath.Base(filePath)).
@@ -1920,8 +2086,22 @@ func (h *DeleteHandler) SetOnFilesRemoved(fn func()) {
 	h.onFilesRemoved = fn
 }
 
-func (h *DeleteHandler) filesRemoved() {
+// SetOnPathsChanged sets the function told which storage prefixes a DELETE
+// changed (main.go: the Iceberg scheduler's RequestReconcilePaths, #1727).
+func (h *DeleteHandler) SetOnPathsChanged(fn func(keys []string)) {
+	h.onPathsChanged = fn
+}
+
+// filesRemovedIn reports a DELETE on database/measurement that removed or
+// rewrote files: the caches are cleared, and the measurement's directory is
+// reported as a storage prefix, not as names. On a hub a spoke's data lives
+// under "{spoke}/{db}/", which the export names differently from the
+// request; the scheduler maps the prefix onto the tables it knows.
+func (h *DeleteHandler) filesRemovedIn(database, measurement string) {
 	if h.onFilesRemoved != nil {
 		h.onFilesRemoved()
+	}
+	if h.onPathsChanged != nil && database != "" && measurement != "" {
+		h.onPathsChanged([]string{database + "/" + measurement + "/"})
 	}
 }

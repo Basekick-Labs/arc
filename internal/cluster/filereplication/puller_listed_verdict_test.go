@@ -88,9 +88,14 @@ func (r *verdictRig) recorded(path string) (string, bool) {
 func (r *verdictRig) catchUp(t *testing.T, entries ...*raft.FileEntry) map[string]int64 {
 	t.Helper()
 	r.p.RunCatchUp(context.Background(), sliceFetcher(entries))
-	return waitStats(t, r.p, func(s map[string]int64) bool {
+	waitStats(t, r.p, func(s map[string]int64) bool {
 		return s["inflight_count"] == 0 && s["queue_depth"] == 0
 	})
+	// Stats loads each counter on its own, forced_refresh and the other
+	// outcome counters before inflight_count, so the snapshot that settled can
+	// predate their bump (#1526). Every counter is bumped before the entry
+	// leaves inflight: a snapshot taken now is complete.
+	return r.p.Stats()
 }
 
 const verdictPath = "db/m/2026/10/15/00/v.parquet"

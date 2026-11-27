@@ -68,3 +68,65 @@ func TestContinuousQuerySourceReadExcludesOpenCompactions(t *testing.T) {
 		t.Fatalf("continuous query source read %q does not leave the open compaction's files out", got)
 	}
 }
+
+// tieredFake names some of its keys as files in cold storage, and counts how
+// often it is asked.
+type tieredFake struct {
+	fakeOpenCompactionsPlain
+	cold        []string
+	tiered, old int
+}
+
+func (f *tieredFake) ExcludedTiered(ctx context.Context, prefix string) ([]string, []string) {
+	f.tiered++
+	return f.fakeOpenCompactionsPlain.ExcludedFor(ctx, prefix), f.cold
+}
+
+func (f *tieredFake) ExcludedFor(ctx context.Context, prefix string) []string {
+	f.old++
+	return f.fakeOpenCompactionsPlain.ExcludedFor(ctx, prefix)
+}
+
+// #1825: a file in cold storage is left out by its address there, the name a
+// read over both tiers reports it under; every key keeps its hot address.
+// The keys and which of them are cold come from one call.
+func TestExclusionsNameAColdFileByItsColdAddress1825(t *testing.T) {
+	hot, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cold, err := storage.NewLocalBackend(t.TempDir(), zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const coldKey, hotKey = "db/m/2026/01/05/x_daily.parquet", "db/m/2026/01/06/o_daily.parquet"
+	src := &tieredFake{fakeOpenCompactionsPlain: fakeOpenCompactionsPlain{keys: []string{coldKey, hotKey}}, cold: []string{coldKey}}
+	// Through the combination, as the query handler holds it.
+	oc := CombineOpenCompactions(&fakeOpenCompactionsPlain{keys: []string{"db/m/2026/01/07/c.parquet"}}, src)
+	excl := snapshotOpenCompactions(context.Background(), oc, "db", "m")
+	if src.tiered != 1 || src.old != 0 {
+		t.Fatalf("the source was asked %d time(s) for the tiered answer and %d for the plain one; want once and never", src.tiered, src.old)
+	}
+	if len(excl.keys) != 3 || len(excl.coldKeys) != 1 || excl.coldKeys[0] != coldKey {
+		t.Fatalf("snapshot: %+v", excl)
+	}
+	expr := "read_parquet(['/hot/db/m/**/*.parquet', '/cold/db/m/**/*.parquet'], union_by_name=true)"
+	coldURI, _ := storage.ObjectURI(cold, coldKey)
+	hotOfCold, _ := storage.ObjectURI(hot, coldKey)
+	hotURI, _ := storage.ObjectURI(hot, hotKey)
+	coldOfHot, _ := storage.ObjectURI(cold, hotKey)
+
+	got := excl.apply(hot, cold, expr)
+	for _, want := range []string{"'" + coldURI + "'", "'" + hotOfCold + "'", "'" + hotURI + "'"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("the read %q does not leave out %s", got, want)
+		}
+	}
+	if strings.Contains(got, coldOfHot) {
+		t.Fatalf("a hot file was left out by a cold address too: %q", got)
+	}
+	// With no cold tier there is no cold glob to filter.
+	if got := excl.apply(hot, nil, expr); strings.Contains(got, coldURI) {
+		t.Fatalf("with no cold backend: %q", got)
+	}
+}

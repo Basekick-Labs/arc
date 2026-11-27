@@ -656,6 +656,12 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 		case isStagedCompaction(obj.Path):
 			// A compaction output waiting for its commit is not data; a
 			// committed one is backed up at its own path (see stagedSource).
+		case strings.HasPrefix(obj.Path, rehomeStagedRoot+"/"):
+			// A re-home job's outputs before they are moved into place
+			// (internal/rehome) are not data: the file they replace is. The
+			// API refuses a backup while such a job is in flight, which is
+			// what keeps a backup from holding both a file and the outputs
+			// already moved into place; this only keeps staged files out.
 		case isCompactionState(obj.Path):
 			stateFiles = append(stateFiles, obj)
 		case strings.HasSuffix(obj.Path, ".parquet"):
@@ -980,12 +986,25 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	}
 
 	// ── 3. Copy SQLite metadata, on the DEFAULT leg ─────────────────────
-	// Snapshotted BEFORE the Iceberg warehouse metadata below, on purpose: a
-	// reconcile commit writes a new metadata file and only then points the
-	// catalog row at it, so a catalog snapshotted after the file copy could
-	// reference a file the backup never held (#637). Snapshotting the rows
-	// first means every referenced file already existed, immutable, when its
-	// row was written, and is copied by the passes that follow.
+	// Snapshotted BEFORE the Iceberg warehouse metadata below is LISTED and
+	// copied, on purpose: a reconcile commit writes a new metadata file and
+	// only then points the catalog row at it, so a catalog snapshotted after
+	// the listing could reference a file the backup never held (#637). Both
+	// 3b and 3c list after this snapshot (3b re-lists: the step-1 listing
+	// predates it, and the export keeps committing through the data copy,
+	// #1613), so every METADATA file a snapshotted row references already
+	// existed when the listing ran. Not a consistent cut: the export is not
+	// paused, so the warehouse copied can be AHEAD of the rows (newer
+	// metadata, a newer version hint). A restore adopts forward to the newest
+	// published version (iceberg adoptPublished, every warehouse is
+	// authoritative since #1613). Two gaps remain, both healed after a
+	// restore: a table that commits more than retain_snapshots times between
+	// the listing and the copy of its row's file loses that file to the prune
+	// (a skip; recoverDeadRow moves the row onto the newest version the
+	// backup holds), and Parquet flushed after the step-1 listing is
+	// referenced by the rows and the hint but not in the backup (the next
+	// export pass drops it from the table; directory readers fail on it until
+	// then).
 	//
 	// The default leg, because the SQLite database is instance-wide: it holds
 	// every database's tier rows, the tokens, the continuous queries and the
@@ -1037,8 +1056,31 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	// this group and therefore on the default target. No data is lost (a
 	// restore puts it back at its original key, from the default target); it
 	// is simply not on the routed database's target.
+	//
+	// Re-listed here, after the snapshot (see step 3), when one was taken;
+	// otherwise the step-1 listing serves, as there are no rows to match.
+	// A scoped backup carries none (#1084).
+	// The version hints are copied last, each checked against the v<N>
+	// files listed beside it (copyIcebergHints).
+	if sc.empty() && (run.def.manifest.HasMetadata || run.def.manifest.HasIcebergCatalog) && (len(icebergMetaFiles) > 0 || m.icebergEnabled) {
+		relisted, err := listInRootIcebergMetadata(ctx, objectLister)
+		if err != nil {
+			progress.Status = "failed"
+			progress.Error = err.Error()
+			run.fail(run.def)
+			return nil, fmt.Errorf("failed to list Iceberg warehouse metadata: %w", err)
+		}
+		progress.TotalFiles += int64(len(relisted)) - int64(len(icebergMetaFiles))
+		icebergMetaFiles = relisted
+	}
 	if len(icebergMetaFiles) > 0 {
-		skipped, err := m.copyDataFiles(ctx, run.def, icebergMetaFiles, nil, m.dataStorage, "data storage", "")
+		rest, hints := splitIcebergHints(icebergMetaFiles)
+		skipped, err := m.copyDataFiles(ctx, run.def, rest, nil, m.dataStorage, "data storage", "")
+		if err == nil {
+			var hintSkipped int64
+			hintSkipped, err = m.copyIcebergHints(ctx, run.def, hints, publishedVersionsByDir(rest))
+			skipped += hintSkipped
+		}
 		if err != nil {
 			progress.Status = "failed"
 			progress.Error = err.Error()
@@ -1117,6 +1159,12 @@ func (m *Manager) CreateBackup(ctx context.Context, opts BackupOptions) (*Backup
 	m.recordUnaddressable(run, unaddressable)
 
 	// ── 4. Copy config, on the DEFAULT leg ──────────────────────────────
+	// Info, not Warn: include_config defaults to true, so an install
+	// configured only through the environment would warn on every backup;
+	// startup already warned once (#1466).
+	if opts.IncludeConfig && m.configPath == "" {
+		m.logger.Info().Str("backup_id", backupID).Msg("Backup holds no config: Arc started without a config file")
+	}
 	if opts.IncludeConfig && m.configPath != "" {
 		// The default for a remote target is false, decided at the API layer
 		// from Manager.TargetIsRemote. Reaching here with a remote target
@@ -2580,6 +2628,10 @@ func isStagedCompaction(path string) bool {
 }
 
 const stagedCompactionRoot = "_compaction_staged"
+
+// rehomeStagedRoot is rehome.StagedRoot, repeated here so that this package
+// does not import the DuckDB-backed one; a test holds the two together.
+const rehomeStagedRoot = "_rehome_staged"
 
 // StagedOutputs is a ClusterManifest that knows committed object-store
 // compactions (#1207 d2a2b): the key an output waits at until its finisher

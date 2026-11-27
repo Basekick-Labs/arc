@@ -308,7 +308,11 @@ func TestMeasure_CollapseBenefitAndCost(t *testing.T) {
 			t.Fatalf("remove-only: %v", err)
 		}
 	}
-	if err := r.exp.addFilesMerging(ctx, txn, toAdd, "mydb", "cpu"); err != nil {
+	adds, _, err := r.exp.buildDataFiles(ctx, tbl, toAdd, nil)
+	if err != nil {
+		t.Fatalf("buildDataFiles: %v", err)
+	}
+	if err := r.exp.addFilesMerging(ctx, txn, adds, "mydb", "cpu"); err != nil {
 		t.Fatalf("addFilesMerging: %v", err)
 	}
 	if _, err := txn.Commit(ctx); err != nil {
@@ -392,7 +396,11 @@ func TestMeasure_CollapseCostByTableSize(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if err := r.exp.addFilesMerging(ctx, txn, toAdd, "mydb", "cpu"); err != nil {
+			adds, _, err := r.exp.buildDataFiles(ctx, tbl, toAdd, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := r.exp.addFilesMerging(ctx, txn, adds, "mydb", "cpu"); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := txn.Commit(ctx); err != nil {

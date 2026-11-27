@@ -10,6 +10,7 @@ import (
 	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/ingest"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 )
@@ -113,7 +114,10 @@ func (h *ImportHandler) forwardWriteIfNeeded(c *fiber.Ctx) (bool, error) {
 			h.totalErrors.Add(1)
 			return true, respondImportTooLarge(c)
 		}
-		req, err := BuildHTTPRequest(c)
+		// Built only here, once the import is forwarded (#1629), on the
+		// router's lifetime: a write-class forward needs no cancel of its own.
+		fctx := h.router.Lifetime()
+		req, release, err := BuildHTTPRequest(c, fctx)
 		if err != nil {
 			h.totalErrors.Add(1)
 			h.logger.Error().Err(err).Msg("Failed to build import request for forwarding")
@@ -122,7 +126,9 @@ func (h *ImportHandler) forwardWriteIfNeeded(c *fiber.Ctx) (bool, error) {
 			})
 		}
 
-		resp, err := h.router.RouteImport(c.Context(), req)
+		defer release()
+
+		resp, err := h.router.RouteImport(fctx, req)
 		if err == cluster.ErrLocalNodeCanHandle {
 			break
 		}
@@ -178,6 +184,10 @@ func (h *ImportHandler) RegisterRoutes(app *fiber.App) {
 // Uses the same ArrowBuffer ingest pipeline as streaming LP ingestion.
 func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
+	// x-arc-wait is not supported on imports (#1759).
+	if handled, err := refuseWaitVisible(c); handled {
+		return err
+	}
 	if handled, err := h.forwardWriteIfNeeded(c); handled {
 		return err
 	}
@@ -205,6 +215,10 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
 		})
+	}
+	if storage.IsWarehouseRootName(database) {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": warehouseDatabaseError(database)})
 	}
 
 	if h.arrowBuffer == nil {
@@ -255,10 +269,11 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 		}
 	}
 
-	// Refuse the whole import up front if writes are fenced (#1207) or the
-	// WAL volume is under disk pressure (#676); the admitted context keeps
+	// Refuse the whole import up front if writes are fenced (#1207), the WAL
+	// volume is under disk pressure (#676), or the rows waiting to be flushed
+	// are near ingest.max_buffered_bytes (#1468); the admitted context keeps
 	// pressure that starts part-way from splitting it.
-	writeCtx, release, err := h.arrowBuffer.AdmitRequest(c.Context(), scan.bytes)
+	writeCtx, release, err := h.arrowBuffer.AdmitImport(c.Context(), scan.bytes)
 	if err != nil {
 		h.totalErrors.Add(1)
 		return respondWriteRefused(c, err)
@@ -269,6 +284,9 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 	w, err := newImportWriter(writeCtx, h.arrowBuffer, database)
 	if err != nil {
 		h.totalErrors.Add(1)
+		if ingest.IsWriteRefusal(err) { // every write slot stayed busy (#1429)
+			return respondWriteRefused(c, err)
+		}
 		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "import rejected (retry): " + err.Error()})
 	}
 	defer w.close()
@@ -293,6 +311,10 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 		if errors.Is(err, ingest.ErrColumnTypeChange) {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 		}
+		if errors.Is(err, ingest.ErrLPCellBudget) {
+			h.logger.Warn().Err(err).Str("database", database).Msg("LP import refused")
+			return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": err.Error()})
+		}
 		h.logger.Error().Err(err).Str("database", database).Msg("LP import: failed to write to buffer")
 		// 503 for the two retryable buffer states: nothing of this import
 		// was written (a partial import answered above).
@@ -308,10 +330,12 @@ func (h *ImportHandler) handleLineProtocolImport(c *fiber.Ctx) error {
 	totalRows := w.rows
 	importedMeasurements := w.order
 
-	// Hand what is still buffered to the flush. The rows are in the buffer
-	// and the WAL (when enabled) already; files follow as their flushes
-	// finish, so a 200 does not mean every file is written.
-	if err := h.arrowBuffer.FlushAll(c.Context()); err != nil {
+	// Hand what is still buffered of the import to the flush, its write slot
+	// already free for the next import (#1429). Rows with a WAL copy are
+	// answered for at once, their files following as the flushes finish;
+	// rows without one are answered for once their flushes are done
+	// (#1888).
+	if err := w.finalFlush(c.Context()); err != nil {
 		h.totalErrors.Add(1)
 		h.logger.Error().Err(err).Str("database", database).Msg("LP import: flush failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -403,6 +427,10 @@ func (h *ImportHandler) importErrorResponse(c *fiber.Ctx, err error) error {
 // Uses the same ArrowBuffer ingest pipeline as streaming TLE ingestion.
 func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 	h.totalRequests.Add(1)
+	// x-arc-wait is not supported on imports (#1759).
+	if handled, err := refuseWaitVisible(c); handled {
+		return err
+	}
 	if handled, err := h.forwardWriteIfNeeded(c); handled {
 		return err
 	}
@@ -427,6 +455,10 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
 		})
+	}
+	if storage.IsWarehouseRootName(database) {
+		h.totalErrors.Add(1)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": warehouseDatabaseError(database)})
 	}
 
 	if h.arrowBuffer == nil {
@@ -532,14 +564,18 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 	// Write directly to the ArrowBuffer ingest pipeline (typed path)
 	totalRows := int64(numRecords)
 	// Admit the whole request, its size reserved against the WAL volume's
-	// free space (#676); a fence or disk pressure refuses it here.
-	writeCtx, release, aerr := h.arrowBuffer.AdmitRequest(c.Context(), int64(len(data)))
+	// free space (#676); a fence, disk pressure or the buffered-bytes limit
+	// (#1468) refuses it here.
+	writeCtx, release, aerr := h.arrowBuffer.AdmitImport(c.Context(), int64(len(data)))
 	if aerr != nil {
 		h.totalErrors.Add(1)
 		return respondWriteRefused(c, aerr)
 	}
 	defer release()
-	if err := h.arrowBuffer.WriteTypedColumnarDirect(writeCtx, database, measurement, batch, numRecords); err != nil {
+	// The import's own outcome (#1888): its rows without a WAL copy are
+	// waited for below, and only a failure of those fails it.
+	outcome := &ingest.FlushOutcome{}
+	if err := h.arrowBuffer.WriteTypedColumnarDirect(ingest.WithFlushOutcome(writeCtx, outcome), database, measurement, batch, numRecords); err != nil {
 		h.totalErrors.Add(1)
 		if ingest.IsWriteRefusal(err) {
 			return respondWriteRefused(c, err) // logged by reason (#1268)
@@ -556,8 +592,12 @@ func (h *ImportHandler) handleTLEImport(c *fiber.Ctx) error {
 		})
 	}
 
-	// Force flush to ensure data is persisted before returning
-	if err := h.arrowBuffer.FlushAll(c.Context()); err != nil {
+	// Flush this import's measurement, not the whole node: a node-wide flush
+	// cut every other writer's buffers into small files and failed this
+	// import on any of their flush errors. Then the same wait and verdict as
+	// the other imports (#1888).
+	flushErr := h.arrowBuffer.FlushMeasurements(c.Context(), database, []string{measurement})
+	if err := h.arrowBuffer.ImportVerdict(c.Context(), outcome, database, []string{measurement}, flushErr); err != nil {
 		h.totalErrors.Add(1)
 		h.logger.Error().Err(err).Str("database", database).Msg("TLE import: flush failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{

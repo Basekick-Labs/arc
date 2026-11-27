@@ -81,16 +81,17 @@ func TestCatchUpPullsMissingSelfOriginFile(t *testing.T) {
 func TestCatchUpPullsShortSelfOriginFile(t *testing.T) {
 	backend := newFakeBackend()
 	const path = "testdb/cpu/2026/04/11/15/short.parquet"
-	// A staging file shorter than the manifest size: a pull interrupted
-	// before the restore. Seeded straight into the fake's map — the public
-	// write refuses the reserved staging suffix, as the real backend does —
-	// which is what a crash mid-pull leaves behind. Not "present"; fully
-	// re-pulled.
-	backend.mu.Lock()
-	backend.files[path+".part"] = bytes.Repeat([]byte("y"), 40)
-	backend.mu.Unlock()
 	body := bytes.Repeat([]byte("x"), 100)
-	fetcher := newFakeFetcher(fakeFetchResult{body: body})
+	// A staging file shorter than the manifest size: a pull interrupted
+	// before the restore, so its bytes are a prefix of the file. Seeded
+	// straight into the fake's map — the public write refuses the reserved
+	// staging suffix, as the real backend does — which is what a crash
+	// mid-pull leaves behind. Not "present", so it is pulled; since #397 the
+	// first attempt resumes from the 40 bytes it already has.
+	backend.mu.Lock()
+	backend.files[path+".part"] = append([]byte(nil), body[:40]...)
+	backend.mu.Unlock()
+	fetcher := newResumeAwareFetcher(body)
 	p := newRepullPuller(t, backend, fetcher, selfResolver())
 	p.Start(context.Background())
 	defer p.Stop()
@@ -101,8 +102,81 @@ func TestCatchUpPullsShortSelfOriginFile(t *testing.T) {
 		t.Fatalf("a short self-origin file must be re-pulled: %+v", stats)
 	}
 	got, err := backend.Read(context.Background(), path)
-	if err != nil || len(got) != 100 {
-		t.Fatalf("final file: err=%v len=%d, want 100", err, len(got))
+	if err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("final file: err=%v len=%d, want the 100-byte body", err, len(got))
+	}
+	if off := fetcher.lastOffset(); off != 40 {
+		t.Errorf("fetch offset = %d, want 40 (resume from the staged prefix)", off)
+	}
+}
+
+// A staged file that is not a prefix of this generation fails the full-file
+// checksum the fetcher computes over prefix + tail. Since #397 the first
+// attempt resumes, so this is the path a stale partial takes: the partial is
+// discarded and the same peer is asked again from zero, within the same
+// attempt, and the mismatch is not charged to the peer. A single attempt is
+// enough — with replication_retry_max_attempts = 1 and one candidate, charging
+// it would have logged "no candidate peer holds the checksum" about a healthy
+// peer and marked the copy stale-kept.
+func TestCatchUpPullsShortSelfOriginFileWhosePartialIsStale(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		errs         []error
+		wantPulled   int64
+		wantMismatch int64
+	}{
+		// The peer holds the manifest's bytes: only the partial was wrong.
+		{name: "partial stale", errs: []error{ErrChecksumMismatch}, wantPulled: 1, wantMismatch: 0},
+		// The peer is wrong too: the from-zero mismatch is the peer's.
+		{name: "peer stale too", errs: []error{ErrChecksumMismatch, ErrChecksumMismatch}, wantPulled: 0, wantMismatch: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := newFakeBackend()
+			const path = "testdb/cpu/2026/04/11/15/stale.parquet"
+			backend.mu.Lock()
+			backend.files[path+".part"] = bytes.Repeat([]byte("y"), 40)
+			backend.mu.Unlock()
+			body := bytes.Repeat([]byte("x"), 100)
+			fetcher := newResumeAwareFetcher(body, tc.errs...)
+			p, err := New(Config{
+				SelfNodeID:              selfNode,
+				RepullMissingSelfOrigin: true,
+				Backend:                 backend,
+				Fetcher:                 fetcher,
+				PeerResolver:            selfResolver(),
+				Workers:                 1,
+				QueueSize:               8,
+				RetryMaxAttempts:        1,
+				RetryInitialBackoff:     10 * time.Millisecond,
+				FetchTimeout:            2 * time.Second,
+				Logger:                  zerolog.Nop(),
+			})
+			if err != nil {
+				t.Fatalf("New puller: %v", err)
+			}
+			p.Start(context.Background())
+			defer p.Stop()
+
+			p.RunCatchUp(context.Background(), sliceFetcher([]*raft.FileEntry{makeEntry(path, selfNode, 100)}))
+			stats := waitStats(t, p, func(s map[string]int64) bool { return s["pulled"]+s["failed"] >= 1 })
+			if stats["pulled"] != tc.wantPulled || stats["checksum_mismatch"] != tc.wantMismatch || stats["checksum_mismatch_exhausted"] != tc.wantMismatch {
+				t.Fatalf("pulled=%d checksum_mismatch=%d checksum_mismatch_exhausted=%d, want %d, %d, %d: %+v",
+					stats["pulled"], stats["checksum_mismatch"], stats["checksum_mismatch_exhausted"],
+					tc.wantPulled, tc.wantMismatch, tc.wantMismatch, stats)
+			}
+			fetcher.mu.Lock()
+			offsets := append([]int64(nil), fetcher.offsets...)
+			fetcher.mu.Unlock()
+			if len(offsets) != 2 || offsets[0] != 40 || offsets[1] != 0 {
+				t.Errorf("fetch offsets = %v, want [40 0]: resume, reject, then the same peer from zero", offsets)
+			}
+			if tc.wantPulled == 1 {
+				got, err := backend.Read(context.Background(), path)
+				if err != nil || !bytes.Equal(got, body) {
+					t.Fatalf("final file: err=%v len=%d, want the 100-byte body", err, len(got))
+				}
+			}
+		})
 	}
 }
 

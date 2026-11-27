@@ -123,6 +123,23 @@ type RouterConfig struct {
 	// requests by their signed identity; nil, or false for a peer, forwards
 	// the caller's credential as before (no Raft, or an older peer).
 	PeerForwardIdentity func(nodeID string) bool
+
+	// PeerReadQueries reports whether a peer accepts the forwarded read
+	// routes (CapabilityForwardReadQueries). RouteReadQuery forwards only to
+	// such peers; nil, or no such peer, runs the request locally.
+	PeerReadQueries func(nodeID string) bool
+
+	// PeerDatabaseCreate reports whether a peer accepts a forwarded
+	// POST /api/v1/databases (CapabilityForwardDatabaseCreate).
+	// RouteDatabaseCreate forwards only to such a writer; nil, or a writer
+	// without it, creates the database locally.
+	PeerDatabaseCreate func(nodeID string) bool
+
+	// WriteDialContext, when set, opens the connections of forwarded writes
+	// and imports instead of a net.Dialer; still bounded by
+	// writeForwardDialTimeout. Nil in production (a test seam: writeTransport
+	// replaces Transport's own DialContext).
+	WriteDialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // Router routes requests to appropriate nodes in the cluster.
@@ -130,6 +147,7 @@ type RouterConfig struct {
 type Router struct {
 	cfg          *RouterConfig
 	httpClient   *http.Client
+	streamClient *http.Client // RouteReadQuery: no whole-response timeout
 	writeClient  *http.Client
 	importClient *http.Client
 	logger       zerolog.Logger
@@ -147,6 +165,12 @@ type Router struct {
 	// Active connection counts per node (for least_connections strategy)
 	activeConns   map[string]*atomic.Int64
 	activeConnsMu sync.RWMutex
+
+	// lifetime is the root of every forward's context (Lifetime): it carries
+	// no values and ends at StopForwards (server shutdown), so a forward
+	// never holds the pooled fasthttp request context (#1629).
+	lifetime     context.Context
+	stopForwards context.CancelFunc
 }
 
 // NewRouter creates a new request router.
@@ -182,28 +206,57 @@ func NewRouter(cfg *RouterConfig) *Router {
 			Timeout:   cfg.Timeout,
 			Transport: transport,
 		},
+		// A forwarded Arrow query streams its result for as long as the
+		// query runs: http.Client.Timeout covers reading the body, so
+		// cfg.Timeout (route_timeout, default 5 s) would cut any longer
+		// stream partway (#1567). The caller bounds the request with its
+		// context instead (the query timeout).
+		streamClient: &http.Client{
+			Transport: transport,
+		},
 		writeClient: &http.Client{
 			Timeout:   cfg.WriteTimeout,
-			Transport: writeTransport(transport),
+			Transport: writeTransport(transport, cfg.WriteDialContext),
 		},
 		// Not the write timeout: a local import has no server-side bound,
 		// and a 500 MB import can outlast any write timeout. A 504 while the
 		// writer is still importing would invite a re-run that duplicates
 		// rows (#1070). ImportTimeout is only a backstop: a forward is not
-		// cancelled when its client gives up (fasthttp ends a request's
-		// context only at shutdown), so without it a writer that never
+		// cancelled when its client gives up (its context, rooted on
+		// Lifetime, ends only at shutdown), so without it a writer that never
 		// answers would hold this node's goroutine, connection and upload.
 		// Dial and TLS handshake stay bounded; TCP keepalive ends a
 		// connection to a writer that vanished, but only after minutes.
 		importClient: &http.Client{
 			Timeout:   cfg.ImportTimeout,
-			Transport: writeTransport(transport),
+			Transport: writeTransport(transport, cfg.WriteDialContext),
 		},
 		logger:      cfg.Logger.With().Str("component", "cluster-router").Logger(),
 		activeConns: make(map[string]*atomic.Int64),
 	}
+	r.lifetime, r.stopForwards = context.WithCancel(context.Background())
 
 	return r
+}
+
+// Lifetime is the context every forward from this router is rooted on
+// (api.forwardContext): it carries no request state and ends at
+// StopForwards. Nil-safe.
+func (r *Router) Lifetime() context.Context {
+	if r == nil || r.lifetime == nil {
+		return context.Background()
+	}
+	return r.lifetime
+}
+
+// StopForwards cancels every forward in flight and every later one: called
+// when the HTTP server starts shutting down (api.Server.OnShutdownStart), as
+// the request context of a forward used to end then. Nil-safe, idempotent.
+func (r *Router) StopForwards() {
+	if r == nil || r.stopForwards == nil {
+		return
+	}
+	r.stopForwards()
 }
 
 // RouteWrite routes a write request to an appropriate writer node.
@@ -220,6 +273,33 @@ func (r *Router) RouteWrite(ctx context.Context, req *http.Request) (*http.Respo
 	writer, err := r.writeTarget()
 	if err != nil {
 		return nil, err
+	}
+	return r.ForwardWriteTo(ctx, writer, req)
+}
+
+// RouteDatabaseCreate forwards POST /api/v1/databases from a node that does
+// not ingest (a reader or compactor) to the writer RouteWrite would pick, so
+// the database is created where its writes land. Only to a writer that
+// advertises CapabilityForwardDatabaseCreate: an older one would refuse the
+// forwarded identity on that route, so ErrNoCapablePeer tells the caller to
+// create it locally, as before. The target is not shopped for: a write goes
+// to the primary for a reason. Sent once, never retried (ForwardWriteTo).
+//
+// With a primary designated but not reachable (a failover window),
+// writeTarget falls back to any healthy writer, which may be a standby. A
+// write sent there is fenced and retried; a create is not, and the standby
+// would create the database on its own storage, the very node it should not
+// be on. So a create waits for the primary: ErrNoWriterAvailable (503).
+func (r *Router) RouteDatabaseCreate(ctx context.Context, req *http.Request) (*http.Response, error) {
+	writer, err := r.writeTarget()
+	if err != nil {
+		return nil, err
+	}
+	if r.cfg.Designated != nil && r.cfg.Designated() != "" && r.designatedWriter() == nil {
+		return nil, ErrNoWriterAvailable
+	}
+	if r.cfg.PeerDatabaseCreate == nil || !r.cfg.PeerDatabaseCreate(writer.ID) {
+		return nil, ErrNoCapablePeer
 	}
 	return r.ForwardWriteTo(ctx, writer, req)
 }
@@ -364,10 +444,19 @@ const IngestFencedResponseHeader = "X-Arc-Ingest-Fenced"
 // nothing written" quickly, not after the whole write timeout.
 const writeForwardDialTimeout = 5 * time.Second
 
-// writeTransport is base with dial and TLS handshake timeouts.
-func writeTransport(base *http.Transport) *http.Transport {
+// writeTransport is base with dial and TLS handshake timeouts. dial, when
+// set, replaces the net.Dialer (RouterConfig.WriteDialContext) under the same
+// dial timeout.
+func writeTransport(base *http.Transport, dial func(ctx context.Context, network, addr string) (net.Conn, error)) *http.Transport {
 	t := base.Clone()
 	t.DialContext = (&net.Dialer{Timeout: writeForwardDialTimeout, KeepAlive: 30 * time.Second}).DialContext
+	if dial != nil {
+		t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			ctx, cancel := context.WithTimeout(ctx, writeForwardDialTimeout)
+			defer cancel()
+			return dial(ctx, network, addr)
+		}
+	}
 	t.TLSHandshakeTimeout = writeForwardDialTimeout
 	return t
 }
@@ -455,6 +544,71 @@ func (r *Router) RouteQuery(ctx context.Context, req *http.Request) (*http.Respo
 	return r.forwardRequest(ctx, reader, req)
 }
 
+type forwardTargetHookKey struct{}
+
+// WithForwardTargetHook returns a context whose forwards report the node they
+// are sent to, before the request goes out: a caller tracking a forward (the
+// query registry's forwarded_to) learns the target while the peer is still
+// working, not only once its answer starts.
+func WithForwardTargetHook(ctx context.Context, hook func(nodeID string)) context.Context {
+	return context.WithValue(ctx, forwardTargetHookKey{}, hook)
+}
+
+// ErrNoCapablePeer reports that the cluster has nodes that could serve a
+// request but none advertises the capability to accept it forwarded
+// (CapabilityForwardReadQueries for RouteReadQuery,
+// CapabilityForwardDatabaseCreate for RouteDatabaseCreate; a rolling
+// upgrade): the caller answers the request itself rather than send it to a
+// peer that would refuse it. With no node to serve it at all, the route
+// returns ErrNoReaderAvailable or ErrNoWriterAvailable instead, which the
+// caller answers 503.
+var ErrNoCapablePeer = errors.New("no peer accepts this forwarded request")
+
+// RouteReadQuery forwards a read that a node which cannot serve queries
+// received (#1567 and its follow-up): /query/arrow, /query/estimate,
+// GET /query/:measurement, the measurements listing and schema, and the
+// databases listings. It forwards only to peers that advertise
+// CapabilityForwardReadQueries, and it uses streamClient, which has no
+// whole-response timeout: the caller bounds the request with ctx. The caller
+// must close the response body.
+func (r *Router) RouteReadQuery(ctx context.Context, req *http.Request) (*http.Response, error) {
+	if r.cfg.LocalNode != nil && r.cfg.LocalNode.Role.GetCapabilities().CanQuery {
+		return nil, ErrLocalNodeCanHandle
+	}
+	capable := func(nodes []*Node) []*Node {
+		if r.cfg.PeerReadQueries == nil {
+			return nil
+		}
+		out := make([]*Node, 0, len(nodes))
+		for _, n := range nodes {
+			if r.cfg.PeerReadQueries(n.ID) {
+				out = append(out, n)
+			}
+		}
+		return out
+	}
+	// Readers first; writers only when there are no readers at all, as
+	// RouteQuery does. Readers that all lack the capability (a rolling
+	// upgrade that reached a writer first) do not send the request to the
+	// writer: it is answered locally instead.
+	candidates := r.cfg.Registry.GetReaders()
+	if len(candidates) == 0 {
+		candidates = r.cfg.Registry.GetWriters()
+	}
+	if len(candidates) == 0 {
+		return nil, ErrNoReaderAvailable
+	}
+	nodes := capable(candidates)
+	if len(nodes) == 0 {
+		return nil, ErrNoCapablePeer
+	}
+	node := r.selectNode(nodes)
+	if node == nil {
+		return nil, ErrNoCapablePeer
+	}
+	return r.forwardRequestWith(ctx, r.streamClient, node, req)
+}
+
 // selectNode selects a node from the list based on the configured strategy.
 func (r *Router) selectNode(nodes []*Node) *Node {
 	if len(nodes) == 0 {
@@ -506,6 +660,11 @@ func (r *Router) selectLeastConnections(nodes []*Node) *Node {
 
 // forwardRequest forwards an HTTP request to the specified node.
 func (r *Router) forwardRequest(ctx context.Context, node *Node, req *http.Request) (*http.Response, error) {
+	return r.forwardRequestWith(ctx, r.httpClient, node, req)
+}
+
+// forwardRequestWith is forwardRequest with the client chosen by the caller.
+func (r *Router) forwardRequestWith(ctx context.Context, client *http.Client, node *Node, req *http.Request) (*http.Response, error) {
 	var lastErr error
 
 	for attempt := 0; attempt <= r.cfg.Retries; attempt++ {
@@ -516,7 +675,7 @@ func (r *Router) forwardRequest(ctx context.Context, node *Node, req *http.Reque
 				Msg("Retrying request forward")
 		}
 
-		resp, err := r.doForward(ctx, r.httpClient, node, req)
+		resp, err := r.doForward(ctx, client, node, req)
 		if err == nil {
 			return resp, nil
 		}
@@ -594,6 +753,9 @@ func (r *Router) doForward(ctx context.Context, client *http.Client, node *Node,
 	}
 
 	// Execute the request
+	if hook, ok := ctx.Value(forwardTargetHookKey{}).(func(string)); ok && hook != nil {
+		hook(node.ID)
+	}
 	start := time.Now()
 	resp, err := client.Do(forwardReq)
 	elapsed := time.Since(start)

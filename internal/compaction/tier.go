@@ -2,6 +2,7 @@ package compaction
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -70,6 +71,13 @@ type Candidate struct {
 	// upstream). False for every candidate a tier discovers itself.
 	SyncExempt bool
 
+	// Settled marks a daily candidate for a settled day with fewer
+	// hour-level files than the tier's MinFiles (#1774): its Files are those
+	// hour-level files only, never an existing daily file, and one file is
+	// enough to compact. Without it such a day never gets a daily file, and
+	// tiering only moves daily files to cold. See DailyTier.settledCandidate.
+	Settled bool
+
 	// BatchNumber and TotalBatches are 1-based and always set by
 	// SplitCandidateIntoBatches, including for a partition that fits in a
 	// single batch (1 of 1). Job and output-file identifiers incorporate
@@ -78,6 +86,43 @@ type Candidate struct {
 	// (not via SplitCandidateIntoBatches) leaves these at 0.
 	BatchNumber  int // 1-based batch index within the partition
 	TotalBatches int // Total number of batches for this partition
+}
+
+// maxSettledCandidatesPerCycle caps how many settled-day candidates (#1774)
+// one cycle starts, per tier: days, not batches, since a day with many
+// stragglers next to its daily file (#1775) splits into several. They run
+// after the tier's regular candidates; the rest wait for the next cycle. The
+// first cycle after an upgrade can find one for every old day of every sparse
+// measurement.
+// maxSettledCandidatesCollected bounds how many a cycle holds while it
+// discovers, so candidates the filters defer do not use up the cap.
+const (
+	maxSettledCandidatesPerCycle  = 500
+	maxSettledCandidatesCollected = 10 * maxSettledCandidatesPerCycle
+)
+
+// minFilesFor is the file count a candidate must keep after a filter drops
+// some of its files: the tier's MinFiles, or 1 for a settled day (#1774).
+func minFilesFor(c Candidate, t Tier) int {
+	if c.Settled {
+		return 1
+	}
+	return t.GetMinFiles()
+}
+
+// singleFileJob reports whether a job of exactly these files may run with one
+// input. Only a settled-day candidate may, and only when that file is not
+// already a daily output: a regular candidate shrunk to its lone existing
+// daily file by a filter would otherwise be rewritten into an identical
+// daily file every cycle (#1774). Every other job needs MinFilesPerBatch.
+func singleFileJob(c Candidate, files []string) bool {
+	return c.Settled && len(files) == 1 && !isDailyOutput(files[0])
+}
+
+// isDailyOutput reports whether a storage key names a daily compaction
+// output, DELETE rewrites included.
+func isDailyOutput(key string) bool {
+	return strings.HasSuffix(storage.StripRewriteSuffix(key), "_daily.parquet")
 }
 
 // SplitCandidateIntoBatches splits a candidate with many files into multiple candidates,
@@ -149,7 +194,10 @@ func SplitCandidateIntoBatches(c Candidate, maxFilesPerBatch int) []Candidate {
 			// Selective constructor: SyncExempt must ride along, or batch
 			// 2+ of a spoke-namespace partition would hit the delivery gate
 			// the whole candidate was exempted from (#619).
-			SyncExempt:   c.SyncExempt,
+			SyncExempt: c.SyncExempt,
+			// Settled too: a batch that lost it would be held to the
+			// tier's MinFiles and the two-file floor again (#1774).
+			Settled:      c.Settled,
 			BatchNumber:  i + 1,
 			TotalBatches: numBatches,
 		}
@@ -217,6 +265,48 @@ type BaseTier struct {
 
 	Logger zerolog.Logger
 	mu     sync.Mutex
+
+	// exclude names files the tier does not see at all (SetExclude).
+	exclude func(path string) bool
+}
+
+// SetExclude gives the tier a test for files it must treat as absent when it
+// groups a listing into candidates: the files compaction leaves alone as
+// misfiled (misfiled.go). They are dropped before a partition is classified,
+// so a day is judged on the files a job could take: one whose other files
+// are fewer than daily_min_files is a settled day and gets its daily file
+// (#1774), where judged with the refused file it would be a regular
+// candidate that a later filter turns down every cycle.
+func (t *BaseTier) SetExclude(fn func(path string) bool) {
+	t.mu.Lock()
+	t.exclude = fn
+	t.mu.Unlock()
+}
+
+// withoutExcluded returns objects less the files SetExclude names.
+func (t *BaseTier) withoutExcluded(objects []string) []string {
+	t.mu.Lock()
+	fn := t.exclude
+	t.mu.Unlock()
+	if fn == nil {
+		return objects
+	}
+	var kept []string
+	for i, o := range objects {
+		if fn(o) {
+			if kept == nil {
+				kept = append(make([]string, 0, len(objects)), objects[:i]...)
+			}
+			continue
+		}
+		if kept != nil {
+			kept = append(kept, o)
+		}
+	}
+	if kept == nil {
+		return objects
+	}
+	return kept
 }
 
 // BaseTierConfig holds configuration for creating a base tier
@@ -305,7 +395,11 @@ func (t *BaseTier) ShouldCompactByFileSuffix(
 		return true
 	}
 
-	// Case 2: Has compacted files, but many new uncompacted files accumulated
+	// Case 2: Has compacted files, but many new uncompacted files accumulated.
+	// The job rewrites the compacted files with the new ones. The daily tier
+	// keeps this only for days younger than daily_skip_file_age_check_days;
+	// an older day folds its stragglers into an additional daily file
+	// instead (DailyTier.foldsSeparately, #1775).
 	if len(compactedFiles) > 0 && len(uncompactedFiles) >= t.MinFiles {
 		t.Logger.Debug().
 			Int("compacted", len(compactedFiles)).

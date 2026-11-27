@@ -44,7 +44,7 @@ func (b *LocalBackend) Sync(ctx context.Context, key string) error {
 func (b *LocalBackend) syncDirs(dir string) error {
 	root := filepath.Clean(b.basePath)
 	for {
-		if err := syncPath(dir); err != nil {
+		if err := b.syncDir(dir); err != nil {
 			return err
 		}
 		if dir == root || len(dir) <= len(root) {
@@ -76,17 +76,32 @@ func (b *LocalBackend) MoveObject(ctx context.Context, src, dst string) error {
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("refusing to move %s: not a regular file", src)
 	}
-	if err := b.ensureDir(filepath.Dir(dstPath)); err != nil {
+	dstDir := filepath.Dir(dstPath)
+	if err := b.ensureDir(dstDir); err != nil {
 		return err
 	}
 	if err := renameFile(srcPath, dstPath); err != nil {
-		return fmt.Errorf("failed to move %s to %s: %w", src, dst, err)
+		if !dirGone(err) {
+			return fmt.Errorf("failed to move %s to %s: %w", src, dst, err)
+		}
+		// dst's directory was removed under us: an empty partition
+		// directory that tiering's cleanup can take while the output moving
+		// in is still wanted (#1804). Recreate it and retry once, as Write
+		// does. ENOENT can also mean the source went; the retry then fails
+		// the same way.
+		b.forgetDir(dstDir)
+		if err := b.ensureDir(dstDir); err != nil {
+			return err
+		}
+		if err := renameFile(srcPath, dstPath); err != nil {
+			return fmt.Errorf("failed to move %s to %s after re-creating its directory: %w", src, dst, err)
+		}
 	}
 	if err := b.syncDirs(filepath.Dir(dstPath)); err != nil {
 		return err
 	}
 	if filepath.Dir(srcPath) != filepath.Dir(dstPath) {
-		if err := syncPath(filepath.Dir(srcPath)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := b.syncDir(filepath.Dir(srcPath)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
@@ -111,6 +126,7 @@ func (b *LocalBackend) RemoveAll(ctx context.Context, key string) error {
 			delete(b.dirCache, d)
 		}
 	}
+	b.dirGen++
 	b.dirMu.Unlock()
 	return nil
 }

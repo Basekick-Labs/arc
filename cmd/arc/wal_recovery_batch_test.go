@@ -83,6 +83,7 @@ func testTrackedRowRecoveryParquetRestart(t *testing.T, count, firstLimit, retry
 	require.Equal(t, 1, w.PendingUnflushedCount())
 	proof, err := w.CurrentCheckpointHashes()
 	require.NoError(t, err)
+	proof = withoutFlushIntents(proof) // the replay flush's intent (#1646)
 	require.NotContains(t, proof, ids[0], "partial flush checkpointed the whole entry")
 	require.Len(t, proof, 1)
 	parent, start, end, ok := wal.ParseRecoveryRowIdentity(proof[0])
@@ -172,4 +173,15 @@ func TestTrackedRowRecoveryValidatesBeforeBatching(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 1, stats.KeptFiles)
 	}
+}
+
+// withoutFlushIntents drops flush intents (#1646) from checkpoint identities.
+func withoutFlushIntents(ids []string) []string {
+	var out []string
+	for _, id := range ids {
+		if _, ok := wal.ParseFlushIntent(id); !ok {
+			out = append(out, id)
+		}
+	}
+	return out
 }

@@ -24,7 +24,12 @@ const DefaultQueryCacheMaxSize = DefaultSQLTransformCacheMaxSize
 // sqlTransformCacheEntry represents a cached transformed SQL with expiration
 type sqlTransformCacheEntry struct {
 	transformed string
+	metadata    []string
 	expiresAt   time.Time
+	// stale, when set, is asked on every read: true makes the entry a miss.
+	// It lets the owner tie an entry to state the key cannot name (which
+	// measurements the transform read is known only after it ran).
+	stale func() bool
 }
 
 // cacheShard is a single shard of the cache with its own lock
@@ -103,6 +108,13 @@ func (c *SQLTransformCache) shardFor(key string) *cacheShard {
 
 // Get retrieves a cached transformed SQL if it exists and hasn't expired
 func (c *SQLTransformCache) Get(sql string) (string, bool) {
+	transformed, _, ok := c.GetWithMetadata(sql)
+	return transformed, ok
+}
+
+// GetWithMetadata retrieves a cached transformed SQL and the metadata stored
+// with it. The metadata is the cache's own: callers must not modify it.
+func (c *SQLTransformCache) GetWithMetadata(sql string) (string, []string, bool) {
 	shard := c.shardFor(sql)
 
 	shard.mu.RLock()
@@ -111,20 +123,36 @@ func (c *SQLTransformCache) Get(sql string) (string, bool) {
 
 	if !ok {
 		c.misses.Add(1)
-		return "", false
+		return "", nil, false
 	}
 
-	if time.Now().After(entry.expiresAt) {
+	if time.Now().After(entry.expiresAt) || (entry.stale != nil && entry.stale()) {
 		c.misses.Add(1)
-		return "", false
+		return "", nil, false
 	}
 
 	c.hits.Add(1)
-	return entry.transformed, true
+	return entry.transformed, entry.metadata, true
 }
 
 // Set stores a transformed SQL in the cache
 func (c *SQLTransformCache) Set(sql, transformed string) {
+	c.SetWithMetadata(sql, transformed, nil)
+}
+
+// SetWithMetadata stores transformed SQL with immutable metadata that remains
+// associated with the transform on cache hits.
+func (c *SQLTransformCache) SetWithMetadata(sql, transformed string, metadata []string) {
+	c.SetWithMetadataCheck(sql, transformed, metadata, nil)
+}
+
+// SetWithMetadataCheck is SetWithMetadata with a staleness check: stale is
+// called on every read of the entry, and a true answer makes the entry a
+// miss. It is also called while the shard is locked, when a full shard looks
+// for entries to evict, so it must not call back into the cache; it must be
+// cheap and safe to call from any goroutine. nil means the entry only
+// expires.
+func (c *SQLTransformCache) SetWithMetadataCheck(sql, transformed string, metadata []string, stale func() bool) {
 	shard := c.shardFor(sql)
 
 	shard.mu.Lock()
@@ -135,14 +163,17 @@ func (c *SQLTransformCache) Set(sql, transformed string) {
 		maxPerShard = 1
 	}
 
-	// Check if we need to evict entries from this shard
-	if len(shard.entries) >= maxPerShard {
+	// Check if we need to evict entries from this shard. Replacing an entry
+	// that is already there never grows the shard, so it is always allowed:
+	// otherwise a stale entry in a full shard could not be refreshed, and its
+	// statement would be transformed again on every query until it expired.
+	if _, replacing := shard.entries[sql]; !replacing && len(shard.entries) >= maxPerShard {
 		// Probabilistic eviction: only check up to 10 random entries
 		// This avoids O(n) scan of entire map while holding lock
 		now := time.Now()
 		evicted := 0
 		for key, entry := range shard.entries {
-			if now.After(entry.expiresAt) {
+			if now.After(entry.expiresAt) || (entry.stale != nil && entry.stale()) {
 				delete(shard.entries, key)
 				evicted++
 				if evicted >= 10 {
@@ -161,7 +192,9 @@ func (c *SQLTransformCache) Set(sql, transformed string) {
 
 	shard.entries[sql] = sqlTransformCacheEntry{
 		transformed: transformed,
+		metadata:    append([]string(nil), metadata...),
 		expiresAt:   time.Now().Add(c.ttl),
+		stale:       stale,
 	}
 	shard.mu.Unlock()
 }

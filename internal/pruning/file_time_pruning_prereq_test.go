@@ -2,6 +2,7 @@ package pruning
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -65,7 +66,7 @@ func TestFileTimePruningDeclinedPassIsNotCachedAndIsCounted(t *testing.T) {
 	if !vol.Volatile {
 		t.Error("a declined live-hour pass must mark the result volatile for the SQL transform cache")
 	}
-	if _, _, ok := p.partitionCache.get(p.partitionCache.cacheKey(glob, sql, p.CacheEpoch(sql))); ok {
+	if _, _, ok := p.partitionCache.get(p.partitionCache.cacheKey(glob, sha256.Sum256([]byte(sql)), p.CacheEpoch(sql))); ok {
 		t.Error("a declined live-hour pass was cached; the next query could have expanded")
 	}
 	after := m.Snapshot()

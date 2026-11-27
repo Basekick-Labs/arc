@@ -128,6 +128,21 @@ type StatusResponse struct {
 	// until a scan completes (#1154).
 	LastScan   *ScanResult `json:"last_scan,omitempty"`
 	LastScanAt *time.Time  `json:"last_scan_at,omitempty"`
+	// ColdMetadata says whether this node's cold tier rows are a complete
+	// record of the cold store. Only when they are does a read whose cold
+	// listing failed answer from hot data for a range with no cold rows;
+	// otherwise that read fails (#1550). Absent without a cold tier.
+	ColdMetadata *ColdMetadataStatus `json:"cold_metadata,omitempty"`
+	// ColdMissingObjects is the last check of cold rows whose object is gone
+	// from cold storage (#1551). Absent without a usable cold tier, before
+	// the first cold sync, and on a cluster reader (#1563).
+	ColdMissingObjects *ColdMissingObjectsStatus `json:"cold_missing_objects,omitempty"`
+}
+
+// ColdMetadataStatus is StatusResponse.ColdMetadata.
+type ColdMetadataStatus struct {
+	Authoritative bool   `json:"authoritative"`
+	Reason        string `json:"reason,omitempty"`
 }
 
 // TierEventCounts is the drainer's tally for StatusResponse.

@@ -205,7 +205,7 @@ func TestValidateSQL_QuotedIdentifierReplacementScans(t *testing.T) {
 	}
 	for _, tt := range reject {
 		t.Run("reject "+tt.name, func(t *testing.T) {
-			if err := ValidateSQLRequest(tt.sql); err == nil {
+			if err := validateSQLErr(tt.sql); err == nil {
 				t.Errorf("accepted: %s", tt.sql)
 			}
 		})
@@ -220,7 +220,7 @@ func TestValidateSQL_QuotedIdentifierReplacementScans(t *testing.T) {
 	}
 	for _, tt := range allow {
 		t.Run("allow "+tt.name, func(t *testing.T) {
-			if err := ValidateSQLRequest(tt.sql); err != nil {
+			if err := validateSQLErr(tt.sql); err != nil {
 				t.Errorf("rejected legal SQL %q: %v", tt.sql, err)
 			}
 		})

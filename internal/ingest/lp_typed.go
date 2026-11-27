@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -199,6 +200,37 @@ type lpColumn struct {
 	n     int
 }
 
+// grow makes room for n values in one allocation.
+func (c *lpColumn) grow(n int) {
+	switch c.kind {
+	case LPKindInt:
+		c.ints = growTo(c.ints, n)
+	case LPKindFloat:
+		c.flts = growTo(c.flts, n)
+	case LPKindString:
+		c.strs = growTo(c.strs, n)
+	case LPKindBool:
+		c.bools = growTo(c.bools, n)
+	}
+	if c.valid != nil {
+		c.valid = growTo(c.valid, n)
+	}
+}
+
+func growTo[T any](v []T, n int) []T {
+	if cap(v) >= n {
+		return v
+	}
+	out := make([]T, len(v), n)
+	copy(out, v)
+	return out
+}
+
+// release drops the column's data, which the batch now holds.
+func (c *lpColumn) release() {
+	c.ints, c.flts, c.strs, c.bools = nil, nil, nil, nil
+}
+
 // pad fills the rows before row with NULL.
 func (c *lpColumn) pad(row int) {
 	for c.n < row {
@@ -306,6 +338,7 @@ type lpMeasurement struct {
 	time []int64
 	cols map[string]*lpColumn
 	hint int // capacity of a new column
+	keys int // keys seen, NULL-only ones included: the columns finish builds
 	// folds maps each column's FoldColumnName to its spelling (#1342).
 	folds map[string]string
 }
@@ -365,6 +398,84 @@ func (p *LineProtocolParser) ParseLPWriteKnown(data []byte, precision string, kn
 // lpMaxColumnHint bounds the rows a new column reserves up front.
 const lpMaxColumnHint = 1 << 16
 
+// A batch is built dense: every column of a measurement holds a value or a
+// NULL for every row, so a column first seen at a late row is padded back to
+// the first. A write in which each point brings a new tag or field key builds
+// rows x rows cells from a body linear in rows: a few hundred KB held over a
+// GB. The empty cells a write may build are bounded by the cells it fills:
+// lpMinPaddingCells, or lpPaddingPerFilled per filled cell if that is more.
+// A filled cell is a value the body carried, so a write's padding costs at
+// most a few times what the same write would cost dense, however its body is
+// padded or compressed; a bound on the body's size is not one, as blank lines
+// and long values compress to nothing. A dense write pads nothing, and a
+// sparse one is admitted down to columns about 11% filled past the floor.
+var (
+	lpMinPaddingCells  int64 = 4 << 20
+	lpPaddingPerFilled int64 = 8
+)
+
+// overPadded reports whether padding (empty cells, plus capacity reserved and
+// not yet filled) is over the bound for filled cells.
+func overPadded(padding, filled int64) bool {
+	return padding > max(lpMinPaddingCells, lpPaddingPerFilled*filled)
+}
+
+// ErrLPCellBudget refuses a write whose points would build more cells than
+// its body allows (see lpMinCellBudget).
+var ErrLPCellBudget = errors.New("write refused: its points carry so many different tag and field keys that the batch would hold too many empty cells; send points with different keys in separate writes, or as separate measurements")
+
+// CheckDenseCells refuses, with ErrLPCellBudget, records whose dense batches
+// would hold more empty cells than their values allow (see
+// lpMinPaddingCells), counted across all of them. It reads what
+// BatchToColumnar and rowsToColumnar will build, before they allocate.
+func CheckDenseCells(records []*models.Record) error {
+	rows := map[string]int64{}
+	tags := map[string]map[string]struct{}{}
+	for _, r := range records {
+		rows[r.Measurement]++
+		set := tags[r.Measurement]
+		if set == nil {
+			set = map[string]struct{}{}
+			tags[r.Measurement] = set
+		}
+		for k := range r.Tags {
+			set[k] = struct{}{}
+		}
+	}
+	// A field named like a tag of any record of its measurement is written to
+	// "<name>_value", as the converters do.
+	cols := map[string]map[string]struct{}{}
+	var filled int64
+	for _, r := range records {
+		set := cols[r.Measurement]
+		if set == nil {
+			set = map[string]struct{}{}
+			for k := range tags[r.Measurement] {
+				set[k] = struct{}{}
+			}
+			cols[r.Measurement] = set
+		}
+		filled += int64(len(r.Tags))
+		for k, v := range r.Fields {
+			if _, isTag := tags[r.Measurement][k]; isTag {
+				k += "_value"
+			}
+			set[k] = struct{}{}
+			if v != nil {
+				filled++
+			}
+		}
+	}
+	var cells int64
+	for m, n := range rows {
+		cells += n * int64(len(cols[m]))
+	}
+	if overPadded(cells-filled, filled) {
+		return ErrLPCellBudget
+	}
+	return nil
+}
+
 type lpDropKey struct{ measurement, column, reason string }
 
 // lpPoint is one point for lpBuilder: its tags, and its fields with the
@@ -403,6 +514,15 @@ type lpBuilder struct {
 	knownBy  map[string]map[string]string
 	newCols  []string          // fits' scratch: the point's new columns
 	newFolds map[string]string // fits' scratch: their folds, cleared per point
+	// cells is rows x keys summed over the measurements built so far, NULL-
+	// only keys included: what finish pads every column to; filled is the
+	// cells given a value. resCols columns of resM reserved resHint rows
+	// each on its first row. budget bounds the empty cells plus the unused
+	// reservation by filled (overPadded).
+	cells, filled    int64
+	resCols, resHint int64
+	resM             *lpMeasurement
+	budget           bool
 }
 
 func newLPBuilder(kinds map[string]map[string]LPKind, hint int) *lpBuilder {
@@ -425,6 +545,37 @@ func (b *lpBuilder) drop(measurement, column, reason string, kind LPKind, v inte
 	d.Points++
 }
 
+// unusedReserved is the capacity first-row columns reserved and the rows so
+// far have not reached.
+func (b *lpBuilder) unusedReserved() int64 {
+	if b.resM == nil {
+		return 0
+	}
+	return b.resCols * max(0, b.resHint-int64(len(b.resM.time)))
+}
+
+// addCells counts n more cells, refusing a write over its padding bound.
+func (b *lpBuilder) addCells(n int64) error {
+	b.cells += n
+	if b.budget && overPadded(b.cells-b.filled+b.unusedReserved(), b.filled) {
+		return ErrLPCellBudget
+	}
+	return nil
+}
+
+// newKey counts a key m has not seen, as a value's column or as a NULL-only
+// one: a cell in every row so far, the current one included.
+func (b *lpBuilder) newKey(m *lpMeasurement) error {
+	m.keys++
+	return b.addCells(int64(len(m.time)))
+}
+
+// isNullOnly reports whether column of measurement has had only NULLs.
+func (b *lpBuilder) isNullOnly(measurement, column string) bool {
+	_, ok := b.nullCols[measurement][column]
+	return ok
+}
+
 // add adds p as one row of its measurement, or (infer mode) drops it.
 func (b *lpBuilder) add(p *lpPoint) error {
 	m := b.ms[p.measurement]
@@ -439,9 +590,19 @@ func (b *lpBuilder) add(p *lpPoint) error {
 	}
 	row := len(m.time)
 	m.time = append(m.time, p.ts)
+	// The row is a cell in every column the measurement has; a new column
+	// below is a cell in every row so far.
+	if err := b.addCells(int64(m.keys)); err != nil {
+		return err
+	}
 	col := func(name string, tag bool, v interface{}) (*lpColumn, error) {
 		c := m.cols[name]
 		if c == nil {
+			if !b.isNullOnly(p.measurement, name) {
+				if err := b.newKey(m); err != nil {
+					return nil, err
+				}
+			}
 			k := LPKindString
 			switch {
 			case tag:
@@ -453,7 +614,18 @@ func (b *lpBuilder) add(p *lpPoint) error {
 			if k == LPKindNone {
 				return nil, fmt.Errorf("measurement %q column %q has no kind", p.measurement, name)
 			}
-			c = newLPColumn(k, tag, m.hint)
+			// Only a column of the first row is reserved for the body: one
+			// first seen later is padded to its row and grows by append, so a
+			// sparse key reserves nothing it does not fill.
+			// The reservation counts against the budget too: a first row
+			// with many keys would otherwise reserve keys x body rows.
+			hint := 0
+			if row == 0 && m.hint > 0 && (!b.budget || !overPadded(b.cells-b.filled+b.unusedReserved()+int64(m.hint), b.filled)) {
+				hint = m.hint
+				b.resM, b.resHint = m, int64(m.hint)
+				b.resCols++
+			}
+			c = newLPColumn(k, tag, hint)
 			m.cols[name] = c
 			m.folds[FoldColumnName(name)] = name
 		}
@@ -468,10 +640,17 @@ func (b *lpBuilder) add(p *lpPoint) error {
 		if err := c.set(row, t.Value); err != nil {
 			return fmt.Errorf("measurement %q column %q: %w", p.measurement, t.Key, err)
 		}
+		b.filled++
 	}
 	for i, f := range p.fields {
 		name := p.cols[i]
 		if f.Value == nil {
+			// finish builds a NULL-only column too, padded to every row.
+			if m.cols[name] == nil && !b.isNullOnly(p.measurement, name) {
+				if err := b.newKey(m); err != nil {
+					return err
+				}
+			}
 			b.nullColumn(p.measurement, name) // a NULL: the row's cell stays empty
 			if k := FoldColumnName(name); m.folds[k] == "" {
 				m.folds[k] = name // a later twin of a NULL-only column is one too (#1342)
@@ -485,6 +664,7 @@ func (b *lpBuilder) add(p *lpPoint) error {
 		if err := c.set(row, f.Value); err != nil {
 			return fmt.Errorf("measurement %q column %q: %w", p.measurement, name, err)
 		}
+		b.filled++
 	}
 	return nil
 }
@@ -665,8 +845,10 @@ func (b *lpBuilder) finish() (map[string]*TypedColumnBatch, map[string]int, []LP
 		batch := &TypedColumnBatch{Data: make(map[string]interface{}, len(m.cols)+1), Validity: map[string][]bool{}}
 		batch.Data["time"] = exactSlice(m.time)
 		for cname, c := range m.cols {
+			c.grow(n) // one allocation of the final size, not append growth
 			c.pad(n)
 			batch.Data[cname] = c.exactData()
+			c.release() // the batch holds the data now; drop the builder's reference
 			if c.valid != nil {
 				batch.Validity[cname] = c.valid
 			}
@@ -705,6 +887,7 @@ func (p *LineProtocolParser) parseLPTyped(data []byte, precision, filter string,
 	// larger body grows by append from the cap.
 	b := newLPBuilder(kinds, min(bytes.Count(data, []byte{'\n'})+1, lpMaxColumnHint))
 	b.known = known
+	b.budget = true
 	var pt lpPoint
 	err := p.LexBatch(data, precision, func(l *LPLine) error {
 		if filter != "" && l.Measurement != filter {

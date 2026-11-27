@@ -954,7 +954,7 @@ func TestSortTypedColumnBatchByKeys_NilValidityEntry(t *testing.T) {
 		Signature:  "time:i64,val:f64",
 	}
 
-	sorted := sortTypedColumnBatchByKeys(batch, []string{"time"})
+	sorted, _ := sortTypedColumnBatchByKeys(batch, []string{"time"})
 
 	// Data should be sorted ascending
 	sortedTime := sorted.Data["time"].([]int64)

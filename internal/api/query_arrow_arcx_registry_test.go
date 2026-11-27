@@ -48,7 +48,11 @@ func TestArcxArrowRegistryLifecycle(t *testing.T) {
 				c *fiber.Ctx,
 				ctx context.Context,
 				cancel context.CancelFunc,
+				_ time.Time,
 				_, _, _ string,
+				_ int,
+				_ func(int64),
+				_ func(),
 				onComplete func(int),
 				onFail func(string),
 			) bool {
@@ -137,7 +141,11 @@ func TestArcxArrowDeclineUsesSameRegistryEntry(t *testing.T) {
 		_ *fiber.Ctx,
 		ctx context.Context,
 		_ context.CancelFunc,
+		_ time.Time,
 		_, _, _ string,
+		_ int,
+		_ func(int64),
+		_ func(),
 		_ func(int),
 		_ func(string),
 	) bool {

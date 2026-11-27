@@ -1,11 +1,15 @@
-// Package sysmem reports how much memory this process may actually use.
+// Package sysmem reports the machine's memory and how much of it this process
+// may actually use.
 //
 // Arc uses a detected cgroup limit to size the main DuckDB database and its
-// compaction subprocesses. Without a configured memory_limit, DuckDB uses 80%
-// of the limit it detects itself; Arc uses this package to leave headroom for
-// Go and other allocations, and to divide the compaction budget across
-// subprocesses in the same cgroup. The host-memory fallback remains available
-// for compaction sizing when no cgroup limit is present.
+// compaction subprocesses. DuckDB defaults to 80% of its detected cgroup limit;
+// Arc uses this package to set a lower main-database budget that leaves room for
+// Go allocations, and to divide the compaction budget across subprocesses in the
+// same cgroup. The host-memory fallback remains available for compaction sizing
+// when no cgroup limit is present.
+//
+// Physical exists for telemetry, which reports the machine's memory beside the
+// usable limit, the way it reports logical_cores beside usable_cores (#1412).
 //
 // Everything that parses or decides lives in this file, deliberately untagged,
 // so the table tests run on every platform. Only the I/O is platform-split, in
@@ -48,6 +52,18 @@ var rootFS fs.FS = os.DirFS("/")
 // whatever behaviour they had rather than substituting a guess.
 func Limit() (bytes uint64, source Source, ok bool) {
 	return limit()
+}
+
+// Physical reports the machine's total memory, ignoring any cgroup limit:
+// /proc/meminfo MemTotal on Linux, hw.memsize on macOS.
+//
+// Inside a container /proc/meminfo is the host's, unless lxcfs is mounted over
+// it, in which case it reads as the container limit.
+//
+// ok is false when it cannot be read; callers must report nothing rather than
+// substitute a guess.
+func Physical() (bytes uint64, source Source, ok bool) {
+	return physical()
 }
 
 // readFileLimited reads a small file, bounded. Paths are rootFS-relative, i.e.

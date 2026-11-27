@@ -414,7 +414,7 @@ func TestSignedLicense_ToRuntimeLicense_DerivesStatusFromSignedExpiry(t *testing
 		ExpiresAt: time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
 		Tier:      "enterprise",
 	}
-	now := time.Date(2026, 6, 2, 0, 0, 0, 0, time.UTC) // one day after expiry
+	now := time.Date(2026, 6, 20, 0, 0, 0, 0, time.UTC) // past the grace cutoff (2026-06-16)
 
 	runtime := lic.ToRuntimeLicense(now)
 	if runtime.Status != "expired" {

@@ -374,6 +374,15 @@ func oversizedPayloadError(err error) error {
 // surface accurate operator-facing messages. Use errors.Is to detect.
 var ErrWALDropped = errors.New("WAL entry dropped: async buffer full")
 
+// ErrNotDurable is returned in AckModeDurable when an entry could not be made
+// durable (write or sync failure, or the writer closing). The entry's pending
+// sequence is released; if its bytes did reach the WAL file, recovery may still
+// replay them, so a client retry can duplicate them (at-least-once).
+var ErrNotDurable = errors.New("WAL entry not durable")
+
+// errWriterExited answers a durable wait the writer loop exited without serving.
+var errWriterExited = errors.New("WAL writer closed before the entry was synced")
+
 // walEntry is a pre-serialized WAL entry ready for writing
 type walEntry struct {
 	data    []byte // Complete entry: header + payload
@@ -396,6 +405,9 @@ type walEntry struct {
 	// flushed. Checkpoint entries also have seq 0 but must NOT set this, or
 	// every file would hold one and none would ever be reclaimable.
 	untrackedData bool
+	// flushIntent marks a flush intent (#1646, intent.go): written without a
+	// sync of its own, and only for the failure log's wording.
+	flushIntent bool
 	// foreignProof marks a CHECKPOINT entry that covers at least one identity
 	// this process did not mint: a row-range identity, or a whole-entry token
 	// from an earlier writer instance. Either can describe entries in a file
@@ -441,8 +453,37 @@ type WriterConfig struct {
 	SyncInterval time.Duration // Request a sync at least this often while bytes are unsynced (default: 100ms; 0 = default)
 	SyncBytes    int64         // Request a sync once this many bytes are unsynced (default: 1MB; 0 = default)
 	BufferSize   int           // Size of async write buffer (default: 10000)
-	Logger       zerolog.Logger
+	// AckMode decides when a tracked data append returns: once its entry is
+	// queued for the writer (AckModeQueued), or once a sync covering it has
+	// completed (AckModeDurable). Unset means queued here; Arc's config
+	// resolves its default ("auto", #1499) before constructing the writer.
+	AckMode AckMode
+	// AckTimeout bounds a durable append's wait for admission and for its
+	// covering sync (#1501): past it the write is refused (ErrNotDurable)
+	// and its entries retracted without waiting on the device. Unset means
+	// DefaultAckTimeout; negative means no bound (the wait ends only with
+	// the sync or the writer's exit).
+	AckTimeout time.Duration
+	Logger     zerolog.Logger
 }
+
+// DefaultAckTimeout is WriterConfig.AckTimeout when unset.
+const DefaultAckTimeout = 30 * time.Second
+
+// AckMode is when a tracked data append is acknowledged to its caller.
+type AckMode string
+
+const (
+	// AckModeQueued returns once the entry is queued for the writer. A crash
+	// loses entries still queued or written but not yet synced, and a full
+	// queue drops entries (ErrWALDropped) while the write is still accepted.
+	// The package default when AckMode is unset.
+	AckModeQueued AckMode = "queued"
+	// AckModeDurable returns once a sync covering the entry has completed, in
+	// every sync mode (async included: a waiting entry forces the sync). A
+	// full queue blocks instead of dropping. Any failure is ErrNotDurable.
+	AckModeDurable AckMode = "durable"
+)
 
 // ReplicationEntry is a WAL entry as the replication hook receives it: the
 // origin stream (#1207) sends it to standby writers.
@@ -450,7 +491,8 @@ type ReplicationEntry struct {
 	// TimestampUS is the entry timestamp in microseconds since epoch
 	TimestampUS uint64
 
-	// Payload is the raw msgpack data
+	// Payload is the entry's logical payload: the msgpack data, preceded by the
+	// database envelope header for entries written with one.
 	Payload []byte
 
 	// Coverage identifies the ingest batch the entry belongs to, for entries
@@ -515,6 +557,19 @@ type Writer struct {
 	// can start. Lock order: w.mu, then syncIOMu, then syncMu; the syncer
 	// takes only the last two.
 	syncIOMu sync.Mutex
+	// Durable acknowledgements failing (#1502): on from the first durable
+	// append the device refused (a timed-out admission or wait, a failed
+	// sync, a failed write), off at the next sync that succeeds. MQTT
+	// subscriptions wait at the broker while it is on. ackFailingMu orders a
+	// set and a clear to the listener as they took effect. probeRetryAt
+	// paces the probe syncs the writer loop requests while it is on: with
+	// writers suspended nothing else would sync, and the state would never
+	// clear on an idle node.
+	ackFailing         atomic.Bool
+	ackFailingMu       sync.Mutex
+	ackFailingListener atomic.Pointer[func(bool)]
+	probeRequested     atomic.Bool
+	probeRetryAt       time.Time
 	// rotateRetryAt delays the next rotation attempt after one failed, so a
 	// full disk is not retried on every entry. Writer loop only.
 	rotateRetryAt time.Time
@@ -575,6 +630,12 @@ type Writer struct {
 	entryChan chan walEntry
 	done      chan struct{}
 	wg        sync.WaitGroup
+	// closedFlag mirrors closed for the durable data append path, which must
+	// stay off w.mu (held across file writes and rotation).
+	closedFlag atomic.Bool
+	// exited is closed by Close once the writer loop has drained and done its
+	// final sync: a durable wait still pending then was never served.
+	exited chan struct{}
 
 	// Replication hook for streaming entries to readers. Atomic, not under
 	// w.mu: the writer loop holds w.mu across fsync and rotation, and a covered
@@ -626,8 +687,16 @@ type Writer struct {
 	FailedSyncs    int64 // Syncs that returned an error
 	TotalRotations int64
 	DroppedEntries int64 // Entries dropped due to full buffer
-	FailedWrites   int64 // Entries the writer loop could not write (lost)
-	DiskFullWrites int64 // FailedWrites whose error was ENOSPC or EDQUOT
+	// DurableAckTimeouts counts durable appends refused because their sync did
+	// not complete within AckTimeout (#1501): a stalled device, as opposed to
+	// a failed sync.
+	DurableAckTimeouts int64
+	// RetractionsFailed counts refused writes whose WAL entries could not be
+	// retracted by checkpoint (#1438): they may come back at the next start.
+	RetractionsFailed int64
+	lastRetractLog    atomic.Int64 // unix nanos of the last failed-retraction Error line
+	FailedWrites      int64        // Entries the writer loop could not write (lost)
+	DiskFullWrites    int64        // FailedWrites whose error was ENOSPC or EDQUOT
 	// RecoveredWrites counts failed entry writes the retry on a new WAL file
 	// recovered: nothing was lost, but the WAL file or its device failed.
 	RecoveredWrites int64
@@ -649,6 +718,13 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 	trackedInstance := binary.BigEndian.Uint64(instanceBytes[:])
 
 	// Set defaults
+	switch cfg.AckMode {
+	case "":
+		cfg.AckMode = AckModeQueued
+	case AckModeQueued, AckModeDurable:
+	default:
+		return nil, fmt.Errorf("invalid WAL ack mode %q (queued or durable)", cfg.AckMode)
+	}
 	if cfg.SyncMode == "" {
 		cfg.SyncMode = SyncModeFdatasync
 	}
@@ -665,6 +741,9 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 	}
 	if cfg.SyncBytes < 0 {
 		return nil, fmt.Errorf("wal.sync_bytes must not be negative, got %d", cfg.SyncBytes)
+	}
+	if cfg.AckTimeout == 0 {
+		cfg.AckTimeout = DefaultAckTimeout
 	}
 	if cfg.SyncBytes == 0 {
 		cfg.SyncBytes = 1024 * 1024 // 1MB
@@ -691,6 +770,7 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 		created:         make(map[string]struct{}),
 		pendingSeqs:     make(map[uint64]struct{}),
 		done:            make(chan struct{}),
+		exited:          make(chan struct{}),
 		trackedInstance: trackedInstance,
 	}
 
@@ -714,6 +794,7 @@ func NewWriter(cfg *WriterConfig) (*Writer, error) {
 	w.logger.Info().
 		Str("dir", cfg.WALDir).
 		Str("sync_mode", string(cfg.SyncMode)).
+		Str("ack_mode", string(cfg.AckMode)).
 		Bool("fdatasync_supported", dataSyncSupported).
 		Int64("max_size_mb", cfg.MaxSizeBytes/1024/1024).
 		Dur("max_age", cfg.MaxAge).
@@ -759,6 +840,7 @@ func (w *Writer) writerLoop() {
 				w.nudgeSyncer()
 			}
 			w.rotateIfSyncFailed()
+			w.probeIfAckFailing()
 
 		case <-w.done:
 			// Drain remaining entries before shutdown. The syncer keeps
@@ -798,8 +880,13 @@ func (w *Writer) syncerLoop(stop <-chan struct{}, done chan<- struct{}) {
 		w.syncMu.Lock()
 		f, gen, target := w.syncTarget, w.syncGen, w.writtenBytes
 		forceData := len(w.syncWaiters) > 0
-		skip := f == nil || target <= w.syncedBytes ||
-			(!forceData && w.config.SyncMode == SyncModeAsync)
+		// A probe (#1502) syncs the file even with nothing unsynced and in
+		// async mode, as a data sync: its result is what clears, or keeps,
+		// ackFailing, and in async mode a plain call would be a no-op that
+		// cleared it without touching the device.
+		probe := w.probeRequested.Swap(false)
+		skip := f == nil || (!probe && (target <= w.syncedBytes ||
+			(!forceData && w.config.SyncMode == SyncModeAsync)))
 		w.syncMu.Unlock()
 		if skip {
 			w.syncIOMu.Unlock()
@@ -808,7 +895,7 @@ func (w *Writer) syncerLoop(stop <-chan struct{}, done chan<- struct{}) {
 		// target was read after the writes it counts had returned, and a sync
 		// covers every write completed before it starts, so a successful sync
 		// covers target.
-		err := w.syncFile(f, forceData)
+		err := w.syncFile(f, forceData || probe)
 		w.syncMu.Lock()
 		if gen == w.syncGen {
 			w.completeSyncLocked(target, err, true)
@@ -822,7 +909,10 @@ func (w *Writer) syncerLoop(stop <-chan struct{}, done chan<- struct{}) {
 }
 
 // completeSyncLocked records a sync covering target and answers the waiters it
-// covers. Caller holds syncMu. A failed sync still advances syncedBytes: the
+// covers; a sync that succeeded also clears ackFailing, which calls the
+// durable-ack listener, so callers hold only locks the listener never takes
+// (syncMu, and w.mu and syncIOMu from rotation and shutdown). Caller holds
+// syncMu. A failed sync still advances syncedBytes: the
 // waiters it covered get the error, and retrying cannot recover pages the
 // kernel already reported lost. The error then sticks to the file, and
 // requestRotate asks the writer loop to move to a new one (the rotation path
@@ -844,6 +934,9 @@ func (w *Writer) completeSyncLocked(target uint64, err error, requestRotate bool
 	}
 	atomic.AddInt64(&w.TotalSyncs, 1)
 	answer := w.syncErr
+	if answer == nil {
+		w.setAckFailing(false) // the device acknowledged: durable again (#1502)
+	}
 	n := 0
 	for _, wt := range w.syncWaiters {
 		if wt.target > target {
@@ -1125,8 +1218,11 @@ func (w *Writer) logWriteFailure(entry walEntry, err error) {
 		return
 	}
 	msg := "WAL data entry could not be written and is lost from the WAL: its rows reach storage only if the flush of the ingest buffer holding them succeeds; a crash or a failed flush before that loses them"
-	if entry.durable {
+	if entry.durable && entry.seq == 0 {
 		msg = "WAL flush checkpoint could not be written: its data is already in storage, but recovery may replay those entries again (a duplicate, not a loss)"
+	}
+	if entry.flushIntent {
+		msg = "WAL flush intent could not be written: a crash before that flush's checkpoint replays its rows (a duplicate, not a loss)"
 	}
 	w.logger.Error().Err(err).
 		Bool("disk_full", isDiskFull(err)).
@@ -1398,6 +1494,11 @@ func (w *Writer) AppendRawWithMeta(database string, payload []byte) error {
 // The identity is used by flush checkpoints to avoid replaying data that was
 // already durably written to storage.
 func (w *Writer) AppendTracked(records []map[string]interface{}) ([]string, error) {
+	hashes, err := w.appendTracked(records)
+	return hashes, w.durableErr(err)
+}
+
+func (w *Writer) appendTracked(records []map[string]interface{}) ([]string, error) {
 	payload, err := msgpack.Marshal(records)
 	if err != nil {
 		return nil, fmt.Errorf("failed to serialize records: %w", err)
@@ -1410,27 +1511,52 @@ func (w *Writer) AppendTracked(records []map[string]interface{}) ([]string, erro
 		}
 	}
 	hashes := make([]string, 0, len(chunks))
+	var dones []chan error
+	deadline, stopDeadline := w.ackDeadline()
+	defer stopDeadline()
 	for _, chunk := range chunks {
 		if !trackedPayloadFits(len(chunk), 0) {
+			w.retractEnqueued(hashes) // earlier chunks: on disk, but no caller tracks them (#1438)
 			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
 		}
-		token, err := w.appendTrackedEntry(chunk)
+		token, done, err := w.appendTrackedEntry(nil, chunk, deadline)
 		if err != nil {
 			// The chunks that already landed are pending in the floor, and
 			// their tokens go out of scope with this slice — the caller gets
 			// nil and cannot release them. Unreleased, each pins the floor for
 			// the life of the process, and because PurgeFlushed stops at the
 			// first retained file the WAL never reclaims anything again (#676).
-			w.releasePending(hashes)
+			// They also reach the file untracked (and, in durable mode, the
+			// write is refused), so they are retracted, not only released
+			// (#1438). A timed-out admission retracts without waiting on the
+			// device (#1501).
+			if errors.Is(err, errAckTimeout) {
+				w.retractTimedOut(hashes, true)
+			} else {
+				w.retractEnqueued(hashes)
+			}
 			return nil, err
 		}
 		hashes = append(hashes, token)
+		if done != nil {
+			dones = append(dones, done)
+		}
+	}
+	if len(dones) > 0 {
+		if err := w.awaitDurable(hashes, dones, deadline); err != nil {
+			return nil, err
+		}
 	}
 	return hashes, nil
 }
 
 // AppendRawWithMetaTracked is the tracked counterpart to AppendRawWithMeta.
 func (w *Writer) AppendRawWithMetaTracked(database string, payload []byte) ([]string, error) {
+	hashes, err := w.appendRawWithMetaTracked(database, payload)
+	return hashes, w.durableErr(err)
+}
+
+func (w *Writer) appendRawWithMetaTracked(database string, payload []byte) ([]string, error) {
 	if len(database) > 255 {
 		return nil, fmt.Errorf("database name too long: %d bytes", len(database))
 	}
@@ -1444,22 +1570,44 @@ func (w *Writer) AppendRawWithMetaTracked(database string, payload []byte) ([]st
 			return nil, oversizedPayloadError(err)
 		}
 	}
+	var envBuf [3 + 255]byte
+	envHeader := envBuf[:putEnvelopeHeader(envBuf[:], dbBytes)]
 	var hashes []string
+	var dones []chan error
+	deadline, stopDeadline := w.ackDeadline()
+	defer stopDeadline()
 	for _, chunk := range chunks {
 		if !trackedPayloadFits(len(chunk), envelopeHeaderLen) {
+			w.retractEnqueued(hashes) // earlier chunks: on disk, but no caller tracks them (#1438)
 			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", envelopeHeaderLen+len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
 		}
-		token, err := w.appendTrackedEntry(envelopePayload(dbBytes, chunk))
+		token, done, err := w.appendTrackedEntry(envHeader, chunk, deadline)
 		if err != nil {
 			// The chunks that already landed are pending in the floor, and
 			// their tokens go out of scope with this slice — the caller gets
 			// nil and cannot release them. Unreleased, each pins the floor for
 			// the life of the process, and because PurgeFlushed stops at the
 			// first retained file the WAL never reclaims anything again (#676).
-			w.releasePending(hashes)
+			// They also reach the file untracked (and, in durable mode, the
+			// write is refused), so they are retracted, not only released
+			// (#1438). A timed-out admission retracts without waiting on the
+			// device (#1501).
+			if errors.Is(err, errAckTimeout) {
+				w.retractTimedOut(hashes, true)
+			} else {
+				w.retractEnqueued(hashes)
+			}
 			return nil, err
 		}
 		hashes = append(hashes, token)
+		if done != nil {
+			dones = append(dones, done)
+		}
+	}
+	if len(dones) > 0 {
+		if err := w.awaitDurable(hashes, dones, deadline); err != nil {
+			return nil, err
+		}
 	}
 	return hashes, nil
 }
@@ -1567,6 +1715,20 @@ func (w *Writer) markFlushed(ctx context.Context, hashes []string, blocking, rel
 				// outlive the process and the caller retains its file.
 				return errors.New("WAL writer is closed")
 			}
+		} else if w.config.AckMode == AckModeDurable {
+			// Durable ingest writers park on a full queue, and the runtime hands
+			// each slot the writer frees to a parked sender: a non-blocking
+			// admission would find the queue full and drop nearly every
+			// checkpoint under sustained load, so flushed data would replay
+			// after a restart. Wait for admission instead. The blocking
+			// admission can land after Close's drain, so the reply is awaited
+			// against exited too.
+			if err := w.enqueueEntryBlocking(context.Background(), entry); err != nil {
+				return err
+			}
+			if err := w.awaitDone(done, nil); err != nil {
+				return fmt.Errorf("failed to persist WAL flush checkpoint: %w", err)
+			}
 		} else {
 			if err := w.tryEnqueueEntry(entry); err != nil {
 				return err
@@ -1582,13 +1744,13 @@ func (w *Writer) markFlushed(ctx context.Context, hashes []string, blocking, rel
 	return nil
 }
 
-func envelopePayload(dbBytes, payload []byte) []byte {
-	out := make([]byte, 3+len(dbBytes)+len(payload))
-	out[0] = WALEnvelopeMarker
-	binary.BigEndian.PutUint16(out[1:3], uint16(len(dbBytes)))
-	copy(out[3:], dbBytes)
-	copy(out[3+len(dbBytes):], payload)
-	return out
+// putEnvelopeHeader writes the envelope header for dbBytes (marker, length,
+// name) at the start of dst and returns its length. dst must have room for
+// 3+len(dbBytes) bytes; callers check the 255-byte name limit first.
+func putEnvelopeHeader(dst, dbBytes []byte) int {
+	dst[0] = WALEnvelopeMarker
+	binary.BigEndian.PutUint16(dst[1:3], uint16(len(dbBytes)))
+	return 3 + copy(dst[3:], dbBytes)
 }
 
 func payloadHash(payload []byte) string {
@@ -1600,7 +1762,13 @@ func trackedPayloadFits(payloadLen, envelopeHeaderLen int) bool {
 	return payloadLen <= MaxWALPayloadSize-walTrackedHeaderSize-envelopeHeaderLen
 }
 
-func (w *Writer) appendTrackedEntry(logicalPayload []byte) (string, error) {
+// appendTrackedEntry appends one tracked entry whose logical payload is
+// envHeader followed by payload (envHeader is nil for entries without an
+// envelope). The entry is built in a single allocation: entry header, tracked
+// header, then the logical payload. The tracked region is byte-identical to the
+// separate trackedPayload this used to assemble, so the CRC and the bytes on
+// disk are unchanged; only the two intermediate copies are gone.
+func (w *Writer) appendTrackedEntry(envHeader, payload []byte, deadline <-chan time.Time) (string, chan error, error) {
 	// Allocating the sequence and publishing it as pending must be one step.
 	// Everything after this — the Sprintf, the CRC, and above all the
 	// synchronous replication hook below — sits between them otherwise, and a
@@ -1612,29 +1780,324 @@ func (w *Writer) appendTrackedEntry(logicalPayload []byte) (string, error) {
 	w.pendingSeqs[seq] = struct{}{}
 	w.pendingMu.Unlock()
 	token := fmt.Sprintf("%016x%016x", w.trackedInstance, seq)
-	trackedPayload := make([]byte, walTrackedHeaderSize+len(logicalPayload))
-	trackedPayload[0] = WALTrackedMarker
-	binary.BigEndian.PutUint64(trackedPayload[1:9], w.trackedInstance)
-	binary.BigEndian.PutUint64(trackedPayload[9:17], seq)
-	copy(trackedPayload[17:], logicalPayload)
-	checksum := crc32.ChecksumIEEE(trackedPayload)
+	trackedLen := walTrackedHeaderSize + len(envHeader) + len(payload)
+	entryData := make([]byte, WALEntryHeaderSize+trackedLen)
+	tracked := entryData[WALEntryHeaderSize:]
+	tracked[0] = WALTrackedMarker
+	binary.BigEndian.PutUint64(tracked[1:9], w.trackedInstance)
+	binary.BigEndian.PutUint64(tracked[9:17], seq)
+	off := walTrackedHeaderSize + copy(tracked[walTrackedHeaderSize:], envHeader)
+	copy(tracked[off:], payload)
+	checksum := crc32.ChecksumIEEE(tracked)
 	timestampUS := uint64(time.Now().UnixMicro())
-	w.replicate(&ReplicationEntry{TimestampUS: timestampUS, Payload: logicalPayload})
-	entryData := make([]byte, WALEntryHeaderSize+len(trackedPayload))
-	binary.BigEndian.PutUint32(entryData[0:4], uint32(len(trackedPayload)))
+	binary.BigEndian.PutUint32(entryData[0:4], uint32(trackedLen))
 	binary.BigEndian.PutUint64(entryData[4:12], timestampUS)
 	binary.BigEndian.PutUint32(entryData[12:16], checksum)
-	copy(entryData[WALEntryHeaderSize:], trackedPayload)
+	// The hook gets the logical payload as a view into entryData, which is
+	// never written again after this point (PrepareCovered hands the hook the
+	// same kind of view). It still runs before the entry is enqueued.
+	w.replicate(&ReplicationEntry{TimestampUS: timestampUS, Payload: tracked[walTrackedHeaderSize:]})
 	// Carry the sequence so the writer loop can record it against the file the
 	// write actually lands in (#1009).
-	if err := w.tryEnqueueEntry(walEntry{data: entryData, seq: seq}); err != nil {
+	entry := walEntry{data: entryData, seq: seq}
+	var err error
+	if w.config.AckMode == AckModeDurable {
+		// A durable entry is answered by the sync that covers it (writeEntry
+		// hands it to the syncer); the caller waits in awaitDurable. Capacity 1
+		// so the answer never blocks the writer or syncer if nobody waits.
+		entry.durable = true
+		entry.done = make(chan error, 1)
+		if err = w.enqueueDurable(entry, deadline); err != nil {
+			err = fmt.Errorf("%w: %w", ErrNotDurable, err)
+		}
+	} else {
+		err = w.tryEnqueueEntry(entry)
+	}
+	if err != nil {
 		w.pendingMu.Lock()
 		delete(w.pendingSeqs, seq)
 		w.pendingMu.Unlock()
 		w.signalPurge() // the floor may have moved (#676)
-		return "", err
+		return "", nil, err
 	}
-	return token, nil
+	return token, entry.done, nil
+}
+
+// enqueueDurable admits a durable data entry, blocking while the queue is full
+// instead of dropping it. It never takes w.mu: the writer loop holds that
+// across file writes and rotation, and this runs on every ingest request.
+func (w *Writer) enqueueDurable(entry walEntry, deadline <-chan time.Time) error {
+	if w.closedFlag.Load() {
+		return errors.New("WAL writer is closed")
+	}
+	// Room in the queue admits the entry even past the deadline, as
+	// enqueueCheckpointNoWait tries the slot before its budget: the deadline
+	// can run out while the entry is built, and a select with both cases
+	// ready picks one at random (#1577). Admission is then deterministic; a
+	// deadline already past still refuses the append, in awaitDone.
+	select {
+	case w.entryChan <- entry:
+		w.enqueuedBytes.Add(uint64(len(entry.data)))
+		return nil
+	default:
+	}
+	select {
+	case w.entryChan <- entry:
+		w.enqueuedBytes.Add(uint64(len(entry.data)))
+		return nil
+	case <-w.done:
+		return errors.New("WAL writer is closed")
+	case <-deadline:
+		// The queue was full when admission was attempted (room is taken
+		// above) and AckTimeout has run out: the device is as stalled as a
+		// sync that never completes. The caller's
+		// error path counts and retracts (retractTimedOut); the state is set
+		// here, so the suspend is not delayed by that (#1502).
+		w.setAckFailing(true)
+		return errAckTimeout
+	}
+}
+
+// OnDurableAckChange registers fn to be told when durable acknowledgements
+// start failing and when they recover (#1502), and tells it the current state
+// at once. fn runs on the refusing write's goroutine for a set and under the
+// writer's sync mutex (and, from rotation and shutdown, the writer mutex) for
+// a clear, so it must return quickly and never call back into the writer;
+// the MQTT manager schedules its change and returns.
+func (w *Writer) OnDurableAckChange(fn func(failing bool)) {
+	w.ackFailingMu.Lock()
+	defer w.ackFailingMu.Unlock()
+	w.ackFailingListener.Store(&fn)
+	fn(w.ackFailing.Load())
+}
+
+// setAckFailing changes the state, the gauge and the listener under one
+// mutex, so a set and a clear racing reach the listener in the order they
+// took effect (the #1468 lesson).
+func (w *Writer) setAckFailing(failing bool) {
+	if w.ackFailing.Load() == failing {
+		return
+	}
+	w.ackFailingMu.Lock()
+	defer w.ackFailingMu.Unlock()
+	if !w.ackFailing.CompareAndSwap(!failing, failing) {
+		return
+	}
+	metrics.Get().SetWALDurableAckFailing(failing)
+	if failing {
+		w.logger.Warn().Msg("WAL durable acknowledgements are failing: live writes are refused until a sync succeeds; MQTT subscriptions wait at the broker")
+	} else {
+		w.logger.Info().Msg("WAL durable acknowledgements recovered")
+	}
+	if fn := w.ackFailingListener.Load(); fn != nil {
+		(*fn)(failing)
+	}
+}
+
+// probeIfAckFailing asks the syncer for a probe sync while acknowledgements
+// are failing, at most once a second: the clear edge is a sync that
+// succeeds, and with writers suspended no write would request one.
+func (w *Writer) probeIfAckFailing() {
+	if !w.ackFailing.Load() || time.Now().Before(w.probeRetryAt) {
+		return
+	}
+	if w.syncFailed.Load() {
+		// The file carries a sticky sync error and the rotation away from
+		// it is pending (rotateIfSyncFailed): a probe of this file can only
+		// answer that error again, and would log it once a second.
+		return
+	}
+	w.probeRetryAt = time.Now().Add(time.Second)
+	w.probeRequested.Store(true)
+	w.nudgeSyncer()
+}
+
+// errAckTimeout is a durable append that waited AckTimeout for admission or
+// for its covering sync (#1501). The device is stalled or far behind.
+var errAckTimeout = errors.New("durable acknowledgement timed out (wal.ack_timeout_seconds); the WAL device is not keeping up")
+
+// ackDeadline is the timer channel bounding one durable append, or nil (never
+// fires) when AckTimeout is negative. The caller stops the timer.
+func (w *Writer) ackDeadline() (<-chan time.Time, func()) {
+	if w.config.AckTimeout < 0 || w.config.AckMode != AckModeDurable {
+		return nil, func() {} // queued mode never waits: no timer on its path
+	}
+	t := time.NewTimer(w.config.AckTimeout)
+	return t.C, func() { t.Stop() }
+}
+
+// awaitDone waits for one durable entry's answer, or for the writer to have
+// exited without serving it.
+func (w *Writer) awaitDone(d chan error, deadline <-chan time.Time) error {
+	select {
+	case err := <-d:
+		return err
+	case <-deadline:
+		// The answer may have arrived with the deadline: a durable entry must
+		// not be refused and retracted, or the client's retry duplicates it.
+		select {
+		case err := <-d:
+			return err
+		default:
+			return errAckTimeout
+		}
+	case <-w.exited:
+		// The loop may have answered d just before exiting.
+		select {
+		case err := <-d:
+			return err
+		default:
+			return errWriterExited
+		}
+	}
+}
+
+// DurableAck reports whether tracked appends acknowledge only durable entries
+// (AckModeDurable). Ingest refuses a write on any append error when it does.
+func (w *Writer) DurableAck() bool { return w.config.AckMode == AckModeDurable }
+
+// durableErr makes every tracked-append failure an ErrNotDurable in
+// AckModeDurable, so no error path (an unsplittable payload, a database name
+// over the limit) can leave the write acknowledged without durability.
+func (w *Writer) durableErr(err error) error {
+	if err == nil || w.config.AckMode != AckModeDurable || errors.Is(err, ErrNotDurable) {
+		return err
+	}
+	return fmt.Errorf("%w: %v", ErrNotDurable, err)
+}
+
+// awaitDurable waits until every entry in dones is covered by a completed
+// sync. On any failure it releases the pending sequences of tokens (the caller
+// returns no tokens, so nothing else would: an unreleased sequence pins the
+// purge floor for the life of the process, #676) and returns ErrNotDurable.
+// The entries are all enqueued before the first wait, so chunks of one payload
+// share syncs instead of paying one each.
+func (w *Writer) awaitDurable(tokens []string, dones []chan error, deadline <-chan time.Time) error {
+	var firstErr error
+	timedOut := false
+	for _, d := range dones {
+		err := w.awaitDone(d, deadline)
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		if errors.Is(err, errAckTimeout) {
+			timedOut = true // the device is stalled: the others would time out too
+			break
+		}
+	}
+	if firstErr != nil {
+		// The device refused (a timeout, a failed sync or write): say so
+		// before the retraction, which may itself wait (#1502). The writer
+		// exiting is shutdown, not the device. A wait that timed out just as
+		// the device recovered sets the state after the recovering sync
+		// cleared it; the next probe, within a second, clears it again, at
+		// the cost of one MQTT hold. The order of set and clear is the order
+		// they took effect, which is what matters.
+		if !errors.Is(firstErr, errWriterExited) {
+			w.setAckFailing(true)
+		}
+		// Not durable is not "not written": the entries may still reach the
+		// file, and the write is refused, so they are retracted (#1438).
+		if timedOut {
+			// The device is stalled: a retraction that waited for its own
+			// completion would park the caller on it again (#1501).
+			w.retractTimedOut(tokens, false)
+		} else {
+			w.retractEnqueued(tokens)
+		}
+		return fmt.Errorf("%w: %w", ErrNotDurable, firstErr)
+	}
+	return nil
+}
+
+// retractTimedOut retracts the entries of a durable append whose sync did not
+// complete within AckTimeout (#1501): the retraction checkpoint is enqueued
+// with bounded admission and its completion is not awaited, and the pending
+// sequences are released at once. The checkpoint sits behind the entries in
+// the writer's queue, so if the device recovers it lands after them and
+// recovery skips them; if it never does, neither reaches the file. A full
+// queue that refuses admission within retractTimeout counts as a failed
+// retraction, as today.
+//
+// Also the error path of a timed-out admission (queueFull): the chunks of
+// the append that were admitted before it are retracted this way, never with
+// the waiting retraction, which would park on the writer mutex the stalled
+// loop holds. The queue was full for the whole AckTimeout then, so the
+// retraction is only tried without waiting: if it is refused, the chunks are
+// released without one and may replay once, the at-least-once case. With no
+// admitted chunk there is nothing to retract; the timeout still counts.
+// During a shutdown drain a retraction admitted after the drain's last pass
+// stays unwritten: the entry is then durable without it and may replay once.
+//
+// One Error line every retractLogInterval, shared with RetractTracked's: on a
+// stalled device both describe the same event.
+func (w *Writer) retractTimedOut(tokens []string, queueFull bool) {
+	atomic.AddInt64(&w.DurableAckTimeouts, 1)
+	metrics.Get().IncWALDurableAckTimeouts()
+	var err error
+	if len(tokens) > 0 {
+		budget := retractTimeout
+		if queueFull {
+			budget = 0 // a refused admission, not a wait on the full queue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), budget)
+		err = w.enqueueCheckpointNoWait(ctx, tokens)
+		cancel()
+		w.releasePending(tokens)
+		w.signalPurge()
+	}
+	if err != nil {
+		atomic.AddInt64(&w.RetractionsFailed, 1)
+		metrics.Get().IncWALRetractionsFailed(1)
+	}
+	now := time.Now().UnixNano()
+	last := w.lastRetractLog.Load()
+	if now-last >= int64(retractLogInterval) && w.lastRetractLog.CompareAndSwap(last, now) {
+		w.logger.Error().Err(err).Int("entries", len(tokens)).Dur("ack_timeout", w.config.AckTimeout).
+			Int64("durable_ack_timeouts_total", atomic.LoadInt64(&w.DurableAckTimeouts)).
+			Msg("Durable acknowledgement timed out: the write is refused and its WAL entries retracted without waiting on the device; if the device recovers before the retraction lands, the entries may be replayed at the next start")
+	}
+}
+
+// enqueueCheckpointNoWait enqueues one retraction checkpoint for hashes with
+// admission bounded by ctx and returns without awaiting its completion. The
+// entry's done channel has capacity 1, so the syncer's answer is dropped. It
+// takes no lock: the stalled writer loop holds w.mu while it is parked in
+// the device write, and the blocking enqueue's closed check would wait on it
+// for as long as the device does. closedFlag answers that check instead.
+func (w *Writer) enqueueCheckpointNoWait(ctx context.Context, hashes []string) error {
+	payload, err := msgpack.Marshal(hashes)
+	if err != nil {
+		return err
+	}
+	checkpoint := append([]byte{WALCheckpointMarker}, payload...)
+	checksum := crc32.ChecksumIEEE(checkpoint)
+	entryData := make([]byte, WALEntryHeaderSize+len(checkpoint))
+	binary.BigEndian.PutUint32(entryData[0:4], uint32(len(checkpoint)))
+	binary.BigEndian.PutUint64(entryData[4:12], uint64(time.Now().UnixMicro()))
+	binary.BigEndian.PutUint32(entryData[12:16], checksum)
+	copy(entryData[WALEntryHeaderSize:], checkpoint)
+	if w.closedFlag.Load() {
+		return errors.New("WAL writer is closed")
+	}
+	entry := walEntry{data: entryData, durable: true, done: make(chan error, 1), foreignProof: w.coversForeignIdentity(hashes)}
+	// A slot free right now is taken whatever ctx says (a zero budget means
+	// "do not wait", not "do not try").
+	select {
+	case w.entryChan <- entry:
+		w.enqueuedBytes.Add(uint64(len(entry.data)))
+		return nil
+	default:
+	}
+	select {
+	case w.entryChan <- entry:
+		w.enqueuedBytes.Add(uint64(len(entry.data)))
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-w.done:
+		return errors.New("WAL writer is closed")
+	}
 }
 
 // appendEnvelopedEntry is AppendRawWithMeta's single-entry fast path: CRC,
@@ -1772,6 +2235,11 @@ func (w *Writer) AppendRaw(payload []byte) error {
 // is used by replication followers so their local WAL participates in the
 // same sequence-floor purge as primary ingest.
 func (w *Writer) AppendRawTracked(payload []byte) ([]string, error) {
+	hashes, err := w.appendRawTracked(payload)
+	return hashes, w.durableErr(err)
+}
+
+func (w *Writer) appendRawTracked(payload []byte) ([]string, error) {
 	chunks := [][]byte{payload}
 	if len(payload) > MaxWALPayloadSize {
 		var err error
@@ -1782,17 +2250,32 @@ func (w *Writer) AppendRawTracked(payload []byte) ([]string, error) {
 	}
 
 	hashes := make([]string, 0, len(chunks))
+	var dones []chan error
+	deadline, stopDeadline := w.ackDeadline()
+	defer stopDeadline()
 	for _, chunk := range chunks {
 		if len(chunk) > MaxWALPayloadSize-walTrackedHeaderSize {
-			w.releasePending(hashes)
+			w.retractEnqueued(hashes) // earlier chunks: on disk, but no caller tracks them (#1438)
 			return nil, oversizedPayloadError(fmt.Errorf("tracked size %d exceeds limit %d", len(chunk)+walTrackedHeaderSize, MaxWALPayloadSize))
 		}
-		hash, err := w.appendTrackedEntry(chunk)
+		hash, done, err := w.appendTrackedEntry(nil, chunk, deadline)
 		if err != nil {
-			w.releasePending(hashes)
+			if errors.Is(err, errAckTimeout) {
+				w.retractTimedOut(hashes, true) // #1501: never wait on the stalled device
+			} else {
+				w.retractEnqueued(hashes) // earlier chunks: on disk, but no caller tracks them (#1438)
+			}
 			return nil, err
 		}
 		hashes = append(hashes, hash)
+		if done != nil {
+			dones = append(dones, done)
+		}
+	}
+	if len(dones) > 0 {
+		if err := w.awaitDurable(hashes, dones, deadline); err != nil {
+			return nil, err
+		}
 	}
 	return hashes, nil
 }
@@ -1852,12 +2335,16 @@ func (w *Writer) Close() error {
 	w.mu.Lock()
 	w.closed = true
 	w.mu.Unlock()
+	w.closedFlag.Store(true)
 
 	// Signal shutdown
 	close(w.done)
 
 	// Wait for writer goroutine to finish
 	w.wg.Wait()
+	// The drain and its final sync have answered every durable entry the loop
+	// dequeued; one that reached the channel after the drain never will.
+	close(w.exited)
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -1874,9 +2361,13 @@ func (w *Writer) Close() error {
 	return nil
 }
 
-// purgeWALFiles deletes WAL files matching the given filter function.
-// Returns the count of deleted files.
-func (w *Writer) purgeWALFiles(shouldDelete func(path string) bool) (int, error) {
+// PurgeAll deletes all WAL files in the directory.
+// Call this after a clean shutdown where all data has been flushed to storage,
+// so that recovery on next startup doesn't replay already-persisted data.
+//
+// It does not look at what a file holds or whether its entries were flushed;
+// the caller vouches for that. During operation, use PurgeFlushed.
+func (w *Writer) PurgeAll() (int, error) {
 	pattern := filepath.Join(w.config.WALDir, "*.wal")
 	files, err := filepath.Glob(pattern)
 	if err != nil {
@@ -1885,50 +2376,23 @@ func (w *Writer) purgeWALFiles(shouldDelete func(path string) bool) (int, error)
 
 	deleted := 0
 	for _, f := range files {
-		if shouldDelete(f) {
-			if err := os.Remove(f); err != nil {
-				w.logger.Error().Err(err).Str("file", f).Msg("Failed to purge WAL file")
-			} else {
-				deleted++
-				// Keep the sequence bookkeeping in step. A stale entry would
-				// leave PurgeFlushed walking to a path that no longer exists,
-				// where the delete fails and — because it stops rather than
-				// skips — nothing after it is ever reclaimed.
-				w.mu.Lock()
-				w.forgetFileLocked(f)
-				w.mu.Unlock()
-			}
+		if err := os.Remove(f); err != nil {
+			w.logger.Error().Err(err).Str("file", f).Msg("Failed to purge WAL file")
+			continue
 		}
+		deleted++
+		// Keep the sequence bookkeeping in step. A stale entry would
+		// leave PurgeFlushed walking to a path that no longer exists,
+		// where the delete fails and — because it stops rather than
+		// skips — nothing after it is ever reclaimed.
+		w.mu.Lock()
+		w.forgetFileLocked(f)
+		w.mu.Unlock()
 	}
-	return deleted, nil
-}
-
-// PurgeAll deletes all WAL files in the directory.
-// Call this after a clean shutdown where all data has been flushed to storage,
-// so that recovery on next startup doesn't replay already-persisted data.
-func (w *Writer) PurgeAll() (int, error) {
-	deleted, err := w.purgeWALFiles(func(_ string) bool { return true })
 	if deleted > 0 {
 		w.logger.Info().Int("deleted", deleted).Msg("Purged WAL files after clean shutdown")
 	}
-	return deleted, err
-}
-
-// PurgeInactive deletes all WAL files except the currently active one.
-// Use this during normal operation (unlike PurgeAll which is for shutdown)
-// to clean up rotated WAL files after their data has been flushed to storage.
-func (w *Writer) PurgeInactive() (int, error) {
-	w.mu.Lock()
-	activePath := w.currentPath
-	w.mu.Unlock()
-
-	deleted, err := w.purgeWALFiles(func(path string) bool {
-		return path != activePath
-	})
-	if deleted > 0 {
-		w.logger.Info().Int("deleted", deleted).Msg("Purged inactive WAL files")
-	}
-	return deleted, err
+	return deleted, nil
 }
 
 // noteWrittenLocked records an entry against w.currentPath. Caller holds w.mu.
@@ -2023,7 +2487,9 @@ func (w *Writer) forgetFileLocked(path string) {
 }
 
 // Quarantined tells the writer that recovery moved path to quarantinedAs
-// after repeated replay failures (#1225). If this process wrote it, entries in
+// after repeated replay failures (#1225), or on the first pass when its only
+// failure is checksum-damaged entries, once the recovery barrier has stored
+// its intact ones (#1634). If this process wrote it, entries in
 // it may still be waiting for a flush: recovery can no longer replay them
 // from it, so keeping them pending would hold the purge floor at this file for
 // the life of the process, and no WAL file would be reclaimed again (#676).
@@ -2100,9 +2566,13 @@ func (w *Writer) trackedTokenSeq(token string) (uint64, bool) {
 }
 
 // coversForeignIdentity reports whether any identity in a checkpoint batch
-// describes an entry this process did not write: a row-range identity (which by
-// construction covers part of an entry recovery replayed), or a whole-entry
-// token minted by an earlier writer instance.
+// describes an entry this process did not write: a whole-entry token minted by
+// an earlier writer instance, or a row-range identity of such a token. A row
+// range of this process's own entry is not foreign: a multi-hour flush writes
+// one for each hour file it stores (#1492), and recovery of this process's
+// own files writes them too. Its parent's sequence stays pending until the
+// parent is checkpointed, so the parent's file stops the purge walk by itself
+// (PurgeFlushed) and the proof needs no pin.
 //
 // The file such a checkpoint lands in must not be purged by sequence while an
 // earlier process's WAL file remains — the entries it vouches for can live in
@@ -2110,8 +2580,14 @@ func (w *Writer) trackedTokenSeq(token string) (uint64, bool) {
 // reach them to stop there.
 func (w *Writer) coversForeignIdentity(hashes []string) bool {
 	for _, h := range hashes {
+		if parent, _, _, ok := ParseRecoveryRowIdentity(h); ok {
+			if _, ours := w.trackedTokenSeq(parent); !ours {
+				return true
+			}
+			continue
+		}
 		if strings.HasPrefix(h, recoveryRowPrefix) {
-			return true
+			return true // a malformed row identity: pin rather than guess
 		}
 		if len(h) == 32 {
 			if _, ours := w.trackedTokenSeq(h); !ours {
@@ -2121,6 +2597,62 @@ func (w *Writer) coversForeignIdentity(hashes []string) bool {
 	}
 	return false
 }
+
+// retractEnqueued takes back the entries a failed append had already
+// enqueued (#1438): the caller gets no tokens, so nothing else would
+// checkpoint them, and in durable mode the write is refused while they may
+// reach the file. See RetractTracked.
+func (w *Writer) retractEnqueued(tokens []string) {
+	w.RetractTracked(tokens)
+}
+
+// RetractTracked checkpoints tracked entries of a write that was refused after
+// they were appended, so recovery never replays what the client was told was
+// not written (#1438), and releases them from the purge floor. A durable
+// writer waits for the checkpoint (admission bounded by retractTimeout); a
+// queued one enqueues it like a flush checkpoint. If the checkpoint cannot be
+// written the entries are only released, as before (they may come back at the
+// next start): counted in RetractionsFailed and arc_wal_retractions_failed_total,
+// and logged at Error at most once per retractLogInterval. Reports whether
+// they were retracted.
+func (w *Writer) RetractTracked(tokens []string) bool {
+	if len(tokens) == 0 {
+		return true
+	}
+	var err error
+	if w.config.AckMode == AckModeDurable {
+		ctx, cancel := context.WithTimeout(context.Background(), retractTimeout)
+		err = w.MarkFlushedContext(ctx, tokens)
+		cancel()
+	} else {
+		err = w.MarkFlushed(tokens)
+	}
+	if err == nil {
+		return true
+	}
+	w.releasePending(tokens)
+	w.signalPurge()
+	atomic.AddInt64(&w.RetractionsFailed, 1)
+	metrics.Get().IncWALRetractionsFailed(1)
+	// Sampled: a failing WAL disk fails every retraction, and logging each
+	// would flood the log at the worst moment.
+	now := time.Now().UnixNano()
+	last := w.lastRetractLog.Load()
+	if now-last >= int64(retractLogInterval) && w.lastRetractLog.CompareAndSwap(last, now) {
+		w.logger.Error().Err(err).Int("entries", len(tokens)).
+			Int64("retractions_failed_total", atomic.LoadInt64(&w.RetractionsFailed)).
+			Msg("WAL entries of a refused write could not be retracted; they may be replayed at the next start, duplicating rows the client was told were not written")
+	}
+	return false
+}
+
+// retractTimeout bounds how long a retraction waits to be admitted to a full
+// queue. Past it the write is refused without its retraction.
+const retractTimeout = 5 * time.Second
+
+// retractLogInterval is the least time between two Error lines for failed
+// retractions (each is counted regardless).
+const retractLogInterval = 10 * time.Second
 
 // releasePending drops identities from the unflushed set. Every release of
 // the purge floor goes through here (MarkFlushed, ReleaseRegistered,
@@ -2346,6 +2878,7 @@ func (w *Writer) Stats() map[string]interface{} {
 		"current_age_seconds": age.Seconds(),
 		"sync_mode":           string(w.config.SyncMode),
 		"total_entries":       atomic.LoadInt64(&w.TotalEntries),
+		"retractions_failed":  atomic.LoadInt64(&w.RetractionsFailed),
 		"total_bytes":         atomic.LoadInt64(&w.TotalBytes),
 		"total_syncs":         atomic.LoadInt64(&w.TotalSyncs),
 		"failed_syncs":        atomic.LoadInt64(&w.FailedSyncs),

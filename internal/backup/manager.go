@@ -78,7 +78,7 @@ type Manager struct {
 	// internal/backup/identity.go.
 	instanceID   string
 	sqliteDBPath string // path to shared SQLite database
-	configPath   string // path to arc.toml
+	configPath   string // the config file config.Load read; "" when Arc started without one (#1466)
 	// icebergCatalogDBPath is the Iceberg SQL catalog, backed up separately only
 	// when iceberg.catalog_db_path points somewhere other than the shared DB.
 	// The catalog holds every Iceberg table's schema and snapshot pointers, so a
@@ -96,7 +96,10 @@ type Manager struct {
 	// "Iceberg is off here and the catalog rows are inert".
 	icebergWarehouseConfigured string
 	icebergEnabled             bool
-	icebergNSPrefix            string
+	// icebergPauser stops the Iceberg export while a restore stages a
+	// catalog (#1813); nil when export is off or not wired.
+	icebergPauser   IcebergExportPauser
+	icebergNSPrefix string
 	// icebergWarehouseKeyPrefix is the storage key prefix of an under-root
 	// warehouse: "" when the warehouse IS the storage root (the default) and
 	// "<sub>/" when it is a subdirectory of it (#534 layout). Only a scoped
@@ -114,8 +117,12 @@ type Manager struct {
 	// view of it (#1085 stage B3), nil without tiering.
 	cluster      ClusterManifest
 	tierRecorder TierRecorder
-	tierLookup   TierLookup
-	coldCounter  ColdCounter
+	// onDataRestored runs once a restore of data files ends, whatever its
+	// outcome: query caches made before it must not answer for the files it
+	// wrote (#1764).
+	onDataRestored func()
+	tierLookup     TierLookup
+	coldCounter    ColdCounter
 	// coldSource is the cold tier itself (#1086 stage C): the store a backup
 	// reads cold objects from and a restore writes them back to. Nil without
 	// tiering, with cold disabled, or when the cold backend failed to build.
@@ -168,8 +175,12 @@ type ManagerConfig struct {
 	// IcebergNamespacePrefix is iceberg.namespace_prefix (default "arc"); the
 	// warehouse walk copies only <prefix>_*.db namespace directories.
 	IcebergNamespacePrefix string
-	ConfigPath             string
-	Logger                 zerolog.Logger
+	// ConfigPath is the config file Arc loaded at startup (config.Config.
+	// ConfigFile, an absolute path), or "" when it started without one. Not
+	// a path relative to the working directory: on a packaged install that
+	// is /var/lib/arc, and the config is /etc/arc/arc.toml (#1466).
+	ConfigPath string
+	Logger     zerolog.Logger
 }
 
 // NewManager creates a new backup manager.
@@ -1461,9 +1472,17 @@ func (m *Manager) DeleteBackup(ctx context.Context, backupID string) error {
 			deleted += len(files)
 			continue
 		}
+		failed := false
 		for _, f := range files {
 			if err := t.backend.Delete(ctx, f); err != nil {
 				m.logger.Warn().Str("path", f).Str("target", t.name).Err(err).Msg("Failed to delete backup file")
+				if !failed {
+					failed = true
+					unreachable = append(unreachable, t.name)
+					if firstErr == nil {
+						firstErr = fmt.Errorf("failed to delete a file of backup %s from %s: %w", backupID, t.describe(), err)
+					}
+				}
 				continue
 			}
 			deleted++
@@ -1474,8 +1493,7 @@ func (m *Manager) DeleteBackup(ctx context.Context, backupID string) error {
 		// Having deleted what it could: the error names the targets that still
 		// hold objects so a re-run finishes the job, and "not found" is never
 		// the answer when a target might still hold the backup.
-		return fmt.Errorf("backup %s was deleted where it could be reached, but these backup targets could not be: %s; run the delete again: %w",
-			backupID, strings.Join(unreachable, ", "), firstErr)
+		return &TargetsUnreachableError{BackupID: backupID, Targets: unreachable, Err: firstErr}
 	}
 	if held == 0 {
 		return fmt.Errorf("%w: %s", ErrBackupNotFound, backupID)
@@ -1484,3 +1502,19 @@ func (m *Manager) DeleteBackup(ctx context.Context, backupID string) error {
 	m.logger.Info().Str("backup_id", backupID).Int("files_deleted", deleted).Int("targets", held).Msg("Backup deleted")
 	return nil
 }
+
+// TargetsUnreachableError is a delete that removed the backup where it could
+// while these targets could not be reached or did not delete every file
+// (#1122). Running the delete again finishes it.
+type TargetsUnreachableError struct {
+	BackupID string
+	Targets  []string
+	Err      error
+}
+
+func (e *TargetsUnreachableError) Error() string {
+	return fmt.Sprintf("backup %s was deleted where it could be reached, but these backup targets could not be: %s; run the delete again: %v",
+		e.BackupID, strings.Join(e.Targets, ", "), e.Err)
+}
+
+func (e *TargetsUnreachableError) Unwrap() error { return e.Err }

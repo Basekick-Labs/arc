@@ -194,10 +194,11 @@ func startRaftNode(t *testing.T, nodeID, bindAddr string, bootstrap bool) *raft.
 		// NodeConfig defaults cannot silently re-time this test. Do NOT
 		// tighten these to speed the test up: raftAuthDeadline (400ms,
 		// internal/cluster/security/raft_auth.go) must sit BELOW
-		// HeartbeatTimeout, because one slow handshake blocks the serial
-		// Accept() loop for the full deadline. The old 100ms heartbeat
-		// violated that and made elections compound on starved CI
-		// runners (#671). Constraint: LeaderLeaseTimeout <=
+		// HeartbeatTimeout, because a dial to a slow peer holds raft's
+		// per-peer heartbeat goroutine for the full deadline. The old
+		// 100ms heartbeat violated that and made elections compound on
+		// starved CI runners (#671). (Accept-side handshakes no longer
+		// block one another since #1431.) Constraint: LeaderLeaseTimeout <=
 		// HeartbeatTimeout (hashicorp/raft validation).
 		ElectionTimeout:    1 * time.Second,
 		HeartbeatTimeout:   500 * time.Millisecond,

@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 )
@@ -44,6 +45,12 @@ type TrackedQuery struct {
 	// compatibility.
 	IsParallel     bool `json:"is_parallel"`
 	PartitionCount int  `json:"partition_count,omitempty"`
+	// ForwardedTo names the node a forwarding node (a compactor) sent this
+	// query to; empty for a query run here. Such an entry records the
+	// forward: its ID is this node's, not the peer's, and it carries no row
+	// count. Cancelling it ends the forward, which stops the peer's query
+	// when the peer cancels on client disconnect (the default).
+	ForwardedTo string `json:"forwarded_to,omitempty"`
 }
 
 // activeEntry stores the tracked query plus its cancel func.
@@ -110,6 +117,28 @@ func (r *Registry) Register(parentCtx context.Context, sql string, tokenID int64
 	return queryID, ctx
 }
 
+// SetForwardedTo records the node a registered query was forwarded to.
+func (r *Registry) SetForwardedTo(queryID, node string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.active[queryID]; ok {
+		e.query.ForwardedTo = node
+	}
+}
+
+// Discard drops an active entry without recording it in history: for a
+// forward registered before routing that ends up running locally, where the
+// local path registers the query itself.
+func (r *Registry) Discard(queryID string) {
+	r.mu.Lock()
+	e, ok := r.active[queryID]
+	delete(r.active, queryID)
+	r.mu.Unlock()
+	if ok {
+		e.cancel()
+	}
+}
+
 // RecordRowCap notes that a query reached an Enterprise governance row cap.
 //
 // It is separate from the terminal dispositions on purpose. A stream can reach
@@ -167,7 +196,12 @@ func (r *Registry) Fail(queryID string, errMsg string) {
 	entry.query.Status = StatusFailed
 	entry.query.EndTime = &now
 	entry.query.DurationMs = float64(now.Sub(entry.query.StartTime).Milliseconds())
-	entry.query.Error = errMsg
+	// Sanitised here, for every caller: the history is served by the API
+	// (GET /api/v1/queries), and a raw DuckDB error carries the rewritten
+	// statement, storage paths and queried values. Both steps are idempotent,
+	// so a caller that already cleaned the text is unaffected.
+	text, _ := sqlutil.ClientErrText(errMsg) // removes unquoted paths too
+	entry.query.Error = sqlutil.SanitizeErrText(text)
 
 	r.addToHistory(entry.query)
 	delete(r.active, queryID)
@@ -231,6 +265,24 @@ func (r *Registry) CancelWithReason(queryID, reason string) bool {
 	r.addToHistory(entry.query)
 	delete(r.active, queryID)
 	return true
+}
+
+// CancelAllWithReason cancels every running query, recording why, and
+// returns how many it cancelled.
+func (r *Registry) CancelAllWithReason(reason string) int {
+	r.mu.Lock()
+	ids := make([]string, 0, len(r.active))
+	for id := range r.active {
+		ids = append(ids, id)
+	}
+	r.mu.Unlock()
+	n := 0
+	for _, id := range ids {
+		if r.CancelWithReason(id, reason) {
+			n++
+		}
+	}
+	return n
 }
 
 // GetActive returns a snapshot of all active queries.

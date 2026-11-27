@@ -20,7 +20,8 @@ import (
 // failover the cluster promotes another writer, and the isolated one's rows
 // reach the others only once the partition heals — or never, if its disk dies
 // first. A fenced writer answers 503 before anything is written, the WAL
-// included, so the client retries against the primary.
+// included, so the client retries against the primary. A line-protocol
+// request is checked once, at admission, not per measurement (#1422).
 //
 // Two rules, on a writer in a cluster with a primary-election manager:
 //   - designation (always): another writer is the designated primary in this
@@ -309,7 +310,8 @@ const (
 func IngestRefusalReason(err error) string { return ingest.RefusalReason(err) }
 
 // startIngestFenceLocked builds and runs the fence where a primary is elected:
-// Raft with local storage. The contact rule also needs automatic failover. The
+// Raft without shared_storage_mode (local storage, or a single-writer shared
+// bucket, #1603). The contact rule also needs automatic failover. The
 // caller holds c.mu: it runs from Start, which holds it throughout.
 func (c *Coordinator) startIngestFenceLocked() {
 	if c.raftNode == nil || c.raftFSM == nil || c.cfg.SharedStorageMode || c.writerFailoverMgr == nil {

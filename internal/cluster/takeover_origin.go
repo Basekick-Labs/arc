@@ -108,6 +108,8 @@ func (c *Coordinator) takeoverGateClosed() bool {
 // designated primary while stream takeover is on here (#1207): a write
 // acknowledged by a standby could be claimed by nobody. Read synchronously
 // from the manifest, unlike the ingest fence, which evaluates on a ticker.
+// A line-protocol request reads it once, at admission, not per measurement
+// (#1422).
 func (c *Coordinator) takeoverDesignationRefuses() bool {
 	st := c.takeoverOrigin.Load()
 	if st == nil || !st.knownOn.Load() || c.raftNode == nil {

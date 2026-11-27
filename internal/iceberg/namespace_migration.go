@@ -58,6 +58,7 @@ func (e *Exporter) ConfigureNamespaceMigrationDryRun(dryRun bool) {
 // orphaning this issue exists to prevent. Scheduler.runPass is what acts on it; that coupling is
 // the point of the mechanism and is pinned by TestSchedulerSkipsBlockedMeasurements.
 func (e *Exporter) MigrateDottedNamespaces(ctx context.Context, measurements []Measurement) (map[string]struct{}, error) {
+	ctx = e.withAWS(ctx)
 	blocked := make(map[string]struct{})
 	if e.db == nil {
 		return blocked, nil

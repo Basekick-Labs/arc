@@ -1,10 +1,12 @@
 package scheduler
 
 import (
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/api"
 	"github.com/rs/zerolog"
 )
 
@@ -305,5 +307,32 @@ func TestCQScheduler_ClusterGate_FailoverTransition(t *testing.T) {
 
 	if !s.clusterGate.IsPrimaryWriter() {
 		t.Error("after failover gate should return IsPrimaryWriter=true without restart")
+	}
+}
+
+// #1433: a reload after the license stopped including the CQ scheduler stopped
+// every job and returned nil, which the API answered 200 "CQ scheduler
+// reloaded successfully". It now returns ErrCQReloadUnlicensed, which the API
+// answers 403, and leaves the running jobs as they are.
+func TestCQScheduler_ReloadAllWithoutALicense(t *testing.T) {
+	s := runningCQScheduler(t)
+	s.mu.Lock()
+	if err := s.startJob(1, "a", "1h"); err != nil {
+		s.mu.Unlock()
+		t.Fatalf("startJob failed: %v", err)
+	}
+	job := s.jobs[1]
+	s.mu.Unlock()
+
+	if err := s.ReloadAll(); !errors.Is(err, api.ErrCQReloadUnlicensed) {
+		t.Fatalf("ReloadAll without a license: err = %v, want ErrCQReloadUnlicensed", err)
+	}
+	if s.jobFor(1) != job {
+		t.Fatal("the refused reload replaced or removed the running job")
+	}
+	select {
+	case <-job.done:
+		t.Fatal("the refused reload stopped the running job")
+	default:
 	}
 }

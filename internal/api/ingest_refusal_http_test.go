@@ -180,8 +180,10 @@ func TestMsgPackFencedWriteIsNotAnIngestError(t *testing.T) {
 
 // Every write path answers a fence refusal the same way: 503 marked as a fence
 // refusal, no per-request line, no ingest error counted, the refusal logged by
-// its reason. LP refuses up front (CheckIngestGate) and per measurement (a
-// gate that closes after the check); both are covered.
+// its reason. LP refuses up front only: a gate that closes after admission
+// no longer splits a request (#1422, see lineprotocol_fence_1422_test.go). The
+// imports (LP, CSV, Parquet) are still refused per buffer call, by a gate
+// that closes after admission; each is covered.
 func TestFencedWritePathsTable(t *testing.T) {
 	newBuf := func(t *testing.T, admitFirst int) *ingest.ArrowBuffer {
 		t.Helper()
@@ -232,15 +234,6 @@ func TestFencedWritePathsTable(t *testing.T) {
 				r.Header.Set("x-arc-database", "db")
 				return r
 			}},
-		{"line protocol, refused per measurement", 1,
-			func(app *fiber.App, b *ingest.ArrowBuffer, lg zerolog.Logger) {
-				NewLineProtocolHandler(b, lg).RegisterRoutes(app)
-			},
-			func() *http.Request {
-				r := httptest.NewRequest("POST", "/api/v1/write/line-protocol", strings.NewReader(lp))
-				r.Header.Set("x-arc-database", "db")
-				return r
-			}},
 		{"tle", 0,
 			func(app *fiber.App, b *ingest.ArrowBuffer, lg zerolog.Logger) {
 				NewTLEHandler(b, lg).RegisterRoutes(app)
@@ -261,6 +254,30 @@ func TestFencedWritePathsTable(t *testing.T) {
 				r := httptest.NewRequest("POST", "/api/v1/import/lp?db=db", body)
 				r.Header.Set("Content-Type", ct)
 				r.Header.Set("x-arc-database", "db")
+				return r
+			}},
+		{"csv import, refused per buffer call", 1,
+			func(app *fiber.App, b *ingest.ArrowBuffer, lg zerolog.Logger) {
+				h := NewImportHandler(lg)
+				h.SetArrowBuffer(b)
+				h.RegisterRoutes(app)
+			},
+			func() *http.Request {
+				body, ct := multipartUpload(t, []byte("time,v\n1700000000,1\n1700000001,2\n"))
+				r := httptest.NewRequest("POST", "/api/v1/import/csv?db=db&measurement=cpu&time_format=epoch_s", bytes.NewReader(body))
+				r.Header.Set("Content-Type", ct)
+				return r
+			}},
+		{"parquet import, refused per buffer call", 1,
+			func(app *fiber.App, b *ingest.ArrowBuffer, lg zerolog.Logger) {
+				h := NewImportHandler(lg)
+				h.SetArrowBuffer(b)
+				h.RegisterRoutes(app)
+			},
+			func() *http.Request {
+				body, ct := multipartUpload(t, parquetFile(t, 2, -1))
+				r := httptest.NewRequest("POST", "/api/v1/import/parquet?db=db&measurement=cpu", bytes.NewReader(body))
+				r.Header.Set("Content-Type", ct)
 				return r
 			}},
 	}

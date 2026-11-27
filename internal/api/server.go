@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"runtime"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/basekick-labs/arc/internal/license"
 	"github.com/basekick-labs/arc/internal/logger"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/tiering"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/recover"
@@ -59,6 +61,8 @@ type Server struct {
 	// mayAcceptIngest backs /ready/write. Nil means "this node takes writes
 	// whenever it is ready", which is right for a single-node deployment.
 	mayAcceptIngest func() bool
+	// mayServeReads is the predicate behind /ready/read (SetReadReadiness).
+	mayServeReads func() (bool, string)
 
 	// dbStats supplies the DuckDB connection-pool snapshot for the metrics
 	// endpoints (#809). Nil when no database is wired, e.g. a test server or
@@ -83,6 +87,19 @@ type Server struct {
 	// (the invisible state behind the 27-restart field incident). Absent for
 	// deployments with no license configured at all.
 	licenseStatus func() license.LicenseHealth
+	// coldMissingObjects supplies the /health "tiering" field (#1551).
+	coldMissingObjects func() *tiering.ColdMissingObjectsStatus
+
+	// onShutdownStart runs first in Shutdown (OnShutdownStart).
+	onShutdownStartMu sync.Mutex
+	onShutdownStart   []func()
+
+	// queryLifetime ends the queries still running once the shutdown grace
+	// is over (QueryLifetime, ShutdownContext); conns tracks the open
+	// connections that shutdown closes after that (#1644).
+	queryLifetime context.Context
+	cancelQueries context.CancelFunc
+	conns         *connTracker
 }
 
 // ServerConfig holds server configuration
@@ -108,7 +125,8 @@ type ServerConfig struct {
 	TLSKeyFile  string
 
 	// ClientRecorder, when set, receives the installation id + version
-	// of arcli clients (Arcli-Installation-Id header) for telemetry.
+	// of arcli and SDK clients (Arc-Client-Installation-Id, or arcli's
+	// legacy Arcli-Installation-Id header) for telemetry.
 	// nil (telemetry disabled) installs no middleware.
 	ClientRecorder ClientRecorder
 	// AuthRequired tells the client-identity middleware that the auth
@@ -169,7 +187,13 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: "*",
 		AllowMethods: "GET,POST,PUT,DELETE,OPTIONS",
-		AllowHeaders: "Origin,Content-Type,Accept,Authorization,x-api-key,x-arc-database,Content-Encoding,Arcli-Installation-Id",
+		// The request headers a browser may send: x-arc-decimals (#1784) and
+		// the Arrow route's encoding options among them.
+		AllowHeaders: "Origin,Content-Type,Accept,Authorization,x-api-key,x-arc-database,Content-Encoding,Arcli-Installation-Id,Arc-Client-Installation-Id," + WaitVisibleHeader + "," + FreshnessHeader +
+			"," + decimalsHeader + ",x-arc-arrow-dictionary,x-arc-arrow-compression",
+		// A browser reads a visible write's answer (#1759) and a fresh
+		// query's (#1760).
+		ExposeHeaders: VisibleHeader + "," + VisibleReasonHeader + "," + FreshnessAnswerHeader + "," + FreshnessReasonHeader + "," + FreshnessWaitHeader,
 	}))
 
 	// Security headers middleware (pass TLS flag for HSTS)
@@ -179,7 +203,7 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	// (request_encoding.go).
 	app.Use(rejectEncodedBodies)
 
-	// arcli installation ids for telemetry (see client_identity.go).
+	// Client (arcli, SDK) installation ids for telemetry (see client_identity.go).
 	if config.ClientRecorder != nil {
 		app.Use(clientIdentity(config.ClientRecorder, config.AuthRequired))
 	}
@@ -198,7 +222,16 @@ func NewServer(config *ServerConfig, logger zerolog.Logger) *Server {
 	// Request logging middleware
 	app.Use(requestLogger(logger))
 
+	queryLifetime, cancelQueries := context.WithCancel(context.Background())
+	conns := newConnTracker()
+	// Fiber never sets ConnState, and app.Server() is the server Listen,
+	// ListenTLS and Listener all serve on.
+	app.Server().ConnState = conns.connState
+
 	return &Server{
+		queryLifetime:  queryLifetime,
+		cancelQueries:  cancelQueries,
+		conns:          conns,
 		app:            app,
 		logger:         logger.With().Str("component", "api-server").Logger(),
 		host:           config.Host,
@@ -218,16 +251,10 @@ func (s *Server) RegisterRoutes() {
 	// Readiness check (for Kubernetes)
 	s.app.Get("/ready", s.readyHandler)
 	s.app.Get("/ready/write", s.readyWriteHandler)
+	s.app.Get("/ready/read", s.readyReadHandler)
 
-	// Metrics endpoint (Prometheus format)
-	s.app.Get("/metrics", s.metricsHandler)
-
-	// API v1 metrics endpoints (JSON format)
-	s.app.Get("/api/v1/metrics", s.apiMetricsHandler)
-	s.app.Get("/api/v1/metrics/memory", s.memoryMetricsHandler)
-	s.app.Get("/api/v1/metrics/query-pool", s.queryPoolMetricsHandler)
-	s.app.Get("/api/v1/metrics/endpoints", s.endpointMetricsHandler)
-	s.app.Get("/api/v1/metrics/timeseries/:type", s.timeseriesMetricsHandler)
+	// NOTE: the metrics endpoints are not registered here either; see
+	// RegisterMetricsRoutes.
 
 	// NOTE: /api/v1/logs is intentionally NOT registered here. It exposes
 	// buffered application logs and must be admin-authenticated. Registering
@@ -248,6 +275,47 @@ func (s *Server) RegisterRoutes() {
 // is nil (authentication disabled), preserving no-auth deployment behaviour.
 func (s *Server) RegisterLogsRoute(authManager *auth.AuthManager) {
 	s.app.Get("/api/v1/logs", withAdminAuth(authManager), s.logsHandler)
+}
+
+// RegisterMetricsRoutes registers /metrics (Prometheus text) and the JSON
+// /api/v1/metrics family. main calls it right after the auth and audit
+// middleware, like RegisterLogsRoute: whether they are public is the auth
+// middleware's public-path list alone (auth.metrics_public). authManager,
+// when non-nil, also guards each route itself, so a registration moved ahead
+// of the auth middleware refuses every request instead of serving metrics
+// without a token (GHSA-m3qr-fvp4-78xj). nil: public (auth off, or
+// auth.metrics_public).
+func (s *Server) RegisterMetricsRoutes(authManager *auth.AuthManager) {
+	h := []fiber.Handler{}
+	if authManager != nil {
+		h = append(h, requireToken)
+	}
+	reg := func(path string, handler fiber.Handler) {
+		s.app.Get(path, append(append([]fiber.Handler{}, h...), handler)...)
+	}
+	reg("/metrics", s.metricsHandler)
+	reg("/api/v1/metrics", s.apiMetricsHandler)
+	reg("/api/v1/metrics/memory", s.memoryMetricsHandler)
+	reg("/api/v1/metrics/query-pool", s.queryPoolMetricsHandler)
+	reg("/api/v1/metrics/endpoints", s.endpointMetricsHandler)
+	reg("/api/v1/metrics/timeseries/:type", s.timeseriesMetricsHandler)
+}
+
+// requireToken refuses a request the auth middleware did not authenticate:
+// any valid token passes, read-only included, but a route reached without
+// one (registered too early, or listed public by mistake) is a 401.
+func requireToken(c *fiber.Ctx) error {
+	if auth.GetTokenInfo(c) == nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "authentication required"})
+	}
+	return c.Next()
+}
+
+// SetColdMissingObjects wires the /health "tiering" field source: the last
+// check of cold tier rows whose object is gone (#1551). fn returns nil while
+// there is nothing to report, and the field is then absent.
+func (s *Server) SetColdMissingObjects(fn func() *tiering.ColdMissingObjectsStatus) {
+	s.coldMissingObjects = fn
 }
 
 // SetLicenseStatus wires the /health "license" field source.
@@ -287,6 +355,51 @@ func (s *Server) readyWriteHandler(c *fiber.Ctx) error {
 		"status": "ready",
 		"time":   time.Now().UTC().Format(time.RFC3339),
 	})
+}
+
+// readyReadHandler answers whether a load balancer should route READS to this
+// node. Like /ready/write it is strictly narrower than /ready. On a cluster
+// whose nodes share one object store, a node that holds no read lease refuses
+// every read (cluster/read_lease.go): it is ready, and not a read target.
+//
+// Unauthenticated, like the other probes, so the reason is a fixed sentence:
+// the lease's own reason can carry addresses from a failed sync.
+func (s *Server) readyReadHandler(c *fiber.Ctx) error {
+	if problem := s.readinessProblem(); problem != nil {
+		body := fiber.Map{
+			"status": "not_ready",
+			"time":   time.Now().UTC().Format(time.RFC3339),
+			"reason": problem.reason,
+		}
+		if problem.tier != "" {
+			body["tier"] = problem.tier
+		}
+		return c.Status(fiber.StatusServiceUnavailable).JSON(body)
+	}
+	if s.mayServeReads != nil {
+		if ok, _ := s.mayServeReads(); !ok {
+			// An expected state, logged when the lease is lost: a load
+			// balancer polling this would otherwise add an Error line per
+			// poll.
+			c.Locals(ingestRefusedLocal, true)
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"status": "not_read_target",
+				"time":   time.Now().UTC().Format(time.RFC3339),
+				"reason": "this node's cluster state is not synced with the leader; route reads to another node",
+			})
+		}
+	}
+	return c.JSON(fiber.Map{
+		"status": "ready",
+		"time":   time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// SetReadReadiness wires the predicate behind /ready/read: whether reads
+// should be routed to this node. Left unset (OSS, a node outside a cluster)
+// the node serves reads whenever it is ready at all.
+func (s *Server) SetReadReadiness(fn func() (bool, string)) {
+	s.mayServeReads = fn
 }
 
 // SetWriteReadiness wires the predicate behind /ready/write: whether writes
@@ -333,11 +446,11 @@ func (s *Server) sampleDBStats() {
 // healthHandler returns server health status.
 //
 // The "storage" field is served UNAUTHENTICATED by design, like the rest of
-// /health and like /metrics (see the PublicRoutes rationale in main.go): it
+// /health (a public route: probes and load balancers do not authenticate): it
 // contains no bucket/container names, endpoints, prefixes, paths, or key
 // material — only tier names, backend types, credential modes, sanitized
 // provider labels, expiry timestamps and error counts. That is what probes
-// and Prometheus need, and they do not authenticate. Field-incident context:
+// need, and they do not authenticate. Field-incident context:
 // a reader served green /health for ~21h while every S3 query failed on
 // expired credentials (#603).
 //
@@ -360,6 +473,16 @@ func (s *Server) healthHandler(c *fiber.Ctx) error {
 	}
 	if s.licenseStatus != nil {
 		payload["license"] = s.licenseStatus()
+	}
+	if s.coldMissingObjects != nil {
+		// Counts only: /health is unauthenticated, so no paths (#1551).
+		if st := s.coldMissingObjects(); st != nil {
+			payload["tiering"] = fiber.Map{
+				"cold_rows_missing_objects":          st.Lost,
+				"cold_rows_missing_objects_hot_copy": st.HotCopy,
+				"cold_missing_checked_at":            st.CheckedAt,
+			}
+		}
 	}
 	return c.JSON(payload)
 }
@@ -563,8 +686,6 @@ func (s *Server) queryPoolMetricsHandler(c *fiber.Ctx) error {
 			"connections_open":     snapshot["db_connections_open"],
 			"connections_in_use":   snapshot["db_connections_in_use"],
 			"connections_idle":     snapshot["db_connections_idle"],
-			"queries_total":        snapshot["db_queries_total"],
-			"query_errors_total":   snapshot["db_query_errors_total"],
 			"query_requests":       snapshot["query_requests_total"],
 			"query_success":        snapshot["query_success_total"],
 			"query_errors":         snapshot["query_errors_total"],
@@ -620,6 +741,12 @@ func (s *Server) endpointMetricsHandler(c *fiber.Ctx) error {
 			"records_total":  snapshot["lineprotocol_records_total"],
 			"bytes_total":    snapshot["lineprotocol_bytes_total"],
 		},
+		"prometheus_remote_write": fiber.Map{
+			"requests_total": snapshot["prometheus_remote_write_requests_total"],
+			"records_total":  snapshot["prometheus_remote_write_records_total"],
+			"bytes_total":    snapshot["prometheus_remote_write_bytes_total"],
+			"errors_total":   snapshot["prometheus_remote_write_errors_total"],
+		},
 		"query": fiber.Map{
 			"requests_total": snapshot["query_requests_total"],
 			"success_total":  snapshot["query_success_total"],
@@ -628,14 +755,15 @@ func (s *Server) endpointMetricsHandler(c *fiber.Ctx) error {
 			"latency_avg_ms": queryLatencyAvgMs,
 		},
 		"buffer": fiber.Map{
-			"records_buffered":     snapshot["buffer_records_buffered"],
-			"records_queued":       snapshot["buffer_records_queued"],
-			"records_inflight":     snapshot["buffer_records_inflight"],
-			"records_written":      snapshot["buffer_records_written"],
-			"flushes_total":        snapshot["buffer_flushes_total"],
-			"errors_total":         snapshot["buffer_errors_total"],
-			"flush_failures_total": snapshot["buffer_flush_failures_total"],
-			"queue_depth":          snapshot["buffer_queue_depth"],
+			"records_buffered":      snapshot["buffer_records_buffered"],
+			"records_queued":        snapshot["buffer_records_queued"],
+			"records_inflight":      snapshot["buffer_records_inflight"],
+			"records_written":       snapshot["buffer_records_written"],
+			"records_dropped_total": snapshot["buffer_records_dropped_total"],
+			"flushes_total":         snapshot["buffer_flushes_total"],
+			"errors_total":          snapshot["buffer_errors_total"],
+			"flush_failures_total":  snapshot["buffer_flush_failures_total"],
+			"queue_depth":           snapshot["buffer_queue_depth"],
 		},
 		"storage": fiber.Map{
 			"writes_total":      snapshot["storage_writes_total"],
@@ -762,19 +890,20 @@ func (s *Server) hardenedTLSListener(addr string) (net.Listener, error) {
 	return tls.NewListener(ln, tlsCfg), nil
 }
 
-// Shutdown gracefully shuts down the server
+// OnShutdownStart registers fn to run when Shutdown starts, before the HTTP
+// server drains: the point at which fasthttp ends its requests' contexts. The
+// cluster router's StopForwards is registered here, so a forward, which does
+// not run on its request's context (#1629), ends when it used to.
+func (s *Server) OnShutdownStart(fn func()) {
+	s.onShutdownStartMu.Lock()
+	s.onShutdownStart = append(s.onShutdownStart, fn)
+	s.onShutdownStartMu.Unlock()
+}
+
+// Shutdown drains the server within timeout: ShutdownContext with that
+// budget.
 func (s *Server) Shutdown(timeout time.Duration) error {
-	s.logger.Info().Msg("Shutting down server gracefully...")
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	if err := s.app.ShutdownWithContext(ctx); err != nil {
-		return fmt.Errorf("server shutdown failed: %w", err)
-	}
-
-	s.logger.Info().Msg("Server stopped")
-	return nil
+	return s.ShutdownContext(context.Background(), timeout)
 }
 
 // WaitForShutdown blocks until shutdown signal is received
@@ -939,7 +1068,16 @@ func requestLogger(logger zerolog.Logger) fiber.Handler {
 		m := metrics.Get()
 
 		m.IncHTTPRequests()
-		m.RecordHTTPLatency(duration.Microseconds())
+		// A write that waited until its rows were visible (#1759) is
+		// recorded in arc_ingest_wait_visible_seconds instead: its seconds
+		// would swamp the HTTP latency of every other request.
+		// So is a fresh query that waited for its flushes (#1760), in
+		// arc_query_fresh_flush_seconds.
+		waited, _ := c.Locals(waitVisibleLocal).(bool)
+		freshWaited, _ := c.Locals(freshWaitedLocal).(bool)
+		if !waited && !freshWaited {
+			m.RecordHTTPLatency(duration.Microseconds())
+		}
 
 		if status >= 400 {
 			m.IncHTTPError()

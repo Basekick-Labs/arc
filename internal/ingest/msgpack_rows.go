@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -32,42 +33,42 @@ type msgRow struct {
 
 // tryDecodeRowsTyped decodes a row-format payload; ok false sends it to the
 // generic path.
-func (d *MessagePackDecoder) tryDecodeRowsTyped(data []byte, known KnownColumns) (recs []interface{}, rows int, drops []LPDrop, ok bool) {
+func (d *MessagePackDecoder) tryDecodeRowsTyped(data []byte, known KnownColumns) (recs []interface{}, rows int, drops []LPDrop, ok bool, err error) {
 	var items [][]byte
 	switch c := data[0]; {
 	case isArrayCode(c):
 		n, pos, ok := msgpackHeader(data, 0, true)
 		if !ok || n == 0 || n > len(data)-pos {
-			return nil, 0, nil, false
+			return nil, 0, nil, false, nil
 		}
 		items = make([][]byte, 0, n)
 		for i := 0; i < n; i++ {
 			end, ok := msgpackValueEnd(data, pos)
 			if !ok {
-				return nil, 0, nil, false
+				return nil, 0, nil, false, nil
 			}
 			items = append(items, data[pos:end])
 			pos = end
 		}
 		if pos != len(data) {
-			return nil, 0, nil, false
+			return nil, 0, nil, false, nil
 		}
 	case isMapCode(c):
 		if spans, ok := batchItemSpans(data); ok {
 			if len(spans) == 0 {
-				return nil, 0, nil, false
+				return nil, 0, nil, false, nil
 			}
 			for _, sp := range spans {
 				items = append(items, data[sp[0]:sp[1]])
 			}
 		} else {
 			if end, ok := msgpackValueEnd(data, 0); !ok || end != len(data) {
-				return nil, 0, nil, false
+				return nil, 0, nil, false, nil
 			}
 			items = [][]byte{data}
 		}
 	default:
-		return nil, 0, nil, false
+		return nil, 0, nil, false, nil
 	}
 
 	decoded := make([]msgRow, 0, len(items))
@@ -78,7 +79,7 @@ func (d *MessagePackDecoder) tryDecodeRowsTyped(data []byte, known KnownColumns)
 			untimed++
 		}
 		if !ok {
-			return nil, 0, nil, false
+			return nil, 0, nil, false, nil
 		}
 		sanitized += s
 		decoded = append(decoded, row)
@@ -107,6 +108,7 @@ func (d *MessagePackDecoder) tryDecodeRowsTyped(data []byte, known KnownColumns)
 	}
 	b := newLPBuilder(nil, min(len(decoded), lpMaxColumnHint))
 	b.known = known
+	b.budget = true
 	var pt lpPoint
 	for i := range decoded {
 		r := &decoded[i]
@@ -123,7 +125,12 @@ func (d *MessagePackDecoder) tryDecodeRowsTyped(data []byte, known KnownColumns)
 			}
 		}
 		if err := b.add(&pt); err != nil {
-			return nil, 0, nil, false // cannot happen in infer mode; the generic path decides
+			if errors.Is(err, ErrLPCellBudget) {
+				// Refused, not handed to the generic path, which would build
+				// the same dense batch.
+				return nil, 0, nil, false, err
+			}
+			return nil, 0, nil, false, nil // cannot happen in infer mode; the generic path decides
 		}
 	}
 	batches, counts, drops := b.finish()
@@ -136,7 +143,7 @@ func (d *MessagePackDecoder) tryDecodeRowsTyped(data []byte, known KnownColumns)
 	for _, name := range names {
 		recs = append(recs, &TypedColumnarRecord{Measurement: name, Batch: batches[name], NumRecords: counts[name]})
 	}
-	return recs, len(decoded), drops, true
+	return recs, len(decoded), drops, true, nil
 }
 
 // decodeRowTyped decodes one row map as decodeRow reads it. sanitized counts

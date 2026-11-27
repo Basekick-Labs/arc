@@ -1,0 +1,274 @@
+package iceberg
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/sync/semaphore"
+)
+
+// One database's tables are not exported and dropped at once (#1789).
+//
+// A database DELETE drops its Iceberg tables from the request's goroutine
+// (DropDatabase), and until this lock a reconcile pass or an append of one of
+// those tables could be anywhere in its work at that moment. A pass that had
+// loaded its table before the drop committed or published after it: the
+// catalog got its row back (from the pass's commit, or adopted from a
+// version file the drop had not reached yet) next to metadata naming
+// manifests the drop then deleted. Such a table loads, so nothing treats it
+// as gone, and every later pass of it fails; a database written again under
+// the same name was exported into it.
+//
+// Every export of a table holds its database's lock shared, from before it
+// lists the measurement to its end (holdDatabase: the scheduler's passes and
+// appends). DropDatabase holds it alone. So a drop waits for the exports of
+// that database in flight and no new one starts until it is done; an export
+// that starts after it lists the storage the DELETE left.
+//
+// An export does not wait for a drop. It runs on the scheduler's loop, or in
+// a batch the loop is waiting for, and while it waited no table of any other
+// database would be exported; a drop deletes every metadata object of every
+// table of its database, which on object storage is not quick. An export
+// that finds its database being dropped (or a drop waiting for it) gives way
+// at once (errDatabaseBeingDropped) and its table is tried again later, as
+// one whose files are changing under the export is.
+//
+// The lock is this process's. On a shared bucket the node that handles the
+// DELETE is usually not the node that exports, and that node's passes are
+// not held by it: the database's drop record is what they go by
+// (shared_drop.go, #1792).
+
+// databaseLockShares is how many exports of one database may hold its lock
+// together: more than can ever run at once. A drop takes all of them.
+const databaseLockShares = 1 << 20
+
+// dropLockWait is the longest DropDatabase waits for the exports of the
+// database in flight, whatever time its caller gives it: a pass has two
+// minutes, and a DELETE that waited that long has something wedged before
+// it. A var for tests.
+var dropLockWait = 150 * time.Second
+
+type databaseLocks struct {
+	mu sync.Mutex
+	m  map[string]*semaphore.Weighted
+	// drops counts the drops of each database (by lock key) in this
+	// process: what was learnt of a table under one count is not true under
+	// the next (databaseDrops).
+	drops map[string]uint64
+	// removals counts, by "<database>\x00<measurement>", the tables this
+	// process removed because another node had dropped their database
+	// (shared_drop.go): the same, for one table (tableDropStamp).
+	removals map[string]uint64
+}
+
+// countTableRemoval records that the table was removed (shared_drop.go).
+func (e *Exporter) countTableRemoval(database, measurement string) {
+	e.dbLocks.mu.Lock()
+	defer e.dbLocks.mu.Unlock()
+	if e.dbLocks.removals == nil {
+		e.dbLocks.removals = make(map[string]uint64)
+	}
+	e.dbLocks.removals[database+"\x00"+measurement]++
+}
+
+// tableDropStamp changes whenever what the scheduler learnt of the table
+// stops being true: the database's tables were dropped in this process, or
+// this table was removed because another node dropped its database. Two
+// counts that only grow, so their sum does too.
+func (e *Exporter) tableDropStamp(database, measurement string) uint64 {
+	e.dbLocks.mu.Lock()
+	defer e.dbLocks.mu.Unlock()
+	return e.dbLocks.drops[databaseLockKey(database)] + e.dbLocks.removals[database+"\x00"+measurement]
+}
+
+// forgetTableMemory is forgetDatabaseMemory for one table: what this
+// exporter remembers of a table removed because its database was dropped on
+// another node (shared_drop.go).
+func (e *Exporter) forgetTableMemory(database, measurement string) {
+	ident := e.tableIdent(database, measurement)
+	key := strings.Join(ident, "\x00")
+	e.publishedMu.Lock()
+	delete(e.published, key)
+	delete(e.markerCleared, key)
+	delete(e.hinted, key)
+	e.publishedMu.Unlock()
+	e.forgetExportLag(ident)
+	e.forgetTableWork(database, measurement)
+}
+
+// forgetTableWork forgets what the export learnt of working on the table
+// (its chunk size, its manifests, the drop id it was found to carry): not
+// true of another lineage under the name.
+func (e *Exporter) forgetTableWork(database, measurement string) {
+	tkey := database + "\x00" + measurement
+	e.dropSeenMu.Lock()
+	delete(e.dropSeen, tkey)
+	e.dropSeenMu.Unlock()
+	e.chunkMu.Lock()
+	delete(e.appendSmall, tkey)
+	delete(e.chunkSize, tkey)
+	delete(e.floorDue, tkey)
+	delete(e.leftAt, tkey) // where an append left the table: another lineage now (#1795)
+	e.chunkMu.Unlock()
+}
+
+// databaseDrops is how many times the database's tables have been dropped in
+// this process. A pass reads it (in tableDropStamp) while it holds the
+// database, so no drop in this process changes it under the pass; what the
+// scheduler cached for a table under another number describes a table that
+// is gone, whatever now has its name.
+func (e *Exporter) databaseDrops(database string) uint64 {
+	e.dbLocks.mu.Lock()
+	defer e.dbLocks.mu.Unlock()
+	return e.dbLocks.drops[databaseLockKey(database)]
+}
+
+func (e *Exporter) countDatabaseDrop(database string) {
+	e.dbLocks.mu.Lock()
+	defer e.dbLocks.mu.Unlock()
+	if e.dbLocks.drops == nil {
+		e.dbLocks.drops = make(map[string]uint64)
+	}
+	e.dbLocks.drops[databaseLockKey(database)]++
+}
+
+// databaseLockKey is what a database's lock is kept under: the database, or
+// for an edge-sync hub's "{spoke}/{db}" the spoke, which is what a DELETE of
+// the spoke drops.
+func databaseLockKey(database string) string {
+	if top, _, nested := strings.Cut(database, "/"); nested {
+		return top
+	}
+	return database
+}
+
+func (l *databaseLocks) of(database string) *semaphore.Weighted {
+	key := databaseLockKey(database)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.m == nil {
+		l.m = make(map[string]*semaphore.Weighted)
+	}
+	sem, ok := l.m[key]
+	if !ok {
+		sem = semaphore.NewWeighted(databaseLockShares)
+		l.m[key] = sem
+	}
+	return sem
+}
+
+// errDatabaseBeingDropped is holdDatabase's refusal: the database's tables
+// are being dropped, or a drop is waiting for their exports to end.
+var errDatabaseBeingDropped = errors.New("iceberg: the database is being dropped")
+
+// holdDatabase holds the database's lock for one export of one of its
+// tables and returns the release. It never waits: a drop, running or waiting
+// its turn, keeps an export out with errDatabaseBeingDropped, and a restore
+// waiting for the restart (restore_pause.go) with errExportPaused.
+func (e *Exporter) holdDatabase(database string) (release func(), err error) {
+	// While a restore stages a catalog no export starts (restore_pause.go).
+	// The pass gives way as it does to a drop, and is tried again after the
+	// restart.
+	paused, err := e.holdExport()
+	if err != nil {
+		return nil, fmt.Errorf("database %q: %w", database, err)
+	}
+	sem := e.dbLocks.of(database)
+	if !sem.TryAcquire(1) {
+		paused()
+		return nil, fmt.Errorf("database %q: %w", database, errDatabaseBeingDropped)
+	}
+	return func() { sem.Release(1); paused() }, nil
+}
+
+// lockDatabaseForDrop holds the database's lock alone, once no export of
+// its tables is running, and returns the release. It gives up after
+// dropLockWait or when ctx ends, whichever is first.
+func (e *Exporter) lockDatabaseForDrop(ctx context.Context, database string) (release func(), err error) {
+	// Not while a restore stages a catalog (restore_pause.go): the restored
+	// catalog would bring back rows for the tables this drop deletes.
+	paused, err := e.holdExport()
+	if err != nil {
+		return nil, fmt.Errorf("the Iceberg tables of database %q were not dropped because a restore is waiting for the server to restart; "+
+			"repeat the DELETE after the restart to drop them: %w", database, err)
+	}
+	sem := e.dbLocks.of(database)
+	if sem.TryAcquire(databaseLockShares) {
+		return func() { sem.Release(databaseLockShares); paused() }, nil
+	}
+	wctx, cancel := context.WithTimeout(ctx, dropLockWait)
+	defer cancel()
+	if err := sem.Acquire(wctx, databaseLockShares); err != nil {
+		paused()
+		return nil, fmt.Errorf("an Iceberg export of database %q was still running and its tables were not dropped; "+
+			"repeat the DELETE to drop them: %w", database, err)
+	}
+	return func() { sem.Release(databaseLockShares); paused() }, nil
+}
+
+// forgetDatabaseMemory drops what the exporter remembers of a dropped
+// database's tables, so a database written again under the same name starts
+// from what is in the warehouse and nothing else.
+func (e *Exporter) forgetDatabaseMemory(database string) {
+	// By table identifier: "<prefix>_<db>\x00<table>".
+	if ns, err := namespaceIdentifier(e.nsPrefix, database); err == nil {
+		prefix := strings.Join(ns, "\x00") + "\x00"
+		e.publishedMu.Lock()
+		for k := range e.published {
+			if strings.HasPrefix(k, prefix) {
+				delete(e.published, k)
+			}
+		}
+		for k := range e.markerCleared {
+			if strings.HasPrefix(k, prefix) {
+				delete(e.markerCleared, k)
+			}
+		}
+		e.publishedMu.Unlock()
+	}
+	e.dropSeenMu.Lock()
+	for k := range e.dropSeen {
+		if strings.HasPrefix(k, database+"\x00") || strings.HasPrefix(k, database+"/") {
+			delete(e.dropSeen, k)
+		}
+	}
+	e.dropSeenMu.Unlock()
+	// By "<db>\x00<measurement>", and "<spoke>/<db>\x00<measurement>" under a spoke.
+	match := func(k string) bool {
+		return strings.HasPrefix(k, database+"\x00") || strings.HasPrefix(k, database+"/")
+	}
+	e.chunkMu.Lock()
+	for k := range e.appendSmall {
+		if match(k) {
+			delete(e.appendSmall, k)
+		}
+	}
+	for k := range e.chunkSize {
+		if match(k) {
+			delete(e.chunkSize, k)
+		}
+	}
+	for k := range e.floorDue {
+		if match(k) {
+			delete(e.floorDue, k)
+		}
+	}
+	for k := range e.leftAt {
+		if match(k) {
+			delete(e.leftAt, k)
+		}
+	}
+	e.chunkMu.Unlock()
+}
+
+// SetOnDatabaseDropped sets what is told after a database's tables were
+// dropped (the scheduler, which forgets what it remembers of them). Call it
+// before the scheduler starts. It is called from DropDatabase's goroutine
+// and must not block.
+func (e *Exporter) SetOnDatabaseDropped(f func(database string)) {
+	e.onDatabaseDropped = f
+}

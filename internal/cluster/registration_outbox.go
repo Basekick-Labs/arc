@@ -47,6 +47,17 @@ type OutboxManifest interface {
 	StreamClaimsEnabled() bool
 }
 
+// fencedOwnedChecker reports a path a compaction being finished under read
+// fences owns (Coordinator, #1852).
+type fencedOwnedChecker interface {
+	CompactionFencedOwns(path string) bool
+}
+
+// rehomeOwnedChecker reports a path a re-home job owns (Coordinator).
+type rehomeOwnedChecker interface {
+	RehomeOwnsPath(path string) bool
+}
+
 // consumedInputChecker is the optional part of OutboxManifest that knows the
 // inputs of the compactions it has not finished (#1358). The coordinator
 // implements it.
@@ -1026,6 +1037,26 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 			}
 		}
 	}
+	// What re-home jobs and fenced compactions hold, read BEFORE the storage
+	// checks: a job or a compaction removes the object, then lets go. Read
+	// only after, one that let go between the two would leave a stat taken
+	// while the object was still there to register a file that is gone
+	// (#1857). The checks in the loop stay, for a hold taken after this read.
+	rehomed, _ := manifest.(rehomeOwnedChecker)
+	fenced, _ := manifest.(fencedOwnedChecker)
+	ownedBefore := map[*outboxEntry]bool{} // the file itself: settles
+	heldBefore := map[*outboxEntry]bool{}  // a rewrite's source, or fenced: waits
+	for _, e := range candidates {
+		if rehomed != nil && rehomed.RehomeOwnsPath(e.rec.Path) {
+			ownedBefore[e] = true
+		}
+		if rehomed != nil && e.rec.Supersedes != "" && rehomed.RehomeOwnsPath(e.rec.Supersedes) {
+			heldBefore[e] = true
+		}
+		if fenced != nil && (fenced.CompactionFencedOwns(e.rec.Path) || (e.rec.Supersedes != "" && fenced.CompactionFencedOwns(e.rec.Supersedes))) {
+			heldBefore[e] = true
+		}
+	}
 	sizes, statErrs := r.statAll(ctx, store, toCheck)
 
 	var ops []raft.BatchFileOp
@@ -1054,6 +1085,33 @@ func (r *RegistrationOutbox) attempt(ctx context.Context, manifest OutboxManifes
 		// committed-and-removed case above does.
 		if consumed != nil && checked[e] && !synced {
 			// Unsynced, the check could miss a compaction that consumed it.
+			deferred = append(deferred, e)
+			continue
+		}
+		// A path a re-home job owns (#1825): the job staged it registered,
+		// and only the job changes it, so registering it again is either
+		// a no-op or, once the job removed it, its resurrection. Settled.
+		// One superseding an owned file (a DELETE rewrite of a job's source)
+		// waits: the job reverts when it sees the rewrite, and the batch
+		// must not carry a refused op meanwhile.
+		if ownedBefore[e] || (rehomed != nil && rehomed.RehomeOwnsPath(e.rec.Path)) {
+			r.markInManifest(e)
+			r.logger.Warn().Str("path", e.rec.Path).
+				Msg("Pending file is owned by a re-home job; not registered again (the job registered it, or removed it)")
+			settled = append(settled, e)
+			continue
+		}
+		if rehomed != nil && e.rec.Supersedes != "" && (heldBefore[e] || rehomed.RehomeOwnsPath(e.rec.Supersedes)) {
+			deferred = append(deferred, e)
+			continue
+		}
+		// A path a compaction being finished under read fences owns
+		// (#1852): the cluster refuses it until the job's inputs are gone,
+		// and the whole batch with it. Deferred, not settled: once the job
+		// ends the entry settles (a consumed input, or an object gone) or
+		// registers.
+		if heldBefore[e] || (fenced != nil && (fenced.CompactionFencedOwns(e.rec.Path) ||
+			(e.rec.Supersedes != "" && fenced.CompactionFencedOwns(e.rec.Supersedes)))) {
 			deferred = append(deferred, e)
 			continue
 		}

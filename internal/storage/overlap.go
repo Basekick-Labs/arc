@@ -1,7 +1,7 @@
 package storage
 
 import (
-	"fmt"
+	"errors"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -163,7 +163,7 @@ func DestinationFromSpec(spec BackendSpec) (Destination, error) {
 		}, nil
 
 	default:
-		return Destination{}, fmt.Errorf("unsupported storage backend %q (use local, s3, minio, azure, azblob or gcs)", spec.Type)
+		return Destination{}, errors.New("storage backend type is not supported (use local, s3, minio, azure, azblob or gcs)")
 	}
 }
 

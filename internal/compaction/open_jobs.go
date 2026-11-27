@@ -3,6 +3,7 @@ package compaction
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -177,8 +178,29 @@ func (a *OpenJobs) Open(prefix string) bool {
 // a read must leave out so it sees each open job's rows once: the inputs of
 // every job whose output is in storage. Empty in the common case.
 func (a *OpenJobs) ExcludedFor(ctx context.Context, prefix string) []string {
+	out, _, _ := a.excludedFor(ctx, prefix, false)
+	return out
+}
+
+// ExcludedForStrict is ExcludedFor for a reader that must not guess (the
+// Iceberg export): an output it cannot stat, or a manifest it cannot read,
+// is an error instead of a read as main does.
+func (a *OpenJobs) ExcludedForStrict(ctx context.Context, prefix string) ([]string, error) {
+	out, _, err := a.excludedFor(ctx, prefix, true)
+	return out, err
+}
+
+// ExcludedWithOutputsStrict is ExcludedForStrict that also names the outputs
+// whose inputs it leaves out: for each of them the output holds every row of
+// the inputs left out, so an export that leaves those inputs out must keep
+// the output, whatever its crash-recovery manifest says (#1722).
+func (a *OpenJobs) ExcludedWithOutputsStrict(ctx context.Context, prefix string) (excluded, outputs []string, err error) {
+	return a.excludedFor(ctx, prefix, true)
+}
+
+func (a *OpenJobs) excludedFor(ctx context.Context, prefix string, strict bool) (excluded, outputs []string, err error) {
 	if a == nil {
-		return nil
+		return nil, nil, nil
 	}
 	a.mu.Lock()
 	var jobs []*openJob
@@ -188,9 +210,12 @@ func (a *OpenJobs) ExcludedFor(ctx context.Context, prefix string) []string {
 		}
 	}
 	a.mu.Unlock()
-	var out []string
+	var out, outs []string
 	for _, j := range jobs {
 		size, err := a.backend.StatFile(ctx, j.output)
+		if err != nil && strict {
+			return nil, nil, fmt.Errorf("stat compaction output %s: %w", j.output, err)
+		}
 		if err != nil || size < 0 {
 			// Absent (or unknown): read as main does; see the type comment.
 			continue
@@ -204,21 +229,29 @@ func (a *OpenJobs) ExcludedFor(ctx context.Context, prefix string) []string {
 				(*fn)()
 			}
 		}
-		out = append(out, a.inputsOf(ctx, j)...)
+		in, err := a.inputsOf(ctx, j)
+		if err != nil && strict {
+			return nil, nil, err
+		}
+		if len(in) > 0 {
+			out = append(out, in...)
+			outs = append(outs, j.output)
+		}
 	}
-	return out
+	return out, outs, nil
 }
 
 // inputsOf is the job's input list from its manifest, read once. A manifest
 // gone with the output in place means the inputs were deleted: the job is
-// over and its entry goes. An unreadable manifest falls back to the parent's
-// candidates.
-func (a *OpenJobs) inputsOf(ctx context.Context, j *openJob) []string {
+// over and its entry goes. An unreadable or unparsable manifest falls back to
+// the parent's candidates; only the unreadable one is reported, as the other
+// will not change by asking again.
+func (a *OpenJobs) inputsOf(ctx context.Context, j *openJob) ([]string, error) {
 	a.mu.Lock()
 	if j.inputs != nil {
 		in := j.inputs
 		a.mu.Unlock()
-		return in
+		return in, nil
 	}
 	path, cand := j.manifestPath, j.candidates
 	a.mu.Unlock()
@@ -226,18 +259,18 @@ func (a *OpenJobs) inputsOf(ctx context.Context, j *openJob) []string {
 	if err != nil {
 		if storage.IsNotFound(err) {
 			a.drop(j)
-			return nil
+			return nil, nil
 		}
-		return cand
+		return cand, fmt.Errorf("read compaction manifest %s: %w", path, err)
 	}
 	var man Manifest
 	if json.Unmarshal(data, &man) != nil {
-		return cand
+		return cand, nil
 	}
 	a.mu.Lock()
 	j.inputs = man.InputFiles
 	a.mu.Unlock()
-	return man.InputFiles
+	return man.InputFiles, nil
 }
 
 // drop removes j if it is still the entry for its output and not running.

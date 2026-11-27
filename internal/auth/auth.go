@@ -75,7 +75,18 @@ type TokenInfo struct {
 	// (#1305): an ID alone can name a different token on a node that kept a
 	// pre-26.06.1 local row at that ID (cluster_apply.go).
 	Fingerprint string `json:"-"`
+	// NodeLocal marks, in the admin list and get on a cluster node, a token
+	// the cluster does not manage: it exists only in this node's database
+	// (#1630). NodeID is that node. Both are unset everywhere else, including
+	// on every authentication.
+	NodeLocal bool   `json:"node_local,omitempty"`
+	NodeID    string `json:"node_id,omitempty"`
 }
+
+// TokenFingerprint is the hex SHA-256 of a token's stored hash: what
+// TokenInfo.Fingerprint carries, computable from the cluster state's copy of
+// the hash too (#1627).
+func TokenFingerprint(tokenHash string) string { return tokenFingerprint(tokenHash) }
 
 // tokenFingerprint is the hex SHA-256 of a token's stored hash.
 func tokenFingerprint(tokenHash string) string {
@@ -158,6 +169,11 @@ type AuthManager struct {
 	lastUsedWG sync.WaitGroup
 
 	logger zerolog.Logger
+
+	// tokenRowHook is called with a token ID after this node writes that
+	// token's api_tokens row. RBAC registers its per-token cache here: its
+	// membership query reads the row's raft_materialised (#1630).
+	tokenRowHook atomic.Pointer[func(int64)]
 
 	// proposer is the Raft seam for cluster-wide auth state replication.
 	// When non-nil (Enterprise cluster mode), every write method routes
@@ -831,16 +847,27 @@ func (am *AuthManager) insertToken(hash, prefix, name, description, permissions 
 		expiresAtVal = expiresAt.UTC()
 	}
 
-	_, err := am.db.Exec(`
+	// ON CONFLICT DO NOTHING turns a taken name into "0 rows inserted"
+	// instead of a driver error whose text would have to be matched. It is
+	// untargeted on purpose: it names no constraint, so it cannot fail with
+	// "ON CONFLICT clause does not match" on a table created by an older
+	// release. api_tokens has two uniqueness constraints, the AUTOINCREMENT
+	// id this INSERT does not set and name, so 0 rows means the name is
+	// taken. #1625.
+	result, err := am.db.Exec(`
 		INSERT INTO api_tokens (name, token_hash, token_prefix, description, permissions, expires_at)
 		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT DO NOTHING
 	`, name, hash, prefix, description, permissions, expiresAtVal)
-
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
-			return fmt.Errorf("token with name '%s' already exists", name)
-		}
 		return fmt.Errorf("failed to create token: %w", err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to create token: %w", err)
+	}
+	if inserted == 0 {
+		return errTokenNameExists(name)
 	}
 
 	return nil
@@ -899,6 +926,12 @@ func (am *AuthManager) CreateToken(ctx context.Context, name, description, permi
 			},
 		}
 		if err := am.proposeCommand(ctx, ProposalCommandCreateToken, payload); err != nil {
+			// The FSM refuses a duplicate name; the cluster proposer tags
+			// that refusal ErrNameConflict. Report it as the standalone path
+			// does.
+			if errors.Is(err, ErrNameConflict) {
+				return "", errTokenNameExists(name)
+			}
 			return "", fmt.Errorf("create token: %w", err)
 		}
 		am.logger.Info().
@@ -1093,13 +1126,14 @@ func (am *AuthManager) HasPermission(info *TokenInfo, permission string) bool {
 // ListTokens returns all tokens (without revealing hashes)
 func (am *AuthManager) ListTokens() ([]TokenInfo, error) {
 	rows, err := am.db.Query(`
-		SELECT id, name, description, permissions, created_at, last_used_at, expires_at, enabled
+		SELECT id, name, description, permissions, created_at, last_used_at, expires_at, enabled, raft_materialised, token_hash
 		FROM api_tokens
 	`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	labeler := am.newTokenLabeler()
 
 	var tokens []TokenInfo
 	for rows.Next() {
@@ -1112,9 +1146,11 @@ func (am *AuthManager) ListTokens() ([]TokenInfo, error) {
 			lastUsedAt  sql.NullTime
 			expiresAt   sql.NullTime
 			enabled     bool
+			marked      sql.NullInt64
+			hash        string
 		)
 
-		if err := rows.Scan(&id, &name, &description, &permissions, &createdAt, &lastUsedAt, &expiresAt, &enabled); err != nil {
+		if err := rows.Scan(&id, &name, &description, &permissions, &createdAt, &lastUsedAt, &expiresAt, &enabled, &marked, &hash); err != nil {
 			return nil, err
 		}
 
@@ -1126,6 +1162,7 @@ func (am *AuthManager) ListTokens() ([]TokenInfo, error) {
 			CreatedAt:   createdAt,
 			Enabled:     enabled,
 		}
+		labeler.label(&info, &tokenWriteRow{id: id, name: name, hash: hash, createdAt: createdAt, enabled: enabled, marked: marked.Int64 == 1})
 		if permissions.Valid && permissions.String != "" {
 			info.Permissions = strings.Split(permissions.String, ",")
 		}
@@ -1223,15 +1260,86 @@ func (am *AuthManager) GetTokenByID(id int64) (*TokenInfo, error) {
 	return info, nil
 }
 
-// UpdateToken updates token metadata.
+// errTokenNotFound is the error every token write returns for an ID with no
+// token. Tagged ErrNotFound so the HTTP handlers map it with errors.Is; the
+// message is the one the API has always reported.
+func errTokenNotFound() error {
+	return tagError(ErrNotFound, errors.New("token not found"))
+}
+
+// errTokenNameExists is the error a token create or rename returns for a name
+// another token holds, on both the SQLite path (a write that changed no row
+// because of the name) and the cluster path (the FSM's refusal, which the
+// cluster proposer tags ErrNameConflict). Tagged ErrNameConflict: a duplicate
+// name is a client error, not a server fault. The message is the one the API
+// has always reported, and ForceAddRecoveryToken matches "already exists" in
+// it.
+func errTokenNameExists(name string) error {
+	return tagError(ErrNameConflict, fmt.Errorf("token with name '%s' already exists", name))
+}
+
+// ErrTokenRevoked tags a rotate of a revoked token. Revocation is permanent:
+// no route re-enables a token, so a rotated secret could never authenticate.
+// The rotate handler maps it to 409. #1625.
+var ErrTokenRevoked = errors.New("token is revoked")
+
+// errTokenRevoked is the error RotateToken returns for a revoked token.
+func errTokenRevoked() error {
+	return tagError(ErrTokenRevoked, errors.New("token is revoked and cannot be rotated"))
+}
+
+// requireLocalToken returns the local SQLite copy of the token with this ID,
+// or errTokenNotFound when it holds none.
+//
+// The standalone RotateToken calls it before it generates a value, and the
+// standalone UpdateToken and RotateToken after a write that changed no row,
+// to tell "not found" from a name conflict or a revoked token. The cluster
+// write paths make the same check through classifyTokenWrite (#1630), which
+// also decides whether the cluster manages the row. The FSM treats an update,
+// revoke, rotate or delete of an unknown ID as an idempotent no-op so that log
+// replay after a delete stays clean, so the proposal itself cannot report it:
+// without this check each of those routes answered 200 for an ID that never
+// existed. The same pre-check, and the same short window on a follower that has
+// not yet applied a token created elsewhere, as RBACManager.DeleteOrganization.
+func (am *AuthManager) requireLocalToken(id int64) (*TokenInfo, error) {
+	info, err := am.GetTokenByID(id)
+	if err != nil {
+		return nil, fmt.Errorf("failed to look up token: %w", err)
+	}
+	if info == nil {
+		return nil, errTokenNotFound()
+	}
+	return info, nil
+}
+
+// UpdateToken updates token metadata. It is UpdateTokenScoped without a
+// ?node= value: on a cluster node, a token the cluster does not manage is
+// refused with a TokenScopeError (#1630).
+func (am *AuthManager) UpdateToken(ctx context.Context, id int64, name, description, permissions *string, expiresAt *time.Time) error {
+	_, err := am.UpdateTokenScoped(ctx, id, name, description, permissions, expiresAt, TokenWriteOptions{})
+	return err
+}
+
+// UpdateTokenScoped updates token metadata.
 //
 // The context bounds the cluster-mode Raft proposal wait. In OSS mode
 // it's currently unused (single SQLite UPDATE statement). Gemini #451
-// round-3 review.
-func (am *AuthManager) UpdateToken(ctx context.Context, id int64, name, description, permissions *string, expiresAt *time.Time) error {
+// round-3 review. On a cluster node a token the cluster does not manage is
+// updated in this node's SQLite only, when opts names this node (#1630).
+func (am *AuthManager) UpdateTokenScoped(ctx context.Context, id int64, name, description, permissions *string, expiresAt *time.Time, opts TokenWriteOptions) (TokenWriteResult, error) {
 	// Cluster mode: propose via Raft with a ChangedFields list so the FSM
 	// applier knows which fields are "leave alone" vs "set to empty".
-	if am.getProposer() != nil {
+	if p := am.getProposer(); p != nil {
+		t, err := am.resolveTokenWrite(p, id, opts)
+		if err != nil {
+			return TokenWriteResult{}, err
+		}
+		switch t.class {
+		case classNodeLocal:
+			return am.updateNodeLocalToken(p, t, name, description, permissions, expiresAt)
+		case classNotInClusterState, classHistoryMismatch:
+			return TokenWriteResult{}, t.localOnlyRefusal()
+		}
 		var changed []string
 		payload := struct {
 			ID                int64    `json:"id"`
@@ -1258,17 +1366,59 @@ func (am *AuthManager) UpdateToken(ctx context.Context, id int64, name, descript
 			changed = append(changed, "expires_at")
 		}
 		if len(changed) == 0 {
-			return nil
+			return t.result(), nil
 		}
 		payload.ChangedFields = changed
 		if err := am.proposeCommand(ctx, ProposalCommandUpdateToken, payload); err != nil {
-			return fmt.Errorf("update token: %w", err)
+			if name != nil && errors.Is(err, ErrNameConflict) {
+				return TokenWriteResult{}, errTokenNameExists(*name)
+			}
+			return TokenWriteResult{}, fmt.Errorf("update token: %w", err)
 		}
-		return nil
+		return t.result(), nil
 	}
 	_ = ctx
 
 	// Standalone / OSS: direct SQLite.
+	query, args := tokenUpdateSQL(id, name, description, permissions, expiresAt)
+	if query == "" {
+		// Nothing to write, but an unknown ID is still not found.
+		_, err := am.requireLocalToken(id)
+		return TokenWriteResult{}, err
+	}
+
+	result, err := am.db.Exec(query, args...)
+	if err != nil {
+		return TokenWriteResult{}, err
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return TokenWriteResult{}, err
+	}
+	if rowsAffected == 0 {
+		if name == nil {
+			return TokenWriteResult{}, errTokenNotFound()
+		}
+		// A rename that changed no row: the ID is unknown or the name is
+		// taken.
+		if _, err := am.requireLocalToken(id); err != nil {
+			return TokenWriteResult{}, err
+		}
+		return TokenWriteResult{}, errTokenNameExists(*name)
+	}
+
+	am.InvalidateCache()
+	am.tokenRowChanged(id)
+	return TokenWriteResult{}, nil
+}
+
+// tokenUpdateSQL builds the SQLite UPDATE of a token's metadata, or "" when
+// no field is set. A rename to a name another token holds changes no row,
+// instead of failing with a driver error whose text would have to be
+// matched; one statement, so SQLite's single writer leaves no window between
+// the check and the write (#1625). extraWhere is ANDed into the row match.
+func tokenUpdateSQL(id int64, name, description, permissions *string, expiresAt *time.Time, extraWhere ...string) (string, []interface{}) {
 	var updates []string
 	var args []interface{}
 
@@ -1290,133 +1440,343 @@ func (am *AuthManager) UpdateToken(ctx context.Context, id int64, name, descript
 		// domain in the column.
 		args = append(args, expiresAt.UTC())
 	}
-
 	if len(updates) == 0 {
-		return nil
+		return "", nil
 	}
 
 	args = append(args, id)
 	query := fmt.Sprintf("UPDATE api_tokens SET %s WHERE id = ?", strings.Join(updates, ", "))
-
-	result, err := am.db.Exec(query, args...)
-	if err != nil {
-		return err
+	for _, w := range extraWhere {
+		query += " AND " + w
 	}
-
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return errors.New("token not found")
+	if name != nil {
+		query += " AND NOT EXISTS (SELECT 1 FROM api_tokens WHERE name = ? AND id <> ?)"
+		args = append(args, *name, id)
 	}
-
-	am.InvalidateCache()
-	return nil
+	return query, args
 }
 
-// DeleteToken deletes a token by ID. The context bounds the cluster-mode
-// Raft proposal wait. Gemini #451 round-3 review.
+// updateNodeLocalToken is UpdateTokenScoped for a token the cluster does not
+// manage: this node's row only, and only while it is still unmarked. A rename
+// to a name a cluster token holds is refused: the cluster token's row could
+// then never be written on this node (its insert would fail UNIQUE(name)).
+func (am *AuthManager) updateNodeLocalToken(p RaftProposer, t *tokenWriteTarget, name, description, permissions *string, expiresAt *time.Time) (TokenWriteResult, error) {
+	if name != nil && *name != t.row.name {
+		if view, ok := p.(ClusterTokenView); ok {
+			if _, held := view.ClusterTokenIDByName(*name); held {
+				return TokenWriteResult{}, &TokenScopeError{Code: TokenCodeNameHeldByCluster, TokenID: t.row.id, NodeID: t.nodeID,
+					Message: fmt.Sprintf("token with name '%s' already exists in the cluster; a token the cluster does not manage cannot take its name", *name)}
+			}
+		}
+	}
+	query, args := tokenUpdateSQL(t.row.id, name, description, permissions, expiresAt, "raft_materialised = 0")
+	if query == "" {
+		return t.result(), nil
+	}
+	res, err := am.db.Exec(query, args...)
+	if err != nil {
+		return TokenWriteResult{}, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return TokenWriteResult{}, err
+	}
+	if n == 0 {
+		row, err := am.getTokenRowForWrite(t.row.id)
+		if err != nil {
+			return TokenWriteResult{}, err
+		}
+		switch {
+		case row == nil:
+			return TokenWriteResult{}, errTokenNotFound()
+		case row.marked || name == nil:
+			return TokenWriteResult{}, errTokenChanged(t.row.id, t.nodeID)
+		}
+		return TokenWriteResult{}, errTokenNameExists(*name)
+	}
+	am.InvalidateCache()
+	am.tokenRowChanged(t.row.id)
+	am.logLocalWrite(t, "update")
+	return t.result(), nil
+}
+
+// DeleteToken deletes a token by ID. It is DeleteTokenScoped without a
+// ?node= value.
 func (am *AuthManager) DeleteToken(ctx context.Context, id int64) error {
-	if am.getProposer() != nil {
+	_, err := am.DeleteTokenScoped(ctx, id, TokenWriteOptions{})
+	return err
+}
+
+// DeleteTokenScoped deletes a token by ID. The context bounds the
+// cluster-mode Raft proposal wait. Gemini #451 round-3 review. On a cluster
+// node a token the cluster does not manage is deleted from this node's SQLite
+// only, when opts names this node (#1630).
+func (am *AuthManager) DeleteTokenScoped(ctx context.Context, id int64, opts TokenWriteOptions) (TokenWriteResult, error) {
+	if p := am.getProposer(); p != nil {
+		t, err := am.resolveTokenWrite(p, id, opts)
+		if err != nil {
+			return TokenWriteResult{}, err
+		}
+		if t.class != classCluster {
+			return am.localTokenWrite(t, "delete", "DELETE FROM api_tokens WHERE id = ? AND raft_materialised = ?")
+		}
 		payload := struct {
 			ID int64 `json:"id"`
 		}{ID: id}
 		if err := am.proposeCommand(ctx, ProposalCommandDeleteToken, payload); err != nil {
-			return fmt.Errorf("delete token: %w", err)
+			return TokenWriteResult{}, fmt.Errorf("delete token: %w", err)
 		}
 		am.logger.Info().Int64("token_id", id).Msg("Deleted API token via Raft")
-		return nil
+		return t.result(), nil
 	}
 	_ = ctx
 
 	result, err := am.db.Exec("DELETE FROM api_tokens WHERE id = ?", id)
 	if err != nil {
-		return err
+		return TokenWriteResult{}, err
 	}
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return errors.New("token not found")
+		return TokenWriteResult{}, errTokenNotFound()
 	}
 
 	am.InvalidateCache()
+	am.tokenRowChanged(id)
 	am.logger.Info().Int64("token_id", id).Msg("Deleted API token")
-	return nil
+	return TokenWriteResult{}, nil
 }
 
-// RevokeToken disables a token. The context bounds the cluster-mode
-// Raft proposal wait. Gemini #451 round-3 review.
+// RevokeToken disables a token. It is RevokeTokenScoped without a ?node=
+// value.
 func (am *AuthManager) RevokeToken(ctx context.Context, id int64) error {
-	if am.getProposer() != nil {
+	_, err := am.RevokeTokenScoped(ctx, id, TokenWriteOptions{})
+	return err
+}
+
+// RevokeTokenScoped disables a token. The context bounds the cluster-mode
+// Raft proposal wait. Gemini #451 round-3 review. On a cluster node a token
+// the cluster does not manage is disabled in this node's SQLite only, when
+// opts names this node (#1630): it then stops authenticating here on the next
+// request, and keeps working on any other node that holds a copy.
+func (am *AuthManager) RevokeTokenScoped(ctx context.Context, id int64, opts TokenWriteOptions) (TokenWriteResult, error) {
+	if p := am.getProposer(); p != nil {
+		t, err := am.resolveTokenWrite(p, id, opts)
+		if err != nil {
+			return TokenWriteResult{}, err
+		}
+		if t.class == classHistoryMismatch {
+			return TokenWriteResult{}, t.localOnlyRefusal()
+		}
+		if t.class != classCluster {
+			return am.localTokenWrite(t, "revoke", "UPDATE api_tokens SET enabled = 0 WHERE id = ? AND raft_materialised = ?")
+		}
 		payload := struct {
 			ID int64 `json:"id"`
 		}{ID: id}
 		if err := am.proposeCommand(ctx, ProposalCommandRevokeToken, payload); err != nil {
-			return fmt.Errorf("revoke token: %w", err)
+			return TokenWriteResult{}, fmt.Errorf("revoke token: %w", err)
 		}
 		am.logger.Info().Int64("token_id", id).Msg("Revoked API token via Raft")
-		return nil
+		return t.result(), nil
 	}
 	_ = ctx
 
 	result, err := am.db.Exec("UPDATE api_tokens SET enabled = 0 WHERE id = ?", id)
 	if err != nil {
-		return err
+		return TokenWriteResult{}, err
 	}
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		return errors.New("token not found")
+		return TokenWriteResult{}, errTokenNotFound()
 	}
 
 	am.InvalidateCache()
+	am.tokenRowChanged(id)
 	am.logger.Info().Int64("token_id", id).Msg("Revoked API token")
-	return nil
+	return TokenWriteResult{}, nil
 }
 
-// RotateToken generates a new token value while keeping metadata. The
-// context bounds the cluster-mode Raft proposal wait. Gemini #451
-// round-3 review.
+// RotateToken generates a new token value while keeping metadata. It is
+// RotateTokenScoped without a ?node= value.
 func (am *AuthManager) RotateToken(ctx context.Context, id int64) (string, error) {
+	token, _, err := am.RotateTokenScoped(ctx, id, TokenWriteOptions{})
+	return token, err
+}
+
+// RotateTokenScoped generates a new token value while keeping metadata. The
+// context bounds the cluster-mode Raft proposal wait. Gemini #451
+// round-3 review. On a cluster node a token the cluster does not manage is
+// rotated in this node's SQLite only, when opts names this node (#1630): the
+// new value authenticates on this node only.
+func (am *AuthManager) RotateTokenScoped(ctx context.Context, id int64, opts TokenWriteOptions) (string, TokenWriteResult, error) {
+	// Checked before a value is generated, in both modes: an unknown or
+	// revoked token is refused without the cost of a new secret. In cluster
+	// mode the FSM drops a rotate of an unknown ID and applies a rotate of a
+	// revoked one, and either way the caller would be handed a token that
+	// authenticates nothing; the re-read after the proposal (below) covers a
+	// revoke or delete that this check could not see yet. Standalone, the
+	// UPDATE's own enabled = 1 is the atomic guard and this is the fast
+	// path. #1625.
+	p := am.getProposer()
+	var t *tokenWriteTarget
+	if p != nil {
+		var err error
+		t, err = am.resolveTokenWrite(p, id, opts)
+		if err != nil {
+			return "", TokenWriteResult{}, err
+		}
+		if t.class == classNotInClusterState || t.class == classHistoryMismatch {
+			return "", TokenWriteResult{}, t.localOnlyRefusal()
+		}
+		if !t.row.enabled {
+			return "", TokenWriteResult{}, errTokenRevoked()
+		}
+	} else {
+		info, err := am.requireLocalToken(id)
+		if err != nil {
+			return "", TokenWriteResult{}, err
+		}
+		if !info.Enabled {
+			return "", TokenWriteResult{}, errTokenRevoked()
+		}
+	}
+
 	token, err := generateToken()
 	if err != nil {
-		return "", fmt.Errorf("failed to generate token: %w", err)
+		return "", TokenWriteResult{}, fmt.Errorf("failed to generate token: %w", err)
 	}
 
 	hash, err := am.hashToken(token)
 	if err != nil {
-		return "", fmt.Errorf("failed to hash token: %w", err)
+		return "", TokenWriteResult{}, fmt.Errorf("failed to hash token: %w", err)
 	}
 
 	// Generate new prefix for O(1) lookup optimization
 	prefix := tokenPrefix(token)
 
+	if t != nil && t.class == classNodeLocal {
+		return am.rotateNodeLocalToken(t, token, hash, prefix)
+	}
+
 	// Cluster mode: propose via Raft. The plaintext token is returned to
 	// the caller out of band — only hash + prefix go through the log.
-	if am.getProposer() != nil {
+	if t != nil {
 		payload := struct {
 			ID        int64  `json:"id"`
 			NewHash   string `json:"new_hash"`
 			NewPrefix string `json:"new_prefix"`
 		}{ID: id, NewHash: hash, NewPrefix: prefix}
 		if err := am.proposeCommand(ctx, ProposalCommandRotateToken, payload); err != nil {
-			return "", fmt.Errorf("rotate token: %w", err)
+			return "", TokenWriteResult{}, fmt.Errorf("rotate token: %w", err)
 		}
-		am.logger.Info().Int64("token_id", id).Msg("Rotated API token via Raft")
-		return token, nil
+		value, err := am.confirmClusterRotate(id, token)
+		if err != nil {
+			return "", TokenWriteResult{}, err
+		}
+		return value, t.result(), nil
 	}
 	_ = ctx
 
-	result, err := am.db.Exec("UPDATE api_tokens SET token_hash = ?, token_prefix = ? WHERE id = ?", hash, prefix, id)
-	if err != nil {
-		return "", err
-	}
-
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		return "", errors.New("token not found")
+	if err := am.writeRotatedToken(id, hash, prefix); err != nil {
+		return "", TokenWriteResult{}, err
 	}
 
 	am.InvalidateCache()
+	am.tokenRowChanged(id)
 	am.logger.Info().Int64("token_id", id).Msg("Rotated API token")
+	return token, TokenWriteResult{}, nil
+}
+
+// rotateNodeLocalToken writes a node-local rotate: this node's row only,
+// while it is still unmarked and enabled (the #1625 guard).
+func (am *AuthManager) rotateNodeLocalToken(t *tokenWriteTarget, token, hash, prefix string) (string, TokenWriteResult, error) {
+	res, err := am.db.Exec("UPDATE api_tokens SET token_hash = ?, token_prefix = ? WHERE id = ? AND enabled = 1 AND raft_materialised = 0", hash, prefix, t.row.id)
+	if err != nil {
+		return "", TokenWriteResult{}, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return "", TokenWriteResult{}, err
+	}
+	if n == 0 {
+		row, err := am.getTokenRowForWrite(t.row.id)
+		switch {
+		case err != nil:
+			return "", TokenWriteResult{}, err
+		case row == nil:
+			return "", TokenWriteResult{}, errTokenNotFound()
+		case !row.marked && !row.enabled:
+			return "", TokenWriteResult{}, errTokenRevoked()
+		}
+		return "", TokenWriteResult{}, errTokenChanged(t.row.id, t.nodeID)
+	}
+	am.InvalidateCache()
+	am.tokenRowChanged(t.row.id)
+	am.logLocalWrite(t, "rotate")
+	return token, t.result(), nil
+}
+
+// writeRotatedToken is the standalone rotate's write. enabled = 1 in the same
+// statement is the atomic guard: RotateToken's pre-check runs before the new
+// value is hashed, and a revoke that lands in between must not get its hash
+// replaced and a dead secret returned (#1625). No route re-enables a token,
+// so a rotated revoked token could never authenticate. On no row changed it
+// returns errTokenNotFound for a deleted token and errTokenRevoked for a
+// revoked one.
+func (am *AuthManager) writeRotatedToken(id int64, hash, prefix string) error {
+	result, err := am.db.Exec("UPDATE api_tokens SET token_hash = ?, token_prefix = ? WHERE id = ? AND enabled = 1", hash, prefix, id)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		if _, err := am.requireLocalToken(id); err != nil {
+			return err
+		}
+		return errTokenRevoked()
+	}
+	return nil
+}
+
+// confirmClusterRotate re-reads the local row after a committed cluster rotate,
+// and refuses the new value when the token is gone (404) or revoked (409): the
+// FSM applies a rotate of a revoked token and drops one of a deleted token, so
+// in either case the value would never authenticate. #1625.
+//
+// How exact this is depends on where the proposal ran:
+//   - Leader: Apply returns after the FSM applied every entry up to the rotate,
+//     and the apply callbacks write this node's SQLite synchronously, so any
+//     revoke or delete ordered before the rotate is visible. A revoke ordered
+//     just after it may be visible too; the 409 is still true, since the value
+//     is dead.
+//   - Follower with cluster policies enabled: the forwarded proposal waits
+//     until this node has applied the rotate's index (forwardAndWaitHere), so
+//     the same holds.
+//   - Follower before cluster policies are enabled, or when that wait times
+//     out (it logs and carries on): this node may not yet have applied a
+//     revoke or delete ordered before the rotate, and the rotate answers 200
+//     with a value that never authenticates.
+//
+// A failed re-read does not fail the rotate: it has committed, and a 500
+// would discard a valid new secret. The value is returned and the failure
+// logged at Warn.
+func (am *AuthManager) confirmClusterRotate(id int64, token string) (string, error) {
+	after, err := am.GetTokenByID(id)
+	switch {
+	case err != nil:
+		am.logger.Warn().Err(err).Int64("token_id", id).
+			Msg("Rotated API token via Raft, but could not re-read it to confirm it is still enabled; returning the new value")
+	case after == nil:
+		return "", errTokenNotFound()
+	case !after.Enabled:
+		return "", errTokenRevoked()
+	}
+	am.logger.Info().Int64("token_id", id).Msg("Rotated API token via Raft")
 	return token, nil
 }
 
@@ -1609,7 +1969,7 @@ func (am *AuthManager) EnsureInitialTokenWithValue(ctx context.Context, tokenVal
 		return "", err
 	}
 	if result == "" {
-		am.logger.Debug().Msg("ARC_AUTH_BOOTSTRAP_TOKEN set but tokens already exist — skipping (no-op)")
+		am.explainSkippedBootstrap(tokenValue)
 	} else {
 		am.logger.Info().Msg("First run detected - created initial admin token from ARC_AUTH_BOOTSTRAP_TOKEN")
 	}
@@ -1627,12 +1987,10 @@ func (am *AuthManager) ForceAddRecoveryToken(ctx context.Context, tokenValue str
 
 	am.logger.Warn().Msg("ARC_AUTH_FORCE_BOOTSTRAP=true: adding recovery admin token (existing tokens preserved)")
 
-	token, err := am.CreateTokenWithValue(ctx, tokenValue, "arc-recovery", "Recovery admin token added via ARC_AUTH_FORCE_BOOTSTRAP", "read,write,delete,admin", nil)
+	token, err := am.CreateTokenWithValue(ctx, tokenValue, recoveryTokenName, "Recovery admin token added via ARC_AUTH_FORCE_BOOTSTRAP", "read,write,delete,admin", nil)
 	if err != nil {
 		if strings.Contains(err.Error(), "already exists") {
-			// Recovery token already exists from a previous restart — no-op, the caller
-			// still holds the token value they provided and can use it.
-			am.logger.Warn().Msg("Recovery token already exists — no-op; use the API to revoke it after regaining access")
+			am.explainExistingRecoveryToken(tokenValue)
 			return "", nil
 		}
 		return "", err
@@ -1641,6 +1999,24 @@ func (am *AuthManager) ForceAddRecoveryToken(ctx context.Context, tokenValue str
 	am.logger.Warn().Msg("Recovery admin token created; existing tokens untouched — use the API to revoke any unwanted tokens after regaining access")
 
 	return token, nil
+}
+
+// SetTokenRowChangedHook registers fn, called with a token ID after this
+// node writes that token's row (an apply, an adoption, or a write through the
+// API). A nil fn removes it. RBAC uses it to drop its cache for that token.
+func (am *AuthManager) SetTokenRowChangedHook(fn func(tokenID int64)) {
+	if fn == nil {
+		am.tokenRowHook.Store(nil)
+		return
+	}
+	am.tokenRowHook.Store(&fn)
+}
+
+// tokenRowChanged calls the hook registered by SetTokenRowChangedHook, if any.
+func (am *AuthManager) tokenRowChanged(id int64) {
+	if fn := am.tokenRowHook.Load(); fn != nil {
+		(*fn)(id)
+	}
 }
 
 // InvalidateCache clears the token cache
@@ -1737,4 +2113,132 @@ func (am *AuthManager) SharesDBPath(dbPath string) bool {
 	}
 
 	return resolve(am.dbPath) == resolve(dbPath)
+}
+
+// recoveryTokenName is the name auth.force_bootstrap gives its token. Names
+// are unique, so a second forced start cannot add another while one exists,
+// disabled (revoked) or not: it has to be deleted.
+const recoveryTokenName = "arc-recovery"
+
+// bootstrapState is what the auth database holds for a configured bootstrap
+// value (#1915).
+type bootstrapState int
+
+const (
+	bootstrapAbsent   bootstrapState = iota // no token has this value
+	bootstrapEnabled                        // an enabled, unexpired token has it
+	bootstrapDisabled                       // a disabled (revoked) token has it
+	bootstrapExpired                        // an expired token has it
+	bootstrapUnknown                        // the database could not be read
+)
+
+// bootstrapValueState reports what the database holds for value, and the
+// name of the token that holds it, by prefix and hash, without the side
+// effects of VerifyToken: no cache entry, no last_used_at write, no metrics.
+// Rows with the legacy prefix (tokens from before prefixes, December 2025)
+// are not checked: the bootstrap has always stored its value with a prefix,
+// and verifying a legacy hash logs a rotation warning in the FIPS build. A
+// value equal to such an old token is reported absent.
+func (am *AuthManager) bootstrapValueState(value string) (bootstrapState, string) {
+	rows, err := am.db.Query(`SELECT name, token_hash, enabled, expires_at FROM api_tokens WHERE token_prefix = ?`, tokenPrefix(value))
+	if err != nil {
+		return bootstrapUnknown, ""
+	}
+	defer rows.Close()
+	state, holder := bootstrapAbsent, ""
+	for rows.Next() {
+		var (
+			name      string
+			hash      string
+			enabled   bool
+			expiresAt sql.NullTime
+		)
+		if err := rows.Scan(&name, &hash, &enabled, &expiresAt); err != nil {
+			continue // as VerifyToken does: one bad row does not hide the others
+		}
+		if !am.verifyTokenHash(value, hash) {
+			continue
+		}
+		switch {
+		case !enabled:
+			state, holder = bootstrapDisabled, name
+		case expiresAt.Valid && time.Now().After(expiresAt.Time):
+			state, holder = bootstrapExpired, name
+		default:
+			return bootstrapEnabled, name
+		}
+	}
+	if rows.Err() != nil {
+		return bootstrapUnknown, ""
+	}
+	return state, holder
+}
+
+// recoveryTokenExists reports whether a token named arc-recovery exists.
+func (am *AuthManager) recoveryTokenExists() bool {
+	var one int
+	return am.db.QueryRow(`SELECT 1 FROM api_tokens WHERE name = ? LIMIT 1`, recoveryTokenName).Scan(&one) == nil
+}
+
+// deleteRecoveryAdvice is how to clear an arc-recovery token out of the way:
+// revoking only disables it, and the name stays taken.
+const deleteRecoveryAdvice = "delete it through the API (DELETE /api/v1/auth/tokens/<id>; revoking only disables it and the name stays taken), then start again with auth.force_bootstrap=true"
+
+// explainSkippedBootstrap says why auth.bootstrap_token was not installed:
+// the auth database already had tokens (#1915). Before, a debug line; an
+// operator who set or fixed the value on a populated database got 401 with
+// nothing saying why. The value is never logged.
+//
+// On a cluster the check is not exact: the database is this node's copy,
+// and the first token is unique by name there, not by the table being
+// empty, so it says what to do without claiming the value is absent.
+func (am *AuthManager) explainSkippedBootstrap(value string) {
+	if am.getProposer() != nil {
+		am.logger.Info().Msg("auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN) is set and the cluster already has an admin token, so it was not installed. If that token is not the configured value, set auth.force_bootstrap=true for one start to add the value as a recovery token")
+		return
+	}
+	state, holder := am.bootstrapValueState(value)
+	switch state {
+	case bootstrapEnabled:
+		am.logger.Debug().Msg("auth.bootstrap_token is already a valid token here — nothing to install")
+	case bootstrapDisabled, bootstrapExpired:
+		why := "is disabled (revoked)"
+		if state == bootstrapExpired {
+			why = "has expired"
+		}
+		msg := "auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN) matches a token that " + why + ", so requests with it get 401. To use the value again, set auth.force_bootstrap=true for one start, which adds it as a new recovery token"
+		if holder == recoveryTokenName {
+			msg = "auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN) matches the arc-recovery token, which " + why + ", so requests with it get 401. To use the value again, " + deleteRecoveryAdvice
+		}
+		am.logger.Warn().Msg(msg)
+	case bootstrapUnknown:
+		am.logger.Warn().Msg("auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN) was not installed because the auth database already has tokens, and whether it holds this value could not be checked")
+	default:
+		msg := "auth.bootstrap_token (ARC_AUTH_BOOTSTRAP_TOKEN) was NOT installed: the auth database already has tokens, and the value is not one of them, so requests with it get 401. To add it as a recovery admin token, set auth.force_bootstrap=true for one start, then remove it"
+		if am.recoveryTokenExists() {
+			msg += ". A token named arc-recovery from an earlier recovery already exists, so first " + deleteRecoveryAdvice
+		}
+		am.logger.Warn().Msg(msg)
+	}
+}
+
+// explainExistingRecoveryToken is what a forced start says when arc-recovery
+// already exists (#1915). It used to say the caller "still holds the token
+// value they provided", which is true only if the existing token has that
+// value and is enabled; otherwise the forced start added nothing and the
+// value got 401.
+func (am *AuthManager) explainExistingRecoveryToken(value string) {
+	if am.getProposer() != nil {
+		am.logger.Warn().Msg("auth.force_bootstrap: a token named arc-recovery already exists, so nothing was added. If it does not hold this value, " + deleteRecoveryAdvice)
+		return
+	}
+	state, holder := am.bootstrapValueState(value)
+	switch {
+	case state == bootstrapEnabled:
+		am.logger.Warn().Msg("Recovery token already exists — no-op; use the API to revoke it after regaining access")
+	case holder == recoveryTokenName:
+		am.logger.Warn().Msg("auth.force_bootstrap: the arc-recovery token holds this value but is disabled or expired, so nothing was added and requests with it get 401. To use the value again, " + deleteRecoveryAdvice)
+	default:
+		am.logger.Warn().Msg("auth.force_bootstrap: a token named arc-recovery from an earlier recovery already exists with a different value, so this value was NOT added and requests with it get 401. To add it, " + deleteRecoveryAdvice)
+	}
 }

@@ -43,12 +43,14 @@ func DefaultMiddlewareConfig() MiddlewareConfig {
 			// The write-pool health check, for the same reason as /ready: a
 			// load balancer cannot authenticate.
 			"/ready/write",
+			// The read-pool health check (#1852), for the same reason.
+			"/ready/read",
 			"/api/v1/auth/verify",
 		},
-		PublicPrefixes: []string{
-			"/metrics",
-		},
-		Skip: false,
+		// /metrics is public only with auth.metrics_public (authPublicPaths,
+		// cmd/arc/audit_coverage.go).
+		PublicPrefixes: []string{},
+		Skip:           false,
 	}
 }
 
@@ -84,43 +86,9 @@ func NewMiddleware(config MiddlewareConfig) fiber.Handler {
 		// so an attacker who can pollute lookup with weird paths can also
 		// pollute the audit trail.
 		reqPath := path.Clean(c.Path())
-		for _, route := range config.PublicRoutes {
-			if reqPath == route {
-				return c.Next()
-			}
+		if IsPublicPath(reqPath, config.PublicRoutes, config.PublicPrefixes) {
+			return c.Next()
 		}
-		for _, prefix := range config.PublicPrefixes {
-			// Normalise prefix: strip exactly one trailing slash. An
-			// operator who reads "this is a directory prefix" and writes
-			// `/metrics/` in their config would otherwise silently break
-			// the anchored match: prefix+"/" becomes "/metrics//" which
-			// matches no real path. Symmetric with the request-path
-			// normalisation above; both sides should be in canonical form
-			// before the equality and HasPrefix checks. We deliberately
-			// don't `path.Clean` the prefix because (a) it's
-			// operator-supplied static config, not attacker-controlled,
-			// and (b) Clean would also collapse a configured `//foo` to
-			// `/foo`, hiding the misconfiguration instead of treating it
-			// as the same prefix the operator wrote.
-			prefix = strings.TrimSuffix(prefix, "/")
-			// Guard against empty-prefix entries (including a configured
-			// `/` that the TrimSuffix above just emptied). `HasPrefix(p, "/")`
-			// is true for every real HTTP path, so an empty prefix would
-			// disable auth wholesale.
-			if prefix == "" {
-				continue
-			}
-			// Anchor the match: require exact path or true subdirectory
-			// (`prefix + "/"`). Without this, a configured prefix `/metrics`
-			// also matches `/metricsX`, `/metrics-secret`, etc. — any route
-			// happening to share the same byte prefix would silently bypass
-			// auth. Matches the same shape gemini-code-assist flagged on
-			// PR #442's deniedRoots check.
-			if reqPath == prefix || strings.HasPrefix(reqPath, prefix+"/") {
-				return c.Next()
-			}
-		}
-
 		// No auth manager configured
 		if config.AuthManager == nil {
 			return c.Next()
@@ -374,6 +342,73 @@ func RequireResourcePermission(am *AuthManager, rm ResourcePermissionChecker, pe
 	}
 }
 
+// AnyResourcePermissionChecker is what RequireAnyResourcePermission needs:
+// *RBACManager.HasPermissionAnywhere.
+type AnyResourcePermissionChecker interface {
+	HasPermissionAnywhere(tokenInfo *TokenInfo, permission string) (bool, error)
+}
+
+// RequireAnyResourcePermission is the door for routes whose resources are
+// named in the request body rather than its path or headers: the tables of a
+// query's SQL, the measurements of an ingest payload. It admits a token that
+// holds `permission` on anything at all — through RBAC when rm is wired, the
+// coarse list otherwise — and the handler then decides per resource
+// (checkQueryPermissions, CheckWritePermissions). A route whose handler does
+// not check per resource must not use it.
+//
+// RequirePermission was the door on these routes until #1559, and it consults
+// only the coarse list: a token whose authority comes from RBAC alone (created
+// with no permissions and added to a team) was refused before RBAC was asked.
+// RequireResourcePermission cannot stand in either: with no database in the
+// path or headers it asks about database "", which a tenant role's pattern
+// never matches.
+//
+// With rm wired, RBAC is authoritative for a team member here as everywhere
+// (see the RBAC ENFORCEMENT MODEL in rbac_manager.go): a token holding the
+// coarse bit whose teams grant `permission` nowhere is refused.
+func RequireAnyResourcePermission(am *AuthManager, rm AnyResourcePermissionChecker, permission string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		tokenInfo := GetTokenInfo(c)
+		if tokenInfo == nil {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"success": false,
+				"error":   "Authentication required",
+			})
+		}
+		var allowed bool
+		if rm == nil {
+			// No checker wired (OSS auth-only build): coarse permissions, as
+			// RequirePermission. Not keyed off the license; see
+			// RequireResourcePermission.
+			allowed = am.HasPermission(tokenInfo, permission)
+		} else {
+			var err error
+			allowed, err = rm.HasPermissionAnywhere(tokenInfo, permission)
+			if err != nil {
+				// Refused (fail closed), but not as "permission denied": the
+				// grants could not be read, and that is what the operator
+				// needs to see. Falling back to the coarse list would widen a
+				// team member restricted by RBAC for as long as the store is
+				// down.
+				am.logger.Error().Err(err).Int64("token_id", tokenInfo.ID).
+					Msg("RBAC grants could not be read; refusing the request (fail closed)")
+				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+					"success": false,
+					"error":   "Permission store unavailable; retry later",
+					"reason":  "hub_unavailable",
+				})
+			}
+		}
+		if !allowed {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+				"success": false,
+				"error":   "Permission denied: " + permission + " required",
+			})
+		}
+		return c.Next()
+	}
+}
+
 // extractDatabase extracts the target database from the request.
 // Checks: x-arc-database header, path parameter, query parameter
 func extractDatabase(c *fiber.Ctx) string {
@@ -446,4 +481,48 @@ func RequireResourceWrite(am *AuthManager, rm ResourcePermissionChecker) fiber.H
 // RequireResourceDelete creates middleware requiring delete permission with resource context
 func RequireResourceDelete(am *AuthManager, rm ResourcePermissionChecker) fiber.Handler {
 	return RequireResourcePermission(am, rm, "delete")
+}
+
+// IsPublicPath reports whether reqPath (already path.Clean-ed) is one the auth
+// middleware lets through without a token: an exact public route, or a public
+// prefix matched at a segment boundary. Exported so the audit coverage check
+// (cmd/arc) applies the same rule (#1630).
+func IsPublicPath(reqPath string, routes, prefixes []string) bool {
+	for _, route := range routes {
+		if reqPath == route {
+			return true
+		}
+	}
+	for _, prefix := range prefixes {
+		// Normalise prefix: strip exactly one trailing slash. An
+		// operator who reads "this is a directory prefix" and writes
+		// `/metrics/` in their config would otherwise silently break
+		// the anchored match: prefix+"/" becomes "/metrics//" which
+		// matches no real path. Symmetric with the request-path
+		// normalisation the caller applies; both sides should be in canonical form
+		// before the equality and HasPrefix checks. We deliberately
+		// don't `path.Clean` the prefix because (a) it's
+		// operator-supplied static config, not attacker-controlled,
+		// and (b) Clean would also collapse a configured `//foo` to
+		// `/foo`, hiding the misconfiguration instead of treating it
+		// as the same prefix the operator wrote.
+		prefix = strings.TrimSuffix(prefix, "/")
+		// Guard against empty-prefix entries (including a configured
+		// `/` that the TrimSuffix above just emptied). `HasPrefix(p, "/")`
+		// is true for every real HTTP path, so an empty prefix would
+		// disable auth wholesale.
+		if prefix == "" {
+			continue
+		}
+		// Anchor the match: require exact path or true subdirectory
+		// (`prefix + "/"`). Without this, a configured prefix `/metrics`
+		// also matches `/metricsX`, `/metrics-secret`, etc. — any route
+		// happening to share the same byte prefix would silently bypass
+		// auth. Matches the same shape gemini-code-assist flagged on
+		// PR #442's deniedRoots check.
+		if reqPath == prefix || strings.HasPrefix(reqPath, prefix+"/") {
+			return true
+		}
+	}
+	return false
 }

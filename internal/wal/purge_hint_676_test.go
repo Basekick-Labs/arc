@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
@@ -21,11 +22,15 @@ func drainPurgeHint(w *Writer) {
 	}
 }
 
+// requirePurgeHint waits for the hint rather than reading it once: a lost
+// write is counted in FailedWrites (what appendOne waits on) before
+// forgetLostEntryLocked releases it and signals, so a single non-blocking read
+// could look in between (about 1 run in 100 under -race).
 func requirePurgeHint(t *testing.T, w *Writer, what string) {
 	t.Helper()
 	select {
 	case <-w.PurgeHint():
-	default:
+	case <-time.After(2 * time.Second):
 		t.Fatalf("%s did not signal the purge hint", what)
 	}
 }

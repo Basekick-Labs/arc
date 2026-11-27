@@ -79,23 +79,70 @@ func validateParquetFile(path string) error {
 	return nil
 }
 
+// hourBucketExpr is the hour of a row's "time": microseconds since the epoch,
+// integer-divided by one hour. It is monotone in time and independent of the
+// session time zone. `//` truncates toward zero, so the two hours either side
+// of 1970-01-01 share a bucket; the order stays monotone, which is all an
+// ORDER BY prefix needs.
+const hourBucketExpr = `epoch_us("time") // 3600000000`
+
 // buildOrderByClause builds an ORDER BY clause from sort keys.
 // Returns an empty string if no sort keys, or "ORDER BY col1, col2, ..." if sort keys exist.
 // Column names are quoted to handle special characters.
+//
+// When the first key is not "time" (configured sort keys such as fleet,name),
+// the clause starts with the hour of "time". Ingest writes each file within
+// one hour, sorted by the keys, so a daily compaction ordered by the keys
+// alone would spread every row group across the day and lose time-range
+// pruning on the long-lived files. Ordering by hour first keeps the keys'
+// clustering within each hour and keeps each row group to contiguous hours:
+// about one hour when an hour's rows fill a row group.
+//
+// The clause refers to "time" as an output column, so the caller must apply it
+// to a derived table whose "time" is already normalized (see
+// buildCompactionQuery): on a raw read_parquet it would bind to a VARCHAR
+// "time" in a mixed-schema partition, and DuckDB rejects an expression in an
+// ORDER BY directly on a UNION.
 func buildOrderByClause(sortKeys []string) string {
 	if len(sortKeys) == 0 {
 		return ""
 	}
 
-	var quotedKeys []string
+	terms := make([]string, 0, len(sortKeys)+1)
+	if sortKeys[0] != "time" {
+		terms = append(terms, hourBucketExpr)
+	}
 	for _, key := range sortKeys {
 		// Double-quote escaping: DuckDB treats "" inside a quoted identifier as a literal "
 		// (same as PostgreSQL). This prevents identifier breakout even if validation is bypassed.
 		escaped := strings.ReplaceAll(key, `"`, `""`)
-		quotedKeys = append(quotedKeys, fmt.Sprintf(`"%s"`, escaped))
+		terms = append(terms, fmt.Sprintf(`"%s"`, escaped))
 	}
 
-	return fmt.Sprintf("ORDER BY %s", strings.Join(quotedKeys, ", "))
+	return fmt.Sprintf("ORDER BY %s", strings.Join(terms, ", "))
+}
+
+// compactionSortKeys returns the sort keys the batch's files have a column
+// for, and the ones they do not. A key without a column cannot bind in the
+// ORDER BY, and the partition would then fail to compact on every cycle.
+// Names match case-insensitively, as DuckDB binds them (see tagsWithColumns).
+// "time" is always kept: the caller has already refused a batch without it.
+// A nil columns map (the schema probe failed) keeps every key, as before.
+// The returned slice is always new: sortKeys may be the shared config slice.
+func compactionSortKeys(sortKeys []string, columns map[string]string) (kept, dropped []string) {
+	kept = make([]string, 0, len(sortKeys))
+	for _, key := range sortKeys {
+		if columns == nil || key == "time" {
+			kept = append(kept, key)
+			continue
+		}
+		if _, ok := columns[asciiLower(key)]; ok {
+			kept = append(kept, key)
+		} else {
+			dropped = append(dropped, key)
+		}
+	}
+	return kept, dropped
 }
 
 // JobStatus represents the status of a compaction job
@@ -123,6 +170,10 @@ type Job struct {
 	BatchNumber   int
 	TempDirectory string   // Base temp directory for compaction files
 	SortKeys      []string // Sort keys for this measurement (for ORDER BY in compaction)
+	// SortKeysExplicit is true when SortKeys come from ingest.sort_keys for
+	// this measurement rather than ingest.default_sort_keys. It only sets the
+	// log level when a key has no column in the batch's files.
+	SortKeysExplicit bool
 
 	// Job metadata
 	JobID       string
@@ -183,28 +234,39 @@ type Job struct {
 	compactedFiles  []string // Files that were actually compacted (valid files only)
 	manifestManager *ManifestManager
 	manifestPath    string // Path to the manifest file for this job
+
+	// checkInputWindow: read each input's time range and refuse the job when
+	// one holds a row outside the partition (misfiled.go).
+	checkInputWindow bool
+	// misfiled is what that check found; the job then compacted nothing.
+	misfiled []MisfiledInput
 }
 
 // JobConfig holds configuration for creating a compaction job
 type JobConfig struct {
-	Measurement     string
-	PartitionPath   string
-	Files           []string
-	StorageBackend  storage.Backend
-	Database        string
-	Tier            string
-	BatchNumber     int      // 1-based batch index within the partition (0 = not batched)
-	TempDirectory   string   // Base temp directory for compaction files (default: ./data/compaction)
-	SortKeys        []string // Sort keys for this measurement (for ORDER BY in compaction)
-	Logger          zerolog.Logger
-	DB              *sql.DB          // Shared DuckDB connection (avoids memory retention from temp connections)
-	ManifestManager *ManifestManager // Manifest manager for crash recovery (optional, recommended)
+	Measurement    string
+	PartitionPath  string
+	Files          []string
+	StorageBackend storage.Backend
+	Database       string
+	Tier           string
+	BatchNumber    int      // 1-based batch index within the partition (0 = not batched)
+	TempDirectory  string   // Base temp directory for compaction files (default: ./data/compaction)
+	SortKeys       []string // Sort keys for this measurement (for ORDER BY in compaction)
+	// SortKeysExplicit — see Job.SortKeysExplicit.
+	SortKeysExplicit bool
+	Logger           zerolog.Logger
+	DB               *sql.DB          // Shared DuckDB connection (avoids memory retention from temp connections)
+	ManifestManager  *ManifestManager // Manifest manager for crash recovery (optional, recommended)
 
 	// CompletionDir is the Phase 4 cluster-mode completion-manifest directory.
 	// When non-empty, the job writes a local-disk CompletionManifest at each
 	// state transition. Empty means OSS / standalone — no completion manifest
 	// is written and the job is byte-compatible with pre-Phase-4 behavior.
 	CompletionDir string
+
+	// CheckInputWindow — see Job.checkInputWindow (#1825).
+	CheckInputWindow bool
 
 	// ParentFinalizesManifest — see Job.ParentFinalizesManifest (#619).
 	ParentFinalizesManifest bool
@@ -266,6 +328,7 @@ func NewJob(cfg *JobConfig) *Job {
 		BatchNumber:             cfg.BatchNumber,
 		TempDirectory:           tempDir,
 		SortKeys:                sortKeys,
+		SortKeysExplicit:        cfg.SortKeysExplicit,
 		JobID:                   jobID,
 		Status:                  JobStatusPending,
 		CompletionDir:           cfg.CompletionDir,
@@ -277,6 +340,7 @@ func NewJob(cfg *JobConfig) *Job {
 		db:                      cfg.DB,
 		manifestManager:         cfg.ManifestManager,
 		outputName:              cfg.OutputName,
+		checkInputWindow:        cfg.CheckInputWindow,
 	}
 }
 
@@ -378,6 +442,22 @@ func (j *Job) Run(ctx context.Context) error {
 		j.discardCompletionManifest()
 		return j.complete()
 	}
+	var refused *errMisfiledInputs
+	if errors.As(err, &refused) {
+		// An input holds rows of another hour or day (misfiled.go). The job
+		// merges nothing: the parent remembers the files and forms the
+		// partition's next candidate without them. Zero work, as above:
+		// nothing uploaded, nothing deleted, no manifest.
+		j.misfiled = refused.files
+		j.logger.Warn().
+			Str("database", j.Database).
+			Str("partition", j.PartitionPath).
+			Int("misfiled", len(refused.files)).
+			Msg("Skipping compaction: an input file holds rows outside this partition; compacting nothing, the parent leaves those files out of the next job")
+		j.BytesBefore = 0
+		j.discardCompletionManifest()
+		return j.complete()
+	}
 	if err != nil {
 		return j.fail(fmt.Errorf("failed to compact files: %w", err))
 	}
@@ -460,13 +540,13 @@ func (j *Job) Run(ctx context.Context) error {
 
 	// Phase 4 durability point: upload succeeded. In cluster mode, write the
 	// completion manifest in state output_written BEFORE we delete sources.
-	// From here on, the watcher will eventually register the compacted file
-	// in the Raft manifest even if the subprocess crashes before the delete
-	// phase.
+	// From here on, the watcher registers the compacted file in the Raft
+	// manifest even if the subprocess crashes before the delete phase, for
+	// as long as the file is in storage at the recorded size.
 	//
 	// Failing here does NOT unwind the upload, and it does not get retried
 	// into a good state either: next cycle recoverLoadedManifest finds the
-	// output present with a matching size (manifest.go:397-460), deletes the
+	// output present with a matching size (recoverLoadedManifest), deletes the
 	// inputs and deletes the compaction manifest without ever writing a
 	// completion manifest, so the Raft RegisterFile never fires and the output
 	// is a file no manifest entry describes. We still fail the job, because a
@@ -827,9 +907,31 @@ func (j *Job) compactFiles(ctx context.Context, files []downloadedFile, tempDir 
 		return "", errNoTimeColumn
 	}
 
-	// Build ORDER BY clause from sort keys
-	// This ensures compacted files maintain the same sort order as ingested files
-	orderByClause := buildOrderByClause(j.SortKeys)
+	// A file that holds a row outside this partition is not merged, and
+	// neither is anything else of the job (misfiled.go, #1825).
+	misfiled, err := j.misfiledInputs(ctx, db, validLocalPaths, validStorageKeys)
+	if err != nil {
+		return "", fmt.Errorf("check that the inputs belong to the partition: %w", err)
+	}
+	if len(misfiled) > 0 {
+		return "", &errMisfiledInputs{files: misfiled}
+	}
+
+	// Build ORDER BY clause from sort keys: the ingest order (keys, then time)
+	// within each hour. Keys these files have no column for are left out.
+	sortKeys, droppedKeys := compactionSortKeys(j.SortKeys, columns)
+	if len(droppedKeys) > 0 {
+		// A key configured for this measurement and missing from its files is
+		// worth an operator's attention. A default_sort_keys key is normal to
+		// be missing from measurements without that column, every cycle.
+		lvl := zerolog.DebugLevel
+		if j.SortKeysExplicit {
+			lvl = zerolog.WarnLevel
+		}
+		j.logger.WithLevel(lvl).Strs("missing_sort_keys", droppedKeys).Strs("sort_keys", sortKeys).
+			Msg("Compacting without sort keys these files have no column for")
+	}
+	orderByClause := buildOrderByClause(sortKeys)
 
 	// Auto-dedup: decide from the files' metadata how this batch removes
 	// duplicate rows (see decideDedup).
@@ -1404,6 +1506,12 @@ func (j *Job) removeDirectoryTree(ctx context.Context, remover storage.Directory
 // has run.
 func (j *Job) CompactedInputKeys() []string {
 	return j.compactedFiles
+}
+
+// MisfiledInputs returns the inputs the job refused because they hold rows
+// outside its partition; when there are any, the job compacted nothing.
+func (j *Job) MisfiledInputs() []MisfiledInput {
+	return j.misfiled
 }
 
 // RetainedManifestPath returns the crash-recovery manifest path the job

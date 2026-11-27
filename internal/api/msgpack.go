@@ -10,6 +10,7 @@ import (
 	"github.com/basekick-labs/arc/internal/cluster"
 	"github.com/basekick-labs/arc/internal/ingest"
 	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/pkg/models"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
@@ -87,10 +88,10 @@ type MsgPackHandler struct {
 	maxPayloadSize int64 // Maximum payload size in bytes (applies to both compressed and decompressed)
 
 	// authManager holds the concrete *auth.AuthManager so we can wire
-	// auth.RequireWrite as route-level middleware AND so RBAC checks
-	// at request time use the same instance. Concrete (not the local
-	// AuthManager interface) because auth.RequireWrite is implemented
-	// against the struct; using the interface required a type
+	// the write-tier route middleware AND so RBAC checks at request time
+	// use the same instance. Concrete (not the local AuthManager
+	// interface) because the auth middleware is implemented against the
+	// struct; using the interface required a type
 	// assertion that could silently miss on a mock and disable route
 	// protection.
 	authManager *auth.AuthManager
@@ -98,6 +99,9 @@ type MsgPackHandler struct {
 
 	// Cluster routing support
 	router *cluster.Router
+
+	// waitVisible serves x-arc-wait: visible (#1759); nil: off.
+	waitVisible *WaitVisible
 }
 
 // NewMsgPackHandler creates a new MessagePack handler
@@ -116,8 +120,8 @@ func NewMsgPackHandler(logger zerolog.Logger, arrowBuffer *ingest.ArrowBuffer, m
 }
 
 // SetAuthAndRBAC sets the auth and RBAC managers. Takes the concrete
-// *auth.AuthManager (not the local AuthManager interface) so route-
-// level auth.RequireWrite middleware can be wired without a type
+// *auth.AuthManager (not the local AuthManager interface) so the route-
+// level write middleware can be wired without a type
 // assertion that could silently miss on a mock and disable
 // protection. nil = auth disabled (OSS default).
 func (h *MsgPackHandler) SetAuthAndRBAC(authManager *auth.AuthManager, rbacManager RBACChecker) {
@@ -129,6 +133,11 @@ func (h *MsgPackHandler) SetAuthAndRBAC(authManager *auth.AuthManager, rbacManag
 // When set, write requests from reader nodes will be forwarded to writer nodes.
 func (h *MsgPackHandler) SetRouter(router *cluster.Router) {
 	h.router = router
+}
+
+// SetWaitVisible sets the node's x-arc-wait: visible support (#1759).
+func (h *MsgPackHandler) SetWaitVisible(wv *WaitVisible) {
+	h.waitVisible = wv
 }
 
 // extractMeasurements extracts unique measurement names from decoded msgpack records.
@@ -177,19 +186,26 @@ func (h *MsgPackHandler) checkWritePermissions(c *fiber.Ctx, database string, me
 	return CheckWritePermissions(c, h.rbacManager, h.logger, database, measurements)
 }
 
-// RegisterRoutes registers MessagePack endpoints. The write endpoint
-// is gated by auth.RequireWrite when an auth manager is configured —
-// per CLAUDE.md, mutating endpoints MUST have an explicit write-tier
-// auth middleware. Stats and spec remain at any-authenticated-token
-// level (gated by the global auth middleware in main.go).
+// RegisterRoutes registers MessagePack endpoints. The write endpoint is
+// gated by withAnyResourceWriteAuth when an auth manager is configured —
+// per CLAUDE.md, mutating endpoints MUST have an explicit write-tier auth
+// middleware. It admits a token holding write on anything, RBAC included
+// (#1559); checkWritePermissions then checks every measurement in the
+// payload. Stats and spec remain at any-authenticated-token level (gated
+// by the global auth middleware in main.go).
 func (h *MsgPackHandler) RegisterRoutes(app *fiber.App) {
-	app.Post("/api/v1/write/msgpack", withWriteAuth(h.authManager), h.writeMsgPack)
+	app.Post("/api/v1/write/msgpack", withAnyResourceWriteAuth(h.authManager, h.rbacManager), h.writeMsgPack)
 	app.Get("/api/v1/write/msgpack/stats", h.msgPackStats)
 	app.Get("/api/v1/write/msgpack/spec", h.msgPackSpec)
 }
 
 // writeMsgPack handles MessagePack binary write requests
 func (h *MsgPackHandler) writeMsgPack(c *fiber.Ctx) error {
+	// x-arc-wait (#1759): refused here, before anything is forwarded or read.
+	vw, handled, err := h.waitVisible.begin(c)
+	if handled {
+		return err
+	}
 	// Check if this request should be forwarded to a writer node
 	// Reader nodes cannot process writes locally, so they forward to writers
 	switch WriteForwardDecision(h.router, c) {
@@ -201,7 +217,10 @@ func (h *MsgPackHandler) writeMsgPack(c *fiber.Ctx) error {
 	case ForwardToPeer:
 		h.logger.Debug().Msg("Forwarding write request to writer node")
 
-		httpReq, err := BuildHTTPRequest(c)
+		// Built only here, once the write is forwarded (#1629), on the
+		// router's lifetime: a write-class forward needs no cancel of its own.
+		fctx := h.router.Lifetime()
+		httpReq, release, err := BuildHTTPRequest(c, fctx)
 		if err != nil {
 			h.logger.Error().Err(err).Msg("Failed to build HTTP request for forwarding")
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -209,7 +228,9 @@ func (h *MsgPackHandler) writeMsgPack(c *fiber.Ctx) error {
 			})
 		}
 
-		resp, err := h.router.RouteWrite(c.Context(), httpReq)
+		defer release()
+
+		resp, err := h.router.RouteWrite(fctx, httpReq)
 		if err == cluster.ErrLocalNodeCanHandle {
 			// Fall through to local processing
 			goto localProcessing
@@ -278,6 +299,12 @@ localProcessing:
 	case len(rawBody) >= 2 && rawBody[0] == 0x1f && rawBody[1] == 0x8b:
 		decompressed, derr := decompressGzipPooled(rawBody, int(h.maxPayloadSize))
 		if derr != nil {
+			var sizeErr *decompressedPayloadTooLargeError
+			if errors.As(derr, &sizeErr) {
+				return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
+					"error": fmt.Sprintf("Payload too large: %v. Consider batching into smaller requests.", sizeErr),
+				})
+			}
 			h.logger.Error().Err(derr).Msg("Failed to decompress gzip data")
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 				"error": fmt.Sprintf("Invalid gzip compression: %v", derr),
@@ -288,6 +315,12 @@ localProcessing:
 	case len(rawBody) >= 4 && rawBody[0] == 0x28 && rawBody[1] == 0xB5 && rawBody[2] == 0x2F && rawBody[3] == 0xFD:
 		decompressed, derr := decompressZstdPooled(rawBody, int(h.maxPayloadSize))
 		if derr != nil {
+			var sizeErr *decompressedPayloadTooLargeError
+			if errors.As(derr, &sizeErr) {
+				return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
+					"error": fmt.Sprintf("Payload too large: %v. Consider batching into smaller requests.", sizeErr),
+				})
+			}
 			h.logger.Error().Err(derr).Msg("Failed to decompress zstd data")
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 				"error": fmt.Sprintf("Invalid zstd compression: %v", derr),
@@ -323,6 +356,10 @@ localProcessing:
 	knownDB = strings.Clone(knownDB)
 	known := writableKnownColumns(c, h.rbacManager, knownDB, h.arrowBuffer.KnownColumns(knownDB))
 	records, recordCount, drops, err := h.decoder.DecodeWithDropsKnown(payload, known)
+	if errors.Is(err, ingest.ErrLPCellBudget) {
+		h.logger.Warn().Err(err).Int("body_bytes", len(payload)).Msg("MessagePack write refused")
+		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": err.Error()})
+	}
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to decode MessagePack")
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -369,6 +406,9 @@ localProcessing:
 			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
 		})
 	}
+	if storage.IsWarehouseRootName(database) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": warehouseDatabaseError(database)})
+	}
 
 	// A record whose tag or field names Arc could not read back is dropped,
 	// the rest written (#1342): a columnar record whole, since its names are
@@ -409,6 +449,18 @@ localProcessing:
 		}
 	}
 
+	// A visible write counts the rows it writes before the write, and takes
+	// its waiter slot (#1759): refused there, nothing is written.
+	var rows int64
+	var rowsKnown bool
+	if list, ok := records.([]interface{}); ok && vw != nil {
+		rows, rowsKnown = ingest.BatchRows(list)
+	}
+	if !vw.acquire() {
+		return respondIngestRefused(c, ingest.ErrWaitVisibleBusy)
+	}
+	defer vw.release()
+
 	// Admit the whole request, its size reserved against the WAL volume's
 	// free space (#676); a fence or disk pressure refuses it here.
 	writeCtx, release, aerr := h.arrowBuffer.AdmitRequest(ctx, int64(len(payload)))
@@ -416,16 +468,33 @@ localProcessing:
 		return respondWriteRefused(c, aerr)
 	}
 	defer release()
-	err = h.arrowBuffer.Write(writeCtx, database, records)
+	writeCtx = vw.context(writeCtx)
+	err = msgpackWrite(h.arrowBuffer, writeCtx, database, records)
+	// Checked first: the batch failed after part of it was buffered (#1437),
+	// so neither the drops answer nor the cause's own answer (a refusal says
+	// nothing was written) is true.
+	if ws, ok := ingest.AsWriteStopped(err); ok {
+		ws.Drops = append(drops, ws.Drops...)
+		if len(ws.Drops) > 0 {
+			logPointDrops(h.logger, "MessagePack", database, ws.Drops)
+		}
+		m := metrics.Get()
+		m.IncMsgPackRecords(ws.RecordsWritten)
+		m.IncIngestRecords(ws.RecordsWritten)
+		vw.notWaited(c, visibleReasonStopped)
+		return respondWriteStopped(c, h.logger, "MessagePack", database, ws)
+	}
 	var rowDrops *ingest.PointsDroppedError
 	if errors.As(err, &rowDrops) {
 		// Rows the record path could not write (the others were written):
 		// a partial write, like the typed path's drops.
+		// Points count rows; recordCount is in the decoder's unit, where a
+		// columnar record refused for its content is one record (#1437).
 		drops = append(drops, rowDrops.Drops...)
 		for _, d := range rowDrops.Drops {
 			dropped += d.Points
-			recordCount -= d.Points
 		}
+		recordCount -= rowDrops.Records
 		err = nil
 	}
 	if err != nil {
@@ -434,9 +503,14 @@ localProcessing:
 		if ingest.IsWriteRefusal(err) {
 			return respondWriteRefused(c, err)
 		}
-		// #440: a client error, refused before the WAL; nothing was written.
-		if errors.Is(err, ingest.ErrColumnTypeChange) {
+		// A client error (#440, #1342, #1424, #1475), refused before the WAL; nothing
+		// was written.
+		if ingest.IsContentRefusal(err) {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
+		if errors.Is(err, ingest.ErrLPCellBudget) {
+			h.logger.Warn().Err(err).Str("database", database).Msg("MessagePack write refused")
+			return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": err.Error()})
 		}
 		h.logger.Error().Err(err).Msg("Failed to write to Arrow buffer")
 		metrics.Get().IncIngestErrors()
@@ -444,9 +518,11 @@ localProcessing:
 		// upstream senders back off, mirroring the LP and TLE handlers.
 		// See ingest.ErrSchemaChurnExceeded.
 		// A write that arrives after its shard was flushed by shutdown is
-		// refused, not lost: the record is still in the WAL. 503 so the client
-		// retries (elsewhere, during a rolling restart) instead of treating a
-		// shutdown race as a permanent server error.
+		// refused: 503 so the client retries (elsewhere, during a rolling
+		// restart) instead of treating a shutdown race as a permanent server
+		// error. Nothing of this request was buffered (#1437); with the WAL on
+		// and no WAL coverage, the refused record itself is kept in the WAL
+		// and replayed at the next start, so the retry can duplicate it.
 		if errors.Is(err, ingest.ErrBufferClosing) {
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
 				"error": "Write rejected (server shutting down): " + err.Error(),
@@ -473,7 +549,19 @@ localProcessing:
 
 	if dropped > 0 {
 		logPointDrops(h.logger, "MessagePack", database, drops)
+		vw.notWaited(c, visibleReasonPartial)
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": partialWriteMessage(drops, dropped, true)})
+	}
+
+	if vw != nil {
+		// The wait holds nothing admission stopped counting: the WAL
+		// reservation is released and the request body returned to its pool,
+		// as when a handler returns (the decoded records and the WAL copied
+		// what they keep, see above). Nothing below reads payload, records or
+		// rawBody.
+		release()
+		c.Request().ResetBody()
+		return vw.answer(c, rows, rowsKnown)
 	}
 
 	// Return 204 No Content (InfluxDB compatible)
@@ -506,35 +594,76 @@ func (h *MsgPackHandler) msgPackStats(c *fiber.Ctx) error {
 
 // msgPackSpec returns MessagePack protocol specification
 func (h *MsgPackHandler) msgPackSpec(c *fiber.Ctx) error {
-	spec := fiber.Map{
+	return c.JSON(msgPackSpecDocument())
+}
+
+// msgPackSpecDocument describes what writeMsgPack and the ingest decoder
+// accept. Every claim here is about code in this package or internal/ingest;
+// TestMsgPackSpecExamplesAreAccepted posts the examples back through the
+// handler, so an example the decoder stops accepting fails a test (#1434).
+func msgPackSpecDocument() fiber.Map {
+	return fiber.Map{
 		"version":      "2.0",
 		"protocol":     "MessagePack",
+		"method":       "POST",
 		"endpoint":     "/api/v1/write/msgpack",
-		"content_type": "application/msgpack",
-		"compression":  "gzip or zstd (optional, zstd recommended for best performance)",
+		"content_type": "application/msgpack (recommended; the server does not check Content-Type)",
+		"compression": fiber.Map{
+			"formats":   []string{"zstd (recommended)", "gzip", "none"},
+			"detection": "by the body's magic bytes; no Content-Encoding header is needed",
+			"limits":    "server.max_payload_size (default 1GB) bounds the request body (413) and the decompressed payload (413); zstd frames declaring a window over 32MB (--long, --ultra) are refused",
+		},
 		"authentication": fiber.Map{
-			"header": "x-api-key",
-			"note":   "Authentication not yet implemented",
+			"header":        "Authorization",
+			"scheme":        "Bearer <token>",
+			"also_accepted": []string{"Authorization: Token <token>", "Authorization: <token>", "x-api-key: <token>", "?p=<token> (deprecated: tokens in URLs reach access logs)"},
+			"permission":    "the token's permissions must include write (or admin); with RBAC configured it must also allow write on each measurement in the payload in the target database (403 otherwise)",
+			"note":          "required unless auth.enabled is false",
+		},
+		"database": fiber.Map{
+			"header":  "x-arc-database",
+			"default": "default",
+		},
+		"time": fiber.Map{
+			"units":   "detected by magnitude: < 1e10 seconds, < 1e13 milliseconds, < 1e16 microseconds, otherwise nanoseconds; columnar from the first value of the time column, applied to every row; row format per row",
+			"stored":  "microseconds",
+			"missing": "a columnar item with no time column, or a row with no t, gets the server's receive time; a null inside a time column is a 400",
 		},
 		"format": fiber.Map{
 			"columnar (RECOMMENDED)": fiber.Map{
-				"m":       "measurement (string)",
-				"columns": "dict of column_name: [array of values]",
-				"note":    "25-35% faster than row format, zero-copy passthrough",
+				"m":        "measurement (string; an integer n becomes measurement_n)",
+				"columns":  "map of column_name: [values]; every column the same length; \"time\" is the timestamp column (optional)",
+				"tag_keys": "list of column names stored as tags (optional); columns not listed are fields",
+				"note":     "fastest path: field names are sent once per batch, not once per row",
 			},
 			"row (LEGACY)": fiber.Map{
-				"m":      "measurement (string or int)",
-				"t":      "timestamp (int64 milliseconds, seconds, or microseconds)",
-				"h":      "host (string or int, optional)",
-				"fields": "dict of field_name: value",
-				"tags":   "dict of tag_name: value (optional)",
+				"m":      "measurement (string; an integer n becomes measurement_n)",
+				"t":      "timestamp (integer; seconds, milliseconds, microseconds or nanoseconds, see time)",
+				"h":      "host tag (string, optional; an integer n becomes host_n)",
+				"fields": "map of field_name: value (required; a positional array under \"f\" becomes field_0, field_1, ...)",
+				"tags":   "map of tag_name: value (optional; non-string values are stored as strings)",
+				"note":   "a row with neither h nor a host tag is tagged host=unknown",
 			},
 			"batch": fiber.Map{
-				"batch": "array of measurements (can mix columnar and row)",
+				"batch": "array of columnar and/or row items in one payload; a top-level array of items is also accepted; an item that cannot be decoded is dropped whole and reported as a partial write, the others are written",
 			},
+			"values": "msgpack bin values are stored as binary (BLOB) columns",
+		},
+		"responses": fiber.Map{
+			"204": "all points written",
+			"400": "empty body, bad compression, malformed MessagePack, a payload missing m or fields/f, columns of different lengths, a non-numeric time, an invalid database or measurement name, a column whose type conflicts with stored data, or \"partial write: N points dropped\" when some points or batch/array items could not be written (the message says whether the others were)",
+			"401": "missing or invalid token",
+			"403": "token lacks write permission",
+			"413": "request body, or the payload it decompresses to, larger than server.max_payload_size; split the batch and retry",
+			"500": "unexpected server error",
+			"502": "cluster: the write could not be routed to a writer",
+			"503": "temporarily refusing writes (shutdown, WAL disk pressure, schema churn, cluster write fence, no writer reachable); retry",
+			"504": "cluster: a forwarded write got no answer and may have been written; retrying can duplicate it",
+			"508": "cluster: forwarding loop detected",
 		},
 		"example_columnar": fiber.Map{
-			"m": "cpu",
+			"m":        "cpu",
+			"tag_keys": []string{"host", "region"},
 			"columns": fiber.Map{
 				"time":         []int64{1633024800000, 1633024801000, 1633024802000},
 				"host":         []string{"server01", "server01", "server01"},
@@ -558,18 +687,7 @@ func (h *MsgPackHandler) msgPackSpec(c *fiber.Ctx) error {
 				"datacenter": "aws-1a",
 			},
 		},
-		"performance": fiber.Map{
-			"expected_rps_columnar": "2.5M+ (columnar format, zero-copy)",
-			"expected_rps_row":      "2.1M (row format, with conversion)",
-			"columnar_advantage":    "25-35% faster (no flattening, no row→column conversion)",
-			"parsing_speed":         "10-15x faster than text parsing",
-			"serialization":         "Direct Arrow (2-3x faster than DataFrame)",
-			"payload_size":          "50-70% smaller than Line Protocol",
-			"wire_efficiency":       "Columnar sends field names once vs per-record",
-		},
 	}
-
-	return c.JSON(spec)
 }
 
 // formatBytes formats a byte count into a human-readable string (e.g., "1GB", "500MB")
@@ -600,3 +718,7 @@ func formatBytes(bytes int64) string {
 		return fmt.Sprintf("%dB", bytes)
 	}
 }
+
+// msgpackWrite is the batch write of a MessagePack request, swapped by tests
+// to fail part-way (#1437).
+var msgpackWrite = (*ingest.ArrowBuffer).Write

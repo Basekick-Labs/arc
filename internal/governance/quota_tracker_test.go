@@ -2,6 +2,7 @@ package governance
 
 import (
 	"testing"
+	"time"
 )
 
 func TestQuotaTracker_AllowWithinLimits(t *testing.T) {
@@ -96,5 +97,92 @@ func TestQuotaTracker_UpdateLimits(t *testing.T) {
 	allowed, _ = tracker.AllowQuery()
 	if !allowed {
 		t.Fatal("expected AllowQuery() = true after increasing limit")
+	}
+}
+
+func newQuotaTrackerAt(clock *fakeClock, maxPerHour, maxPerDay int) *quotaTracker {
+	tracker := newQuotaTracker(maxPerHour, maxPerDay)
+	tracker.now = clock.Now
+	tracker.hourResetAt = clock.Now().Truncate(time.Hour).Add(time.Hour)
+	tracker.dayResetAt = clock.Now().Truncate(24 * time.Hour).Add(24 * time.Hour)
+	return tracker
+}
+
+func TestQuotaTracker_RetryAfterSec(t *testing.T) {
+	const offset = 10*time.Minute + 15*time.Second + 400*time.Millisecond
+
+	tests := []struct {
+		name       string
+		maxPerHour int
+		maxPerDay  int
+		queries    int
+		want       int
+	}{
+		{name: "hourly exhausted waits for the next hour", maxPerHour: 2, maxPerDay: 100, queries: 2, want: 3600 - 615},
+		{name: "daily exhausted waits for the next day", maxPerDay: 2, queries: 2, want: 86400 - 615},
+		{name: "both exhausted waits for the later reset", maxPerHour: 2, maxPerDay: 2, queries: 2, want: 86400 - 615},
+		{name: "within both quotas", maxPerHour: 3, maxPerDay: 3, queries: 2, want: 0},
+		{name: "no quotas", queries: 2, want: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clock := newFakeClock()
+			tracker := newQuotaTrackerAt(clock, tt.maxPerHour, tt.maxPerDay)
+			clock.Advance(offset)
+			for i := 0; i < tt.queries; i++ {
+				if allowed, reason := tracker.AllowQuery(); !allowed {
+					t.Fatalf("query %d: refused: %s", i+1, reason)
+				}
+			}
+
+			got := tracker.RetryAfterSec()
+			if got != tt.want {
+				t.Fatalf("RetryAfterSec() = %d, want %d", got, tt.want)
+			}
+			if tt.want == 0 {
+				return
+			}
+
+			clock.Advance(time.Duration(got-1) * time.Second)
+			if allowed, _ := tracker.AllowQuery(); allowed {
+				t.Fatalf("AllowQuery() succeeded %d seconds into a %d second wait", got-1, got)
+			}
+			clock.Advance(time.Second)
+			if allowed, reason := tracker.AllowQuery(); !allowed {
+				t.Fatalf("AllowQuery() refused after waiting the %d seconds RetryAfterSec() gave: %s", got, reason)
+			}
+		})
+	}
+}
+
+// A wait that ends exactly on the reset time has waited long enough, so the
+// reset time itself belongs to the new hour and the new day.
+func TestQuotaTracker_ResetsOnTheBoundary(t *testing.T) {
+	tests := []struct {
+		name       string
+		maxPerHour int
+		maxPerDay  int
+		want       int
+	}{
+		{name: "hour", maxPerHour: 1, want: 3600},
+		{name: "day", maxPerDay: 1, want: 86400},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clock := newFakeClock()
+			tracker := newQuotaTrackerAt(clock, tt.maxPerHour, tt.maxPerDay)
+			if allowed, reason := tracker.AllowQuery(); !allowed {
+				t.Fatalf("first query refused: %s", reason)
+			}
+
+			got := tracker.RetryAfterSec()
+			if got != tt.want {
+				t.Fatalf("RetryAfterSec() = %d, want %d", got, tt.want)
+			}
+			clock.Advance(time.Duration(got) * time.Second)
+			if allowed, reason := tracker.AllowQuery(); !allowed {
+				t.Fatalf("query on the reset time refused: %s", reason)
+			}
+		})
 	}
 }

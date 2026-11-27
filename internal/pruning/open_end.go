@@ -207,8 +207,21 @@ func (p *PartitionPruner) remoteDirLister(basePath string) dirLister {
 		if !ok {
 			return nil, errors.New("cannot resolve the storage prefix")
 		}
+		var subdirs []string
+		var err error
 		listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		subdirs, err := lister.ListDirectories(listCtx, prefix)
+		if level, ok := lister.(storage.LevelLister); ok {
+			// A day directory's level listing also says whether the day
+			// holds daily files; the pruner's day-level check reads it from
+			// the cache instead of listing the day again.
+			var files []string
+			subdirs, files, err = level.ListLevel(listCtx, prefix)
+			if err == nil && isDayPrefix(prefix) {
+				p.globCache.setScoped("remote:dayfiles:"+prefix, parquetNames(files), scopeFrom(ctx))
+			}
+		} else {
+			subdirs, err = lister.ListDirectories(listCtx, prefix)
+		}
 		cancel()
 		if err != nil {
 			return nil, err
@@ -221,14 +234,16 @@ func (p *PartitionPruner) remoteDirLister(basePath string) dirLister {
 			}
 			names = append(names, s)
 		}
-		p.globCache.set(cacheKey, names)
+		p.globCache.setScoped(cacheKey, names, scopeFrom(ctx))
 		return names, nil
 	}
 }
 
 // tierDirLister lists directories of a tier's backend, keys relative to the
-// tier root, through the tier pruner's cached listings.
-func (p *PartitionPruner) tierDirLister(backend storage.Backend, rootURL string) dirLister {
+// tier root, through the tier pruner's cached listings. A failed listing is
+// recorded on listing; when the call asked to stop after a failure, the
+// lister does not list again (#1550).
+func (p *PartitionPruner) tierDirLister(backend storage.Backend, rootURL string, listing *tierListing) dirLister {
 	return func(ctx context.Context, rel string) ([]string, error) {
 		lister, ok := backend.(storage.DirectoryLister)
 		if backend == nil || !ok {
@@ -238,10 +253,14 @@ func (p *PartitionPruner) tierDirLister(backend storage.Backend, rootURL string)
 		if cached, ok := p.globCache.get(cacheKey); ok {
 			return cached, nil
 		}
+		if listing.skip() {
+			return nil, errTierListingFailed
+		}
 		listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		subdirs, err := lister.ListDirectories(listCtx, rel+"/")
 		cancel()
 		if err != nil {
+			listing.failed = true
 			return nil, err
 		}
 		names := make([]string, 0, len(subdirs))
@@ -252,7 +271,7 @@ func (p *PartitionPruner) tierDirLister(backend storage.Backend, rootURL string)
 			}
 			names = append(names, s)
 		}
-		p.globCache.set(cacheKey, names)
+		p.globCache.setScoped(cacheKey, names, scopeFrom(ctx))
 		return names, nil
 	}
 }

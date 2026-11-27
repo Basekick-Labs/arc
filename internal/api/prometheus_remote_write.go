@@ -1,0 +1,951 @@
+package api
+
+import (
+	"errors"
+	"fmt"
+	"math"
+	"mime"
+	"sort"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/basekick-labs/arc/internal/cluster"
+	"github.com/basekick-labs/arc/internal/ingest"
+	"github.com/basekick-labs/arc/internal/metrics"
+	"github.com/basekick-labs/arc/internal/storage"
+	"github.com/gofiber/fiber/v2"
+	"github.com/klauspost/compress/snappy"
+	"google.golang.org/protobuf/encoding/protowire"
+)
+
+const (
+	prometheusRemoteWritePath = "/api/v1/write/prometheus"
+	// maxRemoteWritePayloadBytes is the most a request may be, compressed or
+	// decoded, and repeat in label bytes, whatever server.max_payload_size
+	// says (remoteWritePayloadLimit).
+	maxRemoteWritePayloadBytes   = 100 << 20
+	maxRemoteWriteColumnCells    = 4_000_000
+	maxRemoteWriteTimeSeries     = 100_000
+	maxRemoteWriteSamples        = 1_000_000
+	maxRemoteWriteLabels         = 1_000_000
+	prometheusRemoteWriteVersion = "0.1.0"
+	prometheusValueColumn        = "value"
+	remoteWriteProtocolName      = "Prometheus remote write"
+	// maxSnappyRatio is above the largest ratio a Snappy block reaches (a
+	// 64-byte copy in a 3-byte tag): a block declaring more is corrupt, and
+	// decoding it would allocate the declared length first.
+	maxSnappyRatio = 32
+)
+
+var (
+	errRemoteWriteTooManyCells   = errors.New("remote write request exceeds 4 million column cells")
+	errRemoteWriteTooManySeries  = errors.New("remote write request exceeds 100,000 time series")
+	errRemoteWriteTooManySamples = errors.New("remote write request exceeds 1 million samples")
+	errRemoteWriteTooManyLabels  = errors.New("remote write request exceeds 1 million labels")
+)
+
+// Limits that follow server.max_payload_size (remoteWritePayloadLimit).
+const (
+	remoteWriteLimitPayload = iota
+	remoteWriteLimitLabelBytes
+)
+
+// remoteWriteLimitError is a request over remoteWritePayloadLimit: its body,
+// compressed or decoded, or the label bytes its samples repeat. A series
+// sends its labels once and every sample row repeats them, in memory and in
+// the WAL, so a small body with long labels and many samples would otherwise
+// build gigabytes; a line-protocol body of the same rows carries those
+// bytes itself.
+type remoteWriteLimitError struct {
+	kind  int
+	limit int
+}
+
+func (e remoteWriteLimitError) Error() string {
+	if e.kind == remoteWriteLimitLabelBytes {
+		return "remote write request repeats more than " + formatBytes(int64(e.limit)) + " of label names and values across its samples"
+	}
+	return "remote write payload exceeds " + formatBytes(int64(e.limit)) + " limit"
+}
+
+// remoteWritePayloadLimit is server.max_payload_size, at most
+// maxRemoteWritePayloadBytes; maxRemoteWritePayloadBytes when it is not set
+// (a handler built without SetMaxPayloadSize, as in tests).
+func (h *LineProtocolHandler) remoteWritePayloadLimit() int {
+	if h.maxPayloadSize <= 0 || h.maxPayloadSize > maxRemoteWritePayloadBytes {
+		return maxRemoteWritePayloadBytes
+	}
+	return int(h.maxPayloadSize)
+}
+
+// WritePrometheusRemoteWrite accepts Prometheus Remote Write 1.0 samples.
+//
+// Its arc_prometheus_remote_write_* counters count what this node answers:
+// a request whose answer is a peer's, copied through (a reader or a standby
+// writer forwarding to the primary), is counted by the node that wrote it.
+// The line-protocol counters and /api/v1/write/line-protocol/stats do not
+// count remote write.
+func (h *LineProtocolHandler) WritePrometheusRemoteWrite(c *fiber.Ctx) error {
+	defer func() {
+		if copied, _ := c.Locals(forwardedResponseLocal).(bool); copied {
+			return
+		}
+		m := metrics.Get()
+		m.IncPromRemoteWriteRequests()
+		if c.Response().StatusCode() >= fiber.StatusBadRequest {
+			m.IncPromRemoteWriteErrors()
+		}
+	}()
+
+	// x-arc-wait is not supported here (#1759).
+	if handled, err := refuseWaitVisible(c); handled {
+		return err
+	}
+	database := c.Query("db", "default")
+	if headerDB := c.Get("x-arc-database"); headerDB != "" {
+		database = headerDB
+	}
+	database = strings.Clone(database)
+	if !isValidDatabaseName(database) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)",
+		})
+	}
+
+	if storage.IsWarehouseRootName(database) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": warehouseDatabaseError(database)})
+	}
+
+	if status, message := validatePrometheusRemoteWriteHeaders(c); status != 0 {
+		return c.Status(status).JSON(fiber.Map{"error": message})
+	}
+
+	switch WriteForwardDecision(h.router, c) {
+	case ForwardAlreadyForwarded:
+		return RespondAlreadyForwarded(c)
+	case ForwardToPeer:
+		// Built only once the write is forwarded, on the router's lifetime,
+		// as handleWrite does (#1629).
+		fctx := h.router.Lifetime()
+		httpReq, release, err := BuildHTTPRequest(c, fctx)
+		if err != nil {
+			h.logger.Error().Err(err).Msg("Failed to build HTTP request for Prometheus remote write forwarding")
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to prepare request for forwarding",
+			})
+		}
+		defer release()
+		resp, err := h.router.RouteWrite(fctx, httpReq)
+		if err == nil {
+			c.Locals(forwardedResponseLocal, true)
+			return CopyResponse(c, resp)
+		}
+		if errors.Is(err, cluster.ErrLocalNodeCanHandle) {
+			goto localProcessing
+		}
+		if !errors.Is(err, cluster.ErrWriteForwardUnavailable) && !errors.Is(err, cluster.ErrWriteForwardAmbiguous) {
+			h.logger.Error().Err(err).Msg("Failed to route Prometheus remote write request")
+		}
+		return respondWriteForwardError(c, err)
+	}
+
+localProcessing:
+	if handled, err := forwardStandbyWrite(h.router, c); handled {
+		return err
+	}
+
+	batch, err := remoteWriteBuild(c.Request().Body(), database,
+		writableKnownColumns(c, h.rbacManager, database, h.buffer.KnownColumns(database)), h.remoteWritePayloadLimit())
+	if err != nil {
+		status := fiber.StatusBadRequest
+		if isRemoteWriteTooLarge(err) {
+			status = fiber.StatusRequestEntityTooLarge
+		}
+		return c.Status(status).JSON(fiber.Map{"error": err.Error()})
+	}
+	records, measurements, drops, dropped, rows, decodedSize := batch.records, batch.measurements, batch.drops, batch.dropped, batch.rows, batch.decodedSize
+	metrics.Get().IncPromRemoteWriteBytes(int64(decodedSize))
+	if rows == 0 {
+		if dropped > 0 {
+			logPointDrops(h.logger, "Prometheus remote write", database, drops)
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": partialWriteMessage(drops, dropped, false)})
+		}
+		// An empty request, or one that carries only staleness markers.
+		return c.SendStatus(fiber.StatusNoContent)
+	}
+
+	if h.rbacManager != nil { // not license-gated; see CheckWritePermissions
+		if err := h.checkWritePermissions(c, database, measurements); err != nil {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": err.Error()})
+		}
+	}
+
+	for _, measurement := range measurements {
+		if err := h.buffer.CheckTypedTextBinary(database, measurement, records[measurement]); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
+	}
+
+	// A request the WAL directory can never hold is refused for good: a 503
+	// would have Prometheus resend it forever. Free-space pressure passes,
+	// and is refused below (503), so it is retried once space is freed.
+	if most := h.buffer.WALMaxReservable(); most > 0 && batch.walBytes > most {
+		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{
+			"error": "remote write request needs " + formatBytes(batch.walBytes) + " of WAL, more than wal.max_directory_mb allows",
+		})
+	}
+
+	// The whole request is admitted once, as handleWrite admits it (#1422),
+	// and a failure part-way answers with what was written (#1437). It
+	// reserves what its rows append to the WAL: every sample row repeats its
+	// series' labels, so that is not the body's size.
+	writeCtx, release, err := h.buffer.AdmitWholeRequest(c.Context(), batch.walBytes)
+	if err != nil {
+		return respondWriteRefused(c, err)
+	}
+	defer release()
+
+	written, dropped, drops, stop := h.writeLPMeasurements(measurements, rows, dropped, drops, func(m string) (int, error) {
+		batch := records[m]
+		times := batch.Data["time"].([]int64)
+		return len(times), lpWriteTyped(h.buffer, writeCtx, database, m, batch, len(times))
+	})
+	if stop != nil {
+		return h.answerLPStop(c, remoteWriteProtocolName, database, stop, drops)
+	}
+
+	m := metrics.Get()
+	m.IncIngestRecords(int64(written))
+	m.IncIngestBytes(int64(decodedSize))
+	m.IncIngestBatches()
+	m.IncPromRemoteWriteRecords(int64(written))
+	if dropped > 0 {
+		logPointDrops(h.logger, "Prometheus remote write", database, drops)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": partialWriteMessage(drops, dropped, true)})
+	}
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// remoteWriteBatch is a decoded request mapped to the records to write.
+type remoteWriteBatch struct {
+	records      map[string]*ingest.TypedColumnBatch
+	measurements []string // kept measurements, in name order
+	drops        []ingest.LPDrop
+	dropped      int // points dropped
+	rows         int // rows to write
+	decodedSize  int
+	walBytes     int64 // what writing the kept measurements appends to the WAL
+}
+
+// remoteWriteBuild decodes body and builds its records: every step between
+// the request body and the write admission, so the benchmark measures what
+// the handler runs. known is the measurement's stored spellings, as the
+// token may see them; limit is remoteWritePayloadLimit. err is set when the
+// request as a whole is refused: isRemoteWriteTooLarge tells 413 from 400.
+func remoteWriteBuild(body []byte, database string, known ingest.KnownColumns, limit int) (*remoteWriteBatch, error) {
+	request, decodedSize, err := decodePrometheusRemoteWrite(body, limit)
+	if err != nil {
+		return nil, err
+	}
+
+	// A series Arc cannot store is dropped and the others are written, as
+	// line protocol drops a point (#1342). Prometheus discards a batch
+	// answered 4xx without retrying, so refusing the request for one series
+	// lost every other series sent with it.
+	records, walSizes, drops, err := prometheusRemoteWriteRecords(request, database, known, limit)
+	if err != nil {
+		return nil, err
+	}
+
+	// In name order: RBAC reads them, and a write that stops part-way says
+	// which were written (#1437).
+	measurements := make([]string, 0, len(records))
+	for measurement := range records {
+		measurements = append(measurements, measurement)
+	}
+	sort.Strings(measurements)
+	// A backstop: the records keep one spelling per name already, so this
+	// drops nothing they hold.
+	names := ingest.NewRecordNameFilter(known)
+	kept := measurements[:0]
+	for _, measurement := range measurements {
+		batch := records[measurement]
+		if names.Keep(&ingest.TypedColumnarRecord{
+			Measurement: measurement,
+			NumRecords:  len(batch.Data["time"].([]int64)),
+			Batch:       batch,
+		}) {
+			kept = append(kept, measurement)
+		}
+	}
+	measurements = kept
+	drops = append(drops, names.Drops()...)
+
+	rows := 0
+	var walBytes int64
+	for _, measurement := range measurements {
+		rows += len(records[measurement].Data["time"].([]int64))
+		walBytes += walSizes[measurement]
+	}
+	return &remoteWriteBatch{
+		records:      records,
+		measurements: measurements,
+		drops:        drops,
+		dropped:      droppedPoints(drops),
+		rows:         rows,
+		decodedSize:  decodedSize,
+		walBytes:     walBytes,
+	}, nil
+}
+
+func isRemoteWriteTooLarge(err error) bool {
+	var limitErr remoteWriteLimitError
+	return errors.As(err, &limitErr) ||
+		errors.Is(err, errRemoteWriteTooManyCells) ||
+		errors.Is(err, errRemoteWriteTooManySeries) ||
+		errors.Is(err, errRemoteWriteTooManySamples) ||
+		errors.Is(err, errRemoteWriteTooManyLabels)
+}
+
+func validatePrometheusRemoteWriteHeaders(c *fiber.Ctx) (int, string) {
+	encoding, ok := oneRequestHeader(c, fiber.HeaderContentEncoding)
+	if !ok || !strings.EqualFold(encoding, "snappy") {
+		return fiber.StatusUnsupportedMediaType, "Content-Encoding must be snappy"
+	}
+
+	contentType, ok := oneRequestHeader(c, fiber.HeaderContentType)
+	if !ok {
+		return fiber.StatusUnsupportedMediaType, "Content-Type must be application/x-protobuf"
+	}
+	mediaType, params, err := mime.ParseMediaType(contentType)
+	if err != nil || !strings.EqualFold(mediaType, "application/x-protobuf") {
+		return fiber.StatusUnsupportedMediaType, "Content-Type must be application/x-protobuf"
+	}
+	// Remote Write 2.0 names its message here; its spec has a receiver
+	// answer 415 to a message it does not take.
+	if proto, ok := params["proto"]; ok && proto != "prometheus.WriteRequest" {
+		return fiber.StatusUnsupportedMediaType, "only Remote Write 1.0 (proto=prometheus.WriteRequest) is supported; set protobuf_message: prometheus.WriteRequest"
+	}
+
+	version, ok := oneRequestHeader(c, "X-Prometheus-Remote-Write-Version")
+	if !ok || version != prometheusRemoteWriteVersion {
+		return fiber.StatusBadRequest, "X-Prometheus-Remote-Write-Version must be 0.1.0"
+	}
+	userAgent, ok := oneRequestHeader(c, fiber.HeaderUserAgent)
+	if !ok || userAgent == "" {
+		return fiber.StatusBadRequest, "User-Agent is required"
+	}
+	return 0, ""
+}
+
+func oneRequestHeader(c *fiber.Ctx, name string) (string, bool) {
+	var value string
+	count := 0
+	c.Request().Header.VisitAll(func(key, headerValue []byte) {
+		if strings.EqualFold(string(key), name) {
+			count++
+			value = strings.TrimSpace(string(headerValue))
+		}
+	})
+	return value, count == 1 && value != ""
+}
+
+type remoteWriteRequest struct {
+	Timeseries []remoteWriteTimeSeries
+}
+
+type remoteWriteTimeSeries struct {
+	Labels     []remoteWriteLabel
+	Samples    []remoteWriteSample
+	Exemplars  int
+	Histograms int
+}
+
+type remoteWriteLabel struct {
+	Name  string
+	Value string
+}
+
+type remoteWriteSample struct {
+	Value     float64
+	Timestamp int64
+}
+
+// decodePrometheusRemoteWrite decodes a request whose body and decoded size
+// are each at most limit (remoteWritePayloadLimit). The HTTP body limit
+// (server.max_payload_size) refuses a larger body before the handler, so the
+// body check here only applies when that is above 100MB.
+func decodePrometheusRemoteWrite(rawBody []byte, limit int) (*remoteWriteRequest, int, error) {
+	if len(rawBody) == 0 {
+		return nil, 0, errors.New("empty remote write request body")
+	}
+	if len(rawBody) > limit {
+		return nil, 0, remoteWriteLimitError{kind: remoteWriteLimitPayload, limit: limit}
+	}
+	decodedLength, err := snappy.DecodedLen(rawBody)
+	if err != nil {
+		return nil, 0, fmt.Errorf("invalid snappy block: %w", normalizeSnappyError(err))
+	}
+	if decodedLength > limit {
+		return nil, 0, remoteWriteLimitError{kind: remoteWriteLimitPayload, limit: limit}
+	}
+	if decodedLength > maxSnappyRatio*len(rawBody)+1024 {
+		return nil, 0, fmt.Errorf("invalid snappy block: declares %d bytes from a %d-byte body", decodedLength, len(rawBody))
+	}
+	decoded, err := snappy.Decode(nil, rawBody)
+	if err != nil {
+		return nil, 0, fmt.Errorf("invalid snappy block: %w", normalizeSnappyError(err))
+	}
+	request, err := unmarshalRemoteWriteRequest(decoded)
+	if err != nil {
+		return nil, 0, fmt.Errorf("invalid remote write protobuf: %w", err)
+	}
+	return request, len(decoded), nil
+}
+
+func normalizeSnappyError(err error) error {
+	switch {
+	case errors.Is(err, snappy.ErrCorrupt):
+		return errors.New("snappy: corrupt input")
+	case errors.Is(err, snappy.ErrTooLarge):
+		return errors.New("snappy: decoded block is too large")
+	case errors.Is(err, snappy.ErrUnsupported):
+		return errors.New("snappy: unsupported input")
+	default:
+		return err
+	}
+}
+
+func unmarshalRemoteWriteRequest(data []byte) (*remoteWriteRequest, error) {
+	request := &remoteWriteRequest{}
+	budget := &remoteWriteParseBudget{}
+	for len(data) > 0 {
+		number, wireType, n := protowire.ConsumeTag(data)
+		if n < 0 {
+			return nil, protowire.ParseError(n)
+		}
+		data = data[n:]
+		if number == 1 && wireType == protowire.BytesType {
+			if len(request.Timeseries) >= maxRemoteWriteTimeSeries {
+				return nil, errRemoteWriteTooManySeries
+			}
+			message, n := protowire.ConsumeBytes(data)
+			if n < 0 {
+				return nil, protowire.ParseError(n)
+			}
+			series, err := unmarshalRemoteWriteTimeSeries(message, budget)
+			if err != nil {
+				return nil, fmt.Errorf("time series %d: %w", len(request.Timeseries), err)
+			}
+			request.Timeseries = append(request.Timeseries, *series)
+			data = data[n:]
+			continue
+		}
+		n = protowire.ConsumeFieldValue(number, wireType, data)
+		if n < 0 {
+			return nil, protowire.ParseError(n)
+		}
+		data = data[n:]
+	}
+	return request, nil
+}
+
+type remoteWriteParseBudget struct {
+	samples int
+	labels  int
+}
+
+func unmarshalRemoteWriteTimeSeries(data []byte, budget *remoteWriteParseBudget) (*remoteWriteTimeSeries, error) {
+	series := &remoteWriteTimeSeries{}
+	for len(data) > 0 {
+		number, wireType, n := protowire.ConsumeTag(data)
+		if n < 0 {
+			return nil, protowire.ParseError(n)
+		}
+		data = data[n:]
+		switch number {
+		case 1:
+			if budget.labels >= maxRemoteWriteLabels {
+				return nil, errRemoteWriteTooManyLabels
+			}
+			message, rest, err := consumeRemoteWriteMessage(wireType, data)
+			if err != nil {
+				return nil, fmt.Errorf("labels: %w", err)
+			}
+			label, err := unmarshalRemoteWriteLabel(message)
+			if err != nil {
+				return nil, fmt.Errorf("label %d: %w", len(series.Labels), err)
+			}
+			series.Labels = append(series.Labels, label)
+			budget.labels++
+			data = rest
+		case 2:
+			if budget.samples >= maxRemoteWriteSamples {
+				return nil, errRemoteWriteTooManySamples
+			}
+			message, rest, err := consumeRemoteWriteMessage(wireType, data)
+			if err != nil {
+				return nil, fmt.Errorf("samples: %w", err)
+			}
+			sample, err := unmarshalRemoteWriteSample(message)
+			if err != nil {
+				return nil, fmt.Errorf("sample %d: %w", len(series.Samples), err)
+			}
+			series.Samples = append(series.Samples, sample)
+			budget.samples++
+			data = rest
+		case 3, 4:
+			_, rest, err := consumeRemoteWriteMessage(wireType, data)
+			if err != nil {
+				return nil, err
+			}
+			if number == 3 {
+				series.Exemplars++
+			} else {
+				series.Histograms++
+			}
+			data = rest
+		default:
+			n = protowire.ConsumeFieldValue(number, wireType, data)
+			if n < 0 {
+				return nil, protowire.ParseError(n)
+			}
+			data = data[n:]
+		}
+	}
+	return series, nil
+}
+
+func unmarshalRemoteWriteLabel(data []byte) (remoteWriteLabel, error) {
+	var label remoteWriteLabel
+	for len(data) > 0 {
+		number, wireType, n := protowire.ConsumeTag(data)
+		if n < 0 {
+			return label, protowire.ParseError(n)
+		}
+		data = data[n:]
+		switch number {
+		case 1, 2:
+			value, rest, err := consumeRemoteWriteString(wireType, data)
+			if err != nil {
+				return label, err
+			}
+			if number == 1 {
+				label.Name = value
+			} else {
+				label.Value = value
+			}
+			data = rest
+		default:
+			n = protowire.ConsumeFieldValue(number, wireType, data)
+			if n < 0 {
+				return label, protowire.ParseError(n)
+			}
+			data = data[n:]
+		}
+	}
+	return label, nil
+}
+
+func unmarshalRemoteWriteSample(data []byte) (remoteWriteSample, error) {
+	var sample remoteWriteSample
+	for len(data) > 0 {
+		number, wireType, n := protowire.ConsumeTag(data)
+		if n < 0 {
+			return sample, protowire.ParseError(n)
+		}
+		data = data[n:]
+		switch number {
+		case 1:
+			if wireType != protowire.Fixed64Type {
+				return sample, errors.New("sample value must use the fixed64 wire type")
+			}
+			bits, n := protowire.ConsumeFixed64(data)
+			if n < 0 {
+				return sample, protowire.ParseError(n)
+			}
+			sample.Value = math.Float64frombits(bits)
+			data = data[n:]
+		case 2:
+			if wireType != protowire.VarintType {
+				return sample, errors.New("sample timestamp must use the varint wire type")
+			}
+			timestamp, n := protowire.ConsumeVarint(data)
+			if n < 0 {
+				return sample, protowire.ParseError(n)
+			}
+			sample.Timestamp = int64(timestamp)
+			data = data[n:]
+		default:
+			n = protowire.ConsumeFieldValue(number, wireType, data)
+			if n < 0 {
+				return sample, protowire.ParseError(n)
+			}
+			data = data[n:]
+		}
+	}
+	return sample, nil
+}
+
+func consumeRemoteWriteMessage(wireType protowire.Type, data []byte) ([]byte, []byte, error) {
+	if wireType != protowire.BytesType {
+		return nil, nil, errors.New("message field must use the bytes wire type")
+	}
+	message, n := protowire.ConsumeBytes(data)
+	if n < 0 {
+		return nil, nil, protowire.ParseError(n)
+	}
+	return message, data[n:], nil
+}
+
+func consumeRemoteWriteString(wireType protowire.Type, data []byte) (string, []byte, error) {
+	message, rest, err := consumeRemoteWriteMessage(wireType, data)
+	if err != nil {
+		return "", nil, err
+	}
+	return string(message), rest, nil
+}
+
+// prometheusStaleNaN is the value Prometheus sends as a staleness marker: the
+// series stopped (its target went away, or its rule stopped producing it). It
+// is a signal, not a sample. Stored, it is a NaN in value, and avg or sum over
+// the series is NaN from then on. Any other NaN is a sample and is kept.
+const prometheusStaleNaN uint64 = 0x7ff0000000000002
+
+// Reasons a series is dropped, for the partial-write answer.
+const (
+	remoteWriteDropNoName     = "series has no __name__ label"
+	remoteWriteDropEmptyLabel = "series has a label with an empty name"
+	remoteWriteDropDupLabel   = "series has the same label twice"
+	remoteWriteDropValueLabel = "label conflicts with the sample column \"value\""
+	remoteWriteDropLabelUTF8  = "label value is not valid UTF-8"
+	remoteWriteDropUnderscore = "label names starting with _ are not stored by Arc"
+	remoteWriteDropTimestamp  = "sample timestamp is outside Arc's supported range"
+	remoteWriteDropHistograms = "native histograms are not supported"
+	remoteWriteDropExemplars  = "exemplars are not supported"
+)
+
+// prometheusRemoteWriteRecords maps a request to one columnar record per
+// measurement. A series Arc cannot store is left out and listed in drops;
+// its exemplars and native histograms are listed too, and its float samples
+// are kept. Staleness markers are skipped. err is set only when the request
+// as a whole is over a limit: limit (remoteWritePayloadLimit) bounds the
+// label names and values repeated across its samples.
+//
+// Of label names that differ only in letter case in a measurement (#1342),
+// one spelling is kept and every series using another is dropped: the
+// stored column's spelling (known, as the token may see it), otherwise the
+// byte-smallest spelling in the request, so the same set of series keeps the
+// same spelling whatever order they arrive in. walBytes is, per measurement,
+// what the typed batch's row-form WAL encoding appends, for the WAL space
+// reservation.
+func prometheusRemoteWriteRecords(request *remoteWriteRequest, database string, known ingest.KnownColumns, limit int) (records map[string]*ingest.TypedColumnBatch, walBytes map[string]int64, drops []ingest.LPDrop, err error) {
+	records = make(map[string]*ingest.TypedColumnBatch)
+	walBytes = make(map[string]int64)
+	tagNames := make(map[string]map[string]struct{})
+	dropAt := make(map[[3]string]int)
+	drop := func(measurement, column, reason string, points int) {
+		key := [3]string{measurement, column, reason}
+		if i, ok := dropAt[key]; ok {
+			drops[i].Points += points
+			return
+		}
+		dropAt[key] = len(drops)
+		drops = append(drops, ingest.LPDrop{Measurement: measurement, Column: column, Reason: reason, Points: points})
+	}
+
+	// Pass 1: the series that can be stored, and per measurement the
+	// byte-smallest spelling of each folded label name.
+	type keptSeries struct {
+		series      *remoteWriteTimeSeries
+		measurement string
+		tags        map[string]string
+		samples     int
+	}
+	kept := make([]keptSeries, 0, len(request.Timeseries))
+	// Per measurement: each spelling seen (-> its fold), the winning
+	// spelling of each fold, and whether any series can lose (a fold spelled
+	// two ways in the request or against the stored columns). Most requests
+	// have none, and then the build skips the per-series check.
+	type measurementNames struct {
+		folds     map[string]string // spelling -> FoldColumnName(spelling)
+		winner    map[string]string // fold -> the spelling kept
+		twins     bool
+		valueTwin bool // a stored column folds to "value" under another spelling
+	}
+	names := make(map[string]*measurementNames)
+	for i := range request.Timeseries {
+		series := &request.Timeseries[i]
+		measurement, tags, column, reason := prometheusSeriesLabels(series.Labels)
+		if series.Histograms > 0 {
+			drop(measurement, "", remoteWriteDropHistograms, series.Histograms)
+		}
+		if series.Exemplars > 0 {
+			drop(measurement, "", remoteWriteDropExemplars, series.Exemplars)
+		}
+		samples := 0
+		for _, sample := range series.Samples {
+			if math.Float64bits(sample.Value) != prometheusStaleNaN {
+				samples++
+			}
+		}
+		if samples == 0 {
+			continue
+		}
+		if reason != "" {
+			drop(measurement, column, reason, samples)
+			continue
+		}
+		inRange := true
+		for _, sample := range series.Samples {
+			if sample.Timestamp < math.MinInt64/1000 || sample.Timestamp > math.MaxInt64/1000 {
+				inRange = false
+				break
+			}
+		}
+		if !inRange {
+			drop(measurement, "", remoteWriteDropTimestamp, samples)
+			continue
+		}
+		mn := names[measurement]
+		if mn == nil {
+			mn = &measurementNames{folds: make(map[string]string), winner: make(map[string]string)}
+			names[measurement] = mn
+		}
+		// The series' tags are its labels but __name__ and empty values.
+		for _, label := range series.Labels {
+			if label.Name == "__name__" || label.Value == "" {
+				continue
+			}
+			if _, seen := mn.folds[label.Name]; seen {
+				continue
+			}
+			fold := ingest.FoldColumnName(label.Name)
+			mn.folds[label.Name] = fold
+			if other, ok := mn.winner[fold]; ok {
+				mn.twins = true
+				if label.Name < other {
+					mn.winner[fold] = label.Name
+				}
+			} else {
+				mn.winner[fold] = label.Name
+			}
+		}
+		kept = append(kept, keptSeries{series: series, measurement: measurement, tags: tags, samples: samples})
+	}
+
+	// The stored spellings, one lookup per measurement: a stored spelling
+	// wins over the request's.
+	if known != nil {
+		valueFold := ingest.FoldColumnName(prometheusValueColumn)
+		for measurement, mn := range names {
+			stored := known(measurement)
+			if len(stored) == 0 {
+				continue
+			}
+			if spelling, ok := stored[valueFold]; ok && spelling != prometheusValueColumn {
+				mn.valueTwin = true
+			}
+			for name, fold := range mn.folds {
+				if spelling, ok := stored[fold]; ok && spelling != name {
+					mn.twins = true
+					mn.winner[fold] = spelling
+				}
+			}
+		}
+	}
+
+	// Pass 2: build. A dropped series takes no cell, label-byte or WAL budget.
+	columnCells := 0
+	repeatedBytes := 0
+	rows := make(map[string]int)
+	rowCapacity := make(map[string]int)
+	for _, k := range kept {
+		rowCapacity[k.measurement] += k.samples
+	}
+	for _, k := range kept {
+		measurement, tags, samples := k.measurement, k.tags, k.samples
+		mn := names[measurement]
+		if mn.valueTwin {
+			// A stored column such as a line-protocol field "Value": the
+			// sample column cannot be written beside it.
+			drop(measurement, prometheusValueColumn, ingest.ColumnNameCaseTwin, samples)
+			continue
+		}
+		if mn.twins {
+			twin := ""
+			for _, label := range k.series.Labels {
+				if label.Name == "__name__" || label.Value == "" {
+					continue
+				}
+				if label.Name != mn.winner[mn.folds[label.Name]] {
+					twin = label.Name
+					break
+				}
+			}
+			if twin != "" {
+				drop(measurement, twin, ingest.ColumnNameCaseTwin, samples)
+				continue
+			}
+		}
+
+		record := records[measurement]
+		if record == nil {
+			record = &ingest.TypedColumnBatch{
+				Data: map[string]interface{}{
+					"time":                make([]int64, 0, rowCapacity[measurement]),
+					prometheusValueColumn: make([]float64, 0, rowCapacity[measurement]),
+				},
+			}
+			records[measurement] = record
+			tagNames[measurement] = make(map[string]struct{})
+		}
+
+		rowCount := len(record.Data["time"].([]int64))
+		columnCount := len(record.Data)
+		newColumns := 0
+		for name := range tags {
+			if _, exists := record.Data[name]; !exists {
+				newColumns++
+			}
+		}
+		newCellCount := (rowCount+samples)*(columnCount+newColumns) - rowCount*columnCount
+		if newCellCount > maxRemoteWriteColumnCells-columnCells {
+			return nil, nil, nil, errRemoteWriteTooManyCells
+		}
+		columnCells += newCellCount
+		// Every sample row repeats the series' label names and values, in
+		// memory and in the WAL: bounded like the decoded body.
+		seriesRepeated := 0
+		for _, label := range k.series.Labels {
+			if label.Name != "__name__" && label.Value != "" {
+				seriesRepeated += ingest.WALStringBytes(label.Name) + ingest.WALStringBytes(label.Value)
+			}
+		}
+		if seriesRepeated > 0 && samples > (limit-repeatedBytes)/seriesRepeated {
+			return nil, nil, nil, remoteWriteLimitError{kind: remoteWriteLimitLabelBytes, limit: limit}
+		}
+		repeatedBytes += samples * seriesRepeated
+		rowBytes := ingest.WALStringBytes("time") + ingest.WALNumberBytes +
+			ingest.WALStringBytes(prometheusValueColumn) + ingest.WALNumberBytes + seriesRepeated
+		walBytes[measurement] += int64(samples) * int64(ingest.WALRowBytes(database, measurement, 2+len(tags), rowBytes))
+		rows[measurement] += samples
+
+		for name := range tags {
+			if _, exists := record.Data[name]; !exists {
+				record.Data[name] = make([]string, rowCount, rowCapacity[measurement])
+				if record.Validity == nil {
+					record.Validity = make(map[string][]bool)
+				}
+				record.Validity[name] = make([]bool, rowCount, rowCapacity[measurement])
+			}
+			tagNames[measurement][name] = struct{}{}
+		}
+		times := record.Data["time"].([]int64)
+		values := record.Data[prometheusValueColumn].([]float64)
+		for _, sample := range k.series.Samples {
+			if math.Float64bits(sample.Value) == prometheusStaleNaN {
+				continue
+			}
+			times = append(times, sample.Timestamp*1000)
+			values = append(values, sample.Value)
+		}
+		record.Data["time"] = times
+		record.Data[prometheusValueColumn] = values
+		for name, data := range record.Data {
+			if name == "time" || name == prometheusValueColumn {
+				continue
+			}
+			tagValues := data.([]string)
+			tagValue, exists := tags[name]
+			for i := 0; i < samples; i++ {
+				tagValues = append(tagValues, tagValue)
+			}
+			record.Data[name] = tagValues
+			for i := 0; i < samples; i++ {
+				record.Validity[name] = append(record.Validity[name], exists)
+			}
+		}
+	}
+
+	for measurement, record := range records {
+		for name := range tagNames[measurement] {
+			record.TagColumns = append(record.TagColumns, name)
+		}
+		sort.Strings(record.TagColumns)
+		walBytes[measurement] += int64(ingest.WALRowsHeaderBytes(rows[measurement]))
+	}
+	return records, walBytes, drops, nil
+}
+
+// prometheusSeriesLabels is a series' measurement and tags. When the series
+// cannot be stored, reason says why (and column names the label at fault);
+// measurement is then the best name for the answer.
+func prometheusSeriesLabels(labels []remoteWriteLabel) (measurement string, tags map[string]string, column, reason string) {
+	metricName := ""
+	tags = make(map[string]string, len(labels))
+	seen := make(map[string]struct{}, len(labels))
+	for _, label := range labels {
+		if label.Name == "__name__" {
+			metricName = label.Value
+		}
+	}
+	measurement = prometheusMeasurementName(metricName)
+	if metricName == "" {
+		return "", nil, "", remoteWriteDropNoName
+	}
+	if !isValidMeasurementName(measurement) {
+		return ingest.QuoteColumnName(metricName), nil, "", "metric name is not a valid Arc measurement name (letters, digits and _, starting with a letter, up to 128 characters)"
+	}
+	for _, label := range labels {
+		if label.Name == "" {
+			return measurement, nil, "", remoteWriteDropEmptyLabel
+		}
+		if _, dup := seen[label.Name]; dup {
+			return measurement, nil, label.Name, remoteWriteDropDupLabel
+		}
+		seen[label.Name] = struct{}{}
+		if label.Name == "__name__" || label.Value == "" {
+			// An empty label value is the same as no label (Prometheus data model).
+			continue
+		}
+		if problem := ingest.ColumnNameProblem(label.Name); problem != "" {
+			return measurement, nil, label.Name, problem
+		}
+		if label.Name[0] == '_' {
+			// The buffer leaves such columns out (unstoredColumn): stored,
+			// the label would vanish and its series merge with another.
+			return measurement, nil, label.Name, remoteWriteDropUnderscore
+		}
+		if ingest.FoldColumnName(label.Name) == ingest.FoldColumnName(prometheusValueColumn) {
+			return measurement, nil, label.Name, remoteWriteDropValueLabel
+		}
+		if !utf8.ValidString(label.Value) {
+			return measurement, nil, label.Name, remoteWriteDropLabelUTF8
+		}
+		tags[label.Name] = label.Value
+	}
+	return measurement, tags, "", ""
+}
+
+// prometheusMeasurementName is the measurement for a metric name: every
+// character other than an ASCII letter, digit or _ becomes _, the rule
+// arc-opentelemetry-exporter applies to OTLP metric names, so a recording
+// rule's job:http_requests:rate5m is stored as job_http_requests_rate5m.
+func prometheusMeasurementName(metric string) string {
+	for i := 0; i < len(metric); i++ {
+		if !prometheusMeasurementByte(metric[i]) {
+			return strings.Map(func(r rune) rune {
+				if r < utf8.RuneSelf && prometheusMeasurementByte(byte(r)) {
+					return r
+				}
+				return '_'
+			}, metric)
+		}
+	}
+	return metric
+}
+
+func prometheusMeasurementByte(b byte) bool {
+	return b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}

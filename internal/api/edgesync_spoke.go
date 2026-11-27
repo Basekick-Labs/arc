@@ -12,13 +12,16 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// syncRunTimeout bounds one manual sync pass.
+// defaultSyncRunTimeout bounds one manual sync pass when the handler is not
+// given edge_sync.spoke.sync_timeout (a hand-built handler in a test).
 //
 // Generous because a pass drains whatever backlog exists: a spoke returning
 // from a long outage may have thousands of files to send, and cutting that
-// short would leave it worse off than not having run at all. An operator who
-// wants a shorter bound cancels the request.
-const syncRunTimeout = 2 * time.Hour
+// short would leave it worse off than not having run at all. Configurable
+// since #1112. Closing the HTTP connection does not cancel the pass: Fiber's
+// request context is cancelled only by a server shutdown, not by a client
+// disconnect, so this bound and a shutdown are what end a pass.
+const defaultSyncRunTimeout = 2 * time.Hour
 
 // EdgeSyncSpokeHandler exposes the manual sync controls on a spoke.
 //
@@ -42,8 +45,18 @@ type EdgeSyncSpokeHandler struct {
 	// never runs the network path at all.
 	exporter *edgesync.Exporter
 
+	// relay is nil unless edge_sync.spoke.relay.enabled (#1685).
+	relay *edgesync.RelaySpoke
+
 	authManager *auth.AuthManager
 	logger      zerolog.Logger
+
+	// syncTimeout and exportTimeout bound one manual pass and one export
+	// (edge_sync.spoke.sync_timeout, edge_sync.spoke.bundle.timeout). Always
+	// positive: the constructor sets the defaults and SetTimeouts ignores a
+	// non-positive value.
+	syncTimeout   time.Duration
+	exportTimeout time.Duration
 }
 
 // NewEdgeSyncSpokeHandler validates configuration and returns a ready handler.
@@ -55,11 +68,26 @@ func NewEdgeSyncSpokeHandler(agent *edgesync.Agent, exporter *edgesync.Exporter,
 		return nil, errors.New("edgesync spoke: an agent or an exporter is required")
 	}
 	return &EdgeSyncSpokeHandler{
-		agent:       agent,
-		exporter:    exporter,
-		authManager: authManager,
-		logger:      logger.With().Str("component", "edgesync-spoke").Logger(),
+		agent:         agent,
+		exporter:      exporter,
+		authManager:   authManager,
+		logger:        logger.With().Str("component", "edgesync-spoke").Logger(),
+		syncTimeout:   defaultSyncRunTimeout,
+		exportTimeout: defaultBundleExportTimeout,
 	}, nil
+}
+
+// SetTimeouts sets the manual sync pass and bundle export bounds from
+// configuration (#1112). A non-positive value keeps the current one, so a
+// zero can never become an already-expired context. Call before
+// RegisterRoutes.
+func (h *EdgeSyncSpokeHandler) SetTimeouts(sync, export time.Duration) {
+	if sync > 0 {
+		h.syncTimeout = sync
+	}
+	if export > 0 {
+		h.exportTimeout = export
+	}
 }
 
 // RegisterRoutes mounts the spoke's manual sync controls.
@@ -83,8 +111,36 @@ func (h *EdgeSyncSpokeHandler) RegisterRoutes(app fiber.Router) {
 	group.Post("/export", h.export)
 	group.Post("/export/:bundle_id/revert", h.revertExport)
 	group.Post("/ack", h.applyAck)
+	group.Post("/relay/run", h.relayRun)
 
 	h.logger.Info().Msg("Edge sync spoke routes registered")
+}
+
+// SetRelay wires the relay transport's manual pass (#1685). Call before
+// RegisterRoutes; nil leaves /relay/run answering 503.
+func (h *EdgeSyncSpokeHandler) SetRelay(r *edgesync.RelaySpoke) { h.relay = r }
+
+// relayRun handles POST /api/v1/spoke-sync/relay/run: one relay pass (apply
+// acks, act on refusals, take back timed-out bundles, export). Free, like a
+// manual network sync; the scheduled pass needs the scheduler licence.
+func (h *EdgeSyncSpokeHandler) relayRun(c *fiber.Ctx) error {
+	if h.relay == nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "the relay transport is not enabled (edge_sync.spoke.relay.enabled)",
+		})
+	}
+	ctx, cancel := context.WithTimeout(c.Context(), h.exportTimeout)
+	defer cancel()
+	res, err := h.relay.Run(ctx)
+	if errors.Is(err, edgesync.ErrRelayInProgress) {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": err.Error()})
+	}
+	if err != nil {
+		h.logger.Error().Err(err).Msg("Manual relay pass failed")
+		// A partial result still says what the pass did before failing.
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error(), "result": res})
+	}
+	return c.JSON(res)
 }
 
 // run handles POST /api/v1/spoke-sync/run.
@@ -100,7 +156,7 @@ func (h *EdgeSyncSpokeHandler) run(c *fiber.Ctx) error {
 		})
 	}
 
-	ctx, cancel := context.WithTimeout(c.Context(), syncRunTimeout)
+	ctx, cancel := context.WithTimeout(c.Context(), h.syncTimeout)
 	defer cancel()
 
 	h.logger.Info().Msg("Manual sync pass starting")
@@ -131,15 +187,20 @@ func (h *EdgeSyncSpokeHandler) run(c *fiber.Ctx) error {
 		Msg("Manual sync pass complete")
 
 	out := fiber.Map{
-		"discovered":      res.Discovered,
-		"recovered":       res.Recovered,
-		"already_present": res.AlreadyPresent,
-		"sent":            res.Sent,
-		"bytes_sent":      res.BytesSent,
-		"partial":         res.Partial,
-		"failed":          res.Failed,
-		"skipped":         res.Skipped,
-		"duration_ms":     res.Duration.Milliseconds(),
+		"discovered":         res.Discovered,
+		"recovered":          res.Recovered,
+		"already_present":    res.AlreadyPresent,
+		"sent":               res.Sent,
+		"local_deleted":      res.LocalDeleted,
+		"verify_kept":        res.VerifyKept,
+		"verify_requeued":    res.VerifyRequeued,
+		"verify_unsupported": res.VerifyUnsupported,
+		"verify_error":       res.VerifyError,
+		"bytes_sent":         res.BytesSent,
+		"partial":            res.Partial,
+		"failed":             res.Failed,
+		"skipped":            res.Skipped,
+		"duration_ms":        res.Duration.Milliseconds(),
 	}
 
 	// Conflicts are reported in full rather than counted. Each one needs a
@@ -413,12 +474,14 @@ func (h *EdgeSyncSpokeHandler) ledger(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"entries": out, "limit": limit})
 }
 
-// bundleExportTimeout bounds one export.
+// defaultBundleExportTimeout bounds one export when the handler is not given
+// edge_sync.spoke.bundle.timeout.
 //
 // Generous for the same reason a sync pass is: a bundle can carry thousands of
 // files to removable media, and cutting that short leaves a partial tree the
-// writer must then clean up. An operator who wants a shorter bound cancels.
-const bundleExportTimeout = 2 * time.Hour
+// writer must then clean up. Configurable since #1112; as for a sync pass,
+// a client disconnect does not cancel it, only this bound or a shutdown.
+const defaultBundleExportTimeout = 2 * time.Hour
 
 // export handles POST /api/v1/spoke-sync/export.
 //
@@ -445,7 +508,7 @@ func (h *EdgeSyncSpokeHandler) export(c *fiber.Ctx) error {
 		})
 	}
 
-	ctx, cancel := context.WithTimeout(c.Context(), bundleExportTimeout)
+	ctx, cancel := context.WithTimeout(c.Context(), h.exportTimeout)
 	defer cancel()
 
 	res, err := h.exporter.Export(ctx, req.Path, req.Limit)
@@ -575,11 +638,13 @@ func (h *EdgeSyncSpokeHandler) applyAck(c *fiber.Ctx) error {
 	}
 
 	out := fiber.Map{
-		"applied":     true,
-		"bundle_id":   res.BundleID,
-		"hub_id":      res.HubID,
-		"imported_at": res.ImportedAt,
-		"synced":      res.Synced,
+		"applied":       true,
+		"bundle_id":     res.BundleID,
+		"hub_id":        res.HubID,
+		"imported_at":   res.ImportedAt,
+		"synced":        res.Synced,
+		"attested":      res.Attested,
+		"local_deleted": res.LocalDeleted,
 	}
 	var warnings []string
 	// The three non-advanced cases mean different things, so they are reported

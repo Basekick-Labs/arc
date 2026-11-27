@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/basekick-labs/arc/internal/auth"
 	"github.com/basekick-labs/arc/internal/cluster/security"
 	"github.com/basekick-labs/arc/internal/edgesync"
 	"github.com/basekick-labs/arc/internal/storage"
@@ -46,6 +47,16 @@ type syncTestRig struct {
 }
 
 func newSyncTestRig(t *testing.T) *syncTestRig {
+	return newSyncTestRigWithSecrets(t, StaticSpokeSecrets(map[string]string{testSpokeID: testSecret}))
+}
+
+func newSyncTestRigWithSecrets(t *testing.T, spokeSecrets SpokeSecretLookup) *syncTestRig {
+	return buildSyncTestRig(t, spokeSecrets, nil, nil)
+}
+
+// buildSyncTestRig is newSyncTestRigWithSecrets with API-token auth: am and
+// rbac non-nil mount the real global auth middleware ahead of the routes.
+func buildSyncTestRig(t *testing.T, spokeSecrets SpokeSecretLookup, am *auth.AuthManager, rbac RBACChecker) *syncTestRig {
 	t.Helper()
 
 	dir, err := os.MkdirTemp("", "api-sync-*")
@@ -73,10 +84,12 @@ func newSyncTestRig(t *testing.T) *syncTestRig {
 	h, err := NewEdgeSyncHandler(EdgeSyncHandlerConfig{
 		Receiver:     recv,
 		Reconciler:   rec,
-		SpokeSecrets: StaticSpokeSecrets(map[string]string{testSpokeID: testSecret}),
+		SpokeSecrets: spokeSecrets,
 		Replay:       security.NewNonceCache(security.HMACTimestampTolerance),
 		HubID:        testHubID,
 		MaxFileBytes: 8 << 20,
+		AuthManager:  am,
+		RBAC:         rbac,
 		Logger:       zerolog.Nop(),
 	})
 	if err != nil {
@@ -86,6 +99,11 @@ func newSyncTestRig(t *testing.T) *syncTestRig {
 	// A generous global limit so tests exercise the HANDLER's per-upload cap
 	// rather than fasthttp's default 4MB, which would mask it.
 	app := fiber.New(fiber.Config{DisableStartupMessage: true, BodyLimit: 32 << 20})
+	if am != nil {
+		mw := auth.DefaultMiddlewareConfig()
+		mw.AuthManager = am
+		app.Use(auth.NewMiddleware(mw))
+	}
 	h.RegisterRoutes(app)
 
 	return &syncTestRig{app: app, backend: backend}
@@ -102,6 +120,7 @@ type syncReq struct {
 	body                      []byte
 	macOverride               string
 	secret                    string
+	token                     string // Arc API token; "" sends none
 }
 
 func defaultReq(body []byte) syncReq {
@@ -151,6 +170,9 @@ func (r syncReq) do(t *testing.T, rig *syncTestRig) *http.Response {
 	httpReq.Header.Set(headerMAC, mac)
 	if r.offset > 0 {
 		httpReq.Header.Set(headerOffset, strconv.FormatInt(r.offset, 10))
+	}
+	if r.token != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+r.token)
 	}
 
 	resp, err := rig.app.Test(httpReq, testRequestTimeoutMS)
@@ -273,6 +295,81 @@ func TestEdgeSyncHandler_RejectsUnauthenticated(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestEdgeSyncHandler_RefusesLegacyFilesystemCollision(t *testing.T) {
+	file, err := os.CreateTemp("", "api-colliding-spokes-*.db")
+	if err != nil {
+		t.Fatalf("temp database: %v", err)
+	}
+	databasePath := file.Name()
+	if err := file.Close(); err != nil {
+		t.Fatalf("close temp database: %v", err)
+	}
+	db, err := sql.Open("sqlite3", databasePath)
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close(); _ = os.Remove(databasePath) })
+
+	cipher := newAdminTestCipher(t)
+	_, err = edgesync.NewRegistry(db, cipher, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("registry: %v", err)
+	}
+	encrypted, err := cipher.Encrypt(testSecret)
+	if err != nil {
+		t.Fatalf("encrypt secret: %v", err)
+	}
+	for _, id := range []string{"rocket_01", "ROCKET_01", "rocket_02"} {
+		if _, err := db.Exec(`
+			INSERT INTO sync_spokes (spoke_id, name, secret_encrypted, enabled, registered_at)
+			VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)`, id, id, encrypted); err != nil {
+			t.Fatalf("insert legacy spoke %q: %v", id, err)
+		}
+	}
+
+	// The second registry models startup with rows left by an older version.
+	registry, err := edgesync.NewRegistry(db, cipher, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("reopen registry: %v", err)
+	}
+	var logs bytes.Buffer
+	rig := newSyncTestRigWithSecrets(t, RegistrySpokeSecrets(registry, zerolog.New(&logs)))
+
+	for _, id := range []string{"rocket_01", "ROCKET_01"} {
+		req := defaultReq([]byte("payload"))
+		req.spokeID = id
+		req.secret = testSecret
+		resp := req.do(t, rig)
+		if resp.StatusCode != fiber.StatusUnauthorized {
+			t.Errorf("sync for colliding ID %q returned %d, want 401", id, resp.StatusCode)
+		}
+		resp.Body.Close()
+		exists, err := rig.backend.Exists(context.Background(), edgesync.NamespacedPath(id, req.path))
+		if err != nil {
+			t.Fatalf("check colliding spoke path %q: %v", id, err)
+		}
+		if exists {
+			t.Errorf("sync for colliding ID %q wrote a file", id)
+		}
+	}
+
+	// A registered member refused for a collision is an operator problem, so
+	// it is a Warn naming it, not the Debug an unknown ID gets (#740).
+	if !strings.Contains(logs.String(), `"level":"warn"`) || !strings.Contains(logs.String(), "shares a directory with another registered ID") {
+		t.Errorf("no collision warning on the sync path; logs:\n%s", logs.String())
+	}
+
+	// Existing registrations outside the collision group keep working.
+	req := defaultReq([]byte("payload"))
+	req.spokeID = "rocket_02"
+	req.secret = testSecret
+	resp := req.do(t, rig)
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("sync for unrelated ID returned %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
 }
 
 func TestEdgeSyncHandler_RejectsReplay(t *testing.T) {
@@ -789,6 +886,7 @@ type reconcileReqSpec struct {
 	body           []byte
 	macOverride    string
 	secret         string
+	token          string // Arc API token; "" sends none
 }
 
 func defaultReconcileReq(entries []edgesync.ReconcileEntry) reconcileReqSpec {
@@ -821,6 +919,9 @@ func (r reconcileReqSpec) do(t *testing.T, rig *syncTestRig) *http.Response {
 	req.Header.Set(headerTS, strconv.FormatInt(r.ts, 10))
 	req.Header.Set(headerMAC, mac)
 	req.Header.Set("Content-Type", "application/json")
+	if r.token != "" {
+		req.Header.Set("Authorization", "Bearer "+r.token)
+	}
 
 	resp, err := rig.app.Test(req, testRequestTimeoutMS)
 	if err != nil {

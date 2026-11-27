@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/basekick-labs/arc/internal/syscpu"
+	"github.com/basekick-labs/arc/internal/sysmem"
 	"github.com/rs/zerolog"
 )
 
@@ -34,6 +35,9 @@ type Config struct {
 	Endpoint string        // Telemetry endpoint URL
 	Interval time.Duration // Reporting interval (default: 24h)
 	DataDir  string        // Directory for instance ID file
+	// InstanceID, when set, is the id: nothing is read from or written to
+	// DataDir (#1885). Config validates it as a UUID.
+	InstanceID string
 }
 
 // DefaultConfig returns the default telemetry configuration
@@ -61,6 +65,10 @@ type Collector struct {
 	logger zerolog.Logger
 
 	clients *clientRegistry
+
+	// Memory figures read once in New; see readMemory.
+	memTotalGB  *float64
+	memUsableGB *float64
 }
 
 // TelemetryPayload represents the data sent to the telemetry endpoint
@@ -73,7 +81,7 @@ type TelemetryPayload struct {
 	CPU        CPUInfo `json:"cpu"`
 	Memory     MemInfo `json:"memory"`
 
-	// Clients lists the arcli installations seen since the last
+	// Clients lists the arcli and SDK installations seen since the last
 	// successful report (see clients.go). Omitted when none.
 	Clients *ClientsInfo `json:"clients,omitempty"`
 }
@@ -114,9 +122,46 @@ type CPUInfo struct {
 	UsableCores   *int `json:"usable_cores"`
 }
 
-// MemInfo contains memory information
+// Memory seams, for the payload tests (same shape as usableCoresFn).
+var (
+	physicalMemFn = sysmem.Physical
+	usableMemFn   = sysmem.Limit
+)
+
+// MemInfo contains memory information, in GiB (1024³ bytes).
+//
+// TotalGB is the machine's memory and UsableGB what a cgroup limit leaves this
+// process, the memory counterpart of logical_cores and usable_cores. Before
+// #1412 TotalGB was runtime.MemStats.Sys, the Go runtime's own footprint, so
+// every earlier report carries a few tens of MB whatever the host has. The
+// collector tells the two apart by UsableGB: fixed reporters always send the
+// key, and it is non-null whenever TotalGB is (sysmem's
+// TestPhysicalImpliesLimit).
+//
+// No omitempty, as with CPUInfo: an undetectable value is a null, never a
+// guess and never an absent key.
 type MemInfo struct {
-	TotalGB *float64 `json:"total_gb"`
+	TotalGB  *float64 `json:"total_gb"`
+	UsableGB *float64 `json:"usable_gb"`
+}
+
+// readMemory takes the memory figures once, when the collector is built at
+// startup. That is the figure Arc sized itself against (the ingest buffer reads
+// sysmem.Limit at startup, and so does the compaction subprocess budget when no
+// memory limit is configured), and it matches usable_cores, which is also a startup reading. A limit changed
+// in place without a restart is therefore reported from the next start. It
+// also keeps file reads, which may sit on an lxcfs FUSE mount, out of the
+// report loop that Stop waits on.
+func readMemory() (total, usable *float64) {
+	inGiB := func(fn func() (uint64, sysmem.Source, bool)) *float64 {
+		b, _, ok := fn()
+		if !ok {
+			return nil
+		}
+		v := float64(b) / (1024 * 1024 * 1024)
+		return &v
+	}
+	return inGiB(physicalMemFn), inGiB(usableMemFn)
 }
 
 // New creates a new telemetry collector
@@ -125,10 +170,14 @@ func New(cfg *Config, version string, logger zerolog.Logger) (*Collector, error)
 		cfg = DefaultConfig()
 	}
 
-	// Load or generate instance ID
-	instanceID, err := loadOrCreateInstanceID(cfg.DataDir)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get instance ID: %w", err)
+	// A configured id, or the one in the id file (#1885).
+	instanceID := cfg.InstanceID
+	if instanceID == "" {
+		var err error
+		instanceID, err = loadOrCreateInstanceID(cfg.DataDir)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get instance ID: %w", err)
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -146,6 +195,7 @@ func New(cfg *Config, version string, logger zerolog.Logger) (*Collector, error)
 		logger:  logger.With().Str("component", "telemetry").Logger(),
 		clients: newClientRegistry(),
 	}
+	c.memTotalGB, c.memUsableGB = readMemory()
 
 	return c, nil
 }
@@ -259,11 +309,6 @@ func (c *Collector) collectPayload() *TelemetryPayload {
 	numCPU := runtime.NumCPU()
 	usableCores := usableCoresFn()
 
-	// Get memory info (total system memory via runtime)
-	var memStats runtime.MemStats
-	runtime.ReadMemStats(&memStats)
-	totalGB := float64(memStats.Sys) / (1024 * 1024 * 1024)
-
 	// Build OS platform string like Python's platform.platform()
 	platform := fmt.Sprintf("%s-%s-%s", runtime.GOOS, runtime.Version(), runtime.GOARCH)
 
@@ -284,7 +329,8 @@ func (c *Collector) collectPayload() *TelemetryPayload {
 			UsableCores:   &usableCores,
 		},
 		Memory: MemInfo{
-			TotalGB: &totalGB,
+			TotalGB:  c.memTotalGB,
+			UsableGB: c.memUsableGB,
 		},
 	}
 }
@@ -297,10 +343,17 @@ func loadOrCreateInstanceID(dataDir string) (string, error) {
 
 	idPath := filepath.Join(dataDir, instanceIDFile)
 
-	// Try to load existing ID
+	// Try to load existing ID. A file holding only whitespace is replaced:
+	// returning "" would merge every such installation into one id on the
+	// server. A read error other than a missing file is reported rather than
+	// minting a new id over a file that may hold the real one (#1885).
 	data, err := os.ReadFile(idPath)
-	if err == nil && len(data) > 0 {
-		return string(bytes.TrimSpace(data)), nil
+	if err == nil {
+		if id := string(bytes.TrimSpace(data)); id != "" {
+			return id, nil
+		}
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("failed to read instance ID: %w", err)
 	}
 
 	// Generate new ID as UUID format (matching Python's uuid.uuid4())
@@ -310,7 +363,7 @@ func loadOrCreateInstanceID(dataDir string) (string, error) {
 	}
 
 	// Save ID
-	if err := os.WriteFile(idPath, []byte(id), 0644); err != nil {
+	if err := os.WriteFile(idPath, []byte(id), 0600); err != nil {
 		return "", fmt.Errorf("failed to save instance ID: %w", err)
 	}
 

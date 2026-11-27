@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/apache/iceberg-go/table"
 	"github.com/rs/zerolog"
@@ -299,6 +300,9 @@ func (s *oneMeasurementSource) LocalFiles(context.Context, Measurement) ([]strin
 func (s *oneMeasurementSource) FilesAndLocal(context.Context, Measurement) ([]FileRef, []string, error) {
 	return s.files, s.local, nil
 }
+func (s *oneMeasurementSource) FileSchema(_ context.Context, f FileRef) (ArcSchema, error) {
+	return SchemaFromParquet(strings.TrimPrefix(f.PhysicalPath, "file://"))
+}
 
 // The scheduler must ACT on the blocked set, not merely receive it.
 //
@@ -365,4 +369,39 @@ func TestSchedulerSkipsMeasurementsAwaitingNamespaceMigration(t *testing.T) {
 		t.Fatalf("catalog holds %d rows for %s, want 1: the pass reconciled a measurement awaiting migration and created a duplicate table", rows, measurement)
 	}
 	assertCatalogNamespace(t, ctx, db, legacyNamespace, measurement)
+
+	// #1846: a re-home job asking about a table that awaits the migration is
+	// told so (Blocked), and no pass runs it. This goroutine stands in for the
+	// scheduler's loop, which owns the blocked set.
+	type reply struct {
+		a   PassAnswer
+		err error
+	}
+	got := make(chan reply, 1)
+	qctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	go func() {
+		a, err := sched.ReconcileAndConfirm(qctx, database, measurement, "")
+		got <- reply{a, err}
+	}()
+	for i := 0; ; i++ {
+		sched.reqMu.Lock()
+		n := len(sched.confirms)
+		sched.reqMu.Unlock()
+		if n == 1 {
+			break
+		}
+		if i > 2000 {
+			t.Fatal("the question was never queued")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	sched.serviceConfirms(ctx)
+	r := <-got
+	if r.err != nil || !strings.Contains(r.a.Blocked, "namespace migration") || r.a.Clear() {
+		t.Fatalf("a table awaiting the migration: %+v, err %v", r.a, r.err)
+	}
+	if ok, why := r.a.Verdict(false); ok || !strings.Contains(why, "namespace migration") {
+		t.Fatalf("verdict %v %q", ok, why)
+	}
 }

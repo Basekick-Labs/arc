@@ -61,7 +61,7 @@ func awaitBufferRecordMetrics(t *testing.T, queued, inflight int64) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("queued/inflight records = %d/%d, want %d/%d", snapshotInt(t, "buffer_records_queued"), snapshotInt(t, "buffer_records_inflight"), queued, inflight)
+	t.Fatalf("queued/inflight records = %d/%d, want %d/%d (%s)", snapshotInt(t, "buffer_records_queued"), snapshotInt(t, "buffer_records_inflight"), queued, inflight, describeLiveBuffers())
 }
 
 func TestBufferMetricsIncludeQueuedAndInFlightRecords(t *testing.T) {
@@ -80,6 +80,7 @@ func TestBufferMetricsIncludeQueuedAndInFlightRecords(t *testing.T) {
 		completed:             make(chan struct{}, 2),
 	}
 	buf := NewArrowBuffer(bufferMetricsConfig(), backend, zerolog.New(io.Discard))
+	requireSoleBuffer(t)
 	t.Cleanup(func() {
 		releaseFlushes()
 		_ = buf.Close()
@@ -146,6 +147,7 @@ func snapshotFloat(t *testing.T, key string) float64 {
 // buffer, so a sampler refreshes it independently.
 func TestBufferMetrics_RecordsBufferedTracksUnflushedData(t *testing.T) {
 	buf := NewArrowBuffer(bufferMetricsConfig(), &mockStorageBackend{}, zerolog.New(io.Discard))
+	requireSoleBuffer(t)
 	t.Cleanup(func() { _ = buf.Close() })
 
 	// Stay below MaxBufferSize so nothing flushes.
@@ -193,6 +195,7 @@ func TestBufferMetricsIncludeInFlightFlush(t *testing.T) {
 	cfg := bufferMetricsConfig()
 	cfg.MaxBufferSize = 1
 	buf := NewArrowBuffer(cfg, backend, zerolog.New(io.Discard))
+	requireSoleBuffer(t)
 	var releaseOnce sync.Once
 	t.Cleanup(func() {
 		releaseOnce.Do(func() { close(release) })
@@ -295,6 +298,7 @@ func TestBufferMetricsWarnAtMemoryThreshold(t *testing.T) {
 // before/after delta on the global would be testing test-execution order.
 func TestBufferMetrics_FlushCountersMove(t *testing.T) {
 	buf := NewArrowBuffer(bufferMetricsConfig(), &mockStorageBackend{}, zerolog.New(io.Discard))
+	requireSoleBuffer(t)
 
 	// Cross MaxBufferSize so a flush fires.
 	for i := 0; i < 12; i++ {
@@ -344,6 +348,7 @@ func newGatedMetricsBuffer(t *testing.T) (*ArrowBuffer, *gatedStorageBackend, fu
 		completed:             make(chan struct{}, 16),
 	}
 	buf := NewArrowBuffer(bufferMetricsConfig(), backend, zerolog.New(io.Discard))
+	requireSoleBuffer(t)
 	t.Cleanup(func() {
 		releaseFlushes()
 		_ = buf.Close()
@@ -396,7 +401,10 @@ func TestBufferMetricsCloseDrainMovesQueuedToInFlight(t *testing.T) {
 	awaitBufferRecordMetrics(t, 20, 10)
 
 	done := make(chan int, 1)
-	go func() { done <- buf.drainAndFlushQueue(time.Now().Add(time.Minute)) }()
+	go func() {
+		withWAL, lost := buf.drainAndFlushQueue(time.Now().Add(time.Minute))
+		done <- withWAL + lost
+	}()
 	awaitStarted(t, backend) // the drain is flushing one task (parallelism 1)
 	awaitBufferRecordMetrics(t, 10, 20)
 	release()
@@ -413,8 +421,10 @@ func TestBufferMetricsCloseDropReleasesQueued(t *testing.T) {
 	writeMetricsRecords(t, buf, 20)
 	awaitBufferRecordMetrics(t, 20, 10)
 
-	if unwritten := buf.drainAndFlushQueue(time.Now().Add(-time.Second)); unwritten != 20 {
-		t.Fatalf("drain past the deadline left %d records unwritten, want 20", unwritten)
+	// No WAL on this buffer: the 20 unattempted rows are lost, not preserved
+	// (#1377).
+	if withWAL, lost := buf.drainAndFlushQueue(time.Now().Add(-time.Second)); withWAL != 0 || lost != 20 {
+		t.Fatalf("drain past the deadline: %d unwritten with a WAL copy and %d lost, want 0 and 20", withWAL, lost)
 	}
 	awaitBufferRecordMetrics(t, 0, 10)
 }
@@ -436,6 +446,7 @@ func metricsTypedBatch() *TypedColumnBatch {
 // flush releases both bytes and age.
 func TestBufferBytesCountTypedAndRawWrites(t *testing.T) {
 	buf := NewArrowBuffer(bufferMetricsConfig(), &mockStorageBackend{}, zerolog.New(io.Discard))
+	requireSoleBuffer(t)
 	t.Cleanup(func() { _ = buf.Close() })
 	ctx := context.Background()
 
@@ -469,6 +480,7 @@ func TestBufferBytesCountTypedAndRawWrites(t *testing.T) {
 // Records still in a shard buffer age from the buffer's first write.
 func TestBufferOldestAgeCoversShardBuffers(t *testing.T) {
 	buf := NewArrowBuffer(bufferMetricsConfig(), &mockStorageBackend{}, zerolog.New(io.Discard))
+	requireSoleBuffer(t)
 	t.Cleanup(func() { _ = buf.Close() })
 	writeMetricsRecords(t, buf, 1) // below MaxBufferSize: stays in the shard
 	time.Sleep(150 * time.Millisecond)

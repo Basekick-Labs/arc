@@ -24,7 +24,7 @@ func TestEncodedRequestBodies(t *testing.T) {
 	app.Post("/api/v1/query", h)
 	// Every endpoint that decodes a compressed body itself; Telegraf and
 	// the InfluxDB clients send Content-Encoding: gzip to the first two.
-	writes := []string{"/write", "/api/v2/write", "/api/v1/write/line-protocol", "/api/v1/write/msgpack", "/api/v1/write/tle"}
+	writes := []string{"/write", "/api/v2/write", "/api/v1/write/line-protocol", "/api/v1/write/prometheus", "/api/v1/write/msgpack", "/api/v1/write/tle"}
 	for _, path := range writes {
 		app.Post(path, func(c *fiber.Ctx) error { return c.SendStatus(fiber.StatusNoContent) })
 	}

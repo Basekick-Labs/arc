@@ -1,6 +1,9 @@
 package license
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestClientEdgeSyncSchedulerReadsCurrentLicense(t *testing.T) {
 	var absent *Client
@@ -8,7 +11,7 @@ func TestClientEdgeSyncSchedulerReadsCurrentLicense(t *testing.T) {
 		t.Fatal("nil client permits scheduling")
 	}
 	c := &Client{}
-	for _, l := range []*License{nil, {Tier: TierStarter, Status: "active"}, {Tier: TierStarter, Status: "expired"}, {Tier: TierProfessional, Status: "grace_period"}, {Tier: TierProfessional, Status: "read_only"}, nil} {
+	for _, l := range []*License{nil, {Tier: TierStarter, Status: "active", ExpiresAt: time.Now().Add(time.Hour)}, {Tier: TierStarter, Status: "expired"}, {Tier: TierProfessional, Status: "grace_period", ExpiresAt: time.Now().Add(time.Hour)}, {Tier: TierProfessional, Status: "read_only"}, nil} {
 		c.mu.Lock()
 		c.license = l
 		c.mu.Unlock()

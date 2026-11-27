@@ -51,10 +51,84 @@ func TestMaskStringLiterals_LiteralBoundariesFollowDuckDB(t *testing.T) {
 			masks:  2,
 		},
 		{
+			// DuckDB joins E'a'<newline>'b' into one escape string; the masker
+			// must too, or it reads the continuation as a plain string with a
+			// different escape rule and mislocates its end.
+			name:   "E-string continued across a newline is one string",
+			sql:    "WHERE a = E'x'\n'y' AND b = 1",
+			masked: "WHERE a = __STR_0__ AND b = 1",
+			masks:  1,
+		},
+		{
+			name:   "E-string continuation may cross a line comment",
+			sql:    "WHERE a = E'x' -- c\n'y' AND b = 1",
+			masked: "WHERE a = __STR_0__ AND b = 1",
+			masks:  1,
+		},
+		{
+			name:   "E-string continuation across a carriage return",
+			sql:    "WHERE a = E'x'\r'y' AND b = 1",
+			masked: "WHERE a = __STR_0__ AND b = 1",
+			masks:  1,
+		},
+		{
+			// A block comment does not bridge a continuation (DuckDB: two
+			// adjacent constants); the two stay separate literals.
+			name:   "E-string not continued across a block comment",
+			sql:    "WHERE a = E'x' /* c */ 'y'",
+			masked: "WHERE a = __STR_0__ /* c */ __STR_1__",
+			masks:  2,
+		},
+		{
+			// A space-only gap does not continue (DuckDB: two adjacent
+			// constants, a syntax error); the two stay separate literals.
+			name:   "E-string not continued without a newline",
+			sql:    `WHERE a = E'x' 'y'`,
+			masked: `WHERE a = __STR_0__ __STR_1__`,
+			masks:  2,
+		},
+		{
+			// The continued segment keeps the escape rule: a trailing backslash
+			// escapes the closing quote, so DuckDB reads the string as running
+			// to end; the masker folds the whole thing into one span, leaving no
+			// code after it for a gate to miss.
+			name:   "backslash in the continued segment extends the string",
+			sql:    "WHERE a = E'p'\n'\\' AND secret = 1",
+			masked: "WHERE a = __STR_0__",
+			masks:  1,
+		},
+		{
 			name:   "quoted identifier ending in a backslash ends at its own quote",
 			sql:    `SELECT "weird\" FROM t WHERE x = 'a'`,
 			masked: `SELECT __IDENT_0__ FROM t WHERE x = __STR_1__`,
 			masks:  2,
+		},
+		{
+			// DuckDB accepts any byte >= 0x80 in a tag, as in an identifier.
+			name:   "non-ASCII dollar-quote tag opens a string",
+			sql:    `SELECT $é$a'b$é$ AS s, 'c' AS t`,
+			masked: `SELECT __STR_0__ AS s, __STR_1__ AS t`,
+			masks:  2,
+		},
+		{
+			name:   "non-ASCII byte after a tag's first letter",
+			sql:    `SELECT $aé1$a'b$aé1$ AS s`,
+			masked: `SELECT __STR_0__ AS s`,
+			masks:  1,
+		},
+		{
+			// `a$e` is one identifier, so the quote opens a plain string, where
+			// a backslash is an ordinary character.
+			name:   "e after an identifier's dollar is not an escape-string prefix",
+			sql:    `SELECT a$e'\' , 'b' AS t`,
+			masked: `SELECT a$e__STR_0__ , __STR_1__ AS t`,
+			masks:  2,
+		},
+		{
+			name:   "e after a lone dollar is an escape-string prefix",
+			sql:    `SELECT $e'it\'s' AS t`,
+			masked: `SELECT $__STR_0__ AS t`,
+			masks:  1,
 		},
 		{
 			name:   "dollar-quoted body is untouched by the backslash rule",

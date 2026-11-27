@@ -201,9 +201,12 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 		// Normalize "time" to TIMESTAMP so a partition that mixes file schemas
 		// (some time=TIMESTAMP, some time=VARCHAR from a misbehaving writer)
 		// still compacts instead of failing the column bind. See timeNormalizeReplace.
+		//
+		// The ORDER BY applies to a derived table so it binds to the
+		// normalized "time", never a raw VARCHAR one (see buildOrderByClause).
 		return []string{fmt.Sprintf(`
 		COPY (
-			SELECT * REPLACE (%s) FROM %s
+			SELECT * FROM (SELECT * REPLACE (%s) FROM %s)
 			%s
 		) TO '%s' (
 			FORMAT PARQUET,
@@ -291,11 +294,15 @@ func buildCompactionQuery(fileListSQL, orderByClause, outputFile string, tagColu
 			KV_METADATA {'` + exactDedupMarker + `': 'true'}`
 	}
 
+	// The UNION is a derived table: DuckDB rejects an expression (the
+	// hour of "time" in buildOrderByClause) in an ORDER BY directly on a UNION.
 	copyOut := fmt.Sprintf(`
 		COPY (
-			(SELECT * FROM %[1]s s WHERE NOT EXISTS (SELECT 1 FROM %[2]s k WHERE %[3]s))
-			UNION ALL
-			(SELECT DISTINCT * FROM %[1]s s WHERE EXISTS (SELECT 1 FROM %[2]s k WHERE %[3]s))
+			SELECT * FROM (
+				(SELECT * FROM %[1]s s WHERE NOT EXISTS (SELECT 1 FROM %[2]s k WHERE %[3]s))
+				UNION ALL
+				(SELECT DISTINCT * FROM %[1]s s WHERE EXISTS (SELECT 1 FROM %[2]s k WHERE %[3]s))
+			)
 			%[4]s
 		) TO '%[5]s' (
 			FORMAT PARQUET,

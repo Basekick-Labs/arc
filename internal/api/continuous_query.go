@@ -18,6 +18,7 @@ import (
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/fieldschema"
 	"github.com/basekick-labs/arc/internal/ingest"
+	"github.com/basekick-labs/arc/internal/readgate"
 	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/basekick-labs/arc/internal/storage"
 	"github.com/basekick-labs/arc/pkg/models"
@@ -34,6 +35,10 @@ type CQSchedulerReloader interface {
 	// StartJobDirect schedules a job using data already in hand, avoiding a
 	// redundant SQLite read that could race with the just-committed INSERT.
 	StartJobDirect(cqID int64, name, interval string, isActive bool) error
+	// StopJob stops the job of a CQ that was deleted, and keeps any later
+	// start for that ID from scheduling it again. A no-op when the CQ has no
+	// job or the scheduler is not running.
+	StopJob(cqID int64)
 }
 
 // CQCoordinator is the minimal cluster interface the CQ handler needs to gate
@@ -50,12 +55,17 @@ type ContinuousQueryHandler struct {
 	arrowBuffer *ingest.ArrowBuffer
 	// lastSkipLogNano samples logSkippedRun (#676).
 	lastSkipLogNano atomic.Int64
-	fieldSchema     *fieldschema.Registry // optional, #914
+	// lastReadSkipLogNano samples logSkippedRead.
+	lastReadSkipLogNano atomic.Int64
+	fieldSchema         *fieldschema.Registry // optional, #914
 	// openCompactions: compaction jobs whose output and inputs can both be in
 	// storage (optional; see wrapOpenCompactions).
 	openCompactions OpenCompactions
-	config          *config.ContinuousQueryConfig
-	sqliteDB        *sql.DB
+	// reads is the query handler's count of reads in flight (SetReads); nil
+	// counts nothing.
+	reads    *readgate.Gate
+	config   *config.ContinuousQueryConfig
+	sqliteDB *sql.DB
 	// ownsDB records whether this handler opened sqliteDB itself. When CQ
 	// shares the auth database (the default), the handle is borrowed and Close
 	// must leave it to its owner.
@@ -75,6 +85,15 @@ type ContinuousQueryHandler struct {
 
 // aggregate runs a CQ's aggregation (executeAggregation, or the test hook).
 func (h *ContinuousQueryHandler) aggregate(ctx context.Context, cq *ContinuousQuery, query string, start, end time.Time) (int64, error) {
+	// On a cluster whose nodes share one object store, not while this
+	// node's cluster state may be behind the leader's: it would leave the
+	// wrong files out, and the run writes what it read back for good
+	// (cluster/read_lease.go). The run is skipped and its window kept.
+	if rr, ok := h.coordinator.(readLeaseReadiness); ok {
+		if ready, why := rr.ReadReady(); !ready {
+			return 0, fmt.Errorf("%w: %s", ErrNoReadLease, why)
+		}
+	}
 	if h.aggregateHook != nil {
 		return h.aggregateHook(ctx, cq, query, start)
 	}
@@ -180,6 +199,9 @@ type ExecuteCQResponse struct {
 	// primary moved it meanwhile; theirs is kept) or "pending" (the cluster
 	// has not taken it yet; the next run settles it).
 	WatermarkStatus string `json:"watermark_status,omitempty"`
+	// Skipped: the run had no new window (see quietEmptyWindow) and did
+	// nothing. Not serialized; the scheduler reads it to log at Debug.
+	Skipped bool `json:"-"`
 }
 
 // CQExecution represents an execution history record
@@ -219,6 +241,10 @@ func (h *ContinuousQueryHandler) sourceRead(ctx context.Context, cq *ContinuousQ
 
 // SetOpenCompactions wires the compaction jobs a source read must account for.
 func (h *ContinuousQueryHandler) SetOpenCompactions(oc OpenCompactions) { h.openCompactions = oc }
+
+// SetReads shares the query handler's count of reads in flight, so a job that
+// swaps files waits for a running continuous query too.
+func (h *ContinuousQueryHandler) SetReads(g *readgate.Gate) { h.reads = g }
 
 func NewContinuousQueryHandler(db *database.DuckDB, storage storage.Backend, arrowBuffer *ingest.ArrowBuffer, cfg *config.ContinuousQueryConfig, authManager *auth.AuthManager, logger zerolog.Logger) (*ContinuousQueryHandler, error) {
 	// continuous_query.db_path defaults to the auth database. When it resolves
@@ -425,6 +451,8 @@ func validateCQDefinition(req *ContinuousQueryRequest, create bool) error {
 		return err
 	} else if ok && !isValidDatabaseName(req.Database.Value) {
 		return errors.New("invalid database name: must start with a letter and contain only alphanumeric characters, underscores, or hyphens (max 64 characters)")
+	} else if ok && storage.IsWarehouseRootName(req.Database.Value) {
+		return errors.New(warehouseDatabaseError(req.Database.Value))
 	}
 	if ok, err := required("source_measurement", req.SourceMeasurement); err != nil {
 		return err
@@ -759,9 +787,61 @@ func (h *ContinuousQueryHandler) handleDelete(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Continuous query not found"})
 	}
 
+	// Stop its job. Left running, it would fire at the CQ's interval until a
+	// restart or reload, every run failing on the missing row and logged at
+	// Error. In a cluster, SyncJobs stops it when the delete is mirrored.
+	if h.scheduler != nil {
+		h.scheduler.StopJob(int64(queryID))
+	}
+
 	h.logger.Info().Int("query_id", queryID).Msg("Deleted continuous query")
 
 	return c.JSON(fiber.Map{"message": "Continuous query deleted successfully"})
+}
+
+// cqNow is the clock a run derives its window from (a test seam).
+var cqNow = time.Now
+
+// quietEmptyWindow reports whether a run's empty window is simply nothing new
+// to process, answered with 0 records rather than an error (#1628): both
+// bounds were derived (the start from the watermark, the end from now), and
+// the watermark is at most cqEndTimeSkew ahead of now. That is a second run
+// within the same second, or a watermark an earlier manual end_time set up to
+// the minute ahead it may. A watermark further ahead (clock skew, a failover)
+// stays an error, so a CQ stuck behind it is not silent; so does an empty
+// window the caller asked for.
+func quietEmptyWindow(start, end, now time.Time, startFromWatermark, endGiven bool) bool {
+	return startFromWatermark && !endGiven &&
+		!start.Before(end) &&
+		!start.After(now.Add(cqEndTimeSkew))
+}
+
+// emptyCQWindowResponse is the answer to a run quietEmptyWindow skipped: the
+// window it reports is empty (start and end at the watermark) and nothing was
+// written. No run happened, so there is no execution to name: execution_id is
+// "" (present, as clients require the key) and no history row has it. Every
+// other field the clients require is set.
+func emptyCQWindowResponse(queryID int64, cq *ContinuousQuery, watermark time.Time, began time.Time, dryRun bool, executedQuery string) ExecuteCQResponse {
+	status := "completed"
+	if dryRun {
+		status = "dry_run"
+	}
+	return ExecuteCQResponse{
+		QueryID:                queryID,
+		QueryName:              cq.Name,
+		ExecutionID:            "",
+		Status:                 status,
+		StartTime:              watermark.Format(time.RFC3339),
+		EndTime:                watermark.Format(time.RFC3339),
+		RecordsRead:            nil,
+		RecordsWritten:         0,
+		ExecutionTimeSeconds:   time.Since(began).Seconds(),
+		DestinationMeasurement: cq.DestinationMeasurement,
+		DryRun:                 dryRun,
+		ExecutedAt:             time.Now().UTC().Format(time.RFC3339),
+		ExecutedQuery:          executedQuery,
+		Skipped:                true,
+	}
 }
 
 // ExecuteCQ executes a continuous query by ID programmatically (used by scheduler)
@@ -803,13 +883,21 @@ func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (
 		startTime, _ = time.Parse(time.RFC3339, *cq.LastProcessedTime)
 		startTime = startTime.UTC()
 	} else {
-		startTime = time.Now().UTC().Add(-1 * time.Hour)
+		startTime = cqNow().UTC().Add(-1 * time.Hour)
 	}
 	// Whole seconds: the window bounds go into the query as RFC3339, and the
 	// watermark is stored at that precision.
-	endTime = time.Now().UTC().Truncate(time.Second)
+	now := cqNow()
+	endTime = now.UTC().Truncate(time.Second)
 
 	if !startTime.Before(endTime) {
+		if quietEmptyWindow(startTime, endTime, now, cq.LastProcessedTime != nil, false) {
+			// Nothing new since the last run (#1628): no aggregation, no
+			// execution row, the watermark left as it is. The scheduler logs
+			// it (Debug), from Skipped.
+			resp := emptyCQWindowResponse(queryID, cq, startTime, start, false, "")
+			return &resp, nil
+		}
 		return nil, fmt.Errorf("start_time must be before end_time")
 	}
 
@@ -828,6 +916,14 @@ func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (
 
 	// Execute the aggregation query using DuckDB
 	recordsWritten, err := h.aggregate(ctx, cq, executedQuery, startTime, endTime)
+	if err != nil && errors.Is(err, ErrNoReadLease) {
+		// This node may not read now (read_lease.go): skipped, not failed,
+		// as for refused writes. No execution row, the window stays, and
+		// the log line is sampled: it holds for every run of every query
+		// until the node has synced again.
+		h.logSkippedRead(cq.Name, err)
+		return nil, fmt.Errorf("execution skipped: %w", err)
+	}
 	if err != nil && ingest.IsWriteRefusal(err) {
 		// Writes are refused (fenced, or WAL volume disk pressure, #676): the
 		// run is skipped, not failed. No execution row, which would be one
@@ -843,7 +939,7 @@ func (h *ContinuousQueryHandler) ExecuteCQ(ctx context.Context, queryID int64) (
 		if src != nil {
 			h.ensureCQMirrored(ctx, queryID)
 		}
-		h.recordExecution(queryID, executionID, "failed", startTime, endTime, nil, 0, executionDuration, err.Error())
+		h.recordExecution(queryID, executionID, "failed", startTime, endTime, nil, 0, executionDuration, clientErrText(h.logger, err))
 
 		h.logger.Error().Err(err).Str("query_name", cq.Name).Msg("Scheduled continuous query execution failed")
 		return nil, fmt.Errorf("execution failed: %w", err)
@@ -959,6 +1055,7 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 
 	// Determine time range
 	var startTime, endTime time.Time
+	startFromWatermark := false
 
 	if req.StartTime != nil && *req.StartTime != "" {
 		startTime, err = time.Parse(time.RFC3339, *req.StartTime)
@@ -969,11 +1066,14 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 	} else if cq.LastProcessedTime != nil {
 		startTime, _ = time.Parse(time.RFC3339, *cq.LastProcessedTime)
 		startTime = startTime.UTC()
+		startFromWatermark = true
 	} else {
-		startTime = time.Now().UTC().Add(-1 * time.Hour)
+		startTime = cqNow().UTC().Add(-1 * time.Hour)
 	}
 
-	if req.EndTime != nil && *req.EndTime != "" {
+	endGiven := req.EndTime != nil && *req.EndTime != ""
+	now := cqNow()
+	if endGiven {
 		endTime, err = time.Parse(time.RFC3339, *req.EndTime)
 		if err != nil {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid end_time format"})
@@ -981,16 +1081,28 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 		endTime = endTime.UTC()
 		// The run's end becomes the watermark: one in the future would make
 		// every later run fail until the clock caught up (#1324).
-		if !req.DryRun && endTime.After(time.Now().Add(cqEndTimeSkew)) {
+		if !req.DryRun && endTime.After(now.Add(cqEndTimeSkew)) {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "end_time may not be more than a minute in the future"})
 		}
 	} else {
-		endTime = time.Now().UTC()
+		endTime = now.UTC()
 	}
 	endTime = endTime.Truncate(time.Second)
 
 	if !startTime.Before(endTime) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "start_time must be before end_time"})
+		if !quietEmptyWindow(startTime, endTime, now, startFromWatermark, endGiven) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "start_time must be before end_time"})
+		}
+		// Nothing new since the last run (#1628): 200 with 0 records, no
+		// aggregation, no execution row, the watermark left as it is.
+		executedQuery := ""
+		if req.DryRun {
+			executedQuery = strings.ReplaceAll(cq.Query, "{start_time}", fmt.Sprintf("'%s'", startTime.Format(time.RFC3339)))
+			executedQuery = strings.ReplaceAll(executedQuery, "{end_time}", fmt.Sprintf("'%s'", startTime.Format(time.RFC3339)))
+		}
+		h.logger.Debug().Str("query_name", cq.Name).Time("watermark", startTime).Bool("dry_run", req.DryRun).
+			Msg("No new window for continuous query")
+		return c.JSON(emptyCQWindowResponse(int64(queryID), cq, startTime, start, req.DryRun, executedQuery))
 	}
 
 	// Replace placeholders in query
@@ -1035,6 +1147,16 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(c.Context(), 10*time.Minute)
 	defer cancel()
 	recordsWritten, err := h.aggregate(ctx, cq, executedQuery, startTime, endTime)
+	if err != nil && errors.Is(err, ErrNoReadLease) {
+		// Nothing was read or written: refused, 503 and retryable.
+		h.logSkippedRead(cq.Name, err)
+		c.Set("Retry-After", "1")
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+			"error": "cluster_state_not_synced",
+			"message": "This node cannot run a query now: " + strings.TrimPrefix(err.Error(), ErrNoReadLease.Error()+": ") +
+				". Retry shortly.",
+		})
+	}
 	if err != nil {
 		executionDuration := time.Since(start).Seconds()
 
@@ -1042,7 +1164,8 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 		if src != nil {
 			h.ensureCQMirrored(c.Context(), int64(queryID))
 		}
-		h.recordExecution(int64(queryID), executionID, "failed", startTime, endTime, nil, 0, executionDuration, err.Error())
+		errText := clientErrText(h.logger, err)
+		h.recordExecution(int64(queryID), executionID, "failed", startTime, endTime, nil, 0, executionDuration, errText)
 
 		if ingest.IsWriteRefusal(err) {
 			// Refused, not failed: 503 and retryable, logged by reason (#676).
@@ -1050,7 +1173,7 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 		}
 		h.logger.Error().Err(err).Str("query_name", cq.Name).Msg("Continuous query execution failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Execution failed: " + err.Error(),
+			"error": "Execution failed: " + errText,
 		})
 	}
 
@@ -1099,20 +1222,212 @@ func (h *ContinuousQueryHandler) handleExecute(c *fiber.Ctx) error {
 // Scope is deliberately narrow — only the `FROM db.measurement` form is matched
 // (not JOIN, comma-joins, or quoted identifiers). A regex cannot safely
 // distinguish a genuine table position from a same-named column qualifier
-// (`db.m.field`), a projection/GROUP BY column (`SELECT a, db.m`), or text inside
-// a string literal without a real SQL tokenizer; widening the pattern to those
-// forms silently corrupts valid queries (rewriting a table-valued function into
+// (`db.m.field`) or a projection/GROUP BY column (`SELECT a, db.m`) without a
+// real SQL tokenizer; widening the pattern to those forms silently corrupts
+// valid queries (rewriting a table-valued function into
 // a scalar position). Anything not matched here is left unchanged and fails
 // loudly at query time rather than being mis-rewritten. Broader, parser-based
 // source matching is tracked as a follow-up. See
 // [[feedback_regex_sql_gating_is_leaky]].
 //
-// ReplaceAllLiteralString (not ReplaceAllString) is used so '$' characters in
-// the storage path are inserted verbatim rather than interpreted as regexp
-// submatch references ($1, $name).
+// The expression is inserted verbatim, so '$' characters in the storage path
+// are never read as regexp submatch references ($1, $name).
+//
+// A body that qualifies a column by the measurement's name (`cpu.usage`) gets
+// the read named after the measurement, as /api/v1/query does (#1447, #1450):
+// DuckDB names an unaliased read_parquet() relation "read_parquet", so
+// `cpu.usage` failed to bind. The rule is aliasTableRef's, applied to the
+// finished expression so the open-compaction exclusion still sees its closing
+// parenthesis.
+//
+// The pattern runs on cqStructureView, a copy of the body with the inside of
+// every literal, quoted identifier and comment blanked, so `FROM db.m` written
+// inside one is not rewritten (#1487). Which spans are literals is
+// MaskStringLiterals' reading of the body, the same one the validator uses.
+// The copy has the body's length, so the splice goes into the body as
+// written: nothing is unmasked, and comments outside the reference stay. A
+// comment between FROM and the name is part of the replaced reference.
+//
+// A match is skipped when the byte on either side would continue an
+// identifier in DuckDB, which Go's ASCII-only \b does not know: `$` and every
+// byte of a multi-byte UTF-8 character. `FROM prod.cpué` names a different
+// table, and rewriting its prefix would leave `é` as an alias of this one.
 func wrapSourceMeasurement(query, database, measurement, readParquetExpr string) string {
 	pattern := regexp.MustCompile(`(?i)\bFROM\s+` + regexp.QuoteMeta(database) + `\.` + regexp.QuoteMeta(measurement) + `\b`)
-	return pattern.ReplaceAllLiteralString(query, "FROM "+readParquetExpr)
+	view := cqStructureView(query)
+	matches := pattern.FindAllStringIndex(view, -1)
+	if matches == nil {
+		return query
+	}
+	// The qualifier scan needs literals masked and comments gone; it only
+	// yields names, so its offsets need not line up with query's.
+	masked, masks := sqlutil.MaskStringLiterals(query, true)
+	// As on the query path: a FROM inside EXTRACT/TRIM/SUBSTRING does not
+	// start a table reference (`EXTRACT(epoch FROM cpu.time)` qualifies).
+	masked, _ = sqlutil.MaskFromKeywordsInFunctionBodies(masked)
+	masked = stripSQLComments(masked, true)
+	qualified := qualifierNames(masked, makeIdentResolver(sqlutil.IdentifierNames(masks)))
+
+	var b strings.Builder
+	last := 0
+	for _, m := range matches {
+		if m[0] > 0 && continuesIdentifier(view[m[0]-1]) || m[1] < len(view) && continuesIdentifier(view[m[1]]) {
+			continue
+		}
+		b.WriteString(query[last:m[0]])
+		expr := readParquetExpr
+		if !cqSourceKeepsOwnName(view, m[1]) {
+			expr = aliasTableRef(expr, view, m[1], measurement, true, qualified)
+		}
+		b.WriteString("FROM ")
+		b.WriteString(expr)
+		last = m[1]
+	}
+	b.WriteString(query[last:])
+	return b.String()
+}
+
+// continuesIdentifier reports whether c, next to a word, would extend it into
+// one identifier in DuckDB though Go's \b sees a boundary there.
+func continuesIdentifier(c byte) bool {
+	return c == '$' || c >= 0x80
+}
+
+// cqStructureView returns query with the inside of every string literal,
+// quoted identifier, dollar-quoted string and comment replaced by spaces. Quote
+// bytes are kept, so they still end a word for the FROM pattern, and the result
+// has query's length, so an offset in it is an offset in query.
+//
+// The literals are the ones MaskStringLiterals finds, read off its output
+// alongside the query: a placeholder is consumed only where the query holds
+// that mask's original text, so a word in the query shaped like a placeholder
+// is never taken for one. If the two ever disagree, the whole query is blanked
+// and nothing is rewritten; the body then fails in DuckDB rather than running
+// a rewrite Arc could not place.
+func cqStructureView(query string) string {
+	masked, masks := sqlutil.MaskStringLiterals(query, true)
+	originals := make(map[string]string, len(masks))
+	for _, m := range masks {
+		originals[m.Placeholder] = m.Original
+	}
+	view := []byte(query)
+	blank := func(from, to int) {
+		for k := from; k < to; k++ {
+			view[k] = ' '
+		}
+	}
+	r := 0
+	for m := 0; m < len(masked); {
+		if ph := placeholderAt(masked, m); ph != "" {
+			if orig, ok := originals[ph]; ok && strings.HasPrefix(query[r:], orig) {
+				blank(r+1, r+len(orig)-1)
+				r += len(orig)
+				m += len(ph)
+				continue
+			}
+		}
+		if r >= len(query) || query[r] != masked[m] {
+			return strings.Repeat(" ", len(query))
+		}
+		r++
+		m++
+	}
+	if r != len(query) {
+		return strings.Repeat(" ", len(query))
+	}
+	// Comments, on the copy: a quote or comment marker inside a literal is
+	// already blank. Block comments nest in DuckDB.
+	for i := 0; i < len(view); {
+		switch {
+		case i+1 < len(view) && view[i] == '-' && view[i+1] == '-':
+			j := i
+			for j < len(view) && view[j] != '\n' && view[j] != '\r' {
+				j++
+			}
+			blank(i, j)
+			i = j
+		case i+1 < len(view) && view[i] == '/' && view[i+1] == '*':
+			j, depth := i+2, 1
+			for j < len(view) && depth > 0 {
+				switch {
+				case j+1 < len(view) && view[j] == '/' && view[j+1] == '*':
+					depth++
+					j += 2
+				case j+1 < len(view) && view[j] == '*' && view[j+1] == '/':
+					depth--
+					j += 2
+				default:
+					j++
+				}
+			}
+			blank(i, j)
+			i = j
+		default:
+			i++
+		}
+	}
+	return string(view)
+}
+
+// placeholderAt returns the __STR_n__ or __IDENT_n__ placeholder starting at
+// i in s, or "".
+func placeholderAt(s string, i int) string {
+	rest := s[i:]
+	var n int
+	switch {
+	case strings.HasPrefix(rest, "__STR_"):
+		n = len("__STR_")
+	case strings.HasPrefix(rest, "__IDENT_"):
+		n = len("__IDENT_")
+	default:
+		return ""
+	}
+	d := n
+	for d < len(rest) && rest[d] >= '0' && rest[d] <= '9' {
+		d++
+	}
+	if d == n || !strings.HasPrefix(rest[d:], "__") {
+		return ""
+	}
+	return rest[:d+2]
+}
+
+// cqSourceKeepsOwnName is keepsOwnName for the raw text a continuous-query
+// body is rewritten in: keepsOwnName expects masked, comment-free SQL. It
+// looks past comments, and treats a quoted word as the reference's own alias.
+// A match the name continues past (`FROM db.m.field`) is not a whole table
+// reference, so it is left as it was.
+func cqSourceKeepsOwnName(query string, end int) bool {
+	if end < len(query) && query[end] == '.' {
+		return true
+	}
+	i := skipSQLSpaceAndComments(query, end)
+	if i < len(query) && query[i] == '"' {
+		return true
+	}
+	return keepsOwnName(query, i)
+}
+
+// skipSQLSpaceAndComments returns the offset of the first byte at or after i
+// that is neither whitespace nor inside a -- or /* */ comment.
+func skipSQLSpaceAndComments(sql string, i int) int {
+	for {
+		i = skipSQLSpace(sql, i)
+		switch {
+		case strings.HasPrefix(sql[i:], "--"):
+			for i < len(sql) && sql[i] != '\n' && sql[i] != '\r' {
+				i++
+			}
+		case strings.HasPrefix(sql[i:], "/*"):
+			if j := strings.Index(sql[i+2:], "*/"); j >= 0 {
+				i += 2 + j + 2
+			} else {
+				return len(sql)
+			}
+		default:
+			return i
+		}
+	}
 }
 
 // executeAggregation runs the aggregation query and writes results.
@@ -1150,9 +1465,11 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	// A body that fails is surfaced, not swallowed: both callers record a
 	// "failed" execution carrying this error, readable via
 	// GET /api/v1/continuous_queries/:id/executions.
-	if err := ValidateSQLRequest(query); err != nil {
+	canonicalSQL, err := ValidateSQLRequest(query)
+	if err != nil {
 		return 0, fmt.Errorf("stored continuous-query definition %q is not valid SQL to execute: %w", cq.Name, err)
 	}
+	query = canonicalSQL
 
 	// A run whose output would be refused (fenced, or WAL volume disk
 	// pressure, #676) fails before it queries: the aggregation can spill to
@@ -1196,6 +1513,9 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	// through the recorded execution, which is not sanitized.
 	if !isValidDatabaseName(cq.Database) {
 		return 0, fmt.Errorf("stored continuous-query definition %q has an invalid database name: %q", cq.Name, cq.Database)
+	}
+	if storage.IsWarehouseRootName(cq.Database) {
+		return 0, fmt.Errorf("stored continuous-query definition %q targets database %q, which is reserved for the Iceberg warehouse", cq.Name, cq.Database)
 	}
 
 	// SECURITY: and the stored measurement names, for the same reason and in
@@ -1241,22 +1561,38 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 		return 0, fmt.Errorf("continuous query %q has an unusable source: %w", cq.Name, err)
 	}
 
-	// Extract CTE names to avoid replacing them with read_parquet paths
-	cteNames := extractCTENames(query)
-
-	// Wrap query to read from parquet files
-	// Replace database.measurement reference in query with read_parquet
-	// Arc uses database.measurement format (e.g., FROM production.cpu)
-	// Skip if the source measurement name matches a CTE name (it's a virtual table reference)
-	wrappedQuery := query
-	if !cteNames[strings.ToLower(cq.SourceMeasurement)] {
-		wrappedQuery = wrapSourceMeasurement(query, cq.Database, cq.SourceMeasurement, h.sourceRead(ctx, cq, measurementPath))
-	}
+	// Replace the `FROM database.measurement` reference with the read of its
+	// files (e.g. FROM production.cpu). Only the qualified form is matched, and
+	// a CTE is never referenced qualified, so a CTE named after the source
+	// measurement (`WITH cpu AS (SELECT … FROM prod.cpu) … FROM cpu`) needs no
+	// exception: skipping the rewrite for it, as this once did, left the CTE's
+	// own `FROM prod.cpu` unrewritten and the query failed (#1487).
+	//
+	// This runs after the definition was re-validated above, which refuses
+	// nested block comments. cqStructureView finds literals with
+	// MaskStringLiterals, which ends a comment at its first `*/`, so it reads a
+	// nested comment as DuckDB does only because the validator never lets one
+	// through.
+	// A read in flight, from before its exclusions are read until its rows
+	// are in memory (internal/readgate). A job that swaps files waits for
+	// it: a run that bound after the swap with the exclusions from before it
+	// would aggregate without the swapped rows and write that back for good.
+	entered, leaveRead := h.reads.EnterAt()
+	defer leaveRead()
+	// Stopped if this node loses its cluster read lease (readgate.Bind).
+	ctx, cancelRead := context.WithCancel(ctx)
+	defer h.reads.Bind(entered, ctx, cancelRead)()
+	wrappedQuery := wrapSourceMeasurement(query, cq.Database, cq.SourceMeasurement, h.sourceRead(ctx, cq, measurementPath))
 
 	h.logger.Debug().Str("query", sqlutil.ForLog(wrappedQuery)).Msg("Executing wrapped query")
 
 	// Execute query using DuckDB
-	rows, err := h.db.Query(wrappedQuery)
+	// With the run's context: without it the statement waited for a pooled
+	// connection, and ran, with no bound at all, past the run's own timeout.
+	// The same context ends when the scheduler stops this query's job (the
+	// query was updated or deleted, or the scheduler reloaded): the run then
+	// fails, its window is not marked done, and the next run covers it.
+	rows, err := h.db.QueryContext(ctx, wrappedQuery)
 	if err != nil {
 		return 0, fmt.Errorf("query execution failed: %w", err)
 	}
@@ -1266,6 +1602,7 @@ func (h *ContinuousQueryHandler) executeAggregation(ctx context.Context, cq *Con
 	if err != nil {
 		return 0, err
 	}
+	leaveRead() // the rows are read; what follows writes them
 
 	h.logger.Info().Int("record_count", len(records)).Msg("Aggregation query returned records")
 
@@ -1393,6 +1730,23 @@ const cqSkipLogEvery = time.Minute
 
 // logSkippedRun logs a run skipped because writes are refused, at most once
 // every cqSkipLogEvery across all continuous queries.
+// ErrNoReadLease is a run refused because this node may not read now: on a
+// cluster whose nodes share one object store, its cluster state may be behind
+// the leader's (cluster/read_lease.go). Retryable; the window is kept.
+var ErrNoReadLease = errors.New("this node cannot read now")
+
+// logSkippedRead logs runs skipped for want of a read lease, at most once a
+// minute.
+func (h *ContinuousQueryHandler) logSkippedRead(name string, err error) {
+	now := time.Now().UnixNano()
+	last := h.lastReadSkipLogNano.Load()
+	if now-last < int64(cqSkipLogEvery) || !h.lastReadSkipLogNano.CompareAndSwap(last, now) {
+		return
+	}
+	h.logger.Warn().Err(err).Str("query_name", name).
+		Msg("Continuous query runs skipped: this node's cluster state may be behind the leader's (retryable); the next run covers the window (sampled: at most one line a minute)")
+}
+
 func (h *ContinuousQueryHandler) logSkippedRun(name string, err error) {
 	now := time.Now().UnixNano()
 	last := h.lastSkipLogNano.Load()
@@ -1408,6 +1762,14 @@ func (h *ContinuousQueryHandler) handleGetExecutions(c *fiber.Ctx) error {
 	queryID, err := c.ParamsInt("id")
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid query ID"})
+	}
+
+	// An ID with no continuous query has no history to list: 404, as GET
+	// /:id answers, rather than a 200 with an empty one.
+	if _, err := h.getQuery(int64(queryID)); isCQWait(err) {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": err.Error()})
+	} else if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Continuous query not found"})
 	}
 
 	limit := c.QueryInt("limit", 50)
@@ -1426,7 +1788,8 @@ func (h *ContinuousQueryHandler) handleGetExecutions(c *fiber.Ctx) error {
 	}
 	defer rows.Close()
 
-	var executions []CQExecution
+	// Non-nil, so a continuous query that has not run yet lists [], not null.
+	executions := []CQExecution{}
 	for rows.Next() {
 		var ex CQExecution
 		if err := rows.Scan(&ex.ID, &ex.QueryID, &ex.ExecutionID, &ex.ExecutionTime, &ex.Status, &ex.StartTime, &ex.EndTime, &ex.RecordsRead, &ex.RecordsWritten, &ex.ExecutionDurationSeconds, &ex.ErrorMessage); err != nil {
@@ -1699,7 +2062,7 @@ func validateCQQuery(query string) error {
 	}
 	probe := strings.ReplaceAll(query, "{start_time}", "'2026-01-01T00:00:00Z'")
 	probe = strings.ReplaceAll(probe, "{end_time}", "'2026-01-01T01:00:00Z'")
-	if err := ValidateSQLRequest(probe); err != nil {
+	if _, err := ValidateSQLRequest(probe); err != nil {
 		return fmt.Errorf("invalid query: %w", err)
 	}
 	return nil

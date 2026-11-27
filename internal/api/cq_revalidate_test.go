@@ -70,7 +70,7 @@ func TestExecuteAggregation_OrdinaryDefinitionsAreNotRefused(t *testing.T) {
 		"SELECT time_bucket(INTERVAL '1 hour', time) AS b, avg(usage) AS a FROM db1.cpu GROUP BY b",
 		"SELECT count(*) AS c FROM db1.cpu WHERE host IN ('a','b') AND usage > 0.5",
 	} {
-		if err := ValidateSQLRequest(q); err != nil {
+		if err := validateSQLErr(q); err != nil {
 			t.Errorf("the guard would refuse an ordinary continuous query: %s -> %v", q, err)
 		}
 	}

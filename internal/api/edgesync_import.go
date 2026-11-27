@@ -12,12 +12,15 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// bundleImportTimeout bounds one import.
+// defaultBundleImportTimeout bounds one import when the handler is not given
+// edge_sync.import.timeout.
 //
 // Generous for the same reason the export is: a bundle can carry thousands of
-// files off removable media, every one hashed twice (verify, then commit). An
-// operator who wants a shorter bound cancels the request.
-const bundleImportTimeout = 4 * time.Hour
+// files off removable media, every one hashed twice (verify, then commit).
+// Configurable since #1112. Closing the HTTP connection does not cancel the
+// import: Fiber's request context is cancelled only by a server shutdown, not
+// by a client disconnect.
+const defaultBundleImportTimeout = 4 * time.Hour
 
 // EdgeSyncImportHandler exposes the hub's air-gap import controls.
 //
@@ -37,6 +40,9 @@ type EdgeSyncImportHandler struct {
 	index       *edgesync.BundleIndex
 	authManager *auth.AuthManager
 	logger      zerolog.Logger
+
+	// timeout bounds one import (edge_sync.import.timeout). Always positive.
+	timeout time.Duration
 }
 
 // NewEdgeSyncImportHandler validates configuration and returns a ready handler.
@@ -64,7 +70,16 @@ func NewEdgeSyncImportHandler(
 		index:       index,
 		authManager: authManager,
 		logger:      logger.With().Str("component", "edgesync-import").Logger(),
+		timeout:     defaultBundleImportTimeout,
 	}, nil
+}
+
+// SetTimeout sets the import bound from configuration (#1112). A
+// non-positive value keeps the current one. Call before RegisterRoutes.
+func (h *EdgeSyncImportHandler) SetTimeout(d time.Duration) {
+	if d > 0 {
+		h.timeout = d
+	}
 }
 
 // RegisterRoutes mounts the import controls. Admin-only.
@@ -109,7 +124,7 @@ func (h *EdgeSyncImportHandler) importBundle(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	ctx, cancel := context.WithTimeout(c.Context(), bundleImportTimeout)
+	ctx, cancel := context.WithTimeout(c.Context(), h.timeout)
 	defer cancel()
 
 	h.logger.Info().Str("dir", resolved).Msg("Bundle import starting")

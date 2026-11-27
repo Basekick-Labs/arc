@@ -657,3 +657,46 @@ func TestIsUnderDir(t *testing.T) {
 		t.Error("isUnderDir should normalize a trailing slash on dir")
 	}
 }
+
+type flipGate struct{ left int }
+
+func (g *flipGate) CanRun() bool {
+	g.left--
+	return g.left >= 0
+}
+
+// The writer gate is re-checked per measurement: a node that loses the lease mid-pass stops
+// writing the remaining tables (#939 A2).
+func TestScheduler_GateRecheckedPerMeasurement(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	backend, err := storage.NewLocalBackend(root, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range []string{"a", "b", "c"} {
+		writeArcStyleParquet(t, filepath.Join(root, "mydb", m, "2023/11/14/22/f.parquet"), 1_700_000_000_000_000, 5)
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(t.TempDir(), "arc.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	exp, err := NewExporter(db, backend, "file://"+root, "arc", 0, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One check for the pass, one for the first measurement, then the lease is gone.
+	sched := NewScheduler(SchedulerConfig{Exporter: exp, Source: NewStorageWalkSource(backend, "arc", zerolog.Nop()),
+		Gate: &flipGate{left: 2}, Logger: zerolog.Nop()})
+	sched.runPass(ctx)
+	exported := 0
+	for _, m := range []string{"a", "b", "c"} {
+		if ok, _ := exp.tableExists(ctx, "mydb", m); ok {
+			exported++
+		}
+	}
+	if exported != 1 {
+		t.Fatalf("%d measurements exported, want 1: the lease was lost after the first", exported)
+	}
+}

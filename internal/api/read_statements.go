@@ -4,6 +4,8 @@ import (
 	"regexp"
 	"strings"
 	"unicode"
+
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 )
 
 // The query API runs read statements only. DuckDB serves every user from one
@@ -172,18 +174,14 @@ func hasNestedBlockComment(masked string) bool {
 				i++
 			}
 		case masked[i] == '/' && masked[i+1] == '*':
-			end := strings.Index(masked[i+2:], "*/")
-			body := masked[i+2:]
-			if end >= 0 {
-				body = body[:end]
-			}
-			if strings.Contains(body, "/*") {
+			// Byte by byte, as DuckDB scans: in `/*/*/` the second opener
+			// shares the first one's '*', and a search for the first `*/`
+			// followed by a look for `/*` in what precedes it misses it.
+			end, _, nested := sqlutil.BlockComment(masked, i)
+			if nested {
 				return true
 			}
-			if end < 0 {
-				return false
-			}
-			i += 2 + end + 1
+			i = end - 1
 		}
 	}
 	return false
@@ -192,9 +190,14 @@ func hasNestedBlockComment(masked string) bool {
 // sideEffectFunctionPattern matches the DuckDB functions a SELECT can call to
 // change or read state shared by every user: logging (enable_logging turns on
 // a database-wide query log that duckdb_logs then shows to any connection),
-// checkpoints, sequences, the random seed, secrets, settings and variables.
-// Enumerated from duckdb_functions() of the linked DuckDB;
-// TestSideEffectFunctionPattern_Family pins the list. The log views are also
+// checkpoints, sequences, the random seed, secrets, settings and variables;
+// profiling and the parser choice, which persist on the pooled connection
+// (enable_profiling's save_location wrote the NEXT request's query to a file
+// the caller named inside the storage root, GHSA-r7vm-9hcg-xgf7); and the
+// views of engine state that name other tenants' files (the external file
+// cache, temporary files) or a pooled connection's PREPAREd statements. Enumerated from duckdb_functions() of the linked
+// DuckDB; TestSideEffectFunctionPattern_Family and
+// TestCoreTableFunctionsReviewed pin the list. The log views are also
 // matched as bare names: `FROM duckdb_logs` needs no parentheses.
 var sideEffectFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join([]string{
 	"checkpoint", "force_checkpoint",
@@ -202,7 +205,9 @@ var sideEffectFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join([]st
 	"nextval", "currval", "setseed",
 	"duckdb_secrets", "which_secret",
 	"duckdb_settings", "duckdb_profiling_settings", "current_setting", "duckdb_variables", "getvariable",
-}, "|") + `)\s*\(|\b(duckdb_logs|duckdb_logs_parsed|duckdb_log_contexts|pg_settings)\b`)
+	"enable_profiling", "disable_profiling", "enable_peg_parser", "disable_peg_parser",
+	"duckdb_external_file_cache", "duckdb_temporary_files", "duckdb_prepared_statements",
+}, "|") + `)\s*\(|\b(duckdb_logs|duckdb_logs_parsed|duckdb_log_contexts|pg_settings|pg_prepared_statements)\b`)
 
 // sideEffectFunction returns the side-effect function or log view named in
 // the identifier-unquoted, literal-masked SQL, or "".

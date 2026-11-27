@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -126,16 +127,25 @@ type CompletionWatcherConfig struct {
 
 	// Staged commit (#1207 d2a2a); nil Staged means no staged manifests are
 	// expected. Storage is this node's backend (the staged copy, the output,
-	// the inputs). BeforeCommit runs before a job's commit is proposed,
+	// the inputs); the legacy path also uses it, to check that an
+	// output_written record's output is in storage before registering it. BeforeCommit runs before a job's commit is proposed,
 	// OnCommitted after it applied and the output is in place, with the
 	// inputs consumed (its error retries the job's finish).
 	Staged       StagedCommitter
 	Storage      storage.Backend
 	BeforeCommit func(output string)
 	OnCommitted  func(inputs []string) error
+	// OnCommittedInto runs right after OnCommitted succeeded, with the job's
+	// output (#1683). Its error retries the finish, as OnCommitted's does.
+	OnCommittedInto func(inputs []string, output string) error
 	// OnFinished runs when an object job's finisher ended it, its input
 	// objects deleted (#1207 d2a2b).
 	OnFinished func()
+	// OnSettled, when set, is told the database and measurement of a staged
+	// job once its inputs are removed and its output is in place here: a
+	// local job at its commit, an object job when its finisher ended it
+	// (#1722: the Iceberg export catches up then).
+	OnSettled func(database, measurement string)
 
 	// Logger receives structured log output. Defaults to Nop if zero.
 	Logger zerolog.Logger
@@ -171,15 +181,28 @@ type CompletionWatcher struct {
 	// sources_deleted. The set is cleared when the manifest is removed
 	// (sources_deleted applied) or on watcher restart.
 	//
-	// Thread safety: accessed only from poll() → applyOne() within the
-	// single loop() goroutine. No lock needed. If applyOne is ever
-	// called from another goroutine, a lock must be added.
+	// Guarded by applyMu: the loop goroutine reads and writes it in
+	// applyOne, and RetractOutput (the compaction cycle's goroutine) drops
+	// an entry.
 	registeredOutputs map[string]struct{}
+
+	// applyMu serialises the legacy (non-staged) part of applyOne with
+	// RetractOutput, so a register cannot land after the un-register it
+	// would undo. Not held across the staged path, which calls back into
+	// the compaction manager and can run long.
+	applyMu sync.Mutex
+
+	// unregisterableLogged holds the jobs whose output_written record was
+	// left unapplied because its output is not in storage as recorded,
+	// with the poll count at which to look again: the warning lands once
+	// per job and the storage check is not repeated every poll. Guarded by
+	// applyMu.
+	unregisterableLogged map[string]int64
 
 	// pauseSkipLogged is set once the watcher has logged that it is leaving
 	// output_written manifests alone under a pause (#1087), and cleared when
 	// the pause ends, so the log line lands once per pause, not per tick.
-	// Same goroutine rule as registeredOutputs.
+	// Loop goroutine only.
 	pauseSkipLogged bool
 
 	// Staged commit state (#1207 d2a2a): per-job memory (loop goroutine
@@ -216,9 +239,10 @@ func NewCompletionWatcher(cfg CompletionWatcherConfig) (*CompletionWatcher, erro
 		cfg.ApplyTimeout = 5 * time.Second
 	}
 	return &CompletionWatcher{
-		cfg:               cfg,
-		logger:            cfg.Logger.With().Str("component", "compaction-completion-watcher").Logger(),
-		registeredOutputs: make(map[string]struct{}),
+		cfg:                  cfg,
+		logger:               cfg.Logger.With().Str("component", "compaction-completion-watcher").Logger(),
+		registeredOutputs:    make(map[string]struct{}),
+		unregisterableLogged: make(map[string]int64),
 	}, nil
 }
 
@@ -269,8 +293,9 @@ func (w *CompletionWatcher) Stop() {
 // when this node has drained its phase-2 commits: sourcesDeleted counts
 // manifests whose inputs are gone from storage but not yet manifest-deleted
 // (the poll loop applies them at its next tick; the pause waits for zero),
-// outputWritten lists the job IDs of manifests whose output is registered but
-// whose subprocess has not yet reported the inputs deleted. Once no compaction
+// outputWritten lists the job IDs of manifests at output_written (the output
+// is registered, or is waiting to be because it is not in storage as
+// recorded) whose subprocess has not yet reported the inputs deleted. Once no compaction
 // cycle is running no subprocess is alive, so an output_written manifest at
 // that point is stuck and will not advance; the caller warns and proceeds.
 // writing_output manifests are left out: they belong to a live subprocess, or
@@ -377,6 +402,81 @@ func (w *CompletionWatcher) poll(ctx context.Context) {
 	}
 }
 
+// RetractOutput un-registers a legacy compaction output before the caller
+// removes it from storage, or after finding it missing: it removes the
+// output's cluster manifest entry and the completion record that would
+// (re)register it. Crash recovery calls it before it discards an output whose
+// stored size disagrees with the job's, and before it gives up on a job whose
+// output is gone. Without it the cluster manifest keeps an entry for a file
+// no node holds (#1811).
+//
+// Order, and why:
+//
+//  1. the output_written record is removed first, so no watcher instance
+//     can register the output afterwards;
+//  2. then the cluster manifest entry, one Raft batch. It is issued whether
+//     or not this node has a record: on shared storage the output may have
+//     been registered by another node's watcher. Deleting a path the
+//     manifest does not hold is a no-op.
+//
+// The caller's storage delete comes after both. Any error means the caller
+// must delete NOTHING and keep its recovery manifest. Every step is
+// idempotent, and nothing but a later compaction cycle with that recovery
+// manifest in its scope repeats it. A failure after step 1 leaves the entry
+// and the file in place with no record; step 2 needs no record, so such a
+// cycle can still finish the job.
+//
+// A record at sources_deleted is refused: the watcher is about to delete
+// the job's sources from the cluster manifest, and the output is then the
+// only copy.
+func (w *CompletionWatcher) RetractOutput(ctx context.Context, jobID, outputPath string) error {
+	w.applyMu.Lock()
+	defer w.applyMu.Unlock()
+
+	// The gate is read directly: pausedByGate also updates loop-goroutine
+	// state. A cycle does not start under a pause, so this is a backstop.
+	if w.cfg.PauseGate != nil && w.cfg.PauseGate() {
+		return errors.New("compaction is paused cluster-wide; not un-registering a compaction output")
+	}
+
+	if err := validateJobID(jobID); err == nil {
+		recordPath := filepath.Join(w.cfg.Dir, jobID+".json")
+		record, err := readCompletionManifest(recordPath)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+		case err != nil:
+			return fmt.Errorf("read completion record of job %s before un-registering its output: %w", jobID, err)
+		case record.State == CompletionStateOutputWritten:
+			if err := deleteCompletionManifest(recordPath); err != nil {
+				return fmt.Errorf("remove completion record of job %s before un-registering its output: %w", jobID, err)
+			}
+		case record.State == CompletionStateWritingOutput:
+			// Never registered; the parent drops the record.
+		default:
+			return fmt.Errorf("completion record of job %s is in state %q; not un-registering its output", jobID, record.State)
+		}
+	}
+
+	applyCtx, cancel := context.WithTimeout(ctx, w.cfg.ApplyTimeout)
+	err := w.cfg.Bridge.BatchFileOps(applyCtx, nil, []DeleteSourceOp{{
+		Path:   outputPath,
+		Reason: "compaction-recovery:" + jobID,
+	}})
+	cancel()
+	w.batchCalls.Add(1)
+	w.deleteCalls.Add(1)
+	if err != nil {
+		return fmt.Errorf("un-register compaction output %s from the cluster manifest: %w", outputPath, err)
+	}
+	delete(w.registeredOutputs, jobID)
+	delete(w.unregisterableLogged, jobID)
+	return nil
+}
+
+// unregisterableRecheckPolls is how many polls pass before an output_written
+// record whose output was not in storage as recorded is checked again.
+const unregisterableRecheckPolls = 60
+
 // pausedByGate reports the cluster-wide compaction pause (#1087) through the
 // configured gate, and re-arms the once-per-pause log line when it ends.
 func (w *CompletionWatcher) pausedByGate() bool {
@@ -436,6 +536,24 @@ func (w *CompletionWatcher) applyOne(ctx context.Context, path string) {
 		return
 	}
 
+	// From here on the legacy path: serialised with RetractOutput, and the
+	// record is read again under the lock, since a retract may have removed
+	// it since the read above.
+	w.applyMu.Lock()
+	defer w.applyMu.Unlock()
+	manifest, err = readCompletionManifest(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	if err != nil {
+		w.logger.Warn().Err(err).Str("path", path).Msg("Failed to read completion manifest; leaving in place")
+		w.applyErrors.Add(1)
+		return
+	}
+	if manifest.State != CompletionStateOutputWritten && manifest.State != CompletionStateSourcesDeleted {
+		return
+	}
+
 	// Skip RegisterCompactedFile if we already applied it for this job on
 	// a previous tick. This happens when the manifest is in output_written
 	// state: the register succeeds, but we leave the manifest in place
@@ -461,6 +579,53 @@ func (w *CompletionWatcher) applyOne(ctx context.Context, path string) {
 				CreatedAt:     output.CreatedAt,
 			})
 		}
+	}
+
+	// An output_written record says "this output is in storage": check that
+	// it still is before telling the cluster so. The record outlives the
+	// file when recovery discards or misses the output on another node, or
+	// when the file is removed some other way, and this watcher's memory of
+	// having registered it does not survive a restart. Registering it then
+	// would leave a cluster manifest entry no node can serve (#1811).
+	//
+	// Only for output_written. Once the sources are deleted the output is
+	// all there is, and the cluster manifest must stop listing the sources
+	// whatever state the output is in.
+	if len(registers) > 0 && manifest.State == CompletionStateOutputWritten && w.cfg.Storage != nil {
+		// A record already found wanting is looked at again only every
+		// unregisterableRecheckPolls polls: nothing may ever remove it (the
+		// job was recovered on another node), and a storage request per
+		// poll for it would never end.
+		if next, waiting := w.unregisterableLogged[manifest.JobID]; waiting && w.pollsTotal.Load() < next {
+			return
+		}
+		for _, output := range manifest.Outputs {
+			// Bounded: this runs under applyMu, which RetractOutput (the
+			// compaction cycle) waits on.
+			statCtx, statCancel := context.WithTimeout(ctx, w.cfg.ApplyTimeout)
+			size, statErr := w.cfg.Storage.StatFile(statCtx, output.Path)
+			statCancel()
+			if statErr != nil {
+				// Unknown: try again next tick.
+				w.logger.Debug().Err(statErr).Str("job_id", manifest.JobID).Str("output", output.Path).
+					Msg("Could not check a compaction output before registering it; will retry next tick")
+				return
+			}
+			if size == output.SizeBytes {
+				continue
+			}
+			if _, logged := w.unregisterableLogged[manifest.JobID]; !logged {
+				w.logger.Warn().
+					Str("job_id", manifest.JobID).
+					Str("output", output.Path).
+					Int64("recorded_size", output.SizeBytes).
+					Int64("stored_size", size).
+					Msg("Compaction output is not in storage as its completion record describes (stored_size -1 means absent); not registering it in the cluster manifest. The record stays and is looked at again periodically; nothing removes it unless this node's own recovery handles the job, so delete it by hand if the job was recovered elsewhere")
+			}
+			w.unregisterableLogged[manifest.JobID] = w.pollsTotal.Load() + unregisterableRecheckPolls
+			return
+		}
+		delete(w.unregisterableLogged, manifest.JobID)
 	}
 
 	// Build the delete slice. Only safe once the subprocess has confirmed
@@ -535,6 +700,7 @@ func (w *CompletionWatcher) applyOne(ctx context.Context, path string) {
 	// Clean up the in-memory dedup tracker — the manifest is gone from
 	// disk so no future tick will see it.
 	delete(w.registeredOutputs, manifest.JobID)
+	delete(w.unregisterableLogged, manifest.JobID)
 	w.manifestsApplied.Add(1)
 	w.logger.Info().
 		Str("job_id", manifest.JobID).

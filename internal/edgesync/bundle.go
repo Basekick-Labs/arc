@@ -1,16 +1,17 @@
 package edgesync
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base32"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -214,6 +215,29 @@ type ExportResult struct {
 // partial tree. The real completeness signal is BundleReader.Verify, which
 // re-hashes every file. Do not treat the manifest's presence as sufficient.
 func (w *BundleWriter) Export(ctx context.Context, parent string, entries []*LedgerEntry, now time.Time) (*ExportResult, error) {
+	return w.export(ctx, entries, now, func(bundleID string) (bundleSink, error) {
+		// The spoke ID is in the directory name so a shared staging area
+		// holding drives from several spokes is unambiguous without opening
+		// each manifest.
+		return newDirSink(parent, "bundle-"+w.spokeID+"-"+bundleID)
+	})
+}
+
+// ExportToRelay writes entries as a bundle into a relay bucket (edge sync 3d,
+// #1685), under RelayOutboxPrefix(spoke, bundle). Each data file streams
+// from spoke storage straight into the bucket, hashed on the way, so the
+// edge box keeps no second copy. Same order as Export: data, entries, and the
+// manifest last, which is what the hub's poller treats as "complete".
+func (w *BundleWriter) ExportToRelay(ctx context.Context, relay storage.Backend, entries []*LedgerEntry, now time.Time) (*ExportResult, error) {
+	if relay == nil {
+		return nil, fmt.Errorf("edgesync: relay export requires a relay backend")
+	}
+	return w.export(ctx, entries, now, func(bundleID string) (bundleSink, error) {
+		return &objectSink{backend: relay, base: RelayOutboxPrefix(w.spokeID, bundleID)}, nil
+	})
+}
+
+func (w *BundleWriter) export(ctx context.Context, entries []*LedgerEntry, now time.Time, open func(bundleID string) (bundleSink, error)) (*ExportResult, error) {
 	start := time.Now()
 
 	if len(entries) == 0 {
@@ -228,22 +252,9 @@ func (w *BundleWriter) Export(ctx context.Context, parent string, entries []*Led
 		return nil, err
 	}
 
-	// The spoke ID is in the directory name so a shared staging area holding
-	// drives from several spokes is unambiguous without opening each manifest.
-	dir := filepath.Join(parent, "bundle-"+w.spokeID+"-"+bundleID)
-
-	// Mkdir on the leaf, not stat-then-MkdirAll: MkdirAll succeeds on an
-	// existing directory, so a stat check leaves a window where two exports
-	// could interleave into one bundle. Mkdir returns EEXIST atomically.
-	// 0700: a bundle holds the spoke's telemetry and sits on removable media.
-	if err := os.MkdirAll(parent, 0o700); err != nil {
-		return nil, fmt.Errorf("edgesync: create bundle parent: %w", err)
-	}
-	if err := os.Mkdir(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("edgesync: create bundle directory: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Join(dir, dataDir), 0o700); err != nil {
-		return nil, fmt.Errorf("edgesync: create bundle data directory: %w", err)
+	sink, err := open(bundleID)
+	if err != nil {
+		return nil, err
 	}
 
 	// Clean up a half-written bundle rather than leaving a partial tree that an
@@ -251,19 +262,22 @@ func (w *BundleWriter) Export(ctx context.Context, parent string, entries []*Led
 	committed := false
 	defer func() {
 		if !committed {
-			if rmErr := os.RemoveAll(dir); rmErr != nil {
-				w.logger.Warn().Err(rmErr).Str("dir", dir).
+			// A fresh context: the usual reason to be here is a cancelled one.
+			cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if rmErr := sink.abort(cctx); rmErr != nil {
+				w.logger.Warn().Err(rmErr).Str("dir", sink.location()).
 					Msg("Could not remove a partially written bundle")
 			}
 		}
 	}()
 
-	written, err := w.writeData(ctx, dir, entries)
+	written, err := w.writeData(ctx, sink, entries)
 	if err != nil {
 		return nil, err
 	}
 
-	digest, entriesSHA, total, err := w.writeEntries(dir, written)
+	digest, entriesSHA, total, err := w.writeEntries(ctx, sink, written)
 	if err != nil {
 		return nil, err
 	}
@@ -286,21 +300,25 @@ func (w *BundleWriter) Export(ctx context.Context, parent string, entries []*Led
 		EntriesDigest: digest,
 		MAC:           mac,
 	}
-	if err := writeJSONFile(filepath.Join(dir, manifestName), m); err != nil {
+	raw, err := encodeIndentedJSON(m)
+	if err != nil {
+		return nil, err
+	}
+	if err := sink.putBytes(ctx, manifestName, raw); err != nil {
 		return nil, err
 	}
 
 	committed = true
 	w.logger.Info().
 		Str("bundle_id", bundleID).
-		Str("dir", dir).
+		Str("dir", sink.location()).
 		Int("files", len(written)).
 		Int64("bytes", total).
 		Msg("Bundle exported")
 
 	return &ExportResult{
 		BundleID:  bundleID,
-		Dir:       dir,
+		Dir:       sink.location(),
 		FileCount: len(written),
 		Bytes:     total,
 		Duration:  time.Since(start),
@@ -312,7 +330,7 @@ func (w *BundleWriter) Export(ctx context.Context, parent string, entries []*Led
 // Re-hashed rather than trusting the ledger's digest: the ledger records what
 // the file was at discovery, and this verifies what is actually being written.
 // A mismatch means the file changed underneath us, which must not be signed.
-func (w *BundleWriter) writeData(ctx context.Context, dir string, entries []*LedgerEntry) ([]BundleEntry, error) {
+func (w *BundleWriter) writeData(ctx context.Context, sink bundleSink, entries []*LedgerEntry) ([]BundleEntry, error) {
 	out := make([]BundleEntry, 0, len(entries))
 
 	for _, e := range entries {
@@ -320,20 +338,35 @@ func (w *BundleWriter) writeData(ctx context.Context, dir string, entries []*Led
 			return nil, err
 		}
 		// The entry path came from the spoke's own storage walk, but it lands
-		// in a filesystem path here — validate before joining, not after.
+		// in a filesystem path or an object key here — validate before
+		// joining, not after.
 		if err := validateSyncPath(e.Path); err != nil {
 			return nil, fmt.Errorf("edgesync: entry %q: %w", truncateForError(e.Path), err)
 		}
 
-		dest := filepath.Join(dir, dataDir, filepath.FromSlash(e.Path))
-		if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
-			return nil, fmt.Errorf("edgesync: create bundle subdirectory: %w", err)
-		}
-
-		sha, n, err := w.copyOne(ctx, e.Path, dest)
+		// Hash and write in one pass. Reading twice would double the I/O on a
+		// constrained edge box and open a window for the file to change between.
+		h := sha256.New()
+		var n int64
+		err := sink.putStream(ctx, dataDir+"/"+e.Path, e.SizeBytes, func(dst io.Writer) error {
+			counter := &countingWriter{w: io.MultiWriter(dst, h)}
+			err := w.backend.ReadTo(ctx, e.Path, counter)
+			n = counter.n
+			if err != nil {
+				return fmt.Errorf("edgesync: read %s: %w", e.Path, err)
+			}
+			return nil
+		})
 		if err != nil {
+			if errors.Is(err, storage.ErrBodyLength) {
+				// The object store refused a body whose length is not the
+				// ledger's: the file changed size since discovery.
+				return nil, fmt.Errorf("edgesync: %q changed while exporting (ledger size %d): %w",
+					e.Path, e.SizeBytes, err)
+			}
 			return nil, err
 		}
+		sha := hex.EncodeToString(h.Sum(nil))
 		if sha != e.SHA256 {
 			return nil, fmt.Errorf("edgesync: %q changed while exporting (ledger %s, read %s)",
 				e.Path, e.SHA256, sha)
@@ -343,33 +376,13 @@ func (w *BundleWriter) writeData(ctx context.Context, dir string, entries []*Led
 	return out, nil
 }
 
-// copyOne streams one file from the backend to dest, returning its digest.
-func (w *BundleWriter) copyOne(ctx context.Context, src, dest string) (string, int64, error) {
-	f, err := os.OpenFile(dest, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return "", 0, fmt.Errorf("edgesync: create %s: %w", dest, err)
-	}
-	defer f.Close()
-
-	// Hash and write in one pass. Reading twice would double the I/O on a
-	// constrained edge box and open a window for the file to change between.
-	h := sha256.New()
-	counter := &countingWriter{w: io.MultiWriter(f, h)}
-	if err := w.backend.ReadTo(ctx, src, counter); err != nil {
-		return "", 0, fmt.Errorf("edgesync: read %s: %w", src, err)
-	}
-	if err := f.Sync(); err != nil {
-		// Without the fsync a bundle can be reported complete while its bytes
-		// are still in the page cache — and the next thing that happens to a
-		// bundle is usually an unplugged drive.
-		return "", 0, fmt.Errorf("edgesync: sync %s: %w", dest, err)
-	}
-	return hex.EncodeToString(h.Sum(nil)), counter.n, nil
-}
-
 // writeEntries writes entries.jsonl and returns the canonical digest, the
 // file's own hash, and the total byte count.
-func (w *BundleWriter) writeEntries(dir string, entries []BundleEntry) (digest, fileSHA string, total int64, err error) {
+//
+// Encoded in memory first: the entry list is bounded by the bundle's file cap
+// (about 2 MB at the default 10,000), and an object store wants the length up
+// front.
+func (w *BundleWriter) writeEntries(ctx context.Context, sink bundleSink, entries []BundleEntry) (digest, fileSHA string, total int64, err error) {
 	paths := make([]string, 0, len(entries))
 	shas := make([]string, 0, len(entries))
 	sizes := make([]int64, 0, len(entries))
@@ -385,39 +398,51 @@ func (w *BundleWriter) writeEntries(dir string, entries []BundleEntry) (digest, 
 		return "", "", 0, fmt.Errorf("edgesync: bundle entries digest: %w", err)
 	}
 
-	path := filepath.Join(dir, entriesName)
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return "", "", 0, fmt.Errorf("edgesync: create %s: %w", path, err)
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	enc := json.NewEncoder(io.MultiWriter(f, h))
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
 	for _, e := range entries {
 		if err := enc.Encode(e); err != nil {
 			return "", "", 0, fmt.Errorf("edgesync: write bundle entry: %w", err)
 		}
 	}
-	if err := f.Sync(); err != nil {
-		return "", "", 0, fmt.Errorf("edgesync: sync %s: %w", path, err)
+	sum := sha256.Sum256(buf.Bytes())
+	if err := sink.putBytes(ctx, entriesName, buf.Bytes()); err != nil {
+		return "", "", 0, err
 	}
-	return digest, hex.EncodeToString(h.Sum(nil)), total, nil
+	return digest, hex.EncodeToString(sum[:]), total, nil
+}
+
+// encodeIndentedJSON renders v as the indented JSON a manifest or ack file
+// holds. Indented because a human at an air gap reads these files.
+func encodeIndentedJSON(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(v); err != nil {
+		return nil, fmt.Errorf("edgesync: encode JSON: %w", err)
+	}
+	return buf.Bytes(), nil
 }
 
 // writeJSONFile writes v as indented JSON, fsynced.
 //
 // Indented because a human at an air gap reads this file.
 func writeJSONFile(path string, v any) error {
+	raw, err := encodeIndentedJSON(v)
+	if err != nil {
+		return err
+	}
+	return writeFileSynced(path, raw)
+}
+
+// writeFileSynced writes data to path (0600) and fsyncs it.
+func writeFileSynced(path string, data []byte) error {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return fmt.Errorf("edgesync: create %s: %w", path, err)
 	}
 	defer f.Close()
-
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(v); err != nil {
+	if _, err := f.Write(data); err != nil {
 		return fmt.Errorf("edgesync: write %s: %w", path, err)
 	}
 	if err := f.Sync(); err != nil {

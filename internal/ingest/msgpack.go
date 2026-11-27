@@ -70,32 +70,103 @@ func (d *MessagePackDecoder) DecodeWithDropsKnown(data []byte, known KnownColumn
 	// row-format payloads decode straight into typed column slices, skipping
 	// the per-value interface boxing of the generic path (~12% of write CPU
 	// at sustained 26M rec/s for columnar). Any shape they don't handle falls
-	// through to the generic path, the authority on accept/reject.
+	// through to the generic path, the authority on accept/reject, except a
+	// write over the cell budget (ErrLPCellBudget), refused here because the
+	// generic path would build the same dense batch.
 	if d.typedEnabled && len(data) > 0 {
 		if recs, ok := d.tryDecodeTyped(data); ok {
 			d.typedHits.Add(1)
 			d.totalDecoded.Add(uint64(len(recs)))
 			return recs, len(recs), nil, nil
 		}
-		if recs, rows, dropped, ok := d.tryDecodeRowsTyped(data, known); ok {
+		recs, rows, dropped, ok, err := d.tryDecodeRowsTyped(data, known)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		if ok {
 			d.typedHits.Add(1)
 			d.totalDecoded.Add(uint64(rows))
 			return recs, rows, dropped, nil
 		}
 		d.typedMisses.Add(1)
 	}
-	records, err = d.decodeGeneric(data)
+	var skipped itemDrops
+	records, err = d.decodeGeneric(data, &skipped)
 	if err != nil {
 		return nil, 0, nil, err
 	}
+	// count includes the skipped items: the caller subtracts drops from it.
 	if list, ok := records.([]interface{}); ok {
-		return records, len(list), nil, nil
+		return records, len(list) + skipped.points, skipped.drops, nil
 	}
-	return records, 1, nil, nil
+	return records, 1 + skipped.points, skipped.drops, nil
+}
+
+// appendDecoded appends an item's decoded records, spreading a nested batch's
+// as the top-level map case does: the writer takes records, not a list of
+// them (a nested batch appended whole was a 500), and the caller's record
+// count is in records.
+func appendDecoded(results []interface{}, result interface{}) []interface{} {
+	if list, ok := result.([]interface{}); ok {
+		return append(results, list...)
+	}
+	return append(results, result)
+}
+
+// LPDropItem is the reason for an item of a batch or a top-level array that
+// could not be decoded. The item is dropped whole and the others are written,
+// as a row the typed decoders drop is (#1434: these were skipped silently,
+// and a request that lost items answered 204).
+const LPDropItem = "an item of the batch or array could not be decoded"
+
+// itemDrops collects the batch and array items decodeGeneric skips, one
+// LPDrop per measurement and error, each item counted as one point.
+type itemDrops struct {
+	drops  []LPDrop
+	points int
+}
+
+func (s *itemDrops) add(item interface{}, err error) {
+	measurement := ""
+	if m, ok := item.(map[string]interface{}); ok {
+		measurement = msgpackItemMeasurement(m["m"])
+	}
+	reason := LPDropItem
+	if err != nil {
+		msg := err.Error()
+		if len(msg) > 200 {
+			msg = msg[:200] + "..."
+		}
+		reason += ": " + msg
+	} else {
+		reason += fmt.Sprintf(": not a map (%T)", item)
+	}
+	s.points++
+	for i := range s.drops {
+		if s.drops[i].Measurement == measurement && s.drops[i].Reason == reason {
+			s.drops[i].Points++
+			return
+		}
+	}
+	s.drops = append(s.drops, LPDrop{Measurement: measurement, Reason: reason, Points: 1})
+}
+
+// msgpackItemMeasurement names a dropped item's measurement for the
+// partial-write message, the way mapToPayload reads "m".
+func msgpackItemMeasurement(v interface{}) string {
+	switch m := v.(type) {
+	case string:
+		return m
+	case int64, uint64, int8, int16, int32, uint8, uint16, uint32, int, uint:
+		return fmt.Sprintf("measurement_%v", m)
+	}
+	return ""
 }
 
 // decodeGeneric decodes any accepted shape through interface{} values.
-func (d *MessagePackDecoder) decodeGeneric(data []byte) (interface{}, error) {
+// Items of a batch or top-level array that cannot be decoded are skipped and
+// recorded in skipped.
+func (d *MessagePackDecoder) decodeGeneric(data []byte, skipped *itemDrops) (interface{}, error) {
 	// NOTE: No bulk UTF-8 pre-validation here. MessagePack is a binary format —
 	// the raw bytes contain type markers, length prefixes, and packed numerics
 	// that are not valid UTF-8. Bulk validation would always fail, adding cost
@@ -123,7 +194,7 @@ func (d *MessagePackDecoder) decodeGeneric(data []byte) (interface{}, error) {
 	switch payload := rawPayload.(type) {
 	case map[string]interface{}:
 		// Standard map format - convert to MsgPackPayload and decode
-		result, err := d.decodeMapPayload(payload, data)
+		result, err := d.decodeMapPayload(payload, data, skipped)
 		if err != nil {
 			d.totalErrors.Add(1)
 			return nil, err
@@ -139,14 +210,14 @@ func (d *MessagePackDecoder) decodeGeneric(data []byte) (interface{}, error) {
 		for _, item := range payload {
 			switch typedItem := item.(type) {
 			case map[string]interface{}:
-				result, err := d.decodeMapPayload(typedItem, nil)
+				result, err := d.decodeMapPayload(typedItem, nil, skipped)
 				if err != nil {
-					d.logger.Error().Err(err).Msg("Failed to decode array item")
+					skipped.add(typedItem, err)
 					continue
 				}
-				results = append(results, result)
+				results = appendDecoded(results, result)
 			default:
-				d.logger.Warn().Interface("type", fmt.Sprintf("%T", item)).Msg("Skipping unknown array item type")
+				skipped.add(item, nil)
 			}
 		}
 
@@ -173,20 +244,23 @@ func unmarshalGeneric(data []byte, v *interface{}) (err error) {
 }
 
 // decodeMapPayload decodes a map[string]interface{} payload
-func (d *MessagePackDecoder) decodeMapPayload(payload map[string]interface{}, rawData []byte) (interface{}, error) {
+func (d *MessagePackDecoder) decodeMapPayload(payload map[string]interface{}, rawData []byte, skipped *itemDrops) (interface{}, error) {
 	// Check for batch format
 	if batch, ok := payload["batch"]; ok {
 		if batchSlice, ok := batch.([]interface{}); ok {
 			var results []interface{}
 			for _, item := range batchSlice {
-				if itemMap, ok := item.(map[string]interface{}); ok {
-					result, err := d.decodeMapPayload(itemMap, nil)
-					if err != nil {
-						d.logger.Error().Err(err).Msg("Failed to decode batch item")
-						continue
-					}
-					results = append(results, result)
+				itemMap, ok := item.(map[string]interface{})
+				if !ok {
+					skipped.add(item, nil)
+					continue
 				}
+				result, err := d.decodeMapPayload(itemMap, nil, skipped)
+				if err != nil {
+					skipped.add(itemMap, err)
+					continue
+				}
+				results = appendDecoded(results, result)
 			}
 			return results, nil
 		}
@@ -566,7 +640,7 @@ func (d *MessagePackDecoder) normalizeTimestamps(columns map[string][]interface{
 }
 
 // normalizeTimestampColumns is the package-level implementation, shared with
-// the WAL-replay/replication path (WriteColumnarDirectNoWAL, #590): raw WAL
+// the WAL-replay path (WriteColumnarDirectReplay, #590): raw WAL
 // payloads are original client bytes that never went through the live decode
 // path, so replay must apply identical normalization. Idempotent for values
 // already in microseconds (multiplier 1).

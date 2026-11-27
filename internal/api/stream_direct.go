@@ -50,6 +50,35 @@ type directBodyStream struct {
 	trailers *responseTrailers   // nil when the response has no trailers
 	header   *fasthttp.ResponseHeader
 	ran      atomic.Bool
+	abort    *streamAbort // nil when the writer cannot abort the response
+}
+
+// streamAbort lets a writer end its response as a failed transfer: WriteTo
+// returns the error, so fasthttp writes no terminating chunk and closes the
+// connection, and the client reads a broken response, not a short complete
+// one. For a body relayed from elsewhere (a forwarded Arrow query, #1567),
+// where a cut can fall mid-message and no in-band marker is reliable.
+type streamAbort struct {
+	mu  sync.Mutex
+	err error
+}
+
+// set records the first abort error.
+func (a *streamAbort) set(err error) {
+	a.mu.Lock()
+	if a.err == nil {
+		a.err = err
+	}
+	a.mu.Unlock()
+}
+
+func (a *streamAbort) get() error {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.err
 }
 
 // directStreamBufSize is the stream's buffer: writers flush it per batch (the
@@ -95,6 +124,9 @@ func (d *directBodyStream) WriteTo(w io.Writer) (int64, error) {
 	defer d.publishTrailers()
 	d.sw(bw)
 	_ = bw.Flush()
+	if err := d.abort.get(); err != nil && cw.err == nil {
+		return cw.n, err
+	}
 	return cw.n, cw.err
 }
 
@@ -148,9 +180,67 @@ func (refusingWriter) Write([]byte) (int, error) { return 0, errResponseBodyNotS
 // body (see directBodyStream). cancel cancels the query when the body is
 // never written; trailers, when not nil, are published after the body.
 //
-// This is the only place in the package that installs a body stream, and the
-// call below is on one line with safeStream so the CI panic-safety guard can
+// This file is the only place in the package that installs a body stream, and
+// each call is on one line with safeStream so the CI panic-safety guard can
 // see both.
-func (h *QueryHandler) setDirectBodyStream(fctx *fasthttp.RequestCtx, cancel func(), trailers *responseTrailers, stream string, onPanic func(), sw func(*bufio.Writer)) {
-	fctx.Response.SetBodyStream(&directBodyStream{sw: h.safeStream(stream, onPanic, sw), cancel: cancel, trailers: trailers, header: &fctx.Response.Header}, -1)
+func (h *QueryHandler) setDirectBodyStream(fctx *fasthttp.RequestCtx, cancel func(), trailers *responseTrailers, stream string, onPanic func(), sw func(*bufio.Writer), panicMetric ...func()) {
+	sw = takeHeldRead(fctx, sw)
+	fctx.Response.SetBodyStream(&directBodyStream{sw: h.safeStream(stream, onPanic, sw, panicMetric...), cancel: cancel, trailers: trailers, header: &fctx.Response.Header}, -1)
+}
+
+// streamReadsFiles marks the request's next direct stream as one that still
+// reads data files while it streams (an arcx-served result, which scans
+// Parquet as it goes; a DuckDB result is complete before its handler
+// returns): the request's held read, if any, leaves when that stream's writer
+// returns (#1858).
+func streamReadsFiles(fctx *fasthttp.RequestCtx) {
+	if hr, _ := fctx.UserValue(heldReadKey).(*heldRead); hr != nil {
+		hr.forStream.Store(true)
+	}
+}
+
+// setAbortableBodyStream is setDirectBodyStream for a writer that may end
+// the response as a failed transfer through abort (see streamAbort).
+func (h *QueryHandler) setAbortableBodyStream(fctx *fasthttp.RequestCtx, cancel func(), trailers *responseTrailers, abort *streamAbort, stream string, onPanic func(), sw func(*bufio.Writer)) {
+	fctx.Response.SetBodyStream(&directBodyStream{sw: h.safeStream(stream, onPanic, sw), cancel: cancel, trailers: trailers, abort: abort, header: &fctx.Response.Header}, -1)
+}
+
+// heldReadKey is the request's user value holding its read in the read gate
+// while the handler runs (holdRead).
+const heldReadKey = "arc.heldRead"
+
+// heldRead is a read in the gate that a streamed response which still reads
+// files takes over (streamReadsFiles, then setDirectBodyStream): the read then leaves when the
+// stream ends, not when the handler returns, so a job that waits for reads
+// does not remove a file the stream still reads (#1858).
+type heldRead struct {
+	leave     func()
+	taken     atomic.Bool
+	forStream atomic.Bool // streamReadsFiles
+}
+
+// holdRead parks leave on the request and returns what the handler defers:
+// it leaves unless a stream took the read over.
+func holdRead(fctx *fasthttp.RequestCtx, leave func()) (release func()) {
+	hr := &heldRead{leave: leave}
+	fctx.SetUserValue(heldReadKey, hr)
+	return func() {
+		if hr.taken.CompareAndSwap(false, true) {
+			hr.leave()
+		}
+	}
+}
+
+// takeHeldRead hands the request's held read, if any, to the stream writer:
+// it leaves when the writer returns. The writer runs exactly once
+// (directBodyStream), so the read always leaves.
+func takeHeldRead(fctx *fasthttp.RequestCtx, sw func(*bufio.Writer)) func(*bufio.Writer) {
+	hr, _ := fctx.UserValue(heldReadKey).(*heldRead)
+	if hr == nil || !hr.forStream.Load() || !hr.taken.CompareAndSwap(false, true) {
+		return sw
+	}
+	return func(w *bufio.Writer) {
+		defer hr.leave()
+		sw(w)
+	}
 }

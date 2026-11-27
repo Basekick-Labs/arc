@@ -2,6 +2,7 @@ package pruning
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"os"
@@ -531,9 +532,9 @@ func TestPartitionCache(t *testing.T) {
 	cache := newPartitionCache(100 * time.Millisecond)
 
 	t.Run("cache key generation", func(t *testing.T) {
-		key1 := cache.cacheKey("/data/mydb/cpu/**/*.parquet", "SELECT * FROM cpu", "0")
-		key2 := cache.cacheKey("/data/mydb/cpu/**/*.parquet", "SELECT * FROM cpu", "0")
-		key3 := cache.cacheKey("/data/mydb/cpu/**/*.parquet", "SELECT * FROM memory", "0")
+		key1 := cache.cacheKey("/data/mydb/cpu/**/*.parquet", sha256.Sum256([]byte("SELECT * FROM cpu")), "0")
+		key2 := cache.cacheKey("/data/mydb/cpu/**/*.parquet", sha256.Sum256([]byte("SELECT * FROM cpu")), "0")
+		key3 := cache.cacheKey("/data/mydb/cpu/**/*.parquet", sha256.Sum256([]byte("SELECT * FROM memory")), "0")
 
 		if key1 != key2 {
 			t.Error("Same inputs should produce same key")
@@ -547,7 +548,7 @@ func TestPartitionCache(t *testing.T) {
 		key := "test-key-1"
 		paths := []string{"path1", "path2"}
 
-		cache.set(key, paths, true)
+		cache.set(key, paths, true, listScope{})
 
 		result, optimized, ok := cache.get(key)
 		if !ok {
@@ -564,7 +565,7 @@ func TestPartitionCache(t *testing.T) {
 
 	t.Run("expiration", func(t *testing.T) {
 		key := "expiring-key"
-		cache.set(key, "result", true)
+		cache.set(key, "result", true, listScope{})
 
 		time.Sleep(150 * time.Millisecond)
 
@@ -577,7 +578,7 @@ func TestPartitionCache(t *testing.T) {
 	t.Run("stats", func(t *testing.T) {
 		statsCache := newPartitionCache(1 * time.Second)
 
-		statsCache.set("hit-key", "result", true)
+		statsCache.set("hit-key", "result", true, listScope{})
 		statsCache.get("hit-key")  // hit
 		statsCache.get("miss-key") // miss
 
@@ -630,7 +631,7 @@ func TestCacheInvalidation(t *testing.T) {
 
 	// Populate caches
 	p.globCache.set("/test/*.parquet", []string{"file.parquet"})
-	p.partitionCache.set("test-key", "result", true)
+	p.partitionCache.set("test-key", "result", true, listScope{})
 
 	t.Run("invalidate glob cache", func(t *testing.T) {
 		p.InvalidateGlobCache()
@@ -667,7 +668,7 @@ func TestCacheInvalidation(t *testing.T) {
 
 	// Repopulate both
 	p.globCache.set("/test/*.parquet", []string{"file.parquet"})
-	p.partitionCache.set("test-key", "result", true)
+	p.partitionCache.set("test-key", "result", true, listScope{})
 
 	t.Run("invalidate all caches", func(t *testing.T) {
 		p.InvalidateAllCaches()
@@ -796,7 +797,7 @@ func TestPartitionCacheConcurrency(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			key := fmt.Sprintf("key-%d", i%10) // Some key overlap
-			cache.set(key, fmt.Sprintf("value-%d", i), i%2 == 0)
+			cache.set(key, fmt.Sprintf("value-%d", i), i%2 == 0, listScope{})
 		}(i)
 	}
 
@@ -1332,7 +1333,7 @@ func TestStartCleanup_RemovesExpiredEntries(t *testing.T) {
 
 	// Seed both caches.
 	pruner.globCache.set("/seed/*.parquet", []string{"a.parquet", "b.parquet"})
-	pruner.partitionCache.set("seed-key", "/seed/optimized", true)
+	pruner.partitionCache.set("seed-key", "/seed/optimized", true, listScope{})
 
 	if _, _, size := pruner.globCache.stats(); size != 1 {
 		t.Fatalf("expected glob cache size 1 after seed, got %d", size)
@@ -1648,7 +1649,7 @@ func TestGlobCacheEvictOnRead(t *testing.T) {
 // TestPartitionCacheEvictOnRead is the partitionCache analogue.
 func TestPartitionCacheEvictOnRead(t *testing.T) {
 	c := newPartitionCache(10 * time.Millisecond)
-	c.set("key-a", "some-path", true)
+	c.set("key-a", "some-path", true, listScope{})
 
 	if _, _, size := c.stats(); size != 1 {
 		t.Fatalf("expected 1 entry after set, got %d", size)
@@ -1692,7 +1693,7 @@ func TestPartitionCacheMaxEntries(t *testing.T) {
 	c.maxEntries = 3
 
 	for i := 0; i < 10; i++ {
-		c.set("key-"+strconv.Itoa(i), "path", true)
+		c.set("key-"+strconv.Itoa(i), "path", true, listScope{})
 	}
 
 	if _, _, size := c.stats(); size > 3 {

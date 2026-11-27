@@ -161,7 +161,7 @@ func TestBinaryBatchOperationsIssue440(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sorted := sortTypedColumnBatchByKeys(merged, []string{"time"})
+	sorted, _ := sortTypedColumnBatchByKeys(merged, []string{"time"})
 	values, ok := sorted.Data["geom"].([][]byte)
 	if !ok || len(values) != 3 {
 		t.Fatalf("sorted binary column = %T", sorted.Data["geom"])

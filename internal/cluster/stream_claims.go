@@ -37,9 +37,26 @@ func (c *Coordinator) localCapabilities() []string {
 	// Compaction commit (#1207 d2) needs nothing of the node: every build
 	// that applies its rules advertises it.
 	// Cluster policies (#1324) likewise.
-	caps := []string{raft.CapabilityCompactionCommit, CapabilityForwardIdentity, raft.CapabilityClusterPolicies, raft.CapabilityClusterRetention, raft.CapabilityClusterCQ}
+	caps := []string{raft.CapabilityCompactionCommit, CapabilityForwardIdentity, CapabilityForwardReadQueries, CapabilityForwardDatabaseCreate, raft.CapabilityClusterPolicies, raft.CapabilityClusterRetention, raft.CapabilityClusterCQ, raft.CapabilityClusterGovernance, raft.CapabilityColdMark, raft.CapabilityIcebergNotice, raft.CapabilityIcebergDatabaseDropped}
+	// Re-home (#1825) applies its rules in every build; whether this node's
+	// configuration lets a job run is its own capability.
+	caps = append(caps, raft.CapabilityRehome)
+	// And the stream-takeover rule of #1872, in every build that has it.
+	caps = append(caps, raft.CapabilityRehomeStreamClaims)
+	// Compaction read fences (#1852): every build applies and keeps them,
+	// whatever the node's role.
+	caps = append(caps, raft.CapabilityCompactionFences)
+	// On local storage a node takes part only once it keeps local copies
+	// of every file (its puller runs): it fetches and holds a job's outputs
+	// (#1860).
+	if c.rehomeInScope.Load() && (c.storage == nil || c.storage.Type() != "local" || c.keepsLocalReplicas()) {
+		caps = append(caps, raft.CapabilityRehomeInScope)
+	}
 	if c.keepsLocalReplicas() {
 		caps = append(caps, CapabilityLocalReplica)
+	}
+	if c.icebergOn.Load() {
+		caps = append(caps, CapabilityIcebergExport)
 	}
 	if c.streamClaimsCapable() {
 		caps = append(caps, raft.CapabilityStreamClaims)

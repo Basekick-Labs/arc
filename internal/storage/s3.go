@@ -72,7 +72,13 @@ type S3Backend struct {
 	useSSL    bool   // stored for subprocess config passing
 	accessKey string // stored for subprocess credential passing
 	secretKey string // stored for subprocess credential passing
-	logger    zerolog.Logger
+	// awsCfg is the config the client was built from, credential provider
+	// included, so another client (the Iceberg FileIO) can share its
+	// credential cache and renewal; clientEndpoint is the endpoint as the
+	// client uses it (with scheme), "" for the SDK's own resolution.
+	awsCfg         aws.Config
+	clientEndpoint string
+	logger         zerolog.Logger
 	// bucketCheckedAt is when a HeadBucket last answered conclusively
 	// (UnixNano; 0 = not yet), and bucketMissing what it answered. See
 	// confirmObjectAbsent.
@@ -162,6 +168,7 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 	var s3Opts []func(*s3.Options)
 
 	// Custom endpoint for MinIO
+	var clientEndpoint string
 	if cfg.Endpoint != "" {
 		endpoint := cfg.Endpoint
 		// Ensure endpoint has protocol
@@ -173,8 +180,10 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 			}
 		}
 
+		clientEndpoint = endpoint
 		s3Opts = append(s3Opts, func(o *s3.Options) {
 			o.BaseEndpoint = aws.String(endpoint)
+			configureGCSS3Options(endpoint, o)
 		})
 		log.Info().Str("endpoint", endpoint).Msg("Using custom S3 endpoint")
 	}
@@ -194,6 +203,11 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 	uploader := manager.NewUploader(client, func(u *manager.Uploader) {
 		u.PartSize = multipartPartSize
 		u.Concurrency = multipartConcurrency
+		// The uploader has its own checksum policy. Apply the GCS exception
+		// without changing other endpoints' existing multipart defaults.
+		if _, gcs := client.Options().HTTPSignerV4.(*gcsS3Signer); gcs {
+			u.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+		}
 	})
 
 	// Validate the prefix rather than repairing it. A prefix that cannot form
@@ -205,17 +219,19 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 	}
 
 	backend := &S3Backend{
-		client:    client,
-		uploader:  uploader,
-		bucket:    cfg.Bucket,
-		prefix:    prefix,
-		region:    region,
-		endpoint:  cfg.Endpoint,
-		pathStyle: cfg.PathStyle,
-		useSSL:    cfg.UseSSL,
-		accessKey: accessKey,
-		secretKey: secretKey,
-		logger:    log,
+		client:         client,
+		uploader:       uploader,
+		bucket:         cfg.Bucket,
+		prefix:         prefix,
+		region:         region,
+		endpoint:       cfg.Endpoint,
+		pathStyle:      cfg.PathStyle,
+		useSSL:         cfg.UseSSL,
+		accessKey:      accessKey,
+		secretKey:      secretKey,
+		awsCfg:         awsCfg,
+		clientEndpoint: clientEndpoint,
+		logger:         log,
 	}
 
 	// Test connection by checking if bucket exists
@@ -237,6 +253,37 @@ func NewS3Backend(cfg *S3Config, logger zerolog.Logger) (*S3Backend, error) {
 // Write writes data to S3
 func (b *S3Backend) Write(ctx context.Context, path string, data []byte) error {
 	return b.WriteReader(ctx, path, bytes.NewReader(data), int64(len(data)))
+}
+
+// WriteIfAbsent writes data at path unless an object is already there
+// (ConditionalWriter), with a conditional PutObject (If-None-Match: *). S3
+// answers 412 PreconditionFailed when the key exists, which is created=false;
+// a 409 ConditionalRequestConflict (another conditional write to the key in
+// flight) is an error for the caller to retry.
+func (b *S3Backend) WriteIfAbsent(ctx context.Context, path string, data []byte) (bool, error) {
+	key, err := b.prefixedKey(path)
+	if err != nil {
+		return false, err
+	}
+	_, err = b.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:        aws.String(b.bucket),
+		Key:           aws.String(key),
+		Body:          bytes.NewReader(data),
+		ContentLength: aws.Int64(int64(len(data))),
+		ContentType:   aws.String("application/octet-stream"),
+		IfNoneMatch:   aws.String("*"),
+	})
+	if err != nil {
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "PreconditionFailed" {
+			return false, nil
+		}
+		recordStorageError(ctx, err)
+		return false, fmt.Errorf("failed to write to S3: %w", err)
+	}
+	metrics.Get().IncStorageWrites()
+	metrics.Get().IncStorageWriteBytes(int64(len(data)))
+	return true, nil
 }
 
 // WriteReader writes data from a reader to S3.
@@ -599,9 +646,30 @@ func (b *S3Backend) StatFile(ctx context.Context, path string) (int64, error) {
 		return -1, fmt.Errorf("HeadObject %s: %w", path, err)
 	}
 	if result.ContentLength == nil {
-		return 0, nil
+		return b.listedSize(ctx, path, key)
 	}
 	return *result.ContentLength, nil
+}
+
+// listedSize is the size of the object at key as a listing reports it, for a
+// store whose HEAD response carried no length (#1812). A listing's schema
+// requires a size, so this is what the store itself records. The exact key
+// sorts before any key it is a prefix of, so the first listed key is it if it
+// exists. No size there either is ErrNoContentLength, never 0: an empty
+// object and an unknown size are different answers.
+func (b *S3Backend) listedSize(ctx context.Context, path, key string) (int64, error) {
+	out, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(b.bucket),
+		Prefix:  aws.String(key),
+		MaxKeys: aws.Int32(1),
+	})
+	if err != nil {
+		return -1, fmt.Errorf("HeadObject %s: %w (and the listing for its size failed: %w)", path, ErrNoContentLength, err)
+	}
+	if len(out.Contents) == 1 && aws.ToString(out.Contents[0].Key) == key && out.Contents[0].Size != nil {
+		return *out.Contents[0].Size, nil
+	}
+	return -1, fmt.Errorf("HeadObject %s: %w", path, ErrNoContentLength)
 }
 
 // List lists objects with the given prefix
@@ -707,7 +775,10 @@ func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 		for _, p := range batch {
 			key, kerr := b.prefixedKey(p)
 			if kerr != nil {
-				nonFatalErrs = append(nonFatalErrs, kerr)
+				// Named here, as a field and in the text: the joined error is
+				// logged only up to its first line (#1113).
+				b.logger.Warn().Err(kerr).Str("key", p).Msg("S3 batch: key refused before the delete")
+				nonFatalErrs = append(nonFatalErrs, fmt.Errorf("%s: %w", p, kerr))
 				continue
 			}
 			objects = append(objects, types.ObjectIdentifier{Key: aws.String(key)})
@@ -736,7 +807,11 @@ func (b *S3Backend) DeleteBatch(ctx context.Context, paths []string) error {
 			}
 			key := "unknown"
 			if e.Key != nil {
-				key = *e.Key
+				// The service answers with the PREFIXED object name (exactly
+				// what prefixObjectKey sent: plain concatenation). Report the
+				// caller's key, the one every manifest, listing and log line
+				// names (#1111), as Azure and GCS do.
+				key = strings.TrimPrefix(*e.Key, b.prefix)
 			}
 			code := ""
 			if e.Code != nil {
@@ -976,6 +1051,22 @@ func (b *S3Backend) ConfigJSON() string {
 // Implements the DirectoryLister interface.
 // Uses S3's delimiter feature to efficiently list only "directories" (common prefixes).
 func (b *S3Backend) ListDirectories(ctx context.Context, prefix string) ([]string, error) {
+	dirs, _, err := b.listLevel(ctx, prefix, false)
+	return dirs, err
+}
+
+// ListLevel implements LevelLister: one delimiter listing, returning the
+// level's directories and the objects directly in it.
+func (b *S3Backend) ListLevel(ctx context.Context, prefix string) ([]string, []string, error) {
+	return b.listLevel(ctx, prefix, true)
+}
+
+var _ LevelLister = (*S3Backend)(nil)
+
+// listLevel is the delimiter listing behind ListDirectories and ListLevel.
+// The level's own objects are collected only when wantFiles is set, so
+// ListDirectories does no per-object work for names it would discard.
+func (b *S3Backend) listLevel(ctx context.Context, prefix string, wantFiles bool) ([]string, []string, error) {
 	// Ensure prefix ends with / for proper directory listing (unless empty)
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix = prefix + "/"
@@ -983,15 +1074,15 @@ func (b *S3Backend) ListDirectories(ctx context.Context, prefix string) ([]strin
 
 	fullPrefix, err := b.prefixedListPrefix(prefix)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	var dirs []string
+	var dirs, files []string
 	var continuationToken *string
 
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		result, err := b.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
@@ -1001,7 +1092,7 @@ func (b *S3Backend) ListDirectories(ctx context.Context, prefix string) ([]strin
 			ContinuationToken: continuationToken,
 		})
 		if err != nil {
-			return nil, listError("failed to list S3 directories", err)
+			return nil, nil, listError("failed to list S3 directories", err)
 		}
 
 		// CommonPrefixes contains the "directories"
@@ -1017,13 +1108,30 @@ func (b *S3Backend) ListDirectories(ctx context.Context, prefix string) ([]strin
 			}
 		}
 
+		// Contents holds the objects directly at this level. Same rule as
+		// List: a key this backend would refuse (a directory marker) is not
+		// data and is left out.
+		for _, obj := range result.Contents {
+			if !wantFiles || obj.Key == nil {
+				continue
+			}
+			if _, err := b.prefixedKey(strings.TrimPrefix(*obj.Key, b.prefix)); err != nil {
+				continue
+			}
+			// A bare name only: a store that ignored the delimiter and
+			// returned a deeper key must not make that key look direct.
+			if name := strings.TrimPrefix(*obj.Key, fullPrefix); name != "" && !strings.Contains(name, "/") {
+				files = append(files, name)
+			}
+		}
+
 		if result.IsTruncated == nil || !*result.IsTruncated {
 			break
 		}
 		continuationToken = result.NextContinuationToken
 	}
 
-	return dirs, nil
+	return dirs, files, nil
 }
 
 // ListObjects lists objects with their metadata at a prefix.
@@ -1185,4 +1293,35 @@ func (b *S3Backend) ListUnusable(ctx context.Context, prefix string) ([]Unusable
 	}
 
 	return objects, nil
+}
+
+// S3ClientSettings is what another S3 client needs to reach the same bucket
+// the same way this backend does.
+type S3ClientSettings struct {
+	// AWS is the config the backend's client was built from. Its credential
+	// provider is the backend's, cache and renewal included.
+	AWS aws.Config
+	// Region is the bucket's region.
+	Region string
+	// Endpoint is the custom endpoint with its scheme, "" when the SDK
+	// resolves the endpoint itself (AWS).
+	Endpoint string
+	// PathStyle is path-style addressing.
+	PathStyle bool
+	// GCSInterop: the endpoint is Google Cloud Storage's S3-compatible XML
+	// API, which this backend reaches through a client option (a signer)
+	// another client built from AWS alone would not have.
+	GCSInterop bool
+}
+
+// ClientSettings returns the settings another S3 client needs to share this
+// backend's bucket and credentials.
+func (b *S3Backend) ClientSettings() S3ClientSettings {
+	return S3ClientSettings{
+		AWS:        b.awsCfg,
+		Region:     b.region,
+		Endpoint:   b.clientEndpoint,
+		PathStyle:  b.pathStyle,
+		GCSInterop: IsGCSEndpoint(b.clientEndpoint),
+	}
 }

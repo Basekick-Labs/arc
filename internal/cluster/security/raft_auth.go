@@ -3,12 +3,16 @@ package security
 import (
 	"crypto/hmac"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/hashicorp/raft"
+	"github.com/rs/zerolog"
 )
 
 // GHSA-wwfh-qrfq-6f8g: Arc's Raft consensus transport performed no
@@ -42,12 +46,27 @@ const (
 	raftAuthMACLen = 32
 	// raftAuthDeadline bounds the whole handshake. It MUST sit below the Raft
 	// HeartbeatTimeout (default 500ms) and well below ElectionTimeout (default
-	// 1s): the hashicorp/raft listen loop calls Accept() serially (one
-	// goroutine), so a handshake that blocks inside Accept() blocks acceptance
-	// of every other peer. A tight deadline caps how long one slow/malicious
-	// peer can stall the loop before it is dropped. 400ms leaves headroom under
-	// the 500ms heartbeat.
+	// 1s): the DIAL side runs inline in hashicorp/raft's per-peer replication
+	// and heartbeat goroutines, so a peer that never answers holds that
+	// goroutine for the full deadline. The ACCEPT side no longer constrains
+	// it — server handshakes run off raft's accept loop (see acceptLoop) — but
+	// it still bounds how long one silent connection holds an in-flight slot.
 	raftAuthDeadline = 400 * time.Millisecond
+	// raftAuthMaxInflight caps concurrent server-side handshakes. Without a
+	// bound, a flood of silent connections ends at file-descriptor exhaustion
+	// for the whole process. At 1024 slots each held at most raftAuthDeadline,
+	// a peer must sustain ~2,500 silent connections a second to delay raft's
+	// accepts; when every slot is busy the loop stops accepting and the kernel
+	// backlog absorbs the excess.
+	raftAuthMaxInflight = 1024
+	// raftAuthWarnInterval rate-limits, per source host, the Warn logged when
+	// a peer is refused, so a probe stays visible without flooding the log.
+	raftAuthWarnInterval = 10 * time.Second
+	// raftAcceptBaseDelay/raftAcceptMaxDelay back off acceptLoop on a listener
+	// error other than close (e.g. EMFILE), the same 5ms-doubling-to-1s steps
+	// net/http.Server.Serve uses for temporary accept errors.
+	raftAcceptBaseDelay = 5 * time.Millisecond
+	raftAcceptMaxDelay  = 1 * time.Second
 )
 
 // AuthenticatedStreamLayer wraps a raft.StreamLayer and performs a mutual
@@ -60,10 +79,29 @@ const (
 // / getConn), so any bytes a buffered reader pulled past the handshake would be
 // silently dropped and desynchronise the very first RPC. Fixed-length
 // unbuffered reads consume exactly the handshake and not one byte more.
+//
+// Server handshakes run concurrently, off the goroutine that calls Accept
+// (#1431). hashicorp/raft's listen loop backs off (5ms doubling to 1s) after
+// every Accept error and resets only on success. When Accept ran the handshake
+// inline and returned its failure, a node stalled for 15s or more woke to a
+// backlog of dials its peers had already abandoned: each failed, raft slept up
+// to 1s, every newer dial outlived its peer's 400ms deadline in the backlog
+// and failed in turn, and the node never rejoined. Accept now returns only
+// authenticated connections, so a failed handshake never reaches raft's
+// backoff, and a slow or silent peer cannot hold up the others.
 type AuthenticatedStreamLayer struct {
 	inner        raft.StreamLayer
 	sharedSecret string
 	clusterName  string
+	logger       zerolog.Logger
+
+	startOnce sync.Once
+	closeOnce sync.Once
+	closeCh   chan struct{}
+	ready     chan net.Conn
+	slots     chan struct{}
+
+	authWarns authWarnLimiter
 }
 
 // NewAuthenticatedStreamLayer wraps inner with the shared-secret handshake.
@@ -73,25 +111,183 @@ func NewAuthenticatedStreamLayer(inner raft.StreamLayer, sharedSecret, clusterNa
 		inner:        inner,
 		sharedSecret: sharedSecret,
 		clusterName:  clusterName,
+		logger:       zerolog.Nop(),
+		closeCh:      make(chan struct{}),
+		ready:        make(chan net.Conn),
+		slots:        make(chan struct{}, raftAuthMaxInflight),
 	}
+}
+
+// WithLogger sets the logger for rejected connections and listener errors,
+// which raft no longer sees. Call it before the layer is handed to raft.
+func (a *AuthenticatedStreamLayer) WithLogger(logger zerolog.Logger) *AuthenticatedStreamLayer {
+	a.logger = logger
+	return a
 }
 
 var _ raft.StreamLayer = (*AuthenticatedStreamLayer)(nil)
 
-// Accept accepts an inner connection and runs the server side of the handshake.
-// On any handshake failure the connection is closed and the error is returned;
-// hashicorp/raft's listen loop logs and continues, so a rejected attacker
-// connection simply dies.
+// Accept returns the next connection whose peer completed the handshake. A
+// connection that fails it is closed and logged here (logHandshakeFailure),
+// never returned, so it
+// cannot trip hashicorp/raft's accept backoff (#1431). Accept returns
+// net.ErrClosed once the layer is closed.
 func (a *AuthenticatedStreamLayer) Accept() (net.Conn, error) {
-	conn, err := a.inner.Accept()
+	a.startOnce.Do(func() { go a.acceptLoop() })
+	select {
+	case conn := <-a.ready:
+		// A handshake that finished as Close ran may win the select above.
+		select {
+		case <-a.closeCh:
+			conn.Close()
+			return nil, net.ErrClosed
+		default:
+			return conn, nil
+		}
+	case <-a.closeCh:
+		return nil, net.ErrClosed
+	}
+}
+
+// acceptLoop accepts inner connections and authenticates each on its own
+// goroutine, at most raftAuthMaxInflight at a time.
+func (a *AuthenticatedStreamLayer) acceptLoop() {
+	var delay time.Duration
+	for {
+		select {
+		case a.slots <- struct{}{}:
+		case <-a.closeCh:
+			return
+		}
+		conn, err := a.inner.Accept()
+		if err != nil {
+			<-a.slots
+			select {
+			case <-a.closeCh:
+				return
+			default:
+			}
+			if errors.Is(err, net.ErrClosed) {
+				// The inner listener is gone without Close being called on
+				// this layer; nothing more can be accepted.
+				a.logger.Error().Err(err).Msg("Raft listener closed; no further peer connections will be accepted")
+				a.closeOnce.Do(func() { close(a.closeCh) })
+				return
+			}
+			if delay == 0 {
+				delay = raftAcceptBaseDelay
+			} else if delay *= 2; delay > raftAcceptMaxDelay {
+				delay = raftAcceptMaxDelay
+			}
+			a.logger.Error().Err(err).Dur("retry_in", delay).Msg("Raft listener accept failed")
+			select {
+			case <-time.After(delay):
+				continue
+			case <-a.closeCh:
+				return
+			}
+		}
+		delay = 0
+		go a.authenticate(conn)
+	}
+}
+
+// authenticate runs the server handshake on conn and hands it to Accept, or
+// closes it.
+func (a *AuthenticatedStreamLayer) authenticate(conn net.Conn) {
+	err := a.serverHandshake(conn)
+	<-a.slots
 	if err != nil {
-		return nil, err
-	}
-	if err := a.serverHandshake(conn); err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("raft auth handshake (accept): %w", err)
+		a.logHandshakeFailure(conn, err)
+		return
 	}
-	return conn, nil
+	select {
+	case a.ready <- conn:
+	case <-a.closeCh:
+		conn.Close()
+	}
+}
+
+// logHandshakeFailure logs a rejected connection. A peer that went away
+// mid-handshake (EOF, reset, deadline) is routine after a stall — its dialer
+// gave up — and is logged at Debug. Anything else is a peer that answered and
+// was refused: a wrong MAC (wrong cluster.shared_secret or cluster name), a TLS
+// client certificate that failed verification, or bytes that are not this
+// protocol. Those are logged at Warn, at most once per raftAuthWarnInterval
+// per source host, so one noisy source cannot hide another.
+func (a *AuthenticatedStreamLayer) logHandshakeFailure(conn net.Conn, err error) {
+	remote := conn.RemoteAddr().String()
+	if isPeerGone(err) {
+		a.logger.Debug().Err(err).Str("remote_addr", remote).Msg("Raft peer connection dropped during authentication handshake")
+		return
+	}
+	host, _, splitErr := net.SplitHostPort(remote)
+	if splitErr != nil {
+		host = remote
+	}
+	suppressed, ok := a.authWarns.allow(host, time.Now())
+	if !ok {
+		return
+	}
+	a.logger.Warn().
+		Err(err).
+		Str("remote_addr", remote).
+		Int64("suppressed_since_last_warning", suppressed).
+		Msg("Rejected Raft connection: peer failed authentication (wrong cluster.shared_secret or cluster name, a rejected TLS client certificate, or not an Arc Raft peer)")
+}
+
+// isPeerGone reports whether a handshake failed because the peer hung up or
+// went silent, rather than because it answered and was refused.
+func isPeerGone(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, net.ErrClosed) || errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// raftAuthWarnMaxSources bounds the per-source rate-limit table.
+const raftAuthWarnMaxSources = 256
+
+// authWarnLimiter rate-limits rejection warnings per source host. Times come
+// from time.Now and keep their monotonic reading, so a wall-clock step cannot
+// silence the warnings.
+type authWarnLimiter struct {
+	mu         sync.Mutex
+	last       map[string]time.Time
+	suppressed int64
+}
+
+// allow reports whether a warning for host may be logged at now, and if so how
+// many were suppressed (across all sources) since the previous one.
+func (l *authWarnLimiter) allow(host string, now time.Time) (int64, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.last == nil {
+		l.last = make(map[string]time.Time)
+	}
+	if t, seen := l.last[host]; seen && now.Sub(t) < raftAuthWarnInterval {
+		l.suppressed++
+		return 0, false
+	}
+	if _, seen := l.last[host]; !seen && len(l.last) >= raftAuthWarnMaxSources {
+		for h, t := range l.last {
+			if now.Sub(t) >= raftAuthWarnInterval {
+				delete(l.last, h)
+			}
+		}
+		if len(l.last) >= raftAuthWarnMaxSources {
+			l.suppressed++
+			return 0, false
+		}
+	}
+	l.last[host] = now
+	n := l.suppressed
+	l.suppressed = 0
+	return n, true
 }
 
 // Dial dials an inner connection and runs the client side of the handshake.
@@ -107,8 +303,11 @@ func (a *AuthenticatedStreamLayer) Dial(address raft.ServerAddress, timeout time
 	return conn, nil
 }
 
-// Close closes the inner listener.
-func (a *AuthenticatedStreamLayer) Close() error { return a.inner.Close() }
+// Close stops accepting, unblocks Accept, and closes the inner listener.
+func (a *AuthenticatedStreamLayer) Close() error {
+	a.closeOnce.Do(func() { close(a.closeCh) })
+	return a.inner.Close()
+}
 
 // Addr returns the inner listener address.
 func (a *AuthenticatedStreamLayer) Addr() net.Addr { return a.inner.Addr() }

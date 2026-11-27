@@ -7,7 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	sqlutil "github.com/basekick-labs/arc/internal/sql"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,8 +19,10 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/basekick-labs/arc/internal/metrics"
+	sqlutil "github.com/basekick-labs/arc/internal/sql"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
+	"github.com/valyala/fasthttp"
 )
 
 // streamArrowIPCFunc indirects streamArrowIPC so tests can drive the
@@ -49,28 +51,6 @@ const arrowExecutionTimeTrailer = "Arc-Execution-Time-Ms"
 // Smaller batches reduce peak memory usage and enable streaming.
 // 10K rows is a good balance between overhead and memory efficiency.
 const arrowBatchSize = 10000
-
-// arrowStreamTruncatedTrailer tells the client the Arrow IPC body it received
-// is short. It is a trailer because the status line and headers are long gone
-// by the time a stream fails.
-const arrowStreamTruncatedTrailer = "Arc-Stream-Truncated"
-
-// arrowRowsCappedTrailer tells the client the Arrow IPC body it received
-// stopped at an Enterprise governance row cap and may therefore be missing
-// rows the query matched (#724). The value is the cap.
-//
-// Read it alongside arrowStreamTruncatedTrailer, which means nearly the
-// opposite: that trailer says the body is short because the stream FAILED and
-// must not be trusted, while this one says the body is short because policy
-// said so, and is a complete, valid result up to the cap.
-//
-// A trailer for the same reason the other two are: the cap is only known to
-// have been reached once the last batch has been written, long after the
-// status line and headers went out. Like every registered trailer it is
-// announced in the Trailer header of every response but sent only when Set
-// (since fasthttp 1.76, Arc 27.01.1; before, it was sent empty), so the
-// client contract is "non-empty means capped".
-const arrowRowsCappedTrailer = "Arc-Rows-Capped"
 
 // transportWriter distinguishes "the socket went away" from "the encoder
 // failed". Both surface as an error out of ipc.Writer.Write, and only the
@@ -118,6 +98,27 @@ func poisonArrowStream(w *bufio.Writer, logger zerolog.Logger) {
 	}
 	if err := w.Flush(); err != nil {
 		logger.Debug().Err(err).Msg("Could not flush the Arrow IPC truncation marker")
+	}
+}
+
+// arrowTrailerRegistrationWarnings is the warning logged when fasthttp refuses
+// to register a trailer, keyed by trailer name.
+var arrowTrailerRegistrationWarnings = map[string]string{
+	arrowStreamTruncatedTrailer: "Failed to register Arrow truncation trailer; clients will not see the reason a stream was cut",
+	arrowExecutionTimeTrailer:   "Failed to register Arrow execution-time trailer; clients will not see server-side timing",
+	arrowRowsCappedTrailer:      "Failed to register Arrow row-cap trailer; clients will not see that a governance cap truncated the result",
+}
+
+// registerArrowResponseTrailers declares every Arrow IPC trailer before the
+// body starts. It walks arrowTrailerNames, the list a #1570 forward relays, so
+// a trailer cannot be declared here without also being forwarded.
+func registerArrowResponseTrailers(header *fasthttp.ResponseHeader, logger zerolog.Logger) {
+	for _, name := range arrowTrailerNames {
+		if err := header.AddTrailer(name); err != nil {
+			arrowTrailerWarnOnce.Do(func() {
+				logger.Warn().Err(err).Str("trailer", name).Msg(arrowTrailerRegistrationWarnings[name])
+			})
+		}
 	}
 }
 
@@ -218,7 +219,7 @@ streamLoop:
 		default:
 		}
 
-		batch := reader.Record()
+		batch := reader.RecordBatch()
 		if batch == nil {
 			break
 		}
@@ -269,9 +270,9 @@ streamLoop:
 			// reader.Next() releases the prior record automatically.
 			if castInfo != nil {
 				var castErr error
-				castedBatch, castErr = castDecimalBatch(batch, castInfo)
+				castedBatch, castErr = castDecimalBatchAt(batch, castInfo, totalRows-batch.NumRows())
 				if castErr != nil {
-					streamErr = fmt.Errorf("failed to cast decimal columns at row %d: %w", totalRows, castErr)
+					streamErr = wrapDecimalCastError(castErr, "failed to cast decimal columns at row %d", totalRows)
 					return true
 				}
 				batch = castedBatch
@@ -379,16 +380,189 @@ streamLoop:
 	return totalRows, streamErr
 }
 
+type contextArrowRecordReader struct {
+	array.RecordReader
+	ctx      context.Context
+	maxRows  int
+	rowsRead int64
+}
+
+func (r *contextArrowRecordReader) RecordBatch() arrow.RecordBatch {
+	record := r.RecordReader.RecordBatch()
+	if record != nil {
+		r.rowsRead += record.NumRows()
+	}
+	return record
+}
+
+// Record is the deprecated spelling of RecordBatch. Without this override a
+// caller using it would reach the embedded reader directly, rowsRead would stay
+// zero, and Err would report a deadline that expired after a capped result as a
+// truncation.
+func (r *contextArrowRecordReader) Record() arrow.RecordBatch { return r.RecordBatch() }
+
+func (r *contextArrowRecordReader) Err() error {
+	if err := r.RecordReader.Err(); err != nil {
+		return err
+	}
+	// Like the DuckDB streamer, reaching the cap is a successful end to the
+	// response; a deadline that expires after the capped batch must not turn
+	// that valid IPC stream into a truncated one.
+	if rowCapReached(r.maxRows, r.rowsRead) {
+		return nil
+	}
+	return r.ctx.Err()
+}
+
+// serveArcxArrowIPCResult hands an ArcX record reader to the same IPC streamer
+// used by DuckDB. Keeping the cap and trailer handling here lets the ArcX hook
+// use the tested streaming semantics without linking its private engine into
+// the ordinary test build.
+//
+// It returns false, having released reader and touched nothing else, when
+// streamCtx has already ended: arcxengine.QueryStream takes no context, so a
+// deadline or cancel that lands while the engine runs is only noticed here. The
+// caller then falls back to DuckDB with the same context, whose execution
+// fails at once and answers 504 (deadline) or 500 (cancel) before any body,
+// with the same registry disposition and metrics as a DuckDB query.
+//
+// Invariants carried over from the inline writer it replaces (#717, #731):
+//   - The helper owns reader. The imported C stream reader's Release is NOT a
+//     no-op: it frees the current batch and drops the engine stream, whose
+//     Drop stops arcx's decode workers. Only the stream struct has a GC
+//     cleanup, so a reader abandoned before EOF (the governance cap, a cancel,
+//     an error) leaks that batch and parks the workers until a GC runs.
+//     The writer's deferred block releases it through
+//     releaseArrowStreamResourcesFunc, which recovers during a panic unwind.
+//   - FFI cliff: runtime.KeepAlive(reader) stays the LAST statement of that
+//     deferred block, so nothing can collect the reader before the final read.
+//   - The async writer OWNS cancel. It runs after the handler returned; a
+//     caller that cancelled eagerly would end streamCtx before the first
+//     batch (schema-only body plus a spurious mid-stream cancel).
+//   - fctx is the fasthttp RequestCtx captured by the caller. The pooled
+//     fiber.Ctx is recycled once the handler returns, so nothing here may
+//     reach for it (use-after-free).
+//   - The registry entry was registered before the engine was chosen (#731);
+//     onComplete/onFail are its only disposition, including on a panic.
+func (h *QueryHandler) serveArcxArrowIPCResult(
+	fctx *fasthttp.RequestCtx,
+	streamCtx context.Context,
+	cancel context.CancelFunc,
+	reader array.RecordReader,
+	governanceMaxRows int,
+	start time.Time,
+	onRows func(int64),
+	onDisconnect func(),
+	onComplete func(int),
+	onFail func(string),
+) (served bool) {
+	if streamCtx.Err() != nil {
+		releaseArrowStreamResourcesFunc(reader, nil, nil, h.logger)
+		return false
+	}
+	schema := reader.Schema()
+	fctx.Response.Header.SetContentType("application/vnd.apache.arrow.stream")
+	registerArrowResponseTrailers(&fctx.Response.Header, h.logger)
+	trailers := newResponseTrailers()
+
+	var streamW *bufio.Writer
+	outcome := newQueryStreamOutcome(metrics.QueryEngineArcx, start)
+	streamReadsFiles(fctx)
+	h.setDirectBodyStream(fctx, cancel, trailers, "arcx_serve_arrow_ipc", func() {
+		poisonArrowStream(streamW, h.logger)
+		trailers.setIfAbsent(arrowStreamTruncatedTrailer, "stream writer panicked")
+		trailers.setIfAbsent(
+			arrowExecutionTimeTrailer,
+			strconv.FormatInt(time.Since(start).Milliseconds(), 10),
+		)
+		if onFail != nil {
+			onFail("stream writer panicked")
+		}
+	}, func(w *bufio.Writer) {
+		streamW = w
+		defer func() {
+			releaseArrowStreamResourcesFunc(reader, nil, cancel, h.logger)
+			runtime.KeepAlive(reader) // LAST: nothing may collect the FFI-backed reader before this.
+		}()
+
+		rows, streamErr := streamArrowIPCFunc(
+			streamCtx, w, &contextArrowRecordReader{
+				RecordReader: reader,
+				ctx:          streamCtx,
+				maxRows:      governanceMaxRows,
+			},
+			schema, nil, false, "", governanceMaxRows, h.logger,
+		)
+		execMs := time.Since(start).Milliseconds()
+		trailers.set(arrowExecutionTimeTrailer, strconv.FormatInt(execMs, 10))
+		if onRows != nil {
+			onRows(rows)
+		}
+
+		if streamErr != nil {
+			outcome.fail()
+			if errors.Is(streamErr, context.DeadlineExceeded) {
+				metrics.Get().IncQueryTimeouts()
+			}
+			if isClientError(streamErr) && onDisconnect != nil {
+				onDisconnect()
+			}
+			if !errors.Is(streamErr, errClientDisconnected) {
+				trailers.set(arrowStreamTruncatedTrailer, sqlutil.SanitizeErrText(streamErr.Error()))
+			}
+			if onFail != nil {
+				onFail(streamErr.Error())
+			}
+			h.streamErrEvent(streamErr).Err(streamErr).
+				Int64("rows_sent", rows).
+				Int64("execution_time_ms", execMs).
+				Msg("ArcX Arrow IPC stream truncated after headers committed")
+			return
+		}
+
+		if rowCapReached(governanceMaxRows, rows) {
+			trailers.set(arrowRowsCappedTrailer, strconv.Itoa(governanceMaxRows))
+		}
+		outcome.succeed(rows)
+		if onComplete != nil {
+			onComplete(int(rows))
+		}
+	}, outcome.fail)
+	return true
+}
+
 // executeQueryArrow handles POST /api/v1/query/arrow - returns Arrow IPC stream
 // Optimized to stream rows directly into Arrow batches without intermediate buffering.
 func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	start := time.Now()
+	// x-arc-freshness: refused before the forward (#1760, fresh_flush.go).
+	if status, msg := h.freshnessRefusal(c); status != 0 {
+		return c.Status(status).JSON(fiber.Map{"success": false, "error": msg})
+	}
 	m := metrics.Get()
 	// Counted here, at the same point as the JSON path (executeQuery), so that
 	// arc_query_requests_total covers both query endpoints. Without it the
 	// Arrow path incremented only arc_query_errors_total, so errors/requests
 	// could exceed 1 — or divide by zero — on an Arrow-only workload (#801).
 	m.IncQueryRequests()
+	decimalMode, err := requestDecimalMode(c)
+	if err != nil {
+		m.IncQueryErrors()
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"success": false, "error": err.Error()})
+	}
+
+	// A node that cannot serve queries (a compactor) forwards, as
+	// executeQuery does (#1567); with no peer that accepts a forwarded Arrow
+	// query it runs the query here, as before.
+	switch QueryForwardDecision(h.router, c) {
+	case ForwardAlreadyForwarded:
+		m.IncQueryErrors()
+		return RespondAlreadyForwarded(c)
+	case ForwardToPeer:
+		if handled, err := h.forwardArrowQuery(c); handled {
+			return err
+		}
+	}
 
 	// Parse request body
 	var req QueryRequest
@@ -401,13 +575,15 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	}
 
 	// Validate SQL (empty, max length, dangerous patterns)
-	if err := ValidateSQLRequest(req.SQL); err != nil {
+	canonicalSQL, err := ValidateSQLRequest(req.SQL)
+	if err != nil {
 		m.IncQueryErrors()
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"success": false,
 			"error":   err.Error(),
 		})
 	}
+	req.SQL = canonicalSQL
 
 	// Opt-in stream encodings. Both change the bytes the client must be able
 	// to parse, so they are strictly request-driven — no config default:
@@ -458,14 +634,10 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// /api/v1/query. normalizeSQLForShow masks literals before stripping
 	// comments so a comment marker inside a quoted db name can't truncate it.
 	showNormalised := normalizeSQLForShow(req.SQL)
+	// No permission check left to make: the route door required read
+	// somewhere, and /api/v1/query shows each caller only the databases it
+	// may see (#1562).
 	if showDatabasesPattern.MatchString(showNormalised) {
-		if err := h.checkMeasurementPermission(c, "*", "*", "read"); err != nil {
-			m.IncQueryErrors()
-			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-				"success": false,
-				"error":   "access denied: no read permission to list databases",
-			})
-		}
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"success": false,
 			"error":   "SHOW DATABASES is not supported on the Arrow endpoint; use /api/v1/query instead",
@@ -526,10 +698,35 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// ArrowQueryContext: once either commits to a body stream the status
 	// code is already on the wire, and the only way left to report a failure is
 	// a trailer the client may not read.
-	convertedSQL, _, err := h.getTransformedSQL(c.Context(), req.SQL, headerDB)
+	//
+	// A governance policy's MaxDuration overrides the global timeout (#702).
+	// Its deadline bounds the transform and the execution (#1482).
+	effectiveTimeout := h.queryTimeout
+	if governanceTimeout > 0 {
+		effectiveTimeout = governanceTimeout
+	}
+	deadline := requestDeadline(effectiveTimeout)
+	transformCtx, cancelTransform := transformContext(c.Context(), deadline)
+	// A read in flight until its statement is bound (internal/readgate).
+	entered, leave := h.reads.EnterAt()
+	// Held until an arcx-served stream ends, when there is one (#1858).
+	defer holdRead(c.Context(), leave)()
+	convertedSQL, _, emittedRefs, err := h.getTransformedSQLWithRefs(transformCtx, req.SQL, headerDB)
+	cancelTransform()
 	if err != nil {
 		m.IncQueryErrors()
+		if errors.Is(err, errQueryTimedOut) {
+			m.IncQueryTimeouts()
+			h.logTransformTimeout(req.SQL, effectiveTimeout)
+		}
 		return c.Status(transformErrorStatus(err)).JSON(fiber.Map{
+			"success": false,
+			"error":   err.Error(),
+		})
+	}
+	if err := h.checkEmittedQueryPermissions(c, "read", emittedRefs); err != nil {
+		m.IncQueryErrors()
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 			"success": false,
 			"error":   err.Error(),
 		})
@@ -547,17 +744,14 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	tokenName := getTokenName(c)
 	tokenID := getTokenID(c)
 
-	// A governance policy's MaxDuration overrides the global timeout (#702).
-	effectiveTimeout := h.queryTimeout
-	if governanceTimeout > 0 {
-		effectiveTimeout = governanceTimeout
-	}
 	// Register before choosing an engine. An arcx-served query must have
 	// the same query ID, cancellation context and history as a DuckDB query.
 	// The registry must not be completed here: streaming starts after this
 	// handler returns, so the stream writer owns the terminal disposition.
 	var queryID string
-	baseCtx := context.Background()
+	// The request's context, not Background: with SetLifetime it is the
+	// handler's lifetime, which shutdown cancels (#1644).
+	baseCtx := c.UserContext()
 	if h.queryRegistry != nil {
 		var queryCtx context.Context
 		queryID, queryCtx = h.queryRegistry.Register(
@@ -570,25 +764,43 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	ctx := baseCtx
 	var cancel context.CancelFunc
 	switch {
-	case effectiveTimeout > 0:
-		ctx, cancel = context.WithTimeout(baseCtx, effectiveTimeout)
+	case !deadline.IsZero():
+		ctx, cancel = context.WithDeadline(baseCtx, deadline)
 	case queryID != "":
 		ctx, cancel = context.WithCancel(baseCtx)
 	}
 	if cancel == nil {
 		ctx, cancel = context.WithCancel(ctx)
 	}
+	// Stopped if this node loses its cluster read lease (readgate.Bind).
+	cancel = h.reads.Bind(entered, ctx, cancel)
 	recordDisconnect := h.watchQueryClientDisconnect(ctx, c.Context().Conn(), queryID, cancel, metrics.DisconnectPathArrowIPC)
 
 	// The arcx hook may install an asynchronous stream writer. A successful
 	// hand-off transfers ownership of cancel and registry disposition to it.
 	// A decline falls through to DuckDB with the SAME context and query ID.
-	var arcxOnComplete func(int)
-	var arcxOnFail func(string)
-	if h.queryRegistry != nil && queryID != "" {
-		arcxOnComplete = func(rows int) {
+	arcxOnRows := func(rows int64) {
+		h.logGovernanceRowCap("arrow_ipc", convertedSQL, tokenID, tokenName, governanceMaxRows, rows)
+		if h.queryRegistry != nil && queryID != "" {
+			h.queryRegistry.RecordRowCap(queryID, reachedRowCap(governanceMaxRows, rows))
+		}
+	}
+	// A completed arcx stream logs what a completed DuckDB stream logs (the
+	// Info line and logSlowQuery at the end of the DuckDB writer below), with
+	// the same fields, measured from the same start. Built here rather than in
+	// the hook so the arcx_engine-only file does not need its own copy.
+	arcxOnComplete := func(rows int) {
+		if h.queryRegistry != nil && queryID != "" {
 			h.queryRegistry.Complete(queryID, rows)
 		}
+		h.logger.Info().
+			Int64("row_count", int64(rows)).
+			Int64("execution_time_ms", time.Since(start).Milliseconds()).
+			Msg("Arrow streaming query completed")
+		h.logSlowQuery(convertedSQL, start, rows, tokenName)
+	}
+	var arcxOnFail func(string)
+	if h.queryRegistry != nil && queryID != "" {
 		arcxOnFail = func(message string) {
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				h.queryRegistry.TimedOut(queryID)
@@ -601,6 +813,13 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// A synchronous panic is caught here, before Fiber's recover middleware.
 	// Without this guard its registry entry would remain running forever.
 	arcxHandled := func() bool {
+		// arcx serves integer sums as int64 (Arc's default decimal contract)
+		// and never produces a decimal column: an exact request (#1784) runs on
+		// DuckDB, so its stream matches the decimal128 schema a Flight SQL
+		// prepare reported.
+		if decimalMode == decimalModeExact {
+			return false
+		}
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				if arcxOnFail != nil {
@@ -613,8 +832,8 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			}
 		}()
 		return arcxArrowDispatch(
-			h, c, ctx, cancel, req.SQL, headerDB, convertedSQL,
-			arcxOnComplete, arcxOnFail,
+			h, c, ctx, cancel, start, req.SQL, headerDB, convertedSQL,
+			governanceMaxRows, arcxOnRows, recordDisconnect, arcxOnComplete, arcxOnFail,
 		)
 	}()
 	if arcxHandled {
@@ -635,7 +854,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			if cancel != nil {
 				cancel()
 			}
-			m.IncQueryErrors()
+			m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			if h.queryRegistry != nil && queryID != "" {
 				h.queryRegistry.Fail(queryID, vanishedPartitionMessage)
 			}
@@ -655,6 +874,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			cancel()
 		}
 		if effectiveTimeout > 0 && ctxErr == context.DeadlineExceeded {
+			m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			m.IncQueryTimeouts()
 			if h.queryRegistry != nil && queryID != "" {
 				h.queryRegistry.TimedOut(queryID)
@@ -665,6 +885,17 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 				"error":   "Query timed out",
 			})
 		}
+		if ctxErr == context.Canceled && h.endedByShutdown(queryID) {
+			// Shutdown cancelled it (#1644): the registry records it as
+			// cancelled, and the metrics as a failed execution, as on every
+			// query route (#1292), so success + errors = requests holds.
+			m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
+			h.logger.Warn().Str("sql", sqlutil.ForLog(req.SQL)).Str("query_id", queryID).Msg("Arrow query cancelled at shutdown")
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
+				"success": false,
+				"error":   "Server shutting down",
+			})
+		}
 		if ctxErr == context.Canceled {
 			// Cancelled through the registry (DELETE /api/v1/queries/:id or a
 			// client disconnect), which already recorded the disposition.
@@ -672,30 +903,64 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			// operator cancel that lands during
 			// execution — the common case for a long query — surfaces here as an
 			// error return, not as a mid-stream break with a truncation trailer.
-			m.IncQueryErrors()
+			m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 			h.logger.Warn().Str("sql", sqlutil.ForLog(req.SQL)).Str("query_id", queryID).Msg("Arrow query cancelled")
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"success": false,
 				"error":   "Query cancelled",
 			})
 		}
-		m.IncQueryErrors()
+		m.RecordQueryFailure(metrics.QueryEngineDuckDB, time.Since(start).Microseconds())
 		if h.queryRegistry != nil && queryID != "" {
 			h.queryRegistry.Fail(queryID, sqlutil.SanitizeErrText(err.Error()))
 		}
 		h.logger.Error().Err(err).Str("sql", sqlutil.ForLog(req.SQL)).Msg("Arrow query execution failed")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
-			"error":   err.Error(),
+			"error":   clientErrText(h.logger, err),
 		})
 	}
+
+	// A value the response cannot carry in the first batch is answered as a
+	// 400 here, before any header or trailer is set (#1784).
+	releaseResult := func() {
+		reader.Release()
+		if conn != nil {
+			conn.Close()
+		}
+		if cancel != nil {
+			cancel()
+		}
+	}
+	peeked, overflow := reader, error(nil)
+	if decimalMode != decimalModeExact {
+		peeked, overflow = peekDecimalOverflowGuarded(reader, governanceMaxRows, releaseResult, func() {
+			if h.queryRegistry != nil && queryID != "" {
+				h.queryRegistry.Fail(queryID, "handler panicked")
+			}
+		})
+	}
+	if overflow != nil {
+		releaseResult()
+		m.IncQueryErrors()
+		if h.queryRegistry != nil && queryID != "" {
+			h.queryRegistry.Fail(queryID, sqlutil.SanitizeErrText(overflow.Error()))
+		}
+		h.logger.Warn().Err(overflow).Str("sql", sqlutil.ForLog(req.SQL)).Msg("Arrow query refused: a decimal value does not fit int64")
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   overflow.Error(),
+		})
+	}
+	reader = peeked
 
 	schema := reader.Schema()
 
 	// Normalize decimal columns in the schema — DuckDB returns SUM(integer) as
 	// decimal(38,0) which many Arrow clients (e.g. Grafana) cannot handle.
-	// castInfo is nil when there are no decimal columns (zero overhead on hot path).
-	castInfo := normalizeDecimalSchema(schema)
+	// castInfo is nil when there is nothing to cast: no decimal columns, or
+	// x-arc-decimals: exact with only decimals it keeps (zero overhead).
+	castInfo := normalizeDecimalSchemaForMode(schema, decimalMode)
 	if castInfo != nil {
 		schema = castInfo.schema
 	}
@@ -712,33 +977,8 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	fctx := c.Context()
 	respHeader := &fctx.Response.Header
 
-	// Declare the execution-time trailer in the response head before the
-	// stream writer runs so the `Trailer:` response header is
-	// emitted before the chunked body starts. Clients that don't read
-	// trailers degrade gracefully to wall-clock timing. The Warn is
-	// sync.Once-gated against per-request log spam if a future fasthttp
-	// release ever rejects the trailer name.
-	if err := respHeader.AddTrailer(arrowStreamTruncatedTrailer); err != nil {
-		arrowTrailerWarnOnce.Do(func() {
-			h.logger.Warn().Err(err).Str("trailer", arrowStreamTruncatedTrailer).
-				Msg("Failed to register Arrow truncation trailer; clients will not see the reason a stream was cut")
-		})
-	}
-	if err := respHeader.AddTrailer(arrowExecutionTimeTrailer); err != nil {
-		arrowTrailerWarnOnce.Do(func() {
-			h.logger.Warn().Err(err).Str("trailer", arrowExecutionTimeTrailer).
-				Msg("Failed to register Arrow execution-time trailer; clients will not see server-side timing")
-		})
-	}
-	// Registered unconditionally rather than only when a cap applies: the
-	// registration has to happen here, before the body streams, and whether
-	// the cap is reached is not known until the stream ends.
-	if err := respHeader.AddTrailer(arrowRowsCappedTrailer); err != nil {
-		arrowTrailerWarnOnce.Do(func() {
-			h.logger.Warn().Err(err).Str("trailer", arrowRowsCappedTrailer).
-				Msg("Failed to register Arrow row-cap trailer; clients will not see that a governance cap truncated the result")
-		})
-	}
+	// Register before the body starts; the ArcX response uses the same helper.
+	registerArrowResponseTrailers(respHeader, h.logger)
 
 	// Trailer values are collected here and published from the connection
 	// goroutine when the body ends (#729). Setting them directly on respHeader
@@ -770,6 +1010,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 	// through onPanic. That retry is gone. It is not worth restoring, but the
 	// change is not strictly better on every panic path.
 	var streamW *bufio.Writer
+	outcome := newQueryStreamOutcome(metrics.QueryEngineDuckDB, start)
 	h.setDirectBodyStream(fctx, cancel, trailers, "query_arrow_ipc", func() {
 		// A recovered panic leaves a stream the client would otherwise read as
 		// complete: fasthttp still writes the terminating chunk, and a cut on
@@ -835,7 +1076,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		}
 
 		if streamErr != nil {
-			m.IncQueryErrors()
+			outcome.fail()
 			// Disposition, mirroring executeQuery: a deadline that fires
 			// mid-stream is a timeout (and counts as one — the pre-stream
 			// branch above already did, this path never had it); everything
@@ -892,9 +1133,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 		if h.queryRegistry != nil && queryID != "" {
 			h.queryRegistry.Complete(queryID, int(totalRows))
 		}
-		m.IncQuerySuccess()
-		m.IncQueryRows(totalRows)
-		m.RecordQueryLatency(time.Since(start).Microseconds())
+		outcome.succeed(totalRows)
 
 		h.logger.Info().
 			Int64("row_count", totalRows).
@@ -902,7 +1141,7 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 			Msg("Arrow streaming query completed")
 		// query.slow_query_threshold_ms covered only the JSON path until #309.
 		h.logSlowQuery(convertedSQL, start, int(totalRows), tokenName)
-	})
+	}, outcome.fail)
 
 	return nil
 }
@@ -918,9 +1157,19 @@ type decimalCastInfo struct {
 // a decimalCastInfo with a substituted schema if any are found, or nil if
 // there are no decimal columns (zero overhead on the common path).
 //
-//   - decimal(x, 0) → int64  (SUM/COUNT of integers)
+//   - decimal(x, 0) → int64  (SUM/COUNT of integers), unless exact mode retains
+//     a precision greater than 18
 //   - decimal(x, y) → float64 (AVG or user-configured decimals)
 func normalizeDecimalSchema(schema *arrow.Schema) *decimalCastInfo {
+	return normalizeDecimalSchemaForMode(schema, decimalModeDefault)
+}
+
+// normalizeDecimalSchemaForMode retains wide integral decimals only when the
+// caller explicitly requested an exact Arrow result. All other decimal
+// columns keep the historical integer/float conversion. It returns nil when
+// no column is cast: no decimal at all, or (exact) only retained ones, so
+// their batches are streamed as DuckDB built them.
+func normalizeDecimalSchemaForMode(schema *arrow.Schema, mode string) *decimalCastInfo {
 	hasDecimal := false
 	for i := 0; i < schema.NumFields(); i++ {
 		// Match the arrow.DecimalType interface, not *arrow.Decimal128Type:
@@ -939,9 +1188,15 @@ func normalizeDecimalSchema(schema *arrow.Schema) *decimalCastInfo {
 
 	targets := make([]arrow.DataType, schema.NumFields())
 	fields := make([]arrow.Field, schema.NumFields())
+	cast := false
 	for i := 0; i < schema.NumFields(); i++ {
 		f := schema.Field(i)
 		if dt, ok := f.Type.(arrow.DecimalType); ok {
+			if mode == decimalModeExact && dt.GetScale() == 0 && dt.GetPrecision() > 18 {
+				fields[i] = f
+				continue
+			}
+			cast = true
 			if dt.GetScale() == 0 {
 				targets[i] = arrow.PrimitiveTypes.Int64
 			} else {
@@ -951,6 +1206,9 @@ func normalizeDecimalSchema(schema *arrow.Schema) *decimalCastInfo {
 		} else {
 			fields[i] = f
 		}
+	}
+	if !cast {
+		return nil
 	}
 
 	md := schema.Metadata()

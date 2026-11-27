@@ -22,6 +22,12 @@ type StringMask struct {
 	// validateSQL, the FROM-in-function-body scanner, the partition pruner)
 	// still sees an inert placeholder.
 	Identifier bool
+	// Uses is how many times MaskStringLiterals wrote Placeholder into the
+	// masked SQL: 1 for a string literal, the number of occurrences of the
+	// quoted name for an identifier. HasCallerPlaceholder compares it with
+	// what the masked SQL holds, so a copy the caller wrote is told apart
+	// from the masker's own reuse.
+	Uses int
 }
 
 // MaskStringLiterals replaces string literals with placeholders to prevent regex from matching inside them.
@@ -49,7 +55,7 @@ func MaskStringLiterals(sql string, hasQuotes bool) (string, []StringMask) {
 	// the CTE and rewrite it to a nonexistent storage path.
 	// Allocated lazily: the common single-quote-only query on this hot path
 	// never carries a double-quoted identifier.
-	var identPlaceholders map[string]string
+	var identPlaceholders map[string]int
 
 	for i < len(sql) {
 		ch := sql[i]
@@ -113,7 +119,7 @@ func MaskStringLiterals(sql string, hasQuotes bool) (string, []StringMask) {
 					original := sql[i:stop]
 					placeholder := fmt.Sprintf("__STR_%d__", maskIndex)
 					maskIndex++
-					masks = append(masks, StringMask{Placeholder: placeholder, Original: original})
+					masks = append(masks, StringMask{Placeholder: placeholder, Original: original, Uses: 1})
 					result.WriteString(placeholder)
 					i = stop
 					continue
@@ -123,7 +129,7 @@ func MaskStringLiterals(sql string, hasQuotes bool) (string, []StringMask) {
 				original := sql[i:]
 				placeholder := fmt.Sprintf("__STR_%d__", maskIndex)
 				maskIndex++
-				masks = append(masks, StringMask{Placeholder: placeholder, Original: original})
+				masks = append(masks, StringMask{Placeholder: placeholder, Original: original, Uses: 1})
 				result.WriteString(placeholder)
 				i = len(sql)
 				continue
@@ -137,14 +143,18 @@ func MaskStringLiterals(sql string, hasQuotes bool) (string, []StringMask) {
 		// reads as a plain identifier and hides the replacement scan from
 		// stringLiteralInTablePosition. Consume the prefix WITH the literal so the
 		// whole construct collapses to one placeholder (GHSA-wmjj-g8xc-6hwr).
-		if (ch == 'e' || ch == 'E') && i+1 < len(sql) && sql[i+1] == '\'' && !isIdentifierByte(prevByte(sql, i)) {
+		//
+		// The prefix must start a token: in `a$e'…'` the `e` continues the
+		// identifier `a$e` (DuckDB accepts `$` inside one), and the quote opens a
+		// plain string, whose escape rule differs.
+		if (ch == 'e' || ch == 'E') && i+1 < len(sql) && sql[i+1] == '\'' && !continuesIdentifier(sql, i) {
 			start := i
 			i += 2 // move past the E and the opening quote
 			i = skipEscString(sql, i)
 			original := sql[start:i]
 			placeholder := fmt.Sprintf("__STR_%d__", maskIndex)
 			maskIndex++
-			masks = append(masks, StringMask{Placeholder: placeholder, Original: original})
+			masks = append(masks, StringMask{Placeholder: placeholder, Original: original, Uses: 1})
 			result.WriteString(placeholder)
 			continue
 		}
@@ -176,20 +186,21 @@ func MaskStringLiterals(sql string, hasQuotes bool) (string, []StringMask) {
 			if quote == '"' {
 				// Identifier class: deduplicated, distinct prefix (see the
 				// StringMask.Identifier comment).
-				placeholder, seen := identPlaceholders[original]
+				k, seen := identPlaceholders[original]
 				if !seen {
 					if identPlaceholders == nil {
-						identPlaceholders = make(map[string]string)
+						identPlaceholders = make(map[string]int)
 					}
-					placeholder = fmt.Sprintf("__IDENT_%d__", maskIndex)
-					identPlaceholders[original] = placeholder
-					masks = append(masks, StringMask{Placeholder: placeholder, Original: original, Identifier: true})
+					k = len(masks)
+					identPlaceholders[original] = k
+					masks = append(masks, StringMask{Placeholder: fmt.Sprintf("__IDENT_%d__", maskIndex), Original: original, Identifier: true})
 					maskIndex++
 				}
-				result.WriteString(placeholder)
+				masks[k].Uses++
+				result.WriteString(masks[k].Placeholder)
 			} else {
 				placeholder := fmt.Sprintf("__STR_%d__", maskIndex)
-				masks = append(masks, StringMask{Placeholder: placeholder, Original: original})
+				masks = append(masks, StringMask{Placeholder: placeholder, Original: original, Uses: 1})
 				result.WriteString(placeholder)
 				maskIndex++
 			}
@@ -203,18 +214,76 @@ func MaskStringLiterals(sql string, hasQuotes bool) (string, []StringMask) {
 }
 
 // UnmaskStringLiterals restores the original string literals from their placeholders.
+//
+// One pass over sql: each placeholder found is replaced by its mask's
+// original text, and restored text is never scanned again. A string
+// placeholder is restored at its first occurrence only; an identifier
+// placeholder, deduplicated at mask time, at every occurrence. Replacing
+// mask by mask (strings.Replace per mask) copied the whole statement once per
+// literal, which is quadratic in the number of literals, and rescanned text
+// it had already restored.
 func UnmaskStringLiterals(sql string, masks []StringMask) string {
-	result := sql
-	for _, mask := range masks {
-		if mask.Identifier {
-			// Identifier placeholders are deduplicated at mask time, so one
-			// mask entry may stand for several occurrences.
-			result = strings.ReplaceAll(result, mask.Placeholder, mask.Original)
+	if len(masks) == 0 {
+		return sql
+	}
+	index := make(map[string]int, len(masks))
+	for i, mask := range masks {
+		index[mask.Placeholder] = i
+	}
+	restored := make([]bool, len(masks))
+	var b strings.Builder
+	b.Grow(len(sql) + len(sql)/4)
+	last := 0
+	for i := 0; i < len(sql); {
+		j := strings.Index(sql[i:], "__")
+		if j < 0 {
+			break
+		}
+		j += i
+		end := placeholderEnd(sql, j)
+		if end < 0 {
+			i = j + 1
 			continue
 		}
-		result = strings.Replace(result, mask.Placeholder, mask.Original, 1)
+		k, ok := index[sql[j:end]]
+		if !ok || (!masks[k].Identifier && restored[k]) {
+			i = j + 1
+			continue
+		}
+		restored[k] = true
+		b.WriteString(sql[last:j])
+		b.WriteString(masks[k].Original)
+		last, i = end, end
 	}
-	return result
+	if last == 0 {
+		return sql
+	}
+	b.WriteString(sql[last:])
+	return b.String()
+}
+
+// placeholderEnd returns the end of the `__STR_<n>__` or `__IDENT_<n>__`
+// placeholder that starts at i in s, or -1 if none starts there. It is
+// lenient about the digits: the caller looks the token up among the masks.
+func placeholderEnd(s string, i int) int {
+	rest := s[i:]
+	var n int
+	switch {
+	case strings.HasPrefix(rest, "__STR_"):
+		n = len("__STR_")
+	case strings.HasPrefix(rest, "__IDENT_"):
+		n = len("__IDENT_")
+	default:
+		return -1
+	}
+	d := n
+	for d < len(rest) && rest[d] >= '0' && rest[d] <= '9' {
+		d++
+	}
+	if !strings.HasPrefix(rest[d:], "__") {
+		return -1
+	}
+	return i + d + 2
 }
 
 // IdentifierNames maps each identifier placeholder to its UNQUOTED name:
@@ -349,12 +418,216 @@ func skipWhitespaceAndCommentsForward(sql string, i int) int {
 	return i
 }
 
-// MaskFromKeywordsInFunctionBodies replaces whole-word FROM tokens that appear
-// inside the argument list of EXTRACT, SUBSTRING, TRIM, or OVERLAY with unique
-// placeholders so the caller's table-rewriter regex (which would otherwise
-// match `FROM <ident>` greedily inside these expressions) skips them. The
-// placeholders contain only identifier characters and never satisfy
-// `\bFROM\b`.
+// ContainsMaskableFromKeyword reports whether sql holds a FROM keyword that
+// MaskFromKeywordsInFunctionBodies masks: one inside EXTRACT, SUBSTRING, TRIM
+// or OVERLAY, or the FROM of an `IS [NOT] DISTINCT FROM` comparison (#1472).
+// Callers that rewrite the token after FROM without running the masker (the
+// single-table fast paths) must bail out when this is true. It is the
+// masker's own scan, stopped at the first hit, so the two cannot disagree;
+// linear in len(sql) and allocation-free unless a trigger function's
+// parenthesis is open.
+func ContainsMaskableFromKeyword(sql string) bool {
+	found := false
+	scanMaskableFroms(sql, func(int) bool {
+		found = true
+		return false
+	})
+	return found
+}
+
+// maskToken is one token of the scan's look-behind window: a word, or a single
+// byte of anything else (punctuation, a quote, a byte of a multi-byte UTF-8
+// sequence). Whitespace and comments are not tokens.
+type maskToken struct {
+	word string // the word, or "" for a non-word byte
+	b    byte   // the byte, when word == ""
+}
+
+func (t maskToken) is(word string) bool { return t.word != "" && equalFoldASCII(t.word, word) }
+
+// scanMaskableFroms is the one pass behind MaskFromKeywordsInFunctionBodies and
+// ContainsMaskableFromKeyword. It walks sql forward, skipping whitespace and
+// SQL comments the way DuckDB's lexer does, and calls visit with the byte
+// offset of every FROM keyword to mask; visit returns false to stop.
+//
+// A FROM is masked when it is
+//   - inside the argument list of EXTRACT, SUBSTRING, TRIM or OVERLAY, at
+//     that call's own paren depth (a subquery in the arguments keeps its FROM);
+//   - the FROM of `IS [NOT] DISTINCT FROM`: the three or four tokens before it
+//     are the words IS, optional NOT, DISTINCT, and the token before IS is not
+//     a '.' (a qualified `t.is` is a column).
+//
+// Adjacency of words is the safety argument, not keyword reservation: IS is
+// not reserved in DuckDB, but `IS [NOT] DISTINCT` is never followed by a FROM
+// that introduces a relation, while `UNION DISTINCT FROM '…'` (FROM-first
+// syntax) does read one and fails the IS test.
+//
+// Words are split the way DuckDB splits identifiers: only ASCII space, tab,
+// CR, LF and form feed separate them (DuckDB rejects a vertical tab), and a
+// non-ASCII byte is part of the word, so `is<U+0085>distinct` and `éis`, which
+// DuckDB reads as single identifiers, are never IS. A caller must therefore
+// run this before folding Unicode spaces.
+//
+// Comments are skipped, never read: a word, a paren or a FROM inside one is
+// not code. Before #1472 the masker's main loop read comments as code and its
+// look-behind scanned back across them, so `/* trim( */` could open a masking
+// frame and `/*is distinct --*/ x FROM t` could hide a real FROM.
+//
+// Linear: one forward pass with a four-token window. The earlier backward
+// scans rescanned each line from its start per keyword.
+func scanMaskableFroms(sql string, visit func(fromIdx int) bool) {
+	var (
+		stack []int // paren depths at which a trigger function's args open
+		depth int
+		win   [4]maskToken // win[3] is the most recent token
+	)
+	push := func(t maskToken) {
+		win[0], win[1], win[2], win[3] = win[1], win[2], win[3], t
+	}
+	operatorBefore := func() bool {
+		if !win[3].is("distinct") {
+			return false
+		}
+		if win[2].is("is") {
+			return !(win[1].word == "" && win[1].b == '.')
+		}
+		return win[2].is("not") && win[1].is("is") && !(win[0].word == "" && win[0].b == '.')
+	}
+	for i := 0; i < len(sql); {
+		c := sql[i]
+		switch {
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f':
+			i++
+		case (c == '/' && i+1 < len(sql) && sql[i+1] == '*') || (c == '-' && i+1 < len(sql) && sql[i+1] == '-'):
+			i = skipWhitespaceAndCommentsForward(sql, i)
+		case isScanWordByte(c):
+			start := i
+			for i < len(sql) && isScanWordByte(sql[i]) {
+				i++
+			}
+			word := sql[start:i]
+			if len(word) == 4 && equalFoldASCII(word, "from") {
+				inFrame := len(stack) > 0 && depth == stack[len(stack)-1]
+				if (inFrame || operatorBefore()) && !visit(start) {
+					return
+				}
+			}
+			push(maskToken{word: word})
+		case c == '(':
+			if w := win[3].word; w != "" && isFromKeywordFunction(w) {
+				stack = append(stack, depth+1)
+			}
+			depth++
+			push(maskToken{b: c})
+			i++
+		case c == ')':
+			depth--
+			if len(stack) > 0 && stack[len(stack)-1] > depth {
+				stack = stack[:len(stack)-1]
+			}
+			push(maskToken{b: c})
+			i++
+		default:
+			push(maskToken{b: c})
+			i++
+		}
+	}
+}
+
+// isScanWordByte reports whether c continues a word for scanMaskableFroms: an
+// ASCII identifier byte, or any byte of a multi-byte UTF-8 sequence, since
+// DuckDB accepts non-ASCII letters (and the code points Arc folds to spaces)
+// inside an unquoted identifier.
+func isScanWordByte(c byte) bool { return isIdentByte(c) || c >= 0x80 }
+
+// isFromKeywordFunction reports whether word names EXTRACT, SUBSTRING, TRIM or
+// OVERLAY, case-insensitively.
+func isFromKeywordFunction(word string) bool {
+	for _, name := range fromKeywordFunctions {
+		if equalFoldASCII(word, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// fromMaskPrefix opens every MaskFromKeywordsInFunctionBodies placeholder.
+const fromMaskPrefix = "__FROM_MASK_"
+
+// ContainsReservedPlaceholder reports whether s holds the opening of a
+// placeholder the maskers in this package generate: `__STR_`, `__IDENT_` or
+// `__FROM_MASK_`. The restorers match placeholders by their exact text,
+// wherever it appears, so a caller-written copy is restored with the real
+// ones; names and other text spliced into masked SQL must not carry it.
+func ContainsReservedPlaceholder(s string) bool {
+	return strings.Contains(s, "__STR_") || strings.Contains(s, "__IDENT_") || strings.Contains(s, fromMaskPrefix)
+}
+
+// ContainsFromMaskPlaceholder reports whether s holds the opening of a
+// MaskFromKeywordsInFunctionBodies placeholder. UnmaskFromKeywordsInFunctionBodies
+// restores every occurrence of a placeholder's text, so caller SQL that
+// spells one gains a FROM after the checks that ran on the masked form.
+func ContainsFromMaskPlaceholder(s string) bool {
+	return strings.Contains(s, fromMaskPrefix)
+}
+
+// HasCallerPlaceholder reports whether masked, the output of
+// MaskStringLiterals that produced masks, holds placeholder text the masker
+// did not write: any FROM placeholder; a `__STR_`/`__IDENT_` opening that
+// does not start one of masks' placeholders; or a placeholder occurring more
+// often than the masker wrote it (StringMask.Uses). Every opening is
+// examined, overlapping ones included, so text written straight after a
+// placeholder that completes another is caught.
+//
+// Text inside a literal or quoted identifier is hidden by its own
+// placeholder and restored as written, so it is never seen here. Text
+// outside them would be restored too: UnmaskStringLiterals restores a
+// literal at the first occurrence of its placeholder and an identifier at
+// every one, so a copy the caller wrote would put a literal or a quoted name
+// there after the checks, next to text that can change how DuckDB lexes it.
+func HasCallerPlaceholder(masked string, masks []StringMask) bool {
+	if ContainsFromMaskPlaceholder(masked) {
+		return true
+	}
+	if !strings.Contains(masked, "__STR_") && !strings.Contains(masked, "__IDENT_") {
+		return false
+	}
+	byText := make(map[string]int, len(masks))
+	for k, m := range masks {
+		byText[m.Placeholder] = k
+	}
+	found := make([]int, len(masks))
+	for i := 0; i+1 < len(masked); i++ {
+		if masked[i] != '_' || masked[i+1] != '_' {
+			continue
+		}
+		rest := masked[i:]
+		if !strings.HasPrefix(rest, "__STR_") && !strings.HasPrefix(rest, "__IDENT_") {
+			continue
+		}
+		end := placeholderEnd(masked, i)
+		if end < 0 {
+			return true
+		}
+		k, ok := byText[masked[i:end]]
+		if !ok {
+			return true
+		}
+		found[k]++
+		if found[k] > masks[k].Uses {
+			return true
+		}
+	}
+	return false
+}
+
+// MaskFromKeywordsInFunctionBodies replaces the FROM keywords that do not
+// introduce a relation with unique placeholders, so the caller's
+// table-rewriter regex (which would otherwise match `FROM <ident>` greedily)
+// skips them: the FROM inside the argument list of EXTRACT, SUBSTRING, TRIM or
+// OVERLAY, and the FROM of `IS [NOT] DISTINCT FROM` (#1472). See
+// scanMaskableFroms for the exact rules. The placeholders contain only
+// identifier characters and never satisfy `\bFROM\b`.
 //
 // The mask is content-addressed via the placeholders, not offset-based —
 // callers may run arbitrary length-changing transformations between the
@@ -366,83 +639,41 @@ func skipWhitespaceAndCommentsForward(sql string, i int) int {
 // substring of mask 10).
 //
 // PRECONDITION: string literals must already be masked by the caller via
-// MaskStringLiterals. The paren-depth scanner does not re-detect quotes,
-// so a literal `'... FROM ...'` inside a trigger-function arg would have
-// its FROM masked too if not pre-masked.
+// MaskStringLiterals, so a quoted "is" or a literal containing FROM is a
+// placeholder. Comments may still be present; they are skipped.
 //
-// Returns the original sql (no allocation) when no trigger function is
-// present.
+// Returns the original sql (no allocation) when there is nothing to mask.
 func MaskFromKeywordsInFunctionBodies(sql string) (string, []FromMask) {
 	if len(sql) == 0 {
 		return sql, nil
 	}
-	// Cheap pre-check skips the scanner allocation when no trigger
-	// function call is present. Round-2 reviewers asked if the
-	// pre-check is redundant; it is NOT — without it we'd build a
-	// strings.Builder and walk the entire SQL byte-by-byte for every
-	// uncached query, even the 99% that have no EXTRACT/SUBSTRING/
-	// TRIM/OVERLAY. The miss path is 0 allocs.
-	if !ContainsFromKeywordFunction(sql) {
+	var at []int
+	scanMaskableFroms(sql, func(i int) bool {
+		at = append(at, i)
+		return true
+	})
+	if len(at) == 0 {
 		return sql, nil
 	}
 
-	// stack holds the paren depths at which active mask frames were entered.
-	// A new frame is pushed when a `(` is preceded by a trigger function
-	// name; popped when paren depth drops back through that level. Nested
-	// non-trigger calls (e.g. EXTRACT(YEAR FROM CAST(t AS DATE))) inherit
-	// the outer mask because the outer frame stays on the stack until its
-	// matching `)`.
-	var stack []int
-	depth := 0
-
 	var b strings.Builder
-	b.Grow(len(sql))
-
-	var masks []FromMask
-	maskIndex := 0
+	b.Grow(len(sql) + len(at)*16)
+	masks := make([]FromMask, 0, len(at))
 	// Reusable scratch buffer for placeholder generation — strconv.AppendInt
 	// writes into this byte slice so we avoid fmt.Sprintf's allocation per
 	// mask. "__FROM_MASK_" + max-19-digit int + "__" fits in 32 bytes.
 	var phBuf [32]byte
-	i := 0
-	for i < len(sql) {
-		c := sql[i]
-		switch c {
-		case '(':
-			if isFromKeywordFuncBeforeParen(sql, i) {
-				stack = append(stack, depth+1)
-			}
-			depth++
-			b.WriteByte(c)
-			i++
-		case ')':
-			depth--
-			if len(stack) > 0 && stack[len(stack)-1] > depth {
-				stack = stack[:len(stack)-1]
-			}
-			b.WriteByte(c)
-			i++
-		default:
-			// Only mask FROM at the trigger frame's own paren depth.
-			// `EXTRACT(YEAR FROM (SELECT t FROM cpu))` — the inner
-			// subquery's `FROM cpu` must be left alone so the regex
-			// rewriter can convert `cpu` to read_parquet(...). Without
-			// the depth-equality check, DuckDB fails with "Table cpu
-			// does not exist". (gemini-code-assist round 2.)
-			if len(stack) > 0 && depth == stack[len(stack)-1] && (c == 'f' || c == 'F') && isFromKeywordAt(sql, i) {
-				ph := strconv.AppendInt(append(phBuf[:0], "__FROM_MASK_"...), int64(maskIndex), 10)
-				ph = append(ph, '_', '_')
-				placeholder := string(ph)
-				masks = append(masks, FromMask{Placeholder: placeholder, Original: sql[i : i+4]})
-				b.WriteString(placeholder)
-				maskIndex++
-				i += 4
-				continue
-			}
-			b.WriteByte(c)
-			i++
-		}
+	last := 0
+	for n, i := range at {
+		ph := strconv.AppendInt(append(phBuf[:0], fromMaskPrefix...), int64(n), 10)
+		ph = append(ph, '_', '_')
+		placeholder := string(ph)
+		masks = append(masks, FromMask{Placeholder: placeholder, Original: sql[i : i+4]})
+		b.WriteString(sql[last:i])
+		b.WriteString(placeholder)
+		last = i + 4
 	}
+	b.WriteString(sql[last:])
 	return b.String(), masks
 }
 
@@ -463,127 +694,6 @@ func UnmaskFromKeywordsInFunctionBodies(sql string, masks []FromMask) string {
 		pairs = append(pairs, m.Placeholder, m.Original)
 	}
 	return strings.NewReplacer(pairs...).Replace(sql)
-}
-
-// isFromKeywordFuncBeforeParen reports whether the identifier immediately
-// preceding the `(` at sql[parenIdx] is one of the trigger SQL builtins
-// (EXTRACT, SUBSTRING, TRIM, OVERLAY). Walks backwards over whitespace and
-// inline SQL comments (`/* ... */` and `--`-to-EOL) — required because the
-// masker runs before stripSQLComments, so `EXTRACT /* c */ (YEAR FROM x)`
-// must still be recognised.
-//
-// Rejects quoted identifiers — `"EXTRACT"(...)` or “ `EXTRACT`(...) “ is
-// a user column, not the builtin. DuckDB does not accept backticks for
-// identifiers in its default parser, but the check costs nothing and
-// matches gemini-code-assist's defensive guidance.
-//
-// Allocation-free: compares the byte range against fromKeywordFunctions
-// in place via equalFoldASCII.
-func isFromKeywordFuncBeforeParen(sql string, parenIdx int) bool {
-	j := skipWhitespaceAndCommentsBack(sql, parenIdx-1)
-	if j < 0 || sql[j] == '"' || sql[j] == '`' {
-		return false
-	}
-	end := j + 1
-	for j >= 0 && isIdentByte(sql[j]) {
-		j--
-	}
-	start := j + 1
-	if start >= end {
-		return false
-	}
-	ident := sql[start:end]
-	for _, name := range fromKeywordFunctions {
-		if equalFoldASCII(ident, name) {
-			return true
-		}
-	}
-	return false
-}
-
-// skipWhitespaceAndCommentsBack walks backwards from sql[i] over ASCII
-// whitespace and SQL comments, returning the index of the first non-skip
-// byte (or -1 if the scan reaches before the start of the string).
-//
-// Handles:
-//   - whitespace: space, tab, CR, LF.
-//   - block comments `/* ... */` — the cursor is on `/` of the closing
-//     `*/`; we walk back to the matching `/*` (no nesting in standard SQL).
-//   - line comments `-- ... \n` — the closing newline is consumed as
-//     whitespace; once we land on the trailing char of a `-- ...` segment
-//     we must walk back to the `--` start. Detected by scanning the
-//     current line backwards to either start-of-string or `\n`, and
-//     checking if a `--` precedes the cursor position on that line.
-func skipWhitespaceAndCommentsBack(sql string, i int) int {
-	for i >= 0 {
-		c := sql[i]
-		// Skip whitespace.
-		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
-			i--
-			continue
-		}
-		// Closing of a block comment `*/`: walk back to the matching `/*`.
-		if c == '/' && i > 0 && sql[i-1] == '*' {
-			i -= 2 // step past the `/` and `*` of `*/`
-			for i > 0 && !(sql[i-1] == '/' && sql[i] == '*') {
-				i--
-			}
-			// i now points at the `*` of `/*`; step past both bytes.
-			i -= 2
-			continue
-		}
-		// Possible end of a `-- ...` line comment: walk to start-of-line
-		// and check whether a `--` opens a comment that covers position i.
-		if dashStart, ok := findDashCommentStartBackward(sql, i); ok {
-			i = dashStart - 1
-			continue
-		}
-		return i
-	}
-	return -1
-}
-
-// findDashCommentStartBackward checks whether sql[i] is inside a
-// `-- ...`-style line comment that has not yet been terminated by `\n`.
-// If so, returns the index of the first `-` in the `--` opener (so the
-// caller can resume scanning at that-1). Otherwise returns (_, false).
-//
-// SQL `--` line comments run from `--` to the next `\n`. The caller has
-// already established sql[i] is non-whitespace; we walk back to either
-// start-of-string or `\n` and then forward looking for `--` on that line.
-func findDashCommentStartBackward(sql string, i int) (int, bool) {
-	lineStart := i
-	for lineStart > 0 && sql[lineStart-1] != '\n' && sql[lineStart-1] != '\r' {
-		lineStart--
-	}
-	for k := lineStart; k < i; k++ {
-		if sql[k] == '-' && k+1 < len(sql) && sql[k+1] == '-' {
-			return k, true
-		}
-	}
-	return 0, false
-}
-
-// isFromKeywordAt reports whether sql[i:i+4] is a whole-word case-insensitive
-// FROM keyword.
-func isFromKeywordAt(sql string, i int) bool {
-	if i+4 > len(sql) {
-		return false
-	}
-	c0, c1, c2, c3 := sql[i], sql[i+1], sql[i+2], sql[i+3]
-	if (c0 != 'f' && c0 != 'F') ||
-		(c1 != 'r' && c1 != 'R') ||
-		(c2 != 'o' && c2 != 'O') ||
-		(c3 != 'm' && c3 != 'M') {
-		return false
-	}
-	if i > 0 && isIdentByte(sql[i-1]) {
-		return false
-	}
-	if i+4 < len(sql) && isIdentByte(sql[i+4]) {
-		return false
-	}
-	return true
 }
 
 // isIdentByte returns true if c is a valid SQL identifier byte (a-z, A-Z,
@@ -638,10 +748,12 @@ func QuoteStringLiteral(s string) string {
 // so, returns its tag (empty for the anonymous `$$` form).
 //
 // DuckDB/Postgres dollar quoting is `$tag$body$tag$`, where tag is empty or a
-// valid identifier that must not start with a digit. Bounding the tag this way
-// keeps `a$1` (a legal identifier) and `$1` (a positional parameter) from being
-// misread as string openers — misreading either would swallow the rest of the
-// query into a placeholder and hide real SQL from every scanner.
+// valid identifier that must not start with a digit. As in an unquoted
+// identifier, every byte of a multi-byte UTF-8 character is a tag byte:
+// DuckDB reads `$é$…$é$` as a string, so the masker must too, to keep the same
+// code/literal split the checks rely on. Bounding the tag this way keeps `a$1`
+// (a legal identifier) and `$1` (a positional parameter) from being misread as
+// string openers, which would fold the rest of the query into one placeholder.
 func dollarQuoteTag(sql string, i int) (string, bool) {
 	if i >= len(sql) || sql[i] != '$' {
 		return "", false
@@ -653,17 +765,13 @@ func dollarQuoteTag(sql string, i int) (string, bool) {
 	// second and third `$` as an opener found no closing tag and masked the
 	// rest of the statement into one placeholder, hiding it from every gate
 	// while DuckDB parsed the name and ran what followed.
-	j := i - 1
-	for j >= 0 && sql[j] == '$' {
-		j--
-	}
-	if j >= 0 && isIdentifierByte(sql[j]) {
+	if continuesIdentifier(sql, i) {
 		return "", false
 	}
 	k := i + 1
 	for k < len(sql) && sql[k] != '$' {
 		c := sql[k]
-		isAlpha := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+		isAlpha := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c >= 0x80
 		isDigit := c >= '0' && c <= '9'
 		if !isAlpha && !(isDigit && k > i+1) {
 			return "", false
@@ -691,10 +799,149 @@ func isIdentifierByte(c byte) bool {
 		(c >= '0' && c <= '9')
 }
 
-// prevByte returns the byte before index i, or 0 at the start of the string.
-func prevByte(s string, i int) byte {
-	if i == 0 {
-		return 0
+// continuesIdentifier reports whether the byte at i would continue an unquoted
+// identifier that ends just before it. DuckDB accepts `$` inside an identifier
+// (not as its first byte), so a run of `$` is walked back and the byte before
+// the run decides: `t$$$` and `a$e` are each one name, while a lone `$` is not.
+func continuesIdentifier(sql string, i int) bool {
+	j := i - 1
+	for j >= 0 && sql[j] == '$' {
+		j--
 	}
-	return s[i-1]
+	return j >= 0 && isIdentifierByte(sql[j])
+}
+
+// Span marks a byte range [Start, End) of sql that is inside a string literal
+// (any of the four quoted forms) or a comment — the regions a text rewrite
+// must not match into, because changing their bytes changes what the SQL
+// means or where a literal/comment ends. Code is every byte outside a span.
+type Span struct {
+	Start int
+	End   int
+}
+
+// scanSQLSpans walks sql once and calls emit for each maximal literal or
+// comment span, in order, using the SAME leaf scanners and the SAME branch
+// order as MaskStringLiterals (single/double quotes, E'…', $tag$…$tag$) and as
+// stripSQLComments (line comment to \n or \r, block comment to the first */).
+// It is the single place those rules live for span consumers;
+// TestProtectedSpansPropertyVsMasker pins it against MaskStringLiterals so the
+// two cannot drift.
+func scanSQLSpans(sql string, emit func(start, end int)) {
+	i := 0
+	n := len(sql)
+	for i < n {
+		ch := sql[i]
+
+		// Line comment: ends at \n or \r (DuckDB), like stripSQLComments.
+		if ch == '-' && i+1 < n && sql[i+1] == '-' {
+			j := i
+			for j < n && sql[j] != '\n' && sql[j] != '\r' {
+				j++
+			}
+			emit(i, j)
+			i = j
+			continue
+		}
+		// Block comment: to the first */ (not nested), like stripSQLComments.
+		if ch == '/' && i+1 < n && sql[i+1] == '*' {
+			j := i + 2
+			for j+1 < n && !(sql[j] == '*' && sql[j+1] == '/') {
+				j++
+			}
+			if j+1 < n {
+				j += 2
+			} else {
+				j = n
+			}
+			emit(i, j)
+			i = j
+			continue
+		}
+		// Dollar-quoted string $tag$…$tag$ (no escape; may be unterminated).
+		if ch == '$' {
+			if tag, ok := dollarQuoteTag(sql, i); ok {
+				closing := "$" + tag + "$"
+				rel := strings.Index(sql[i+len(closing):], closing)
+				var stop int
+				if rel >= 0 {
+					stop = i + len(closing) + rel + len(closing)
+				} else {
+					stop = n // unterminated: to end
+				}
+				emit(i, stop)
+				i = stop
+				continue
+			}
+		}
+		// Escape string E'…' / e'…' (backslash escapes); the prefix is part of
+		// the span. Same guard as the masker (continuesIdentifier), and
+		// skipEscString folds quote-continuations identically.
+		if (ch == 'e' || ch == 'E') && i+1 < n && sql[i+1] == '\'' && !continuesIdentifier(sql, i) {
+			start := i
+			i = skipEscString(sql, i+2)
+			emit(start, i)
+			continue
+		}
+		// Plain '…' string or "…" identifier (only the doubled quote escapes).
+		if ch == '\'' {
+			start := i
+			i = skipStdString(sql, i+1)
+			emit(start, i)
+			continue
+		}
+		if ch == '"' {
+			start := i
+			i = skipQuotedIdent(sql, i+1)
+			emit(start, i)
+			continue
+		}
+		i++
+	}
+}
+
+// ProtectedSpans returns the literal and comment spans of sql, in order. A
+// text rewrite that matches outside every span, and whose own output does not
+// alter span structure, keeps the SQL's meaning unchanged.
+func ProtectedSpans(sql string) []Span {
+	var spans []Span
+	scanSQLSpans(sql, func(start, end int) {
+		spans = append(spans, Span{Start: start, End: end})
+	})
+	return spans
+}
+
+// InProtectedSpan reports whether byte offset pos falls inside one of spans
+// (which must be in ascending, non-overlapping order, as ProtectedSpans
+// returns them).
+func InProtectedSpan(spans []Span, pos int) bool {
+	for _, s := range spans {
+		if pos < s.Start {
+			return false
+		}
+		if pos < s.End {
+			return true
+		}
+	}
+	return false
+}
+
+// IsMaskerClean reports whether s contains no string literal and no comment:
+// MaskStringLiterals leaves it byte-for-byte unchanged and it has no comment
+// marker. A fragment that is masker-clean can be duplicated or moved by a
+// rewrite without changing the surrounding SQL's literal/comment structure.
+// s must begin in code (a caller checks the match start is not in a span
+// first), so a fragment that opens a literal is detected by the masker here.
+func IsMaskerClean(s string) bool {
+	if strings.Contains(s, "--") || strings.Contains(s, "/*") || strings.Contains(s, "*/") {
+		return false
+	}
+	if !HasQuotes(s) {
+		return true
+	}
+	// A `'`, `"` or `$` that does not open a literal (a dollar-quoted body
+	// needs a closing tag; `ts$a$` is one identifier) leaves the masker output
+	// identical, and is clean.
+	masked, _ := MaskStringLiterals(s, true)
+	return masked == s
 }

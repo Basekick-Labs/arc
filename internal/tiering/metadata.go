@@ -42,7 +42,10 @@ type MetadataStore struct {
 	logger zerolog.Logger
 
 	// Cache for GetTiersForMeasurement - keyed by "database/measurement"
-	tierCache    map[string]*tierCacheEntry
+	tierCache map[string]*tierCacheEntry
+	// tierVersions moves per measurement on every invalidateTierCache
+	// (TierVersion, #1765); entries are never removed (one per measurement).
+	tierVersions map[string]uint64
 	tierCacheGen uint64
 	tierCacheMu  sync.RWMutex
 }
@@ -50,9 +53,10 @@ type MetadataStore struct {
 // NewMetadataStore creates a new metadata store using the provided SQLite connection
 func NewMetadataStore(db *sql.DB, logger zerolog.Logger) (*MetadataStore, error) {
 	store := &MetadataStore{
-		db:        db,
-		logger:    logger.With().Str("component", "tiering-metadata").Logger(),
-		tierCache: make(map[string]*tierCacheEntry),
+		db:           db,
+		logger:       logger.With().Str("component", "tiering-metadata").Logger(),
+		tierCache:    make(map[string]*tierCacheEntry),
+		tierVersions: make(map[string]uint64),
 	}
 
 	if err := store.initSchema(); err != nil {
@@ -112,6 +116,12 @@ func (s *MetadataStore) initSchema() error {
 	-- cutoff lookup in CleanupOldMigrations is index-backed. The plain
 	-- started_at index cannot serve datetime(started_at) comparisons.
 	CREATE INDEX IF NOT EXISTS idx_tier_migrations_started_normalized ON tier_migrations(datetime(started_at));
+
+	-- Tiering's own facts about this database (#1550). One row per key.
+	CREATE TABLE IF NOT EXISTS tier_state (
+		key TEXT PRIMARY KEY,
+		value TEXT NOT NULL
+	);
 	`
 
 	_, err := s.db.Exec(schema)
@@ -145,10 +155,11 @@ const tierFileColumns = "id, path, database, measurement, partition_time, tier, 
 // invalidateTierCache removes the cache entry for a database/measurement pair.
 // Call this after any operation that might change which tiers have data.
 func (s *MetadataStore) invalidateTierCache(database, measurement string) {
-	cacheKey := database + "/" + measurement
+	cacheKey := database + "/" + measurement // exact lookup; measurement names have no "/" (#1475)
 	s.tierCacheMu.Lock()
 	delete(s.tierCache, cacheKey)
 	s.tierCacheGen++
+	s.tierVersions[cacheKey]++
 	s.tierCacheMu.Unlock()
 }
 
@@ -849,16 +860,35 @@ func (s *MetadataStore) CountFilesInTierForDatabase(ctx context.Context, databas
 // Quarantined rows are excluded: this is the migration candidate query, and a
 // quarantined file is one tiering has established it can never act on (#758).
 func (s *MetadataStore) GetFilesOlderThan(ctx context.Context, tier Tier, maxAge time.Duration) ([]FileMetadata, error) {
+	return s.GetFilesOlderThanFiltered(ctx, tier, maxAge, "", "")
+}
+
+// GetFilesOlderThanFiltered retrieves migration candidates older than the
+// specified age, optionally restricted to one database and/or measurement.
+// Filters are applied in SQL so a manual migration does not load unrelated
+// metadata into memory.
+func (s *MetadataStore) GetFilesOlderThanFiltered(ctx context.Context, tier Tier, maxAge time.Duration, database, measurement string) ([]FileMetadata, error) {
 	cutoff := time.Now().UTC().Add(-maxAge)
 
 	query := `
 		SELECT ` + tierFileColumns + `
 		FROM tier_files
 		WHERE tier = ? AND partition_time < ? AND quarantined_at IS NULL
-		ORDER BY partition_time ASC
 	`
+	args := []any{string(tier), cutoff}
 
-	rows, err := s.db.QueryContext(ctx, query, string(tier), cutoff)
+	if database != "" {
+		query += " AND database = ?"
+		args = append(args, database)
+	}
+	if measurement != "" {
+		query += " AND measurement = ?"
+		args = append(args, measurement)
+	}
+
+	query += " ORDER BY partition_time ASC"
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query old files: %w", err)
 	}
@@ -928,6 +958,27 @@ func (s *MetadataStore) GetFilesByDatabase(ctx context.Context, database string)
 	return s.scanFiles(rows)
 }
 
+// GetFilesInTierForDatabase retrieves the files of one database in one tier,
+// newest partition first, as GetFilesByDatabase orders them (#1430). The
+// filter runs in SQLite, on the (database, tier) index, rather than over every
+// row of the database in Go.
+func (s *MetadataStore) GetFilesInTierForDatabase(ctx context.Context, database string, tier Tier) ([]FileMetadata, error) {
+	query := `
+		SELECT ` + tierFileColumns + `
+		FROM tier_files
+		WHERE database = ? AND tier = ?
+		ORDER BY partition_time DESC
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, database, string(tier))
+	if err != nil {
+		return nil, fmt.Errorf("failed to query files in tier for database: %w", err)
+	}
+	defer rows.Close()
+
+	return s.scanFiles(rows)
+}
+
 // GetFilesForQuery retrieves files for a database, optionally filtered by
 // measurement and/or time range. Filters are pushed into the SQL WHERE
 // clause instead of being applied client-side, so SQLite's indexes on
@@ -970,8 +1021,24 @@ func (s *MetadataStore) GetFilesForQuery(ctx context.Context, database, measurem
 // day), so the lower bound is widened by a day: a range starting mid-day
 // still needs that day's file.
 func (s *MetadataStore) HasColdFilesInRange(ctx context.Context, database, measurement string, start, end *time.Time) (bool, error) {
+	return s.hasColdRowsInRange(ctx, database, measurement, start, end, false)
+}
+
+// HasAnyColdRowsInRange is HasColdFilesInRange counting quarantined cold rows
+// too (#1550). A quarantined key is one Arc's own path checks refuse, but
+// DuckDB's glob over the partition does not apply them: on a healthy store
+// the read still returns that object's rows. So a read that may leave the
+// cold tier out on metadata's word must treat a quarantined row as data.
+func (s *MetadataStore) HasAnyColdRowsInRange(ctx context.Context, database, measurement string, start, end *time.Time) (bool, error) {
+	return s.hasColdRowsInRange(ctx, database, measurement, start, end, true)
+}
+
+func (s *MetadataStore) hasColdRowsInRange(ctx context.Context, database, measurement string, start, end *time.Time, includeQuarantined bool) (bool, error) {
 	query := `SELECT 1 FROM tier_files
-		WHERE database = ? AND measurement = ? AND tier = ? AND quarantined_at IS NULL`
+		WHERE database = ? AND measurement = ? AND tier = ?`
+	if !includeQuarantined {
+		query += " AND quarantined_at IS NULL"
+	}
 	args := []any{database, measurement, string(TierCold)}
 	if start != nil {
 		query += " AND partition_time >= ?"
@@ -1219,6 +1286,55 @@ func (s *MetadataStore) DeleteFileInTier(ctx context.Context, path string, tier 
 	return true, nil
 }
 
+// retireColdRowsChunk bounds one DELETE's IN list.
+const retireColdRowsChunk = 500
+
+// RetireColdRowsIfUnquarantined deletes the rows of paths that are still cold
+// and not quarantined, one statement per chunk of retireColdRowsChunk, and
+// invalidates the tier cache once per database/measurement it touched (one
+// invalidation per row would discard every concurrent tier-cache fill on a
+// node serving queries, #1188). Returns the paths it deleted, including those
+// deleted before an error. A quarantined row is the record that a key is
+// unusable (#758) and is never retired here.
+func (s *MetadataStore) RetireColdRowsIfUnquarantined(ctx context.Context, paths []string) ([]string, error) {
+	touched := make(map[tierCacheScope]struct{})
+	defer s.invalidateTierCacheScopes(touched)
+	var deleted []string
+	for start := 0; start < len(paths); start += retireColdRowsChunk {
+		if err := ctx.Err(); err != nil {
+			return deleted, err
+		}
+		chunk := paths[start:min(start+retireColdRowsChunk, len(paths))]
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, string(TierCold))
+		for _, p := range chunk {
+			args = append(args, p)
+		}
+		rows, err := s.db.QueryContext(ctx, `DELETE FROM tier_files WHERE tier = ? AND quarantined_at IS NULL AND path IN (?`+
+			strings.Repeat(",?", len(chunk)-1)+`) RETURNING path, database, measurement`, args...)
+		if err != nil {
+			return deleted, fmt.Errorf("failed to retire cold rows: %w", err)
+		}
+		for rows.Next() {
+			var path, database, measurement string
+			if err := rows.Scan(&path, &database, &measurement); err != nil {
+				rows.Close()
+				return deleted, fmt.Errorf("failed to retire cold rows: %w", err)
+			}
+			deleted = append(deleted, path)
+			if database != "" && measurement != "" {
+				touched[tierCacheScope{database: database, measurement: measurement}] = struct{}{}
+			}
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return deleted, fmt.Errorf("failed to retire cold rows: %w", err)
+		}
+	}
+	return deleted, nil
+}
+
 // hotRowsPage returns up to limit hot rows that are not quarantined, with an
 // id above afterID, in id order: the stale-row walk reads them a page at a
 // time rather than every hot row in one statement, which held the store's
@@ -1443,7 +1559,7 @@ func (s *MetadataStore) GetTierStats(ctx context.Context) (map[Tier]TierStats, e
 // Returns a map of tier -> bool indicating presence of data in that tier.
 // Results are cached for 30 seconds to reduce SQLite query overhead during query execution.
 func (s *MetadataStore) GetTiersForMeasurement(ctx context.Context, database, measurement string) (map[Tier]bool, error) {
-	cacheKey := database + "/" + measurement
+	cacheKey := database + "/" + measurement // exact lookup; measurement names have no "/" (#1475)
 
 	// Check cache first (with separate lock to avoid blocking other operations).
 	s.tierCacheMu.RLock()
@@ -1473,6 +1589,16 @@ func (s *MetadataStore) GetTiersForMeasurement(ctx context.Context, database, me
 		result[tier] = true
 	}
 	return result, nil
+}
+
+// TierVersion is a counter that moves whenever the tier rows of the
+// measurement may have changed (invalidateTierCache), read from memory only.
+// A caller that must not do I/O, such as the SQL transform cache's staleness
+// check, which runs under the cache's lock, compares two readings (#1765).
+func (s *MetadataStore) TierVersion(database, measurement string) uint64 {
+	s.tierCacheMu.RLock()
+	defer s.tierCacheMu.RUnlock()
+	return s.tierVersions[database+"/"+measurement]
 }
 
 // readTierSet is GetTiersForMeasurement without the cache: the tiers that have
@@ -1752,4 +1878,39 @@ func (s *MetadataStore) scanFiles(rows *sql.Rows) ([]FileMetadata, error) {
 	}
 
 	return files, nil
+}
+
+// tierStateColdRowsComplete is the tier_state key that records a cold-tier
+// metadata sync which recorded a row for every cold object, against THIS
+// database (#1550). It lives in the database on purpose: a fresh, lost or
+// moved database starts without it, so its rows never vouch for the cold
+// store before a sync has filled them.
+const tierStateColdRowsComplete = "cold_rows_complete"
+
+// coldRowsComplete reports whether tier_state records a complete cold sync.
+func (s *MetadataStore) coldRowsComplete(ctx context.Context) (bool, error) {
+	var v string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM tier_state WHERE key = ?`, tierStateColdRowsComplete).Scan(&v)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("read tier_state: %w", err)
+	}
+	return v == "1", nil
+}
+
+// setColdRowsComplete records (or forgets) a complete cold sync.
+func (s *MetadataStore) setColdRowsComplete(ctx context.Context, complete bool) error {
+	var err error
+	if complete {
+		_, err = s.db.ExecContext(ctx, `INSERT INTO tier_state (key, value) VALUES (?, '1')
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value`, tierStateColdRowsComplete)
+	} else {
+		_, err = s.db.ExecContext(ctx, `DELETE FROM tier_state WHERE key = ?`, tierStateColdRowsComplete)
+	}
+	if err != nil {
+		return fmt.Errorf("write tier_state: %w", err)
+	}
+	return nil
 }

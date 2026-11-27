@@ -49,6 +49,18 @@ service:
   type: ClusterIP
   port: 8000
 
+# Arrow Flight SQL listener (Arc 27.01.1+): a gRPC port for ADBC clients,
+# serving the same read-only query path as the HTTP API (see
+# docs/operations/flight-sql.md). Off by default: with enabled: false no port
+# is opened in the container or on the Service. TLS follows the HTTP API's
+# server.tls_* settings. The chart's Ingress routes HTTP only; expose this
+# port through the Service (a LoadBalancer, or an ingress controller that
+# proxies gRPC).
+flightSql:
+  enabled: false
+  port: 50051          # container port (flight_sql.port); must not be 8000
+  servicePort: 50051   # port on the Service
+
 ingress:
   enabled: false
   className: ""

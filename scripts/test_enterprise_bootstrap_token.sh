@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Arc refuses a bootstrap token under 32 characters, logs one error and starts
-# with no admin token, so the Enterprise chart must refuse to render one.
+# Arc refuses to start with a bootstrap token under 32 characters (#1915), so
+# the Enterprise chart must refuse to render one.
 set -euo pipefail
 
 chart="${1:-helm/arc-enterprise}"
@@ -20,6 +20,20 @@ if out=$(render --set-string auth.bootstrapToken.value=0123456789012345678901234
 fi
 if ! grep -q 'must be at least 32 characters' <<<"$out"; then
   echo "unexpected render error for a short bootstrap token: $out" >&2
+  exit 1
+fi
+
+# Arc trims surrounding whitespace before the length check (#1713), so a
+# 31-character value plus a trailing newline must be refused too.
+ws_values=$(mktemp)
+trap 'rm -f "$ws_values"' EXIT
+printf 'auth:\n  bootstrapToken:\n    value: "0123456789012345678901234567890\\n"\n' > "$ws_values"
+if out=$(render -f "$ws_values" 2>&1); then
+  echo 'chart rendered a 31-character bootstrap token padded with a newline' >&2
+  exit 1
+fi
+if ! grep -q 'must be at least 32 characters' <<<"$out"; then
+  echo "unexpected render error for a newline-padded short bootstrap token: $out" >&2
   exit 1
 fi
 

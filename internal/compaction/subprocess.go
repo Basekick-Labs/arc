@@ -48,8 +48,11 @@ type SubprocessJobConfig struct {
 	// raws next to the compacted output — permanent duplication. With it, a
 	// surviving manifest re-fires the marks through recovery (idempotent).
 	ParentFinalizesManifest bool     `json:"parent_finalizes_manifest,omitempty"`
-	SortKeys                []string `json:"sort_keys"`    // Sort keys for ORDER BY in compaction
-	MemoryLimit             string   `json:"memory_limit"` // DuckDB memory limit (e.g., "8GB")
+	SortKeys                []string `json:"sort_keys"` // Sort keys for ORDER BY in compaction
+	// SortKeysExplicit — see Job.SortKeysExplicit. Omitted (false) from an
+	// older parent, which only lowers the missing-key log to Debug.
+	SortKeysExplicit bool   `json:"sort_keys_explicit,omitempty"`
+	MemoryLimit      string `json:"memory_limit"` // DuckDB memory limit (e.g., "8GB")
 	// Threads is the DuckDB thread count for this subprocess. 0 means leave
 	// DuckDB at its own default, which is the container's CPU quota where there
 	// is one and all cores where there is not — the parent normally sends the
@@ -86,6 +89,9 @@ type SubprocessJobConfig struct {
 	// sentinel checked via IsZero, and this is internal parent↔subprocess IPC,
 	// not a user-facing field — matches the plain tag on completion.go's twin.
 	PartitionTime time.Time `json:"partition_time"`
+	// CheckInputWindow: refuse the job when an input holds a row outside the
+	// partition (compaction.refuse_misfiled_inputs, #1825).
+	CheckInputWindow bool `json:"check_input_window,omitempty"`
 	// Staged commit (#1207 d2a2a): see JobConfig.Staged.
 	// OutputName is the output's file name, chosen by the parent so it can
 	// register the job (OpenJobs) before the output can exist. Empty from
@@ -109,6 +115,11 @@ type SubprocessJobResult struct {
 	// LEFT in storage, and must keep their normal edge-sync receipts). The
 	// parent's consumed-inputs observer marks the matching receipts (#619).
 	CompactedInputs []string `json:"compacted_inputs,omitempty"`
+	// MisfiledInputs are inputs the job refused because they hold rows
+	// outside its partition (misfiled.go). When set, the job compacted
+	// nothing: the parent remembers the files and leaves them out of the
+	// partition's next job.
+	MisfiledInputs []MisfiledInput `json:"misfiled_inputs,omitempty"`
 	// ManifestPath is the crash-recovery storage manifest the subprocess
 	// left in place under ParentFinalizesManifest; empty otherwise. The
 	// parent deletes it after receipt marking commits.
@@ -218,7 +229,12 @@ func RunSubprocessJob(config *SubprocessJobConfig) (*SubprocessJobResult, error)
 	// under a host-zone session a non-UTC host would permanently rewrite
 	// those instants shifted by the UTC offset during compaction. Hard-fail:
 	// compacting with a wrong zone corrupts data, not just query results.
-	if _, err := db.Exec("SET TimeZone='UTC'"); err != nil {
+	// GLOBAL: a plain SET pins the one pooled connection that ran it. The
+	// job runs its statements one after another, so in practice they reuse
+	// that connection; nothing guarantees it, and the input check in
+	// misfiled.go compares times before the COPY, so every connection of the
+	// pool is pinned.
+	if err := pinTimeZoneUTC(db); err != nil {
 		return nil, fmt.Errorf("failed to pin compaction DuckDB TimeZone to UTC: %w", err)
 	}
 	// Read a GeoParquet file's geometry column as BLOB, as the query engine
@@ -680,18 +696,19 @@ func ClassifySubprocessError(err error, stderr string) (recoverable bool, reason
 // the job writing the output under the name the parent registered).
 func subprocessJobConfig(config *SubprocessJobConfig, backend storage.Backend, logger zerolog.Logger, db *sql.DB, manifestManager *ManifestManager) *JobConfig {
 	return &JobConfig{
-		Database:        config.Database,
-		Measurement:     config.Measurement,
-		PartitionPath:   config.PartitionPath,
-		Files:           config.Files,
-		StorageBackend:  backend,
-		Tier:            config.Tier,
-		BatchNumber:     config.BatchNumber,
-		TempDirectory:   config.TempDirectory,
-		SortKeys:        config.SortKeys,
-		Logger:          logger,
-		DB:              db,
-		ManifestManager: manifestManager,
+		Database:         config.Database,
+		Measurement:      config.Measurement,
+		PartitionPath:    config.PartitionPath,
+		Files:            config.Files,
+		StorageBackend:   backend,
+		Tier:             config.Tier,
+		BatchNumber:      config.BatchNumber,
+		TempDirectory:    config.TempDirectory,
+		SortKeys:         config.SortKeys,
+		SortKeysExplicit: config.SortKeysExplicit,
+		Logger:           logger,
+		DB:               db,
+		ManifestManager:  manifestManager,
 		// Phase 4: thread cluster-mode fields through to the job. When
 		// CompletionDir is empty (OSS / standalone), clusterMode() is
 		// false and the completion-manifest writes are no-ops.
@@ -702,7 +719,15 @@ func subprocessJobConfig(config *SubprocessJobConfig, backend storage.Backend, l
 		Staged:                  config.Staged,
 		Inputs:                  config.Inputs,
 		OutputName:              config.OutputName,
+		CheckInputWindow:        config.CheckInputWindow,
 	}
+}
+
+// pinTimeZoneUTC sets the time zone of every connection of db's pool, the
+// ones not opened yet included.
+func pinTimeZoneUTC(db *sql.DB) error {
+	_, err := db.Exec("SET GLOBAL TimeZone='UTC'")
+	return err
 }
 
 // subprocessResult is what the subprocess reports for job after Run.
@@ -717,6 +742,7 @@ func subprocessResult(job *Job, err error) *SubprocessJobResult {
 		// on this; the temp path would never match a storage listing.
 		OutputFile:      job.OutputStorageKey,
 		CompactedInputs: job.CompactedInputKeys(),
+		MisfiledInputs:  job.MisfiledInputs(),
 		ManifestPath:    job.RetainedManifestPath(),
 		SourcesDeleted:  job.sourcesDeleted,
 		// Taken after Run: every count is I/O this job did (backend

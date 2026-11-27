@@ -45,14 +45,19 @@ func republishRig(t *testing.T) (*claimantRigT, uint64, *republisher) {
 		t.Fatal(err)
 	}
 	waitFSM(t, func() bool { return r.outbox.Pending() == 0 })
+	// The refusal's ack was journaled after the flush synced the journal: until
+	// it is durable the file still counts as on its way, and republish skips it.
+	if err := r.outbox.SyncRegistrations(); err != nil {
+		t.Fatal(err)
+	}
 	parked := 0
 	for _, f := range r.outbox.InstanceFiles(inst) {
 		if f.Parked {
 			parked++
 		}
 	}
-	if parked != 1 {
-		t.Fatalf("parked files %d", parked)
+	if parked != 1 || len(r.outbox.InstanceFiles(inst)) != 1 {
+		t.Fatalf("parked files %d of %+v", parked, r.outbox.InstanceFiles(inst))
 	}
 	rp := newRepublisher(r.c, r.outbox, r.buffer, filepath.Dir(r.wal.CurrentFile()), func() uint64 { return inst + 1 })
 	return r, inst, rp

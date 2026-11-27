@@ -2,6 +2,8 @@ package cluster
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"hash/fnv"
 	"strconv"
 	"strings"
@@ -55,6 +57,10 @@ type openState struct {
 	// onOutputSeen runs the first time an object job's output is seen (drop
 	// DuckDB's object-store listing cache when it is on).
 	onOutputSeen atomic.Pointer[func()]
+	// onSwitched runs the first time this node reads an Acked object job at
+	// switched (#1852): the query caches that remember the output's
+	// directory as empty must not answer for it.
+	onSwitched atomic.Pointer[func(output raft.FileEntry)]
 }
 
 // localDelete is one pending local unlink. For a compaction input, output is
@@ -103,6 +109,15 @@ func (c *Coordinator) SetOnObjectOutputSeen(fn func()) {
 	}
 }
 
+// SetOnCompactionSwitched sets what runs the first time a read here sees a
+// fenced object job switched to its output, before the read takes its
+// exclusions.
+func (c *Coordinator) SetOnCompactionSwitched(fn func(output raft.FileEntry)) {
+	if c != nil && fn != nil {
+		c.open.onSwitched.Store(&fn)
+	}
+}
+
 // excludableReason: a delete whose local copy reads may leave out before its
 // unlink (localDeleteExcludable says when). Other reasons (a snapshot drop, a
 // repair) are not tracked: the copy is read until the unlink, as before, and
@@ -140,13 +155,13 @@ func (c *Coordinator) forgetLocalDeleted(path string) {
 // registered member of its rewrite family (which holds every row the DELETE
 // kept) is in storage at its registered size; a retention or whole-file
 // DELETE removal at once (its rows are gone).
-func (c *Coordinator) localDeleteExcludable(ctx context.Context, fsm *raft.ClusterFSM, path string, d localDelete) (localDelete, bool) {
+func (c *Coordinator) localDeleteExcludable(ctx context.Context, fsm *raft.ClusterFSM, path string, d localDelete) (localDelete, bool, error) {
 	if d.reason == deleteRewriteReason {
 		return c.rewriteSiblingReadable(ctx, fsm, path, d)
 	}
 	job, ok := strings.CutPrefix(d.reason, "compaction:")
 	if !ok {
-		return d, true
+		return d, true, nil
 	}
 	if d.output == "" && time.Since(d.resolvedAt) >= localResolveEvery {
 		d.resolvedAt = time.Now()
@@ -157,31 +172,58 @@ func (c *Coordinator) localDeleteExcludable(ctx context.Context, fsm *raft.Clust
 		}
 	}
 	if d.output == "" {
-		return d, false
+		return d, false, nil
 	}
 	// Still the job's output: anything else under that path (a DELETE
 	// rewrite, a later compaction) has its own accounting.
 	if e, ok := fsm.GetFile(d.output); !ok || e.CompactionJob != job {
-		return d, false
+		return d, false, nil
 	}
 	size, err := c.storage.StatFile(ctx, d.output)
-	return d, err == nil && size == d.outputSize
+	if err != nil {
+		return d, false, fmt.Errorf("stat compaction output %s: %w", d.output, err)
+	}
+	return d, size == d.outputSize, nil
 }
+
+// errDeletedCopiesImplausible: the stale-local breaker holds, so this node's
+// deleted copies are not left out of reads and a strict reader cannot tell
+// which of them still count.
+var errDeletedCopiesImplausible = errors.New("this node's deleted local copies look implausible (stale-local breaker); cannot tell which files to leave out")
 
 // OpenExcludedFor returns the storage keys under prefix ("db/measurement/")
 // a read on this node must leave out so each compaction's rows count once.
 func (c *Coordinator) OpenExcludedFor(ctx context.Context, prefix string) []string {
+	out, _ := c.openExcludedFor(ctx, prefix, false)
+	return out
+}
+
+// OpenExcludedForStrict is OpenExcludedFor for a reader that must not guess
+// (the Iceberg export). Where OpenExcludedFor counts a file next to its
+// replacement because it could not tell (a failed stat, the stale-local
+// breaker), this returns an error: a read can over-count for a moment, a
+// published snapshot keeps the duplicate until the next one.
+func (c *Coordinator) OpenExcludedForStrict(ctx context.Context, prefix string) ([]string, error) {
+	return c.openExcludedFor(ctx, prefix, true)
+}
+
+func (c *Coordinator) openExcludedFor(ctx context.Context, prefix string, strict bool) ([]string, error) {
 	if c == nil || c.raftNode == nil || c.storage == nil {
-		return nil
+		return nil, nil
 	}
 	fsm := c.raftNode.FSM()
 	if fsm == nil {
-		return nil
+		return nil, nil
 	}
-	var out []string
-	out = append(out, c.objectExcluded(ctx, fsm, prefix)...)
-	out = append(out, c.localExcluded(ctx, fsm, prefix)...)
-	return out
+	obj, err := c.objectExcluded(ctx, fsm, prefix, strict)
+	if err != nil {
+		return nil, err
+	}
+	loc, err := c.localExcluded(ctx, fsm, prefix, strict)
+	if err != nil {
+		return nil, err
+	}
+	return append(obj, loc...), nil
 }
 
 // OpenAny reports whether a read under prefix must not be cached: a
@@ -220,7 +262,10 @@ func (c *Coordinator) OpenGeneration() uint64 {
 	return h.Sum64()
 }
 
-// objectExcluded: the inputs of every committed object job under prefix
+// objectExcluded: for a job finished under read fences (#1852), what its
+// phase says: the output before the switch, every input the manifest does
+// not list after it. For a job committed before the fences were on: the
+// inputs of every committed object job under prefix
 // whose output is registered by the job and at its final key. Known from the
 // commit on every node, so a reader whose FSM lags the finisher still knows
 // the job. A job whose output left the manifest (it is being reverted, or
@@ -231,7 +276,7 @@ func (c *Coordinator) OpenGeneration() uint64 {
 // settles (deleteObjectInputs, #1358); until then this node counts such an
 // input next to the output, for at most about a minute — the safe direction
 // when the hold may be a registration this FSM has not applied yet.
-func (c *Coordinator) objectExcluded(ctx context.Context, fsm *raft.ClusterFSM, prefix string) []string {
+func (c *Coordinator) objectExcluded(ctx context.Context, fsm *raft.ClusterFSM, prefix string, strict bool) ([]string, error) {
 	jobs := fsm.FinalizingObjectJobsUnder(prefix)
 	c.open.mu.Lock()
 	c.open.init()
@@ -240,9 +285,9 @@ func (c *Coordinator) objectExcluded(ctx context.Context, fsm *raft.ClusterFSM, 
 		for _, s := range fsm.FinalizingObjectJobsUnder("") {
 			live[s.Job] = true
 		}
-		for job := range c.open.seen {
-			if !live[job] {
-				delete(c.open.seen, job)
+		for key := range c.open.seen {
+			if !live[strings.TrimSuffix(key, "#switched")] {
+				delete(c.open.seen, key)
 			}
 		}
 	}
@@ -250,6 +295,32 @@ func (c *Coordinator) objectExcluded(ctx context.Context, fsm *raft.ClusterFSM, 
 	var out []string
 	hold := stagedCommitter{c: c}.HoldsRegistration
 	for _, s := range jobs {
+		if s.Acked {
+			// A fenced job (#1852): the phase alone decides, every node at
+			// the same log index the same way.
+			switch s.Phase {
+			case raft.PhaseSwitched, raft.PhaseRemoved:
+				key := s.Job + "#switched"
+				c.open.mu.Lock()
+				first := !c.open.seen[key]
+				c.open.seen[key] = true
+				c.open.mu.Unlock()
+				if first {
+					c.open.gen.Add(1)
+					if fn := c.open.onSwitched.Load(); fn != nil {
+						(*fn)(s.Output)
+					}
+				}
+				for _, in := range s.Inputs {
+					if !fsm.HasFile(in.Path) {
+						out = append(out, in.Path)
+					}
+				}
+			default:
+				out = append(out, s.Output.Path)
+			}
+			continue
+		}
 		if e, ok := fsm.GetFile(s.Output.Path); !ok || e.CompactionJob != s.Job || e.SHA256 != s.Output.SHA256 {
 			continue
 		}
@@ -258,6 +329,9 @@ func (c *Coordinator) objectExcluded(ctx context.Context, fsm *raft.ClusterFSM, 
 		c.open.mu.Unlock()
 		if !seen {
 			size, err := c.storage.StatFile(ctx, s.Output.Path)
+			if err != nil && strict {
+				return nil, fmt.Errorf("stat compaction output %s: %w", s.Output.Path, err)
+			}
 			if err != nil || size != s.Output.SizeBytes {
 				continue
 			}
@@ -279,15 +353,15 @@ func (c *Coordinator) objectExcluded(ctx context.Context, fsm *raft.ClusterFSM, 
 			out = append(out, in.Path)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // localExcluded: this node's copies the manifest deleted that may be left out
 // now (localDeleteExcludable). A path the manifest lists again is dropped
 // (a snapshot can re-list it without a register callback). Stops when the
 // deletes look implausible (the stale-local breaker): over-counting is the
-// safe direction.
-func (c *Coordinator) localExcluded(ctx context.Context, fsm *raft.ClusterFSM, prefix string) []string {
+// safe direction for a read; a strict caller gets errDeletedCopiesImplausible.
+func (c *Coordinator) localExcluded(ctx context.Context, fsm *raft.ClusterFSM, prefix string, strict bool) ([]string, error) {
 	c.open.mu.Lock()
 	var cands []string
 	var dels []localDelete
@@ -299,10 +373,13 @@ func (c *Coordinator) localExcluded(ctx context.Context, fsm *raft.ClusterFSM, p
 	}
 	c.open.mu.Unlock()
 	if len(cands) == 0 {
-		return nil
+		return nil, nil
 	}
 	if seen := c.stale.seen.Load(); seen != nil && seen.err() == nil && c.deletedCopiesImplausible(seen, fsm) {
-		return nil
+		if strict {
+			return nil, errDeletedCopiesImplausible
+		}
+		return nil, nil
 	}
 	var out []string
 	for i, p := range cands {
@@ -320,7 +397,10 @@ func (c *Coordinator) localExcluded(ctx context.Context, fsm *raft.ClusterFSM, p
 				continue
 			}
 		}
-		d, ok := c.localDeleteExcludable(ctx, fsm, p, d)
+		d, ok, err := c.localDeleteExcludable(ctx, fsm, p, d)
+		if err != nil && strict {
+			return nil, err
+		}
 		if d != dels[i] {
 			c.open.mu.Lock()
 			if cur := c.open.localDeleted[p]; cur != nil && cur.reason == d.reason {
@@ -332,7 +412,7 @@ func (c *Coordinator) localExcluded(ctx context.Context, fsm *raft.ClusterFSM, p
 			out = append(out, p)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // rewriteSiblingReadable: a registered member of path's rewrite family is in
@@ -341,13 +421,13 @@ func (c *Coordinator) localExcluded(ctx context.Context, fsm *raft.ClusterFSM, p
 // looked for again). The first sighting drops DuckDB's object-store listing
 // cache: a listing cached before the member landed would have path without
 // it.
-func (c *Coordinator) rewriteSiblingReadable(ctx context.Context, fsm *raft.ClusterFSM, path string, d localDelete) (localDelete, bool) {
+func (c *Coordinator) rewriteSiblingReadable(ctx context.Context, fsm *raft.ClusterFSM, path string, d localDelete) (localDelete, bool, error) {
 	// Its unlink waits for the rewrite, which was not here (rewrite_unlink.go):
 	// read it, looking for the rewrite at most every goneCheckEvery (the
 	// rewrite may land just before its wake).
 	if c.unlinkDeferred(path) {
 		if time.Since(d.siblingCheckedAt) < goneCheckEvery {
-			return d, false
+			return d, false, nil
 		}
 		d.siblingCheckedAt = time.Now()
 	}
@@ -355,19 +435,25 @@ func (c *Coordinator) rewriteSiblingReadable(ctx context.Context, fsm *raft.Clus
 	if d.sibling != "" {
 		for _, e := range sibs {
 			if e.Path == d.sibling && e.SizeBytes == d.siblingSize {
-				return d, true
+				return d, true, nil
 			}
 		}
 		d.sibling, d.siblingSize = "", 0
 	}
+	var statErr error
 	for _, e := range sibs {
-		if size, err := c.storage.StatFile(ctx, e.Path); err == nil && size == e.SizeBytes {
+		size, err := c.storage.StatFile(ctx, e.Path)
+		if err != nil {
+			statErr = fmt.Errorf("stat rewrite of %s at %s: %w", path, e.Path, err)
+			continue
+		}
+		if size == e.SizeBytes {
 			d.sibling, d.siblingSize = e.Path, e.SizeBytes
 			if fn := c.open.onOutputSeen.Load(); fn != nil {
 				(*fn)()
 			}
-			return d, true
+			return d, true, nil
 		}
 	}
-	return d, false
+	return d, false, statErr
 }

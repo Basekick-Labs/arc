@@ -197,7 +197,8 @@ services:
       # back to standalone, and the reader bootstraps its OWN admin token —
       # so writer-issued tokens are rejected at /api/v1/query.
       ARC_CLUSTER_RAFT_ADVERTISE_ADDR: "arc-reader1:9200"
-      ARC_CLUSTER_REPLICATION_ENABLED: "true"
+      # No peer file replication: every node reads the shared bucket, so
+      # there is nothing to replicate (Arc ignores it here, #1605).
     labels:
       <<: *traefik-reader-labels
     depends_on:

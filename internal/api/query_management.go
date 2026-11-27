@@ -70,6 +70,8 @@ func (h *QueryManagementHandler) listActiveQueries(c *fiber.Ctx) error {
 		DurationMs     float64 `json:"duration_ms"`
 		IsParallel     bool    `json:"is_parallel"`
 		PartitionCount int     `json:"partition_count,omitempty"`
+		// ForwardedTo: the node a compactor forwarded this query to.
+		ForwardedTo string `json:"forwarded_to,omitempty"`
 	}
 
 	queries := make([]querySummary, 0, len(active))
@@ -89,6 +91,7 @@ func (h *QueryManagementHandler) listActiveQueries(c *fiber.Ctx) error {
 			DurationMs:     q.DurationMs,
 			IsParallel:     q.IsParallel,
 			PartitionCount: q.PartitionCount,
+			ForwardedTo:    q.ForwardedTo,
 		})
 	}
 

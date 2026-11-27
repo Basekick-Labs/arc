@@ -953,6 +953,151 @@ func TestDatabasesHandler_DeleteEmptyDatabase(t *testing.T) {
 	}
 }
 
+// listedDatabases returns the names GET /api/v1/databases lists.
+func listedDatabases(t *testing.T, app *fiber.App) []string {
+	t.Helper()
+	resp, err := app.Test(httptest.NewRequest("GET", "/api/v1/databases", nil), testRequestTimeoutMS)
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("Expected status 200, got %d: %s", resp.StatusCode, string(body))
+	}
+	var result DatabaseListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+	names := make([]string, 0, len(result.Databases))
+	for _, db := range result.Databases {
+		names = append(names, db.Name)
+	}
+	return names
+}
+
+// TestDatabasesHandler_DeleteRemovesDirectoryTree is #1425: on local storage
+// the files of a deleted database left their measurement/YYYY/MM/DD/HH
+// directories behind, so the listing, which reads directories, kept the
+// database (with measurement_count 0) while GET answered 404 for it, and its
+// measurements were still listed.
+func TestDatabasesHandler_DeleteRemovesDirectoryTree(t *testing.T) {
+	_, app, tmpDir := setupTestDatabasesHandler(t, true)
+	defer os.RemoveAll(tmpDir)
+
+	ctx := context.Background()
+	backend, err := storage.NewLocalBackend(tmpDir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	for _, key := range []string{
+		"dropdb/.arc-database",
+		"dropdb/cpu/2026/01/01/00/a.parquet",
+		"dropdb/cpu/2026/01/01/01/b.parquet",
+		"dropdb/mem/2026/01/02/00/c.parquet",
+		"keepdb/cpu/2026/01/01/00/a.parquet",
+	} {
+		if err := backend.Write(ctx, key, []byte("data")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/dropdb?confirm=true", nil), testRequestTimeoutMS)
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("Expected status 200, got %d: %s", resp.StatusCode, string(body))
+	}
+
+	if got := listedDatabases(t, app); !equalStrings(got, []string{"keepdb"}) {
+		t.Errorf("databases listed after the delete = %v, want [keepdb]", got)
+	}
+	for _, path := range []string{"/api/v1/databases/dropdb", "/api/v1/databases/dropdb/measurements"} {
+		resp, err := app.Test(httptest.NewRequest("GET", path, nil), testRequestTimeoutMS)
+		if err != nil {
+			t.Fatalf("Request failed: %v", err)
+		}
+		if resp.StatusCode != fiber.StatusNotFound {
+			body, _ := io.ReadAll(resp.Body)
+			t.Errorf("GET %s after the delete: status %d, want 404: %s", path, resp.StatusCode, body)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, "dropdb")); !os.IsNotExist(err) {
+		t.Errorf("the deleted database's directory is still on disk (stat err %v)", err)
+	}
+	if ok, err := backend.Exists(ctx, "keepdb/cpu/2026/01/01/00/a.parquet"); err != nil || !ok {
+		t.Errorf("another database's file is gone (exists %v, err %v)", ok, err)
+	}
+}
+
+// TestDatabasesHandler_DeleteClearsEmptyDirectoryResidue covers a database an
+// earlier version deleted on local storage: only empty directories are left.
+// The listing does not show it, since it holds nothing, and repeating the
+// DELETE still answers 404 and removes the directories (#1425).
+func TestDatabasesHandler_DeleteClearsEmptyDirectoryResidue(t *testing.T) {
+	_, app, tmpDir := setupTestDatabasesHandler(t, true)
+	defer os.RemoveAll(tmpDir)
+
+	for _, dir := range []string{"olddb/cpu/2026/01/01/00", "olddb/mem/2026/01/02/03"} {
+		if err := os.MkdirAll(filepath.Join(tmpDir, filepath.FromSlash(dir)), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := listedDatabases(t, app); len(got) != 0 {
+		t.Fatalf("residue listed as %v before the delete, want none", got)
+	}
+
+	resp, err := app.Test(httptest.NewRequest("DELETE", "/api/v1/databases/olddb?confirm=true", nil), testRequestTimeoutMS)
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusNotFound {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("Expected status 404, got %d: %s", resp.StatusCode, string(body))
+	}
+	if got := listedDatabases(t, app); len(got) != 0 {
+		t.Errorf("databases listed after the delete = %v, want none", got)
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, "olddb")); !os.IsNotExist(err) {
+		t.Errorf("the residue's directories are still on disk (stat err %v)", err)
+	}
+}
+
+// TestRemoveEmptyDirectoriesKeepsOccupiedBranches checks the sweep removes
+// only empty directories: one holding a file, a hidden one included, stays
+// with every directory above it, and empty siblings still go.
+func TestRemoveEmptyDirectoriesKeepsOccupiedBranches(t *testing.T) {
+	tmpDir := t.TempDir()
+	backend, err := storage.NewLocalBackend(tmpDir, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	for _, dir := range []string{"db/cpu/2026/01/01/00", "db/cpu/2026/01/02/00", "db/mem/2026/01/01/00"} {
+		if err := os.MkdirAll(filepath.Join(tmpDir, filepath.FromSlash(dir)), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A hidden file is not listed, but it is still something the directory holds.
+	occupied := filepath.Join(tmpDir, "db", "cpu", "2026", "01", "02", "00", ".arc-inflight.tmp")
+	if err := os.WriteFile(occupied, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	removeEmptyDirectories(context.Background(), backend, "db", zerolog.Nop())
+
+	if _, err := os.Stat(occupied); err != nil {
+		t.Fatalf("a file under the database is gone: %v", err)
+	}
+	for _, gone := range []string{"db/cpu/2026/01/01", "db/mem"} {
+		if _, err := os.Stat(filepath.Join(tmpDir, filepath.FromSlash(gone))); !os.IsNotExist(err) {
+			t.Errorf("empty directory %s was kept (stat err %v)", gone, err)
+		}
+	}
+}
+
 // TestDatabasesHandler_DeleteWarnsAboutFilesNoListingAddresses covers the
 // consumer side of #772. A partial whose key the contract refuses is omitted by
 // ListStaged, so the reclaim loop no longer warns about it on every DROP; the

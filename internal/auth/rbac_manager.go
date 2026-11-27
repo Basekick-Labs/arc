@@ -64,6 +64,19 @@ type permissionCacheKey struct {
 	permission  string
 }
 
+// owned returns the key with its strings copied, for storing in permCache.
+// A request's database and measurement names can point into the HTTP
+// framework's request buffer (fasthttp reuses it for the next request on the
+// same connection), so a key stored without a copy would change under the
+// cache: an allow cached for one name would then match another. Lookups may
+// use the uncopied key, as the map compares the bytes at that moment.
+func (k permissionCacheKey) owned() permissionCacheKey {
+	k.database = strings.Clone(k.database)
+	k.measurement = strings.Clone(k.measurement)
+	k.permission = strings.Clone(k.permission)
+	return k
+}
+
 // permissionCacheEntry caches a permission check result
 type permissionCacheEntry struct {
 	result    *PermissionCheckResult
@@ -1403,13 +1416,60 @@ func (rm *RBACManager) RemoveTokenFromTeam(ctx context.Context, tokenID, teamID 
 	return nil
 }
 
-// GetTokenTeams returns all teams a token belongs to
+// RemoveTokenFromTeamLocal removes a membership of a token the cluster does
+// not manage, from this node's SQLite only (#1630): the cluster state has no
+// such membership, so a proposal would be dropped and the route answered 200
+// with nothing removed. Only an unmarked membership is removed. When the only
+// row for the pair is marked, it is the cluster token's that holds the same
+// ID on this cluster (an ID collision), and the removal is refused.
+func (rm *RBACManager) RemoveTokenFromTeamLocal(ctx context.Context, tokenID, teamID int64) error {
+	result, err := rm.db.ExecContext(ctx, `
+		DELETE FROM rbac_token_memberships WHERE token_id = ? AND team_id = ? AND raft_materialised = 0
+	`, tokenID, teamID)
+	if err != nil {
+		return fmt.Errorf("failed to remove token from team: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to remove token from team: %w", err)
+	}
+	if n == 0 {
+		var exists int
+		err := rm.db.QueryRowContext(ctx,
+			`SELECT 1 FROM rbac_token_memberships WHERE token_id = ? AND team_id = ?`, tokenID, teamID).Scan(&exists)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return tagError(ErrNotFound, errors.New("token membership not found"))
+		case err != nil:
+			return fmt.Errorf("failed to look up token membership: %w", err)
+		}
+		return &TokenScopeError{Code: TokenCodeClusterMembership, TokenID: tokenID,
+			Message: fmt.Sprintf("This membership belongs to the cluster token with ID %d, not to the token this node keeps at that ID (an ID collision). Nothing was changed. To remove it from the cluster token, send the request without ?node to a node where token %d is the cluster token.", tokenID, tokenID)}
+	}
+	rm.InvalidateTokenCache(tokenID)
+	rm.logger.Info().Int64("token_id", tokenID).Int64("team_id", teamID).
+		Msg("Removed a membership of a token the cluster does not manage, on this node only")
+	return nil
+}
+
+// GetTokenTeams returns all teams a token belongs to.
+//
+// A membership the cluster wrote (raft_materialised = 1) counts only for a
+// token row the cluster wrote too. On a cluster node, the token this node
+// keeps at ID X from before v26.06.1 (unmarked) and the cluster's token with
+// the same ID are different tokens, but memberships are keyed by token_id
+// alone, so without this the node's token would inherit every team of the
+// cluster's token (#1630). An unmarked membership counts for any token: it
+// is a grant made on this node to the row this node holds at that ID.
+// Standalone nodes that never joined a cluster have no marked rows, so the
+// condition is always true there.
 func (rm *RBACManager) GetTokenTeams(tokenID int64) ([]Team, error) {
 	rows, err := rm.db.Query(`
 		SELECT t.id, t.organization_id, t.name, t.description, t.created_at, t.updated_at, t.enabled
 		FROM rbac_teams t
 		INNER JOIN rbac_token_memberships m ON t.id = m.team_id
-		WHERE m.token_id = ?
+		INNER JOIN api_tokens tok ON tok.id = m.token_id
+		WHERE m.token_id = ? AND (m.raft_materialised = 0 OR tok.raft_materialised = 1)
 		ORDER BY t.name
 	`, tokenID)
 	if err != nil {
@@ -1424,6 +1484,9 @@ func (rm *RBACManager) GetTokenTeams(tokenID int64) ([]Team, error) {
 			return nil, fmt.Errorf("failed to scan team: %w", err)
 		}
 		teams = append(teams, team)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read token teams: %w", err)
 	}
 	return teams, nil
 }
@@ -1479,7 +1542,7 @@ func (rm *RBACManager) CheckPermission(req *PermissionCheckRequest) *PermissionC
 	if result.Source != SourceUnavailable {
 		rm.permCacheMu.Lock()
 		rm.evictPermCacheIfFull()
-		rm.permCache[cacheKey] = &permissionCacheEntry{
+		rm.permCache[cacheKey.owned()] = &permissionCacheEntry{
 			result:    result,
 			expiresAt: time.Now().Add(rm.permCacheTTL),
 		}
@@ -1594,7 +1657,7 @@ func (rm *RBACManager) CheckPermissionsBatch(reqs []*PermissionCheckRequest) []*
 			if result.Source != SourceUnavailable {
 				rm.permCacheMu.Lock()
 				rm.evictPermCacheIfFull()
-				rm.permCache[cacheKey] = &permissionCacheEntry{
+				rm.permCache[cacheKey.owned()] = &permissionCacheEntry{
 					result:    result,
 					expiresAt: time.Now().Add(rm.permCacheTTL),
 				}
@@ -1797,8 +1860,8 @@ func hasCoarseAdmin(info *TokenInfo) bool {
 // MEMBERSHIPS, never by the license. The license gates RBAC *management* only
 // (RBACHandler.requireRBACLicense guards every /api/v1/rbac route).
 //
-// Keying enforcement off the license would fail OPEN. License.IsValid() is
-// true only for "active" and "grace_period", and cmd/arc/main.go sets
+// Keying enforcement off the license would fail OPEN. License.IsValid()
+// checks the signed expiry against the current clock, and cmd/arc/main.go sets
 // licenseClient to nil when validation fails at boot — so a lapsed trial, a
 // revoked key, or an outage past the cached-license window all make
 // IsRBACEnabled() false. If that switched enforcement off, every tenant token
@@ -1820,7 +1883,13 @@ func hasCoarseAdmin(info *TokenInfo) bool {
 // RBAC under any configuration: a token had to hold "read" to pass the route
 // middleware, and had to NOT hold it for an RBAC denial to stand. Those are
 // contradictory, so every read and write path was unnarrowable. Both halves
-// are fixed together; see RequireResourcePermission in middleware.go.
+// are fixed together; see RequireResourcePermission in middleware.go for
+// routes that name their database in the path or headers, and
+// RequireAnyResourcePermission for routes whose resources are in the body —
+// query SQL and ingest payloads (#1559: those routes kept the coarse door
+// after the first fix, so an RBAC-only token could not query or ingest).
+// Edge-sync pushes are checked on the spoke's namespace ({spoke_id}, the
+// spoke's database) after the request MAC (#1561).
 
 // checkOSSPermission checks permissions using OSS token model
 func (rm *RBACManager) checkOSSPermission(req *PermissionCheckRequest) *PermissionCheckResult {
@@ -1853,55 +1922,106 @@ func (rm *RBACManager) checkOSSPermission(req *PermissionCheckRequest) *Permissi
 // Resolution order matches CheckPermission: admin break-glass, then
 // memberships, then coarse permissions.
 func (rm *RBACManager) CanAccessAnythingIn(tokenInfo *TokenInfo, database, permission string) bool {
-	if tokenInfo == nil {
-		return false
-	}
-	if hasCoarseAdmin(tokenInfo) {
-		return true
-	}
-	data, err := rm.getTokenRBACData(tokenInfo.ID)
+	ok, err := rm.holdsGrant(tokenInfo, permission, func(pattern string) bool {
+		return matchPattern(pattern, database)
+	})
 	if err != nil {
 		rm.logger.Error().Err(err).
 			Int64("token_id", tokenInfo.ID).
 			Msg("RBAC data load failed; denying listing (fail closed)")
 		return false
 	}
+	return ok
+}
+
+// CanAccessAnythingInErr is CanAccessAnythingIn with the store error returned
+// rather than read as a denial. A caller whose answer an outside system
+// caches (the Iceberg REST catalog, #1690: a remote catalog can drop a table
+// that disappears from a listing) must tell "not permitted" from "the grants
+// could not be read", and answer the second with a 503.
+func (rm *RBACManager) CanAccessAnythingInErr(tokenInfo *TokenInfo, database, permission string) (bool, error) {
+	return rm.holdsGrant(tokenInfo, permission, func(pattern string) bool {
+		return matchPattern(pattern, database)
+	})
+}
+
+// HasPermissionAnywhere reports whether the token holds any grant permitting
+// `permission` on at least one measurement of at least one database.
+//
+// This is the question a route asks at the door when the resource it serves is
+// named in the request BODY — the tables in a query's SQL, the measurements in
+// an ingest payload — and so is not known to the middleware (#1559). The
+// handler behind such a route must then decide per resource, as the query and
+// ingest handlers do (checkQueryPermissions, CheckWritePermissions). Never use
+// it as the only gate on a route that serves data.
+//
+// Rules are CanAccessAnythingIn's with every database pattern matching: admin
+// break-glass; with memberships, RBAC is authoritative (a role with
+// measurement grants counts only through them); without memberships, the
+// coarse permissions. A grant of one permission never implies another.
+//
+// An error means the token's grants could not be read: the caller must refuse
+// (fail closed), and should say the store is unavailable rather than that
+// the token lacks the permission. Coarse admin is decided before the store is
+// read, so it never errors.
+func (rm *RBACManager) HasPermissionAnywhere(tokenInfo *TokenInfo, permission string) (bool, error) {
+	return rm.holdsGrant(tokenInfo, permission, func(string) bool { return true })
+}
+
+// holdsGrant is CanAccessAnythingIn and HasPermissionAnywhere: whether the
+// token holds a grant permitting `permission` on a measurement of a database
+// whose role pattern dbMatches accepts.
+func (rm *RBACManager) holdsGrant(tokenInfo *TokenInfo, permission string, dbMatches func(pattern string) bool) (bool, error) {
+	if tokenInfo == nil {
+		return false, nil
+	}
+	if hasCoarseAdmin(tokenInfo) {
+		return true, nil
+	}
+	data, err := rm.getTokenRBACData(tokenInfo.ID)
+	if err != nil {
+		return false, err
+	}
 	if len(data.teams) == 0 {
+		// The coarse list names no database, so the database plays no part.
 		return rm.checkOSSPermission(&PermissionCheckRequest{
-			TokenInfo: tokenInfo, Database: database, Measurement: "*", Permission: permission,
-		}).Allowed
+			TokenInfo: tokenInfo, Measurement: "*", Permission: permission,
+		}).Allowed, nil
 	}
 	// Enabled is checked here rather than at the top, matching
 	// checkRBACPermissionCached, which is reached the same way. A disabled
-	// token cannot arrive on a request path at all: VerifyToken is the only
-	// producer of a TokenInfo there and it never returns a disabled one, so
-	// the ordering is not load-bearing. A future caller that constructs a
+	// token cannot arrive on a request path at all: its only producers there
+	// are VerifyToken and, for a request forwarded by a cluster peer,
+	// TokenForForward, and neither returns a disabled or expired one, so the
+	// ordering is not load-bearing. A future caller that constructs a
 	// TokenInfo directly must not rely on that.
 	if !tokenInfo.Enabled {
-		return false
+		return false, nil
 	}
 	for _, team := range data.teams {
 		if !team.Enabled {
 			continue
 		}
 		for _, role := range data.roles[team.ID] {
-			if !matchPattern(role.DatabasePattern, database) {
+			if !dbMatches(role.DatabasePattern) {
 				continue
 			}
+			// A role with measurement grants is restricted to them: its
+			// role-level list no longer grants anything on its own.
 			if measPerms := data.measPerms[role.ID]; len(measPerms) > 0 {
 				for _, mp := range measPerms {
 					if containsPermission(mp.Permissions, permission) {
-						return true
+						return true, nil
 					}
 				}
 				continue
 			}
 			if containsPermission(role.Permissions, permission) {
-				return true
+				return true, nil
 			}
 		}
 	}
-	return false
+	return false, nil
 }
 
 // checkRBACPermissionCached checks permissions using cached RBAC data (no DB queries)
@@ -2316,12 +2436,13 @@ func (rm *RBACManager) countTeamCascadeDescendants(ctx context.Context, teamID i
 // map it to 409 Conflict. Phase A.2 Item 2.
 var ErrCascadeCapExceeded = errors.New("cascade exceeds configured limit")
 
-// ErrNameConflict is the sentinel tagging every organization/team
-// name-collision error, on both the OSS direct-SQLite path (UNIQUE
-// constraint violation) and the cluster Raft path ("already exists"
-// from the FSM apply). HTTP handlers detect it via errors.Is and map it
-// to 409 Conflict — a duplicate name is a client error, not a server
-// fault. Issue #549.
+// ErrNameConflict is the sentinel tagging every organization/team and
+// API token name-collision error, on both the OSS direct-SQLite path
+// (UNIQUE constraint violation; for tokens, a write that changed no row
+// because of the name) and the cluster Raft path ("already exists" from
+// the FSM apply; for tokens, tagged by the cluster proposer). HTTP
+// handlers detect it via errors.Is and map it to 409 Conflict — a
+// duplicate name is a client error, not a server fault. Issue #549, #1625.
 var ErrNameConflict = errors.New("name already exists")
 
 // ErrInvalidName is the sentinel tagging validateName failures on the
@@ -2339,7 +2460,8 @@ var ErrInvalidRoleInput = errors.New("invalid role input")
 
 // ErrNotFound is the sentinel tagging every "entity does not exist" error
 // returned by RBACManager — organizations, teams, roles, and measurement
-// permissions, on both the OSS direct-SQLite and cluster Raft paths.
+// permissions, on both the OSS direct-SQLite and cluster Raft paths — and
+// by the AuthManager token writes (update, revoke, rotate, delete).
 //
 // Handlers must NOT map this to a status code centrally. The same error
 // means different things depending on where the missing ID sits in the

@@ -158,7 +158,7 @@ func TestImportWriterCarvesGroupBudgetFromAllowance(t *testing.T) {
 	w, err := newImportWriter(context.Background(), ci.buf, "d")
 	require.NoError(t, err)
 	defer w.close()
-	require.Equal(t, ci.buf.BufferedBytes()+50<<20, w.limit)
+	require.Equal(t, ci.buf.BufferedBytes()+50<<20, w.pacer.limit())
 }
 
 // Several windows: a budget of about three chunks fills, writes, keeps
