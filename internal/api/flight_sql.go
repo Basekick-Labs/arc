@@ -72,8 +72,9 @@ const flightSQLInternalKeyHeader = "X-Arc-Flight-Internal-Key"
 // in, as the HTTP header of the same name. ADBC sets it with the connection
 // option adbc.flight.sql.rpc.call_header.x-arc-database. The other is
 // x-arc-decimals (decimalsHeader, #1784), sent only to the Arrow route and the
-// schema route, and only after the call's value was checked against the one
-// the ticket or prepared statement handle stored. Of the client's metadata
+// schema route, and only after the call's value was checked: against the one
+// the ticket or prepared statement handle stored, or, for GetTables with
+// schemas, at the call's entry. Of the client's metadata
 // only these two, the bearer token and the User-Agent cross; the peer header
 // is the bridge's proxy header (the audit log's client address), and the
 // other x-arc-* headers change what the Arrow route encodes or whether it

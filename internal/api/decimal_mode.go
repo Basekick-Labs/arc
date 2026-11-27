@@ -21,7 +21,7 @@ const (
 )
 
 // errDecimalsRepeated is the refusal of a header sent more than once.
-var errDecimalsRepeated = errors.New("the x-arc-decimals header was sent more than once")
+var errDecimalsRepeated = errors.New("the x-arc-decimals header was sent more than once; send it once (with ADBC, set it at either the database or the connection level, not both)")
 
 // decimalModeOf is the one x-arc-decimals rule, for HTTP and Flight SQL, over
 // every value a request carried. Each value is trimmed and an empty one is
@@ -61,6 +61,9 @@ func decimalModeOf(values []string) (mode string, present bool, err error) {
 // fasthttp's scratch slice only when it is there.
 func requestDecimalMode(c *fiber.Ctx) (string, error) {
 	hd := &c.Request().Header
+	// Peek returns a non-nil empty slice for a header sent with an empty value,
+	// so an empty first value still reaches PeekAll and the later values are
+	// read (pinned by the "empty then exact" test).
 	if hd.Peek(decimalsHeader) == nil {
 		return decimalModeDefault, nil
 	}
@@ -75,7 +78,7 @@ func requestDecimalMode(c *fiber.Ctx) (string, error) {
 
 // flightSQLDecimalMode reads x-arc-decimals from an incoming Flight SQL call
 // (decimalModeOf). present distinguishes an omitted header from an explicit
-// "default", so the bridge forwards what the client sent.
+// "default". The bridge forwards the parsed constant, never the raw value.
 func flightSQLDecimalMode(ctx context.Context) (mode string, present bool, err error) {
 	md, _ := metadata.FromIncomingContext(ctx)
 	mode, present, err = decimalModeOf(md.Get(decimalsHeader))

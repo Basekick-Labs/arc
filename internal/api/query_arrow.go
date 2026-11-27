@@ -956,7 +956,8 @@ func (h *QueryHandler) executeQueryArrow(c *fiber.Ctx) error {
 
 	// Normalize decimal columns in the schema — DuckDB returns SUM(integer) as
 	// decimal(38,0) which many Arrow clients (e.g. Grafana) cannot handle.
-	// castInfo is nil when there are no decimal columns (zero overhead on hot path).
+	// castInfo is nil when there is nothing to cast: no decimal columns, or
+	// x-arc-decimals: exact with only decimals it keeps (zero overhead).
 	castInfo := normalizeDecimalSchemaForMode(schema, decimalMode)
 	if castInfo != nil {
 		schema = castInfo.schema
