@@ -11,7 +11,13 @@ import (
 )
 
 // arrowTypeName maps an Arrow data type to the name Arc publishes in the
-// msgpack response's "types" array.
+// "types" array of the msgpack and JSON query responses (JSON since #1967).
+//
+// The two wires share these names, so the rules below that cite
+// encodeColumn's case set hold only while jsonValueEncoder.appendValue
+// (json_append.go) has the same one. A typed case added to one encoder is
+// added to the other in the same change, or a name here describes one
+// wire's payload and misdescribes the other's.
 //
 // This is Arc's wire contract, deliberately NOT arrow.DataType.String().
 // That method is Go debug output and upstream changes its format in patch
@@ -163,7 +169,7 @@ func unknownArrowTypeName(dt arrow.DataType) string {
 			Str("component", "query-handler").
 			Str("arrow_type", dt.String()).
 			Int("arrow_type_id", int(dt.ID())).
-			Msg("msgpack response: Arrow type has no Arc wire-type name; emitting unknown: sentinel")
+			Msg("query response: Arrow type has no Arc wire-type name; emitting unknown: sentinel")
 	}
 	return wireTypeUnknownPrefix + dt.String()
 }

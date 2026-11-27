@@ -77,15 +77,16 @@ func respondError(c *fiber.Ctx, status int, errMsg, timestamp string, start time
 //  2. First-non-nil-cell inference is fragile when leading rows are
 //     nil for a column that later carries data.
 //
-// types may be nil, in which case the JSON path doesn't emit a types
-// field (the JSON envelope shape never had one) and the msgpack path
-// falls back to empty strings — a deliberate signal to the client that
-// the schema is unknown.
+// Both wires carry types (JSON since #1967, as the streaming query path
+// does). types may be nil, in which case the JSON path omits the field
+// and the msgpack path falls back to empty strings — a deliberate signal
+// to the client that the schema is unknown.
 func respondSuccessRows(c *fiber.Ctx, columns []string, types []string, data [][]interface{}, timestamp string, start time.Time) error {
 	if !isMsgPackWire(c) {
 		return c.JSON(QueryResponse{
 			Success:         true,
 			Columns:         columns,
+			Types:           types,
 			Data:            data,
 			RowCount:        len(data),
 			ExecutionTimeMs: float64(time.Since(start).Milliseconds()),

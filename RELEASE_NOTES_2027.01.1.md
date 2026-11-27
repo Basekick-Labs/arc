@@ -2,6 +2,23 @@
 
 > **Status:** Planned — January 2027 release.
 
+## New: JSON query responses carry column types (`types`), as MessagePack does ([#1967](https://github.com/Basekick-Labs/arc/issues/1967))
+
+**Who is affected:** JSON clients of `POST /api/v1/query` and `GET /api/v1/query/:measurement` that need to know a column's type: a `TIMESTAMP` from a string, an `INT64` from a whole `DOUBLE`. The field is additive; a client that does not read it sees no change.
+
+The JSON envelope now has `"types"` right after `"columns"`, one name per column, the same names the MessagePack response carries for the same query:
+
+```json
+{"success":true,"columns":["time","host","usage"],"types":["timestamp[us]","utf8","float64"],"data":[...],...}
+```
+
+- **The names describe the column, not the JSON token.** In JSON, timestamps and dates are RFC 3339 strings in UTC (a `date32` is that day at `T00:00:00Z`), and `binary` is base64. `string_encoded`, `list`, `struct`, `map` and `unknown:…` columns are strings, as they are in MessagePack. A float NaN or ±Inf is `null` in JSON. Integers are bare numbers, so an `int64` or `uint64` above 2^53 loses precision in a client that reads every number as a double.
+- **Decimals:** the names follow the conversion Arc already applies, so a `sum()` of an integer column reads `int64` and a scaled decimal `float64`, matching the values.
+- **Empty answers:** a measurement with no data yet answers `"columns":[],"types":[]`. A query with no matching rows names its columns and their types, with `"data":[]`.
+- **SHOW DATABASES / SHOW TABLES** in JSON carry the types they already sent in MessagePack.
+- **Treat it as optional.** It is absent on error responses, from a node older than this release (on a cluster, until every node is upgraded), and in the rare case where Arc answers without the Arrow path (a connection that cannot open an Arrow stream).
+- **Cost:** written once per response, a few bytes per column. Row encoding is unchanged.
+
 ## New: exact integer decimals for Arrow IPC and Flight SQL (`x-arc-decimals: exact`) ([#1784](https://github.com/Basekick-Labs/arc/issues/1784))
 
 **Who is affected:** Arrow IPC (`/api/v1/query/arrow`) and Flight SQL clients that need integer results beyond int64, for example `sum()` over a large `BIGINT` column. Nothing changes for a client that does not send the new header.

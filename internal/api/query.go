@@ -929,10 +929,16 @@ type QueryRequest struct {
 	SQL string `json:"sql"`
 }
 
-// QueryResponse represents a SQL query response
+// QueryResponse represents a SQL query response.
+//
+// Types is Arc's wire type name per column, parallel to Columns: the names
+// the msgpack response carries (#1967). omitzero, not omitempty: an empty
+// answer sends "types":[], and a response without them (an error, or the
+// database/sql fallback) has no key at all.
 type QueryResponse struct {
 	Success         bool                   `json:"success"`
 	Columns         []string               `json:"columns"`
+	Types           []string               `json:"types,omitzero"`
 	Data            [][]interface{}        `json:"data"`
 	RowCount        int                    `json:"row_count"`
 	ExecutionTimeMs float64                `json:"execution_time_ms"`
