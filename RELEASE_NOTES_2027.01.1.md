@@ -7283,6 +7283,8 @@ function. DuckDB storage and network errors, and out-of-memory errors, answer
 `DoGet` maps the query's `400` to `INVALID_ARGUMENT`, matching its prepare
 path. The estimate route is unchanged.
 
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1974](https://github.com/Basekick-Labs/arc/pull/1974).
+
 ### Fix: an Arrow query served by arcx honours the governance row cap ([#727](https://github.com/Basekick-Labs/arc/issues/727))
 
 A `POST /api/v1/query/arrow` query that arcx served ignored the token's
