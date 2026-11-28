@@ -4996,6 +4996,21 @@ policy. It now stores its own copy too.
 Full technical detail will accompany the corresponding security advisory once
 it is published. Responsibly reported by **[@gablealder823](https://github.com/gablealder823)**.
 
+## Security: the S3 cache extension's functions are refused in user SQL
+
+**Deployments with `query.enable_s3_cache = true`** (off by default). The
+extension Arc loads for that setting adds SQL functions that report on and
+change the cache every query shares. Arc's checks on query text did not cover
+them, so any token that could run a query could call them. They are now
+refused with `400` on every query endpoint, in continuous queries and in
+`DELETE` predicates. Arc's own cache maintenance is unaffected. The extension
+review test now loads this extension too and requires a decision on every
+function it adds, so a newer build cannot add one unnoticed.
+
+DuckDB's automatic extension loading and installing are also switched off
+once Arc's sandbox is active: every extension Arc uses is loaded at startup,
+before then.
+
 ## Security: more DuckDB functions are refused in user SQL
 
 Some functions of the DuckDB release Arc links were not covered by the checks

@@ -129,3 +129,35 @@ func containsString(list []string, s string) bool {
 	}
 	return false
 }
+
+// The functions of cache_httpfs, which Arc loads itself for
+// query.enable_s3_cache, are refused like a supported extension's: they
+// report and change the cache every tenant's reads share. Most are zero-
+// argument scalars, a call form the table-position probes above do not use.
+func TestEngineExtensionFunctionsRefused(t *testing.T) {
+	denied := database.DeniedExtensionFunctions()
+	n := 0
+	for _, fn := range denied {
+		if !strings.HasPrefix(fn, "cache_httpfs_") {
+			continue
+		}
+		n++
+		for _, sql := range []string{
+			"SELECT " + fn + "()",
+			"SELECT " + strings.ToUpper(fn) + " ()",
+			"SELECT * FROM " + fn + "()",
+			"SELECT time FROM cpu WHERE " + fn + "() IS NOT NULL",
+		} {
+			err := validateSQLErr(sql)
+			if err == nil || !strings.Contains(strings.ToLower(err.Error()), fn) {
+				t.Errorf("%q: want a refusal naming %s, got %v", sql, fn, err)
+			}
+		}
+		if _, _, err := (&DeleteHandler{}).validateWhereClause(fn + "() IS NOT NULL"); err == nil {
+			t.Errorf("DELETE WHERE with %s() was accepted", fn)
+		}
+	}
+	if n != 20 {
+		t.Fatalf("found %d cache_httpfs functions in the denylist, want 20", n)
+	}
+}

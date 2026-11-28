@@ -820,3 +820,18 @@ func TestBuildDSNDisablesPersistentSecrets(t *testing.T) {
 		t.Errorf("buildDSN with arcx = %q, lost allow_unsigned_extensions", dsn)
 	}
 }
+
+// After lockdown no extension autoloads or autoinstalls: a known
+// extension's functions would otherwise appear the first time user SQL
+// named one, a surface no validator was reviewed against.
+func TestSandboxDisablesExtensionAutoload(t *testing.T) {
+	db, _ := newSandboxFixture(t)
+	var autoload, autoinstall bool
+	if err := db.DB().QueryRowContext(context.Background(),
+		"SELECT current_setting('autoload_known_extensions')::BOOLEAN, current_setting('autoinstall_known_extensions')::BOOLEAN").Scan(&autoload, &autoinstall); err != nil {
+		t.Fatal(err)
+	}
+	if autoload || autoinstall {
+		t.Fatalf("autoload_known_extensions=%t autoinstall_known_extensions=%t after lockdown, want both false", autoload, autoinstall)
+	}
+}

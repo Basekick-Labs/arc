@@ -59,6 +59,49 @@ var supportedExtensions = map[string]supportedExtension{
 	},
 }
 
+// engineExtensions are DuckDB extensions Arc loads from its own
+// configuration rather than from database.extensions, so an operator cannot
+// name them there. Their functions reach user SQL all the same once loaded,
+// so they carry the same review as supportedExtensions and their denied
+// functions join DeniedExtensionFunctions. installFrom is the repository
+// INSTALL names ("" for DuckDB's core repository).
+var engineExtensions = map[string]struct {
+	supportedExtension
+	installFrom string
+}{
+	// query.enable_s3_cache (duckdb.go). Every function it adds manages or
+	// reports the process-wide cache that all tenants' reads share: the
+	// status views list cached object keys (other databases' paths), and
+	// the rest clear the cache, change its exclusion rules or wrap
+	// filesystems. Arc calls cache_httpfs_clear_cache itself on its own
+	// connection; user SQL may call none of them.
+	"cache_httpfs": {
+		installFrom: "community",
+		supportedExtension: supportedExtension{denied: []string{
+			"cache_httpfs_add_exclusion_regex",
+			"cache_httpfs_cache_access_info_query",
+			"cache_httpfs_cache_status_query",
+			"cache_httpfs_cleanup_dead_temp",
+			"cache_httpfs_clear_cache",
+			"cache_httpfs_clear_cache_for_file",
+			"cache_httpfs_clear_profile",
+			"cache_httpfs_get_cache_config",
+			"cache_httpfs_get_cache_filesystems",
+			"cache_httpfs_get_cache_type",
+			"cache_httpfs_get_data_cache_config",
+			"cache_httpfs_get_file_handle_cache_config",
+			"cache_httpfs_get_glob_cache_config",
+			"cache_httpfs_get_metadata_cache_config",
+			"cache_httpfs_get_ondisk_data_cache_size",
+			"cache_httpfs_get_profile",
+			"cache_httpfs_list_exclusion_regex",
+			"cache_httpfs_list_registered_filesystems",
+			"cache_httpfs_reset_exclusion_regex",
+			"cache_httpfs_wrap_cache_filesystem",
+		}},
+	},
+}
+
 // SupportedExtensionNames is the sorted set database.extensions accepts.
 func SupportedExtensionNames() []string {
 	names := make([]string, 0, len(supportedExtensions))
@@ -69,14 +112,17 @@ func SupportedExtensionNames() []string {
 	return names
 }
 
-// DeniedExtensionFunctions is every function a supported extension adds that
-// the validators refuse, lower-case and sorted. It does not depend on which
+// DeniedExtensionFunctions is every function a supported or engine extension
+// adds that the validators refuse, lower-case and sorted. It does not depend on which
 // extensions this node loads: a denied name nothing defines costs nothing,
 // and a validator whose rules change with configuration is one a reviewer
 // cannot read.
 func DeniedExtensionFunctions() []string {
 	var out []string
 	for _, ext := range supportedExtensions {
+		out = append(out, ext.denied...)
+	}
+	for _, ext := range engineExtensions {
 		out = append(out, ext.denied...)
 	}
 	sort.Strings(out)
