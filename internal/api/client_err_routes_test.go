@@ -19,6 +19,7 @@ import (
 	"github.com/basekick-labs/arc/internal/database"
 	"github.com/basekick-labs/arc/internal/queryregistry"
 	"github.com/basekick-labs/arc/internal/storage"
+	duckdb "github.com/duckdb/duckdb-go/v2"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
@@ -48,7 +49,9 @@ func TestQueryRoutesReturnClientErrorText(t *testing.T) {
 	for _, path := range []string{"/api/v1/query", "/api/v1/query/arrow", "/api/v1/query/estimate"} {
 		code, out := usDoJSON(t, app, "POST", path, map[string]string{"sql": bad}, hdr)
 		if path != "/api/v1/query/estimate" { // the estimate answers 200 with the error in the body
-			require.GreaterOrEqual(t, code, 400, "%s: %v", path, out)
+			require.Equal(t, fiber.StatusBadRequest, code, "%s: %v", path, out)
+		} else {
+			require.Equal(t, fiber.StatusOK, code, "%s: %v", path, out)
 		}
 		msg, _ := out["error"].(string)
 		requireClientErr(t, path, msg, "Binder Error", `"vv"`)
@@ -63,7 +66,7 @@ func TestQueryRoutesReturnClientErrorText(t *testing.T) {
 	require.NoError(t, err)
 	raw, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	require.GreaterOrEqual(t, resp.StatusCode, 400)
+	require.Equal(t, fiber.StatusBadRequest, resp.StatusCode)
 	requireClientErr(t, "msgpack", string(raw), "Binder Error", `"vv"`)
 
 	// A damaged file: DuckDB's error names it, the client does not see the
@@ -78,14 +81,70 @@ func TestQueryRoutesReturnClientErrorText(t *testing.T) {
 	require.NoError(t, err)
 	raw, _ = io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	require.GreaterOrEqual(t, resp.StatusCode, 400, "%s", raw)
+	require.Equal(t, fiber.StatusInternalServerError, resp.StatusCode, "%s", raw)
 	requireClientErr(t, "msgpack drain", string(raw))
 	require.NotContains(t, string(raw), "cpu_b.parquet", "the damaged file's path reached the client")
 
 	code, out := usDoJSON(t, app, "GET", "/api/v1/query/cpu?database=test&where="+url.QueryEscape("vv > 1"), nil, nil)
-	require.GreaterOrEqual(t, code, 400, "%v", out)
+	require.Equal(t, fiber.StatusBadRequest, code, "%v", out)
 	msg, _ := out["error"].(string)
 	requireClientErr(t, "measurement", msg, "Binder Error", `"vv"`)
+}
+
+func TestQueryRoutesClassifyStatementErrorsAsBadRequest(t *testing.T) {
+	app := unicodeSpaceRig(t)
+	hdr := map[string]string{"x-arc-database": "test"}
+	queries := []struct {
+		name  string
+		sql   string
+		where string
+	}{
+		{name: "unknown column", sql: "SELECT missing_column FROM cpu", where: "missing_column > 0"},
+		{name: "syntax", sql: "SELECT FROM cpu", where: "1 >"},
+		{name: "unknown function", sql: "SELECT no_such_function(1) FROM cpu", where: "no_such_function(1) > 0"},
+	}
+	for _, query := range queries {
+		t.Run(query.name, func(t *testing.T) {
+			for _, path := range []string{"/api/v1/query", "/api/v1/query/arrow"} {
+				code, out := usDoJSON(t, app, "POST", path, map[string]string{"sql": query.sql}, hdr)
+				require.Equal(t, fiber.StatusBadRequest, code, "%s: %v", path, out)
+			}
+
+			body, err := json.Marshal(map[string]string{"sql": query.sql})
+			require.NoError(t, err)
+			req := httptest.NewRequest("POST", "/api/v1/query/msgpack", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("x-arc-database", "test")
+			resp, err := app.Test(req, -1)
+			require.NoError(t, err)
+			_ = resp.Body.Close()
+			require.Equal(t, fiber.StatusBadRequest, resp.StatusCode, "msgpack")
+
+			path := "/api/v1/query/cpu?database=test&where=" + url.QueryEscape(query.where)
+			code, out := usDoJSON(t, app, "GET", path, nil, nil)
+			require.Equal(t, fiber.StatusBadRequest, code, "measurement: %v", out)
+		})
+	}
+}
+
+func TestQueryFailureStatusCodeUsesDuckDBErrorClass(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"statement", &duckdb.Error{Type: duckdb.ErrorTypeParser, Msg: "Parser Error: syntax error"}, fiber.StatusBadRequest},
+		{"storage IO", &duckdb.Error{Type: duckdb.ErrorTypeIO, Msg: "IO Error: read failed"}, fiber.StatusServiceUnavailable},
+		{"storage network", &duckdb.Error{Type: duckdb.ErrorTypeNetwork, Msg: "Network Error: connection failed"}, fiber.StatusServiceUnavailable},
+		{"out of memory", &duckdb.Error{Type: duckdb.ErrorTypeOutOfMemory, Msg: "Out of Memory Error: failed to allocate"}, fiber.StatusServiceUnavailable},
+		{"corrupt Parquet", &duckdb.Error{Type: duckdb.ErrorTypeInvalidInput, Msg: "Invalid Input Error: No magic bytes found at end of file bad.parquet"}, fiber.StatusInternalServerError},
+		{"internal", &duckdb.Error{Type: duckdb.ErrorTypeInternal, Msg: "INTERNAL Error: unexpected"}, fiber.StatusInternalServerError},
+		{"non DuckDB", fmt.Errorf("connection was closed"), fiber.StatusInternalServerError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, queryFailureStatusCode(tc.err))
+		})
+	}
 }
 
 // The query history keeps no statement, path or queried value, whoever

@@ -200,6 +200,18 @@ func newPreparedRig(t *testing.T, opts preparedRigOptions) *preparedRig {
 	return rig
 }
 
+func TestFlightSQLDoGetMapsStatementErrorToInvalidArgument(t *testing.T) {
+	rig := newPreparedRig(t, preparedRigOptions{})
+	info, err := rig.client.Execute(rig.ctx, `SELECT missing_column FROM "sample"."cpu"`)
+	require.NoError(t, err)
+	require.NotEmpty(t, info.Endpoint)
+
+	_, err = rig.client.DoGet(rig.ctx, info.Endpoint[0].Ticket)
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err), "%v", err)
+	require.Contains(t, err.Error(), "Binder Error")
+}
+
 // prepareAndRun prepares sql, executes it and reads the whole result,
 // returning the prepared schema, the result's schema and its row count.
 func (r *preparedRig) prepareAndRun(t *testing.T, sql string) (prepared, result *arrow.Schema, rows int64) {

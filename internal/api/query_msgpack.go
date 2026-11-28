@@ -160,7 +160,7 @@ func executeArrowMsgPackQuery(
 			onFail(err.Error())
 		}
 		h.logger.Error().Err(err).Str("format", "msgpack").Str("sql", sqlutil.ForLog(convertedSQL)).Msg("Arrow MsgPack query failed")
-		_ = respondError(c, fiber.StatusInternalServerError, clientErrText(h.logger, err), timestamp, start)
+		_ = respondError(c, queryFailureStatusCode(err), clientErrText(h.logger, err), timestamp, start)
 		return -1, true
 	}
 
@@ -241,7 +241,7 @@ func executeArrowMsgPackQuery(
 		}
 		h.logger.Error().Err(drainErr).Str("format", "msgpack").
 			Str("sql", sqlutil.ForLog(convertedSQL)).Msg("Arrow MsgPack drain failed")
-		_ = respondError(c, fiber.StatusInternalServerError, clientErrText(h.logger, drainErr), timestamp, start)
+		_ = respondError(c, queryFailureStatusCode(drainErr), clientErrText(h.logger, drainErr), timestamp, start)
 		return -1, true
 	}
 

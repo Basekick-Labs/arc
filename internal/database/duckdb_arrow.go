@@ -119,6 +119,42 @@ var schemaStorageErrorTypes = map[duckdb.ErrorType]bool{
 	duckdb.ErrorTypeConnection: true,
 }
 
+// DuckDBQueryErrorClass is the source of a DuckDB query failure, as far as
+// DuckDB's error type can tell. A query error may be fixed by its caller;
+// storage and memory errors may succeed on retry; unknown errors remain
+// server failures.
+type DuckDBQueryErrorClass uint8
+
+const (
+	DuckDBQueryErrorUnknown DuckDBQueryErrorClass = iota
+	DuckDBQueryErrorStatement
+	DuckDBQueryErrorStorage
+	DuckDBQueryErrorMemory
+)
+
+// ClassifyDuckDBQueryError classifies a wrapped DuckDB error by its typed
+// error, using the same type sets as DescribeArrowSchema. Corrupt Parquet
+// files and error types outside those sets remain unknown: they are not
+// evidence that the caller's statement is wrong or that a retry will help.
+func ClassifyDuckDBQueryError(err error) DuckDBQueryErrorClass {
+	var de *duckdb.Error
+	if !errors.As(err, &de) {
+		return DuckDBQueryErrorUnknown
+	}
+	switch {
+	case de.Type == duckdb.ErrorTypeInvalidInput && corruptParquetMessage(de.Msg):
+		return DuckDBQueryErrorUnknown
+	case de.Type == duckdb.ErrorTypeOutOfMemory:
+		return DuckDBQueryErrorMemory
+	case schemaBindErrorTypes[de.Type]:
+		return DuckDBQueryErrorStatement
+	case schemaStorageErrorTypes[de.Type]:
+		return DuckDBQueryErrorStorage
+	default:
+		return DuckDBQueryErrorUnknown
+	}
+}
+
 // corruptParquetMessage reports whether an Invalid Input error is DuckDB's
 // Parquet reader refusing a file in storage. Those texts were measured with
 // the duckdb-go Arc ships: a damaged file is not the statement's fault, and
@@ -134,17 +170,13 @@ func corruptParquetMessage(msg string) bool {
 
 // bindError wraps a PrepareContext error by what its DuckDB type blames.
 func bindError(err error) error {
-	var de *duckdb.Error
-	if errors.As(err, &de) {
-		switch {
-		case de.Type == duckdb.ErrorTypeInvalidInput && corruptParquetMessage(de.Msg):
-		case de.Type == duckdb.ErrorTypeOutOfMemory:
-			return fmt.Errorf("%w: %w", ErrSchemaMemory, err)
-		case schemaBindErrorTypes[de.Type]:
-			return fmt.Errorf("%w: %w", ErrSchemaBind, err)
-		case schemaStorageErrorTypes[de.Type]:
-			return fmt.Errorf("%w: %w", ErrSchemaStorage, err)
-		}
+	switch ClassifyDuckDBQueryError(err) {
+	case DuckDBQueryErrorMemory:
+		return fmt.Errorf("%w: %w", ErrSchemaMemory, err)
+	case DuckDBQueryErrorStatement:
+		return fmt.Errorf("%w: %w", ErrSchemaBind, err)
+	case DuckDBQueryErrorStorage:
+		return fmt.Errorf("%w: %w", ErrSchemaStorage, err)
 	}
 	return fmt.Errorf("bind: %w", err)
 }
