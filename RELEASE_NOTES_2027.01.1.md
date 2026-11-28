@@ -7274,6 +7274,17 @@ an unbounded operation.
 
 ## Bug fixes
 
+### Fix: a query rejected by DuckDB no longer answers as a server failure ([#1969](https://github.com/Basekick-Labs/arc/issues/1969))
+
+The JSON, Arrow IPC, MessagePack and measurement query routes now answer `400`
+for statement errors, including a missing column, invalid syntax or an unknown
+function. DuckDB storage and network errors, and out-of-memory errors, answer
+`503`; other failures, including corrupt Parquet files, keep `500`. Flight SQL
+`DoGet` maps the query's `400` to `INVALID_ARGUMENT`, matching its prepare
+path. The estimate route is unchanged.
+
+Contributed by [@efegokdemir](https://github.com/efegokdemir) in [#1974](https://github.com/Basekick-Labs/arc/pull/1974).
+
 ### Fix: an Arrow query served by arcx honours the governance row cap ([#727](https://github.com/Basekick-Labs/arc/issues/727))
 
 A `POST /api/v1/query/arrow` query that arcx served ignored the token's
