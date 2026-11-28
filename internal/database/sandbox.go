@@ -76,10 +76,10 @@ func lockdownDirs(ctx context.Context, db *sql.DB, dirs []string, logger zerolog
 		quoted[i] = "'" + escapeSQLString(d) + "'"
 	}
 	// No extension loads after this point: Arc LOADs every extension it uses
-	// before lockdown. Autoload would otherwise pull in a known extension the
-	// first time user SQL names one of its functions, a function surface no
-	// validator was reviewed against; today it fails only because DuckDB's
-	// extension directory is outside the allowlist.
+	// before lockdown. enable_external_access=false below already refuses an
+	// external LOAD, autoload included; turning autoload off as well is
+	// defence in depth, so no later change to the sandbox can let user SQL
+	// pull in an extension whose functions no validator was reviewed against.
 	for _, set := range []string{"SET GLOBAL autoload_known_extensions = false", "SET GLOBAL autoinstall_known_extensions = false"} {
 		if _, err := db.ExecContext(ctx, set); err != nil {
 			return fmt.Errorf("%s: %w", set, err)

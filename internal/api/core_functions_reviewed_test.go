@@ -113,8 +113,10 @@ func refusedBody(body string) string {
 // parquet_full_metadata and read_duckdb read files under the storage root and
 // enable_profiling wrote one, all three accepted (GHSA-r7vm-9hcg-xgf7).
 //
-// Extensions Arc can load are covered by TestSupportedExtensionFunctionsReviewed;
-// duckdb_functions() lists only what is loaded, and the sandbox refuses autoload.
+// Extensions are covered by TestSupportedExtensionFunctionsReviewed in
+// internal/database, both those database.extensions loads and those Arc loads
+// itself (aws, httpfs, azure, cache_httpfs); duckdb_functions() lists only
+// what is loaded, and the sandbox refuses autoload.
 func TestCoreTableFunctionsReviewed(t *testing.T) {
 	duck, err := database.New(&database.Config{MemoryLimit: "256MB", ThreadCount: 1, MaxConnections: 1}, zerolog.Nop())
 	require.NoError(t, err)

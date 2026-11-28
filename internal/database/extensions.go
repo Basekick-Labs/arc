@@ -64,11 +64,28 @@ var supportedExtensions = map[string]supportedExtension{
 // name them there. Their functions reach user SQL all the same once loaded,
 // so they carry the same review as supportedExtensions and their denied
 // functions join DeniedExtensionFunctions. installFrom is the repository
-// INSTALL names ("" for DuckDB's core repository).
+// INSTALL names ("" for DuckDB's core repository). deniedPrefix, when set,
+// refuses every function whose name starts with it, listed or not: an
+// extension INSTALLed at startup without a pinned version can be a newer
+// build than the one CI reviewed, and its new functions must not reach user
+// SQL before the next review catches up.
+//
+// An entry with empty lists (httpfs, azure) adds no functions today; it is
+// here so the review test fails the day a build adds one.
 var engineExtensions = map[string]struct {
 	supportedExtension
-	installFrom string
+	installFrom  string
+	deniedPrefix string
 }{
+	// Loaded with httpfs for every S3 or GCS backend, hot or cold
+	// (ensureHTTPFSLoaded). load_aws_credentials reads the host's AWS
+	// credential chain into the process-wide S3 settings and returns what
+	// it loaded: the server's credentials, not the caller's.
+	"aws": {
+		supportedExtension: supportedExtension{denied: []string{"load_aws_credentials"}},
+	},
+	"httpfs": {},
+	"azure":  {},
 	// query.enable_s3_cache (duckdb.go). Every function it adds manages or
 	// reports the process-wide cache that all tenants' reads share: the
 	// status views list cached object keys (other databases' paths), and
@@ -76,7 +93,8 @@ var engineExtensions = map[string]struct {
 	// filesystems. Arc calls cache_httpfs_clear_cache itself on its own
 	// connection; user SQL may call none of them.
 	"cache_httpfs": {
-		installFrom: "community",
+		installFrom:  "community",
+		deniedPrefix: "cache_httpfs_",
 		supportedExtension: supportedExtension{denied: []string{
 			"cache_httpfs_add_exclusion_regex",
 			"cache_httpfs_cache_access_info_query",
@@ -124,6 +142,19 @@ func DeniedExtensionFunctions() []string {
 	}
 	for _, ext := range engineExtensions {
 		out = append(out, ext.denied...)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// DeniedExtensionFunctionPrefixes is every engine extension's deniedPrefix,
+// lower-case and sorted: the validators refuse any function named with one.
+func DeniedExtensionFunctionPrefixes() []string {
+	var out []string
+	for _, ext := range engineExtensions {
+		if ext.deniedPrefix != "" {
+			out = append(out, ext.deniedPrefix)
+		}
 	}
 	sort.Strings(out)
 	return out

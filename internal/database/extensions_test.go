@@ -80,13 +80,15 @@ func listSignatures(t *testing.T, db *sql.DB) map[duckdbSignature]bool {
 // readable.
 func TestSupportedExtensionFunctionsReviewed(t *testing.T) {
 	for _, name := range SupportedExtensionNames() {
-		t.Run(name, func(t *testing.T) { checkExtensionReviewed(t, name, "", supportedExtensions[name], false) })
+		t.Run(name, func(t *testing.T) { checkExtensionReviewed(t, name, "", "", supportedExtensions[name], false) })
 	}
 	// The extensions Arc loads from its own configuration (cache_httpfs for
 	// query.enable_s3_cache): a configuration the minimal engine of
 	// TestCoreTableFunctionsReviewed never builds.
 	for name, ext := range engineExtensions {
-		t.Run(name, func(t *testing.T) { checkExtensionReviewed(t, name, ext.installFrom, ext.supportedExtension, true) })
+		t.Run(name, func(t *testing.T) {
+			checkExtensionReviewed(t, name, ext.installFrom, ext.deniedPrefix, ext.supportedExtension, true)
+		})
 	}
 }
 
@@ -94,7 +96,8 @@ func TestSupportedExtensionFunctionsReviewed(t *testing.T) {
 // adds that needs review and is in neither of ext's lists. With reviewAll,
 // every signature needs review: an engine extension's zero-argument scalars
 // are the ones that clear or report shared state (cache_httpfs_clear_cache()).
-func checkExtensionReviewed(t *testing.T, name, repo string, ext supportedExtension, reviewAll bool) {
+// A function under deniedPrefix counts as denied.
+func checkExtensionReviewed(t *testing.T, name, repo, deniedPrefix string, ext supportedExtension, reviewAll bool) {
 	t.Helper()
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
@@ -121,7 +124,7 @@ func checkExtensionReviewed(t *testing.T, name, repo string, ext supportedExtens
 		added++
 		text := strings.Contains(sig.params, "VARCHAR") || strings.Contains(sig.params, "ANY")
 		needsReview := reviewAll || text || (sig.kind != "scalar" && sig.kind != "aggregate")
-		if needsReview && !known[sig.name] {
+		if needsReview && !known[sig.name] && (deniedPrefix == "" || !strings.HasPrefix(sig.name, deniedPrefix)) {
 			unreviewed = append(unreviewed, sig.name+" ("+sig.kind+" "+sig.params+")")
 		}
 		for _, d := range deniedNames {
@@ -130,7 +133,8 @@ func checkExtensionReviewed(t *testing.T, name, repo string, ext supportedExtens
 			}
 		}
 	}
-	if added == 0 {
+	// An entry with empty lists (httpfs, azure) is expected to add nothing.
+	if added == 0 && len(ext.denied)+len(ext.reviewed) > 0 {
 		t.Fatalf("loading %s added no functions; the diff is not seeing the extension", name)
 	}
 	sort.Strings(unreviewed)
