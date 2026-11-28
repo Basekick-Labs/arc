@@ -16,12 +16,23 @@ import (
 // local run needs no network.
 func loadTestExtension(t *testing.T, db *sql.DB, name string) {
 	t.Helper()
+	loadTestExtensionFrom(t, db, name, "")
+}
+
+// loadTestExtensionFrom is loadTestExtension for an extension installed
+// from a named repository ("" is DuckDB's core repository).
+func loadTestExtensionFrom(t *testing.T, db *sql.DB, name, repo string) {
+	t.Helper()
 	if _, err := db.Exec("LOAD " + quoteDuckDBIdent(name)); err == nil {
 		return
 	} else if os.Getenv("ARC_TEST_EXTENSIONS") != "1" {
 		t.Skipf("DuckDB extension %s is not in the local cache (set ARC_TEST_EXTENSIONS=1 to install it): %v", name, err)
 	}
-	if _, err := db.Exec("INSTALL " + quoteDuckDBIdent(name)); err != nil {
+	install := "INSTALL " + quoteDuckDBIdent(name)
+	if repo != "" {
+		install += " FROM " + repo
+	}
+	if _, err := db.Exec(install); err != nil {
 		t.Fatalf("install %s: %v", name, err)
 	}
 	if _, err := db.Exec("LOAD " + quoteDuckDBIdent(name)); err != nil {
@@ -69,56 +80,72 @@ func listSignatures(t *testing.T, db *sql.DB) map[duckdbSignature]bool {
 // readable.
 func TestSupportedExtensionFunctionsReviewed(t *testing.T) {
 	for _, name := range SupportedExtensionNames() {
+		t.Run(name, func(t *testing.T) { checkExtensionReviewed(t, name, "", "", supportedExtensions[name], false) })
+	}
+	// The extensions Arc loads from its own configuration (cache_httpfs for
+	// query.enable_s3_cache): a configuration the minimal engine of
+	// TestCoreTableFunctionsReviewed never builds.
+	for name, ext := range engineExtensions {
 		t.Run(name, func(t *testing.T) {
-			db, err := sql.Open("duckdb", "")
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer db.Close()
-			db.SetMaxOpenConns(1)
-			before := listSignatures(t, db)
-			loadTestExtension(t, db, name)
-			after := listSignatures(t, db)
-			ext := supportedExtensions[name]
-			known := map[string]bool{}
-			for _, n := range append(append([]string{}, ext.denied...), ext.reviewed...) {
-				known[n] = true
-			}
-			deniedNames := DeniedExtensionFunctions()
-			var unreviewed []string
-			names := map[string]bool{}
-			added := 0
-			for sig := range after {
-				names[sig.name] = true
-				if before[sig] {
-					continue
-				}
-				added++
-				text := strings.Contains(sig.params, "VARCHAR") || strings.Contains(sig.params, "ANY")
-				needsReview := text || (sig.kind != "scalar" && sig.kind != "aggregate")
-				if needsReview && !known[sig.name] {
-					unreviewed = append(unreviewed, sig.name+" ("+sig.kind+" "+sig.params+")")
-				}
-				for _, d := range deniedNames {
-					if sig.macro != "" && strings.Contains(strings.ToLower(sig.macro), d+"(") {
-						unreviewed = append(unreviewed, sig.name+" (macro calling denied "+d+")")
-					}
-				}
-			}
-			if added == 0 {
-				t.Fatalf("loading %s added no functions; the diff is not seeing the extension", name)
-			}
-			sort.Strings(unreviewed)
-			if len(unreviewed) > 0 {
-				t.Errorf("%s adds signatures nobody has reviewed; add each function to supportedExtensions[%q].denied (refused by the validators) or .reviewed:\n  %s",
-					name, name, strings.Join(unreviewed, "\n  "))
-			}
-			for _, fn := range ext.denied {
-				if !names[fn] {
-					t.Errorf("denied function %s does not exist in %s any more; check what replaced it", fn, name)
-				}
-			}
+			checkExtensionReviewed(t, name, ext.installFrom, ext.deniedPrefix, ext.supportedExtension, true)
 		})
+	}
+}
+
+// checkExtensionReviewed loads one extension and fails on any signature it
+// adds that needs review and is in neither of ext's lists. With reviewAll,
+// every signature needs review: an engine extension's zero-argument scalars
+// are the ones that clear or report shared state (cache_httpfs_clear_cache()).
+// A function under deniedPrefix counts as denied.
+func checkExtensionReviewed(t *testing.T, name, repo, deniedPrefix string, ext supportedExtension, reviewAll bool) {
+	t.Helper()
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	before := listSignatures(t, db)
+	loadTestExtensionFrom(t, db, name, repo)
+	after := listSignatures(t, db)
+	known := map[string]bool{}
+	for _, n := range append(append([]string{}, ext.denied...), ext.reviewed...) {
+		known[n] = true
+	}
+	deniedNames := DeniedExtensionFunctions()
+	var unreviewed []string
+	names := map[string]bool{}
+	added := 0
+	for sig := range after {
+		names[sig.name] = true
+		if before[sig] {
+			continue
+		}
+		added++
+		text := strings.Contains(sig.params, "VARCHAR") || strings.Contains(sig.params, "ANY")
+		needsReview := reviewAll || text || (sig.kind != "scalar" && sig.kind != "aggregate")
+		if needsReview && !known[sig.name] && (deniedPrefix == "" || !strings.HasPrefix(sig.name, deniedPrefix)) {
+			unreviewed = append(unreviewed, sig.name+" ("+sig.kind+" "+sig.params+")")
+		}
+		for _, d := range deniedNames {
+			if sig.macro != "" && strings.Contains(strings.ToLower(sig.macro), d+"(") {
+				unreviewed = append(unreviewed, sig.name+" (macro calling denied "+d+")")
+			}
+		}
+	}
+	// An entry with empty lists (httpfs, azure) is expected to add nothing.
+	if added == 0 && len(ext.denied)+len(ext.reviewed) > 0 {
+		t.Fatalf("loading %s added no functions; the diff is not seeing the extension", name)
+	}
+	sort.Strings(unreviewed)
+	if len(unreviewed) > 0 {
+		t.Errorf("%s adds signatures nobody has reviewed; add each function to its entry's denied list (refused by the validators) or reviewed list:\n  %s",
+			name, strings.Join(unreviewed, "\n  "))
+	}
+	for _, fn := range ext.denied {
+		if !names[fn] {
+			t.Errorf("denied function %s does not exist in %s any more; check what replaced it", fn, name)
+		}
 	}
 }
 

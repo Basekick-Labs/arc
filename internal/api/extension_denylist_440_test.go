@@ -129,3 +129,76 @@ func containsString(list []string, s string) bool {
 	}
 	return false
 }
+
+// The functions of cache_httpfs, which Arc loads itself for
+// query.enable_s3_cache, are refused like a supported extension's: they
+// report and change the cache every tenant's reads share. Most are zero-
+// argument scalars, a call form the table-position probes above do not use.
+func TestEngineExtensionFunctionsRefused(t *testing.T) {
+	denied := database.DeniedExtensionFunctions()
+	n := 0
+	for _, fn := range denied {
+		if !strings.HasPrefix(fn, "cache_httpfs_") {
+			continue
+		}
+		n++
+		for _, sql := range []string{
+			"SELECT " + fn + "()",
+			"SELECT " + strings.ToUpper(fn) + " ()",
+			"SELECT * FROM " + fn + "()",
+			"SELECT time FROM cpu WHERE " + fn + "() IS NOT NULL",
+		} {
+			err := validateSQLErr(sql)
+			if err == nil || !strings.Contains(strings.ToLower(err.Error()), fn) {
+				t.Errorf("%q: want a refusal naming %s, got %v", sql, fn, err)
+			}
+		}
+		if _, _, err := (&DeleteHandler{}).validateWhereClause(fn + "() IS NOT NULL"); err == nil {
+			t.Errorf("DELETE WHERE with %s() was accepted", fn)
+		}
+	}
+	if n != 20 {
+		t.Fatalf("found %d cache_httpfs functions in the denylist, want 20", n)
+	}
+}
+
+// A cache_httpfs function no review has listed yet (a newer build than CI
+// reviewed, INSTALLed unpinned at startup) is refused by its prefix.
+func TestEngineExtensionPrefixRefused(t *testing.T) {
+	const fn = "cache_httpfs_some_future_function"
+	for _, sql := range []string{"SELECT " + fn + "()", "SELECT * FROM " + fn + "('x')", `SELECT "` + fn + `"()`} {
+		err := validateSQLErr(sql)
+		if err == nil || !strings.Contains(strings.ToLower(err.Error()), fn) {
+			t.Errorf("%q: want a refusal naming %s, got %v", sql, fn, err)
+		}
+	}
+	if _, _, err := (&DeleteHandler{}).validateWhereClause(fn + "() IS NULL"); err == nil {
+		t.Errorf("DELETE WHERE with %s() was accepted", fn)
+	}
+	// The prefix is a function-name prefix, not a substring: an identifier
+	// that merely contains it is not refused.
+	if err := validateSQLErr("SELECT x_cache_httpfs_y FROM cpu"); err != nil {
+		t.Errorf("false positive: %v", err)
+	}
+}
+
+// The aws extension, loaded for every S3 or GCS backend, reads the host's
+// AWS credential chain into process-wide settings through
+// load_aws_credentials; user SQL may not call it.
+func TestAWSExtensionFunctionRefused(t *testing.T) {
+	const fn = "load_aws_credentials"
+	for _, sql := range []string{
+		"SELECT * FROM " + fn + "()",
+		"SELECT * FROM " + fn + "('default')",
+		"SELECT loaded_access_key_id FROM " + strings.ToUpper(fn) + " ()",
+		"SELECT 1 FROM cpu WHERE EXISTS (FROM main." + fn + "())",
+	} {
+		err := validateSQLErr(sql)
+		if err == nil || !strings.Contains(strings.ToLower(err.Error()), fn) {
+			t.Errorf("%q: want a refusal naming %s, got %v", sql, fn, err)
+		}
+		if err := validateCQQuery(sql); err == nil {
+			t.Errorf("continuous query: %q was accepted", sql)
+		}
+	}
+}

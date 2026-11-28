@@ -3889,9 +3889,14 @@ var unicodeEscapePattern = regexp.MustCompile(`(?i)\bu&__(?:STR|IDENT)_\d+__`)
 // functions and fails on one that is neither refused nor reviewed, so an
 // upgrade cannot add a reader silently (GHSA-r7vm-9hcg-xgf7: DuckDB added
 // parquet_full_metadata and read_duckdb after this list was written).
-// TestIOTableFunctionPattern_Family pins the names. An extension's functions are not listed here: they
-// come from database.DeniedExtensionFunctions, and an extension is loadable
-// only once its function surface is reviewed there (#440).
+// TestIOTableFunctionPattern_Family pins the names.
+//
+// An extension's functions are not listed here: they come from
+// database.DeniedExtensionFunctions and DeniedExtensionFunctionPrefixes, and
+// an extension is loadable only once its function surface is reviewed there
+// (#440). Those entries are not all file readers: the functions of the
+// extensions Arc loads itself (aws, cache_httpfs) read or change state every
+// tenant shares, which is refused for the same reason.
 var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join(append([]string{
 	"read_parquet",
 	"parquet_scan",
@@ -3926,9 +3931,22 @@ var ioTableFunctionPattern = regexp.MustCompile(`(?i)\b(` + strings.Join(append(
 	// the POINTER arguments today; denied rather than reviewed as safe.
 	"arrow_scan",
 	"arrow_scan_dumb",
-	// The file readers of the DuckDB extensions database.extensions may load
-	// (#440), denied whether or not this node loads them.
-}, database.DeniedExtensionFunctions()...), "|") + `)\s*\(`)
+	// The denied functions of the DuckDB extensions database.extensions may
+	// load and of those Arc loads itself (database.engineExtensions: aws,
+	// cache_httpfs), refused whether or not this node loads them, and every
+	// function under an engine extension's denied prefix (#440).
+}, append(database.DeniedExtensionFunctions(), deniedPrefixAlternatives()...)...), "|") + `)\s*\(`)
+
+// deniedPrefixAlternatives turns database.DeniedExtensionFunctionPrefixes
+// into regexp alternatives matching the whole function name, so a refusal
+// names the function that was called.
+func deniedPrefixAlternatives() []string {
+	var out []string
+	for _, p := range database.DeniedExtensionFunctionPrefixes() {
+		out = append(out, regexp.QuoteMeta(p)+`\w*`)
+	}
+	return out
+}
 
 // dynamicSQLFunctionPattern matches DuckDB table functions that evaluate a
 // string as SQL (or resolve a string to a relation). They are the I/O

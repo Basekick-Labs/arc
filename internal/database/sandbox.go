@@ -75,6 +75,17 @@ func lockdownDirs(ctx context.Context, db *sql.DB, dirs []string, logger zerolog
 	for i, d := range dirs {
 		quoted[i] = "'" + escapeSQLString(d) + "'"
 	}
+	// No extension loads after this point: Arc LOADs every extension it uses
+	// before lockdown. enable_external_access=false below already refuses an
+	// external LOAD, autoload included; turning autoload off as well is
+	// defence in depth, so no later change to the sandbox can let user SQL
+	// pull in an extension whose functions no validator was reviewed against.
+	for _, set := range []string{"SET GLOBAL autoload_known_extensions = false", "SET GLOBAL autoinstall_known_extensions = false"} {
+		if _, err := db.ExecContext(ctx, set); err != nil {
+			return fmt.Errorf("%s: %w", set, err)
+		}
+	}
+
 	setDirs := "SET GLOBAL allowed_directories = [" + strings.Join(quoted, ", ") + "]"
 	if _, err := db.ExecContext(ctx, setDirs); err != nil {
 		return fmt.Errorf("set allowed_directories: %w", err)
@@ -94,6 +105,13 @@ func lockdownDirs(ctx context.Context, db *sql.DB, dirs []string, logger zerolog
 	}
 	if got {
 		return fmt.Errorf("sandbox lockdown did not take effect: enable_external_access is still true")
+	}
+	var autoload, autoinstall bool
+	if err := db.QueryRowContext(ctx, "SELECT current_setting('autoload_known_extensions')::BOOLEAN, current_setting('autoinstall_known_extensions')::BOOLEAN").Scan(&autoload, &autoinstall); err != nil {
+		return fmt.Errorf("read back extension autoload: %w", err)
+	}
+	if autoload || autoinstall {
+		return fmt.Errorf("sandbox lockdown did not take effect: autoload_known_extensions=%t autoinstall_known_extensions=%t", autoload, autoinstall)
 	}
 
 	componentLogger.Info().Strs("allowed_directories", dirs).Msg("DuckDB external access locked down (sandbox active)")

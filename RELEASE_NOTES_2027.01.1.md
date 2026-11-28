@@ -4996,6 +4996,26 @@ policy. It now stores its own copy too.
 Full technical detail will accompany the corresponding security advisory once
 it is published. Responsibly reported by **[@gablealder823](https://github.com/gablealder823)**.
 
+## Security: functions of the extensions Arc loads for object storage are refused in user SQL
+
+**Deployments on S3 or GCS storage (hot or cold tier), and S3-primary
+deployments with `query.enable_s3_cache = true`.** The DuckDB extensions Arc
+loads for these backends add SQL functions that read or change state the
+whole server shares, outside the caller's scope. Arc's checks on query text
+did not cover them, so any token that could run a query could call them. They
+are now refused with `400` on every query endpoint, in continuous queries and
+in `DELETE` predicates; Arc's own use of them is unaffected. Every function of
+the S3 cache extension is refused by name prefix, including any a newer build
+of the extension adds. The extension review test now loads each extension Arc
+loads itself and requires a decision on every function it adds.
+
+DuckDB's automatic extension loading and installing are also switched off
+once Arc's sandbox is active, as defence in depth: every extension Arc uses is
+loaded at startup, before then.
+
+Full technical detail will accompany the corresponding security advisory once
+it is published.
+
 ## Security: more DuckDB functions are refused in user SQL
 
 Some functions of the DuckDB release Arc links were not covered by the checks
