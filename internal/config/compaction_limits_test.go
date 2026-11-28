@@ -145,19 +145,9 @@ func TestLoad_ExplicitCompactionThreadsSurvives(t *testing.T) {
 }
 
 // TestDeriveCompactionMemoryLimit_EmptyDatabaseLimitDerivesFromSystem pins the
-// contract change in #1026.
-//
-// This case used to return "", which was correct while database.memory_limit
-// always had a value. It no longer does: Arc now leaves that empty so DuckDB
-// applies its own cgroup-aware default. Returning "" here would mean EVERY
-// compaction subprocess also falls back to DuckDB's default and takes 80% of the
-// same cgroup — a main process plus the default two subprocesses budgeting 240%
-// of the container. subprocess.go only warns when a SET fails, so it would do
-// that silently.
-//
-// The share is detected*0.8/(maxConcurrent+1): the +1 reserves the main
-// process's share, because the subprocesses are separate processes in the SAME
-// cgroup rather than independent budgets.
+// fallback used when Load cannot derive a cgroup main-database limit. The
+// subprocesses share detected*0.8/(maxConcurrent+1); the +1 reserves a share
+// for the main process when DuckDB's own limit remains in effect.
 func TestDeriveCompactionMemoryLimit_EmptyDatabaseLimitDerivesFromSystem(t *testing.T) {
 	detected, _, ok := sysmem.Limit()
 	if !ok {
@@ -188,6 +178,179 @@ func TestDeriveCompactionMemoryLimit_EmptyDatabaseLimitDerivesFromSystem(t *test
 		if bytes != want {
 			t.Fatalf("maxConcurrent=%d: derived %d bytes, want %d (detected*0.8/(maxConcurrent+1))", maxConcurrent, bytes, want)
 		}
+	}
+}
+
+func TestLoad_CgroupMemoryDefaultLeavesHeadroom(t *testing.T) {
+	original := systemMemoryLimitFn
+	t.Cleanup(func() { systemMemoryLimitFn = original })
+	systemMemoryLimitFn = func() (uint64, sysmem.Source, bool) {
+		return 3 << 30, sysmem.SourceCgroupV2, true
+	}
+
+	t.Chdir(t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("ARC_DATABASE_MEMORY_LIMIT", "")
+	t.Setenv("ARC_COMPACTION_MEMORY_LIMIT", "")
+	t.Setenv("ARC_COMPACTION_MAX_CONCURRENT", "2")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	const cgroupLimit = uint64(3 << 30)
+	wantDatabase := formatDuckDBBytes(cgroupLimit * 3 / 5)
+	wantCompaction := formatDuckDBBytes(cgroupLimit / 5 / 2)
+	if cfg.Database.MemoryLimit != wantDatabase {
+		t.Errorf("database.memory_limit = %q, want %q (60%% of cgroup)", cfg.Database.MemoryLimit, wantDatabase)
+	}
+	if cfg.Compaction.MemoryLimit != wantCompaction {
+		t.Errorf("compaction.memory_limit = %q, want %q (20%% cgroup budget split across two subprocesses)", cfg.Compaction.MemoryLimit, wantCompaction)
+	}
+}
+
+func TestDeriveDefaultDatabaseMemoryLimitSupportsBothCgroups(t *testing.T) {
+	want := formatDuckDBBytes(uint64(3<<30) * 3 / 5)
+	for _, source := range []sysmem.Source{sysmem.SourceCgroupV1, sysmem.SourceCgroupV2} {
+		if got := deriveDefaultDatabaseMemoryLimit(3<<30, source, true); got != want {
+			t.Errorf("source %q: database memory limit = %q, want %q", source, got, want)
+		}
+	}
+}
+
+func TestDeriveDefaultCgroupCompactionMemoryLimitSharesBudget(t *testing.T) {
+	detected := uint64(3 << 30)
+	for _, maxConcurrent := range []int{0, 1, 2, 4} {
+		got := deriveDefaultCgroupCompactionMemoryLimit(detected, maxConcurrent)
+		if got == "" {
+			t.Fatalf("maxConcurrent=%d: got empty memory limit", maxConcurrent)
+		}
+		var share uint64
+		if _, err := fmt.Sscanf(got, "%dB", &share); err != nil {
+			t.Fatalf("maxConcurrent=%d: invalid derived limit %q: %v", maxConcurrent, got, err)
+		}
+		effectiveConcurrent := maxConcurrent
+		if effectiveConcurrent <= 0 {
+			effectiveConcurrent = 2
+		}
+		compactionLimit := uint64(float64(detected) * defaultCompactionBudgetFraction)
+		if total := share * uint64(effectiveConcurrent); total > compactionLimit {
+			t.Errorf("maxConcurrent=%d: aggregate compaction budget %d exceeds 20%% of %d", maxConcurrent, total, detected)
+		}
+		databaseLimit := uint64(float64(detected) * defaultDatabaseMemoryFraction)
+		combinedLimit := uint64(float64(detected) * duckdbDefaultMemoryFraction)
+		if total := databaseLimit + share*uint64(effectiveConcurrent); total > combinedLimit {
+			t.Errorf("maxConcurrent=%d: combined DuckDB budget %d exceeds 80%% of %d", maxConcurrent, total, detected)
+		}
+	}
+}
+
+func TestLoad_ExplicitDatabaseMemoryLimitStillWins(t *testing.T) {
+	original := systemMemoryLimitFn
+	t.Cleanup(func() { systemMemoryLimitFn = original })
+	var detections int
+	systemMemoryLimitFn = func() (uint64, sysmem.Source, bool) {
+		detections++
+		return 3 << 30, sysmem.SourceCgroupV2, true
+	}
+
+	t.Chdir(t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("ARC_DATABASE_MEMORY_LIMIT", "2GB")
+	t.Setenv("ARC_COMPACTION_MEMORY_LIMIT", "")
+	t.Setenv("ARC_COMPACTION_MAX_CONCURRENT", "2")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Database.MemoryLimit != "2GB" {
+		t.Errorf("database.memory_limit = %q, want explicit value 2GB", cfg.Database.MemoryLimit)
+	}
+	if cfg.Compaction.MemoryLimit != "1GB" {
+		t.Errorf("compaction.memory_limit = %q, want existing explicit-limit derivation 1GB", cfg.Compaction.MemoryLimit)
+	}
+	if detections != 0 {
+		t.Errorf("system memory detected %d times with an explicit database.memory_limit; want no probe", detections)
+	}
+}
+
+func TestLoad_ExplicitCompactionMemoryLimitStillWins(t *testing.T) {
+	original := systemMemoryLimitFn
+	t.Cleanup(func() { systemMemoryLimitFn = original })
+	systemMemoryLimitFn = func() (uint64, sysmem.Source, bool) {
+		return 3 << 30, sysmem.SourceCgroupV2, true
+	}
+
+	t.Chdir(t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("ARC_DATABASE_MEMORY_LIMIT", "")
+	t.Setenv("ARC_COMPACTION_MEMORY_LIMIT", "256MB")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Database.MemoryLimit != formatDuckDBBytes(uint64(3<<30)*3/5) {
+		t.Errorf("database.memory_limit = %q, want the cgroup-derived default", cfg.Database.MemoryLimit)
+	}
+	if cfg.Compaction.MemoryLimit != "256MB" {
+		t.Errorf("compaction.memory_limit = %q, want explicit value 256MB", cfg.Compaction.MemoryLimit)
+	}
+}
+
+func TestLoad_WithoutCgroupKeepsDuckDBDatabaseDefault(t *testing.T) {
+	original := systemMemoryLimitFn
+	t.Cleanup(func() { systemMemoryLimitFn = original })
+	detected := uint64(3 << 30)
+	systemMemoryLimitFn = func() (uint64, sysmem.Source, bool) {
+		return detected, sysmem.SourceMemInfo, true
+	}
+
+	t.Chdir(t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("ARC_DATABASE_MEMORY_LIMIT", "")
+	t.Setenv("ARC_COMPACTION_MEMORY_LIMIT", "")
+	t.Setenv("ARC_COMPACTION_MAX_CONCURRENT", "2")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Database.MemoryLimit != "" {
+		t.Errorf("database.memory_limit = %q, want empty without a cgroup limit", cfg.Database.MemoryLimit)
+	}
+	wantCompaction := formatDuckDBBytes(uint64(float64(detected)*duckdbDefaultMemoryFraction) / 3)
+	if cfg.Compaction.MemoryLimit != wantCompaction {
+		t.Errorf("compaction.memory_limit = %q, want legacy host-derived value %q", cfg.Compaction.MemoryLimit, wantCompaction)
+	}
+}
+
+func TestLoad_SmallCgroupKeepsDuckDBDatabaseDefault(t *testing.T) {
+	original := systemMemoryLimitFn
+	t.Cleanup(func() { systemMemoryLimitFn = original })
+	systemMemoryLimitFn = func() (uint64, sysmem.Source, bool) {
+		return 128 << 20, sysmem.SourceCgroupV2, true
+	}
+
+	t.Chdir(t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("ARC_DATABASE_MEMORY_LIMIT", "")
+	t.Setenv("ARC_COMPACTION_MEMORY_LIMIT", "")
+	t.Setenv("ARC_COMPACTION_MAX_CONCURRENT", "2")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Database.MemoryLimit != "" {
+		t.Errorf("database.memory_limit = %q, want empty below the 128 MiB useful limit", cfg.Database.MemoryLimit)
+	}
+	cgroupLimit := uint64(128 << 20)
+	wantCompaction := formatDuckDBBytes(uint64(float64(cgroupLimit)*duckdbDefaultMemoryFraction) / 3)
+	if cfg.Compaction.MemoryLimit != wantCompaction {
+		t.Errorf("compaction.memory_limit = %q, want legacy fallback %q", cfg.Compaction.MemoryLimit, wantCompaction)
 	}
 }
 

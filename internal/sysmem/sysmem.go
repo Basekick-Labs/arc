@@ -1,15 +1,12 @@
 // Package sysmem reports the machine's memory and how much of it this process
 // may actually use.
 //
-// Limit exists for the compaction subprocess budget. DuckDB already performs its
-// own cgroup-aware detection — duckdb::CGroups::GetMemoryLimit is in the linked
-// library, and with no memory_limit set DuckDB defaults to 80% of the detected
-// limit — so Arc does NOT need this to size the main database. What Arc does need
-// it for is the compaction subprocess limit: those are separate processes in the
-// SAME cgroup, and if each one falls back to DuckDB's own default they take 80% of
-// the whole container each, so a main process plus two subprocesses budgets 240%
-// of the box. Dividing a share requires a concrete number, and that is what this
-// package supplies.
+// Arc uses a detected cgroup limit to size the main DuckDB database and its
+// compaction subprocesses. DuckDB defaults to 80% of its detected cgroup limit;
+// Arc uses this package to set a lower main-database budget that leaves room for
+// Go allocations, and to divide the compaction budget across subprocesses in the
+// same cgroup. The host-memory fallback remains available for compaction sizing
+// when no cgroup limit is present.
 //
 // Physical exists for telemetry, which reports the machine's memory beside the
 // usable limit, the way it reports logical_cores beside usable_cores (#1412).
